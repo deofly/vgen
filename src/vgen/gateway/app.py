@@ -62,6 +62,7 @@ from .schemas import (
     DeviceRecoveryChallengeRequest,
     DeviceRecoveryCompleteRequest,
     EnrollmentDecision,
+    HealthResponse,
     InviteClaim,
     InviteCreate,
     LeaseRequest,
@@ -1218,8 +1219,8 @@ def create_app(
             raise VGenError(ErrorCode.REPLAY_DETECTED)
         return spec, authorization, expires_at, str(intent_payload["spec_digest"])
 
-    @app.get("/healthz", tags=["system"])
-    @app.get("/api/v1/health", tags=["system"])
+    @app.get("/healthz", tags=["system"], response_model=HealthResponse)
+    @app.get("/api/v1/health", tags=["system"], response_model=HealthResponse)
     def health() -> dict[str, Any]:
         return db.health()
 

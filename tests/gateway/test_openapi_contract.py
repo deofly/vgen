@@ -38,6 +38,16 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
     health = schema["paths"]["/api/v1/health"]["get"]
     assert "VgenProtocolVersion" not in _headers(health)
     assert "security" not in health
+    health_schema = schema["components"]["schemas"]["HealthCounts"]
+    assert set(health_schema["required"]) == {
+        "users",
+        "workspaces",
+        "tasks",
+        "workers_total",
+        "workers_active",
+        "workers_online",
+        "workers_revoked",
+    }
 
     public_write = schema["paths"]["/api/v1/auth/challenges"]["post"]
     assert set(_headers(public_write)) == {"VgenProtocolVersion"}

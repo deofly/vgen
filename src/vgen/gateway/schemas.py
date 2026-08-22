@@ -20,6 +20,23 @@ class WireModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
+class HealthCounts(WireModel):
+    users: int = Field(ge=0)
+    workspaces: int = Field(ge=0)
+    tasks: int = Field(ge=0)
+    workers_total: int = Field(ge=0)
+    workers_active: int = Field(ge=0)
+    workers_online: int = Field(ge=0)
+    workers_revoked: int = Field(ge=0)
+
+
+class HealthResponse(WireModel):
+    ok: Literal[True]
+    schema_version: int = Field(ge=1)
+    journal_mode: str
+    counts: HealthCounts
+
+
 class BootstrapRequest(WireModel):
     bootstrap_code: str = Field(min_length=1)
     display_name: str = Field(default="Gateway Operator", min_length=1, max_length=120)

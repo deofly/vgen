@@ -30,7 +30,14 @@ from vgen.protocol.user_enrollment import (
     workspace_recipient_admission_digest,
 )
 
-from .database import GatewayDatabase, json_text, new_id, now, row_dict
+from .database import (
+    WORKER_ONLINE_WINDOW_SECONDS,
+    GatewayDatabase,
+    json_text,
+    new_id,
+    now,
+    row_dict,
+)
 from .public_metadata import (
     PublicMetadataError,
     validate_artifact_media_metadata,
@@ -313,7 +320,12 @@ class GatewayRepository:
                       WHERE ta.worker_id=w.id AND ta.state IN ('reserved','leased','running')
                         AND (active_task.reservation_expires_at IS NULL OR active_task.reservation_expires_at>?)) < w.capacity
                ORDER BY COALESCE(w.last_seen_at,0) DESC,w.created_at LIMIT 50"""
-        args = (pool_id, executor_type, stamp - 120, stamp)
+        args = (
+            pool_id,
+            executor_type,
+            stamp - WORKER_ONLINE_WINDOW_SECONDS,
+            stamp,
+        )
         if isinstance(conn, GatewayDatabase):
             return conn.fetchall(sql, args)
         return conn.execute(sql, args).fetchall()
@@ -344,7 +356,7 @@ class GatewayRepository:
                             AND (active_task.reservation_expires_at IS NULL
                                  OR active_task.reservation_expires_at>?)) < w.capacity
                    LIMIT 1"""
-        args = (pool_id, stamp - 120, stamp)
+        args = (pool_id, stamp - WORKER_ONLINE_WINDOW_SECONDS, stamp)
         if isinstance(conn, GatewayDatabase):
             return conn.fetchone(sql, args) is not None
         return conn.execute(sql, args).fetchone() is not None
@@ -6137,7 +6149,7 @@ class GatewayRepository:
                     task["pool_id"],
                     task["assigned_worker_id"],
                     task["executor_type"],
-                    stamp - 120,
+                    stamp - WORKER_ONLINE_WINDOW_SECONDS,
                     stamp,
                 ),
             ).fetchall()

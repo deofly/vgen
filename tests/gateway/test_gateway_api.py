@@ -110,6 +110,56 @@ def user_enrollment_proof(keys: DeviceKeys, claim: dict) -> str:
     return sign_user_registration_claim(keys.signing_private_key, claim)
 
 
+def test_health_separates_worker_lifecycle_and_online_counts(tmp_path) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    with TestClient(app) as client:
+        client.headers.update({"Vgen-Protocol-Version": "1"})
+        boot, _ = bootstrap(client)
+        stamp = time.time()
+        rows = (
+            ("wrk_health_recent", "active", stamp - 10),
+            ("wrk_health_stale", "active", stamp - 121),
+            ("wrk_health_revoked", "revoked", stamp - 10),
+            ("wrk_health_offline", "offline", None),
+        )
+        with app.state.db.transaction(immediate=True) as conn:
+            for worker_id, status, last_seen_at in rows:
+                conn.execute(
+                    """INSERT INTO workers
+                       (id,owner_user_id,name,signing_public_key,encryption_public_key,
+                        executor_type,executor_version,capabilities,capacity,status,
+                        last_seen_at,created_at,updated_at,revoked_at)
+                       VALUES (?,?,?,?,?,'comfyui','0.33.0','{}',1,?,?,?,?,?)""",
+                    (
+                        worker_id,
+                        boot["user"]["id"],
+                        worker_id,
+                        f"signing-{worker_id}",
+                        f"encryption-{worker_id}",
+                        status,
+                        last_seen_at,
+                        stamp,
+                        stamp,
+                        stamp if status == "revoked" else None,
+                    ),
+                )
+
+        response = client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        counts = response.json()["counts"]
+        assert counts["workers_total"] == 4
+        assert counts["workers_active"] == 2
+        assert counts["workers_online"] == 1
+        assert counts["workers_revoked"] == 1
+        assert "workers" not in counts
+
+
 def test_bootstrap_workspace_pool_and_idempotency(tmp_path) -> None:
     app = create_app(
         database_path=str(tmp_path / "gateway.db"),
@@ -123,6 +173,15 @@ def test_bootstrap_workspace_pool_and_idempotency(tmp_path) -> None:
         health = client.get("/api/v1/health")
         assert health.status_code == 200
         assert health.json()["journal_mode"] == "wal"
+        assert health.json()["counts"] == {
+            "users": 1,
+            "workspaces": 0,
+            "tasks": 0,
+            "workers_total": 0,
+            "workers_active": 0,
+            "workers_online": 0,
+            "workers_revoked": 0,
+        }
 
         write_headers = {**headers, "Idempotency-Key": "create-workspace-1"}
         first = client.post("/api/v1/workspaces", json={"name": "Studio"}, headers=write_headers)

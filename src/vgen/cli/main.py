@@ -2909,8 +2909,311 @@ def _usage_command(args: argparse.Namespace) -> None:
         client.close()
 
 
+_COMMAND_HELP: dict[tuple[str, ...], str] = {
+    ("setup",): "在 Mac 上完成首次初始化，创建身份、Workspace、资源池和 Home Broker。",
+    ("upgrade",): "检查并升级已托管安装的 VGen CLI，同时刷新 Home Broker。",
+    ("identity",): "管理用户身份、设备登录、恢复和撤销。",
+    ("identity", "init"): "创建新的本地用户身份和恢复材料。",
+    ("identity", "recover"): "使用恢复词或私钥文件在当前设备恢复用户身份。",
+    ("identity", "show"): "查看本地身份的公开信息，不显示私钥。",
+    ("identity", "device"): "查看当前身份对应的本地设备信息。",
+    ("identity", "revoke"): "撤销指定设备，或仅忘记当前设备的本地身份。",
+    ("identity", "login"): "向 Gateway 发起密钥挑战并建立短期登录会话。",
+    ("identity", "logout"): "删除当前 Profile 保存的本地登录会话。",
+    ("identity", "enroll"): "使用一次性邀请加入 Gateway 并创建用户身份。",
+    ("identity", "device-enroll"): "使用设备邀请把当前设备接入已有用户身份。",
+    ("profile",): "管理 Gateway 地址、默认 Workspace 和本地身份的连接配置。",
+    ("profile", "add"): "保存一个 Gateway 连接配置，并可设为当前默认配置。",
+    ("profile", "use"): "切换后续命令默认使用的 Profile。",
+    ("profile", "show"): "查看指定或当前 Profile 的连接配置。",
+    ("profile", "list"): "列出本机保存的全部 Profile。",
+    ("gateway",): "执行 Gateway 首次绑定和健康检查。",
+    ("gateway", "bootstrap"): "用一次性 Bootstrap code 绑定首位 Gateway Operator。",
+    ("gateway", "health"): "查看 Gateway、数据库以及 Worker 在线统计。",
+    ("service",): "管理供 API 程序使用的独立 Service 身份和密钥。",
+    ("service", "enroll"): "使用邀请创建 Service 密钥并接入 Workspace。",
+    ("service", "use"): "把 Profile 绑定到本地已有的 Service 凭据。",
+    ("service", "login"): "为当前 Service 建立短期登录会话。",
+    ("service", "logout"): "删除当前 Service 的本地登录会话。",
+    ("service", "show"): "查看当前 Profile 绑定的 Service 信息。",
+    ("service", "revoke-local"): "从本机删除 Service 凭据和会话，不撤销服务端主体。",
+    ("service", "key-sync"): "同步 Service 可访问的 Workspace 数据密钥。",
+    ("workspace",): "管理 Workspace、资源池、成员准入、密钥和审计记录。",
+    ("workspace", "create"): "创建 Workspace，并初始化本地端到端加密密钥。",
+    ("workspace", "list"): "列出当前用户可访问的 Workspace。",
+    ("workspace", "pool-create"): "在 Workspace 中创建 Worker 资源池。",
+    ("workspace", "pool-list"): "列出 Workspace 中的资源池。",
+    ("workspace", "owner-migrate"): "确认并固定旧版 Workspace Owner 公钥。",
+    ("workspace", "key-sync"): "同步当前设备可访问的 Workspace 数据密钥。",
+    ("workspace", "key-grant"): "把指定版本的 Workspace 密钥安全封装给接收方。",
+    ("workspace", "key-grant-enrollment"): "向已完成准入的用户授予 Workspace 密钥。",
+    ("workspace", "key-rotate"): "轮换 Workspace 数据密钥并生成新版本。",
+    ("workspace", "authority-pin"): "在本地固定可信 Workspace 管理员公钥。",
+    ("workspace", "invite"): "生成用户、设备或 Service 的一次性邀请。",
+    ("workspace", "apply"): "主动申请加入指定 Workspace。",
+    ("workspace", "decide"): "批准或拒绝一条待处理的准入申请。",
+    ("workspace", "enrollment-list"): "列出 Workspace 的邀请领取和申请记录。",
+    ("workspace", "allocation-list"): "列出 Workspace 中的 Worker 资源分配。",
+    ("workspace", "audit"): "查看 Workspace 控制面审计记录。",
+    ("join",): "通过邀请加入他人的 Workspace，并在需要时等待管理员批准。",
+    ("broker",): "管理 Home Broker、Broker Device 和 Worker 维护任务。",
+    ("broker", "create"): "创建属于当前用户的 Logical Home Broker。",
+    ("broker", "list"): "列出当前用户拥有的 Broker。",
+    ("broker", "status"): "查看 Gateway 记录的 Broker Device 和心跳状态。",
+    ("broker", "local-status"): "检查这台 Mac 上 Home Broker 的进程和运行版本。",
+    ("broker", "service-refresh"): "让本机 Home Broker 切换到当前 CLI 版本并重新加载。",
+    ("broker", "device"): "把一个已登记设备关联到指定 Broker。",
+    ("broker", "serve"): "前台运行 Home Broker 轮询服务，适合调试。",
+    ("broker", "worker-update"): "向 Worker 推送经过校验的 VGen wheel 更新任务。",
+    ("broker", "model-install"): "要求 Worker 按工作流清单校验并下载缺失模型。",
+    ("broker", "maintenance-list"): "列出 Worker 更新和模型安装任务。",
+    ("broker", "maintenance-show"): "查看一条 Worker 维护任务的状态和结果。",
+    ("broker", "maintenance-cancel"): "取消尚未结束的 Worker 维护任务。",
+    ("worker",): "接入、分配、运行和维护 GPU Worker。",
+    ("worker", "bundle"): "创建已绑定身份的一键 Windows Worker 安装包。",
+    ("worker", "installer-bundle"): "创建不含任何用户凭据的通用 Windows 安装包。",
+    ("worker", "invite"): "为通用 Windows 安装包生成一次性 Worker 邀请。",
+    ("worker", "claim-invite"): "在 Worker 设备生成密钥并领取一次性邀请。",
+    ("worker", "approve-enrollment"): "核对验证码并批准待接入的 Worker。",
+    ("worker", "enroll"): "直接登记当前用户拥有的 Worker。",
+    ("worker", "list"): "列出 Worker、状态、心跳和能力信息。",
+    ("worker", "manager-set"): "指定负责维护某台 Worker 的 Broker。",
+    ("worker", "offer"): "由 Worker 所有者提议把 Worker 加入资源池。",
+    ("worker", "approve-allocation"): "由 Workspace 管理员批准 Worker 资源分配。",
+    ("worker", "leave"): "让 Worker 停止接收新任务并退出资源池。",
+    ("worker", "revoke"): "立即撤销并隔离一台 Worker。",
+    ("worker", "rate-propose"): "提交 Worker 的计算和流量计费建议。",
+    ("worker", "rate-approve"): "批准一条 Worker 费率建议。",
+    ("worker", "serve"): "运行 Worker 主循环，领取、执行并回传加密任务。",
+    ("workflow",): "安装、校验、制作和管理工作流包。",
+    ("workflow", "install"): "从本地文件或市场地址安装签名工作流包。",
+    ("workflow", "custom"): "安装自定义工作流，并与市场版本隔离保存。",
+    ("workflow", "list"): "列出本机已安装的工作流版本。",
+    ("workflow", "show"): "查看工作流清单、参数和依赖。",
+    ("workflow", "verify"): "校验工作流包的结构、摘要和签名。",
+    ("workflow", "search"): "在指定市场索引中搜索工作流。",
+    ("workflow", "remove"): "删除本机安装的指定工作流版本。",
+    ("workflow", "sign"): "使用作者私钥签署工作流包。",
+    ("workflow", "package"): "把工作流目录打包为可分发文件。",
+    ("workflow", "publish"): "把工作流包发布到本地市场目录。",
+    ("workflow", "update"): "从市场索引安装工作流的可用更新。",
+    ("task",): "预检、提交、查看、取消和下载生成任务。",
+    ("task", "preflight"): "只检查工作流、Worker 能力和费率，不创建任务。",
+    ("task", "submit"): "加密提示词和输入文件，提交视频生成任务。",
+    ("task", "show"): "查看任务状态、分配 Worker 和执行 Attempt。",
+    ("task", "cancel"): "取消尚未结束的任务。",
+    ("task", "retry"): "为失败或需要重封装的任务创建新 Attempt。",
+    ("task", "get"): "下载并解密已完成任务的输出文件。",
+    ("task", "list"): "列出 Workspace 中的任务。",
+    ("task", "watch"): "持续等待任务结束并显示最终状态。",
+    ("task", "usage"): "查看任务 Attempt 的原始用量和计费记录。",
+    ("usage",): "查询跨任务的 Worker 用量和 billing_token 账本。",
+    ("usage", "list"): "列出 Workspace 的近期用量账本。",
+    ("usage", "show"): "按账本、Attempt 或 Task ID 查找详细用量。",
+}
+
+
+_ARGUMENT_HELP: dict[str, str] = {
+    "accept_legacy_tofu": "跳过交互确认并接受屏幕显示的旧版 Owner 公钥；仅限已人工核对时使用。",
+    "accept_license": "接受模型要求的许可证标识；多个许可证可重复传入。",
+    "alias": "本地身份别名，默认使用 default。",
+    "allocation_id": "待批准的 Worker allocation ID。",
+    "allow_http": "允许连接明文 HTTP Gateway；仅建议本机测试使用。",
+    "allow_unsigned": "允许安装未签名工作流；仅限已人工审查的本地包。",
+    "announce": "启动后立即向 Gateway 上报 Worker 能力。",
+    "broker": "Broker ID；省略时使用当前 Profile 的 Home Broker。",
+    "broker_device_id": "运行该 Broker 服务的 Broker Device ID。",
+    "broker_id": "Logical Broker ID。",
+    "broker_name": "首次创建的 Home Broker 名称。",
+    "bootstrap_code_file": "从指定文件安全读取一次性 Bootstrap code。",
+    "bootstrap_code_stdin": "从标准输入安全读取一次性 Bootstrap code。",
+    "capacity": "Worker 可同时执行的任务数。",
+    "check": "只检查是否存在新版本，不执行安装。",
+    "code": "Worker 屏幕显示的短验证码，用于人工核对公钥。",
+    "comfy_model_root": "ComfyUI 模型目录；用于模型校验和维护。",
+    "comfy_output_dir": "ComfyUI 输出目录。",
+    "comfy_policy_file": "本机管理员审核过的 ComfyUI 图白名单文件。",
+    "comfy_url": "本机 ComfyUI API 地址，默认 http://127.0.0.1:8188。",
+    "comfyui_root": "Windows 上包含 ComfyUI main.py 的目录；常见位置会自动识别。",
+    "compute_rate": "每 GPU 秒的计算费率，单位为 microtoken。",
+    "credentials_account": "在系统 Keychain 中保存或读取凭据所用的账户名。",
+    "credentials_file": "凭据文件路径；应限制为仅当前用户可读。",
+    "credentials_keyring": "从系统凭据存储读取 Worker 凭据。",
+    "dangerously_export_recovery": "把恢复材料明文导出到指定文件；文件权限会限制为 0600。",
+    "device_id": "设备 ID；省略时表示当前本地设备。",
+    "device_name": "这台设备在 Gateway 中显示的名称。",
+    "display_name": "用户在 Gateway 和 Workspace 中显示的名称。",
+    "endpoint": "Gateway 的 HTTPS 地址，例如 https://vgen.example.com。",
+    "enrollment_id": "待处理的 Enrollment ID。",
+    "entry_id": "Usage Ledger、Attempt 或 Task ID。",
+    "executor": "执行器类型，当前通常为 comfyui。",
+    "executor_version": "Worker 对外声明的执行器版本。",
+    "expected_key_version": "预期的当前密钥版本；不匹配时拒绝轮换以避免并发覆盖。",
+    "force": "立即停止当前 Attempt 并退出，不等待任务自然结束。",
+    "forget_local": "只删除本机设备密钥；不会向 Gateway 撤销远端设备。",
+    "gateway_url": "Gateway 的完整 HTTPS 地址。",
+    "generate_identity": "为 Worker 新生成独立密钥。",
+    "idempotency_key": "幂等键；网络重试时复用同一值可避免重复创建或计费。",
+    "identity": "本地用户身份别名，默认使用当前 Profile 配置。",
+    "identity_account": "Worker 身份在系统凭据存储中的账户名。",
+    "identity_file": "Worker 私钥文件路径；应限制为仅当前用户可读。",
+    "image": "首帧图片路径；不指定图片时执行文生视频。",
+    "index": "工作流市场索引文件或 URL。",
+    "interval": "轮询间隔秒数。",
+    "invite_stdin": "从标准输入读取完整邀请 URI，避免 secret 进入命令历史。",
+    "job_id": "Worker 维护任务 ID。",
+    "json": "以便于脚本处理的 JSON 格式输出。",
+    "key_file": "用于签署工作流包的 Ed25519 私钥文件。",
+    "key_version": "Workspace 数据密钥版本；省略时使用最新版本。",
+    "kind": "准入主体类型，例如 user、broker_device、service 或 workspace_member。",
+    "last_image": "尾帧图片路径；与 --image 同时指定时生成首尾帧视频。",
+    "lease_ttl": "Worker lease 有效秒数。",
+    "limit": "最多返回的记录数。",
+    "local_artifact_root": "允许 Worker 读取的本地 artifact 根目录；可重复指定。",
+    "manager_broker": "负责该 Worker 更新和模型维护的 Broker ID。",
+    "method": "邀请流程：direct_invite 领取即生效，invite_approval 领取后还需审批。",
+    "name": "资源名称。",
+    "no_broker_service": "完成初始化但不安装或启动本机 Home Broker 服务。",
+    "no_home_broker": "只初始化用户和 Workspace，不创建 Home Broker。",
+    "no_use": "保存 Profile 后不把它切换为当前默认配置。",
+    "non_interactive": "禁用交互询问；缺少必要参数时直接报错。",
+    "once": "只执行一轮轮询后退出，适合诊断。",
+    "output": "输出文件或目录路径。",
+    "output_dir": "保存下载结果的目录。",
+    "overwrite": "允许覆盖本地已存在的目标文件或记录。",
+    "parameter": "工作流参数，格式为 key=value；可重复指定。",
+    "policy": "资源池公开调度策略的 JSON 对象。",
+    "poll_seconds": "Broker 轮询 Gateway 的间隔秒数。",
+    "pool": "Pool 名称或 ID；仅有一个资源池时通常可省略。",
+    "pool_name": "首次创建的默认 GPU Pool 名称。",
+    "priority": "任务调度优先级；数值越大优先级越高。",
+    "private_key_file": "恢复私钥文件；省略时从隐藏输入读取恢复词。",
+    "profile": "要使用的本地 Profile；省略时使用当前默认 Profile。",
+    "prompt": "视频生成提示词；内容会在本地加密后提交。",
+    "provenance": "限定删除 market 或 custom 来源的工作流。",
+    "publisher_key": "通过独立可信渠道取得的作者 Ed25519 公钥。",
+    "query": "工作流搜索关键词。",
+    "rate_id": "待批准的 Rate Card ID。",
+    "recipient_id": "密钥接收方的 User、Device 或 Service ID。",
+    "recipient_type": "密钥接收方类型。",
+    "recovery_file": "已有恢复文件路径；用于恢复而不是创建新用户。",
+    "relationship": "加入 Workspace 后的关系或角色说明。",
+    "resume": "继续此前因等待审批或密钥授权而暂停的接入流程。",
+    "root_key_id": "用户根签名公钥的 key ID。",
+    "root_signing_public_key": "经过独立核对的用户根 Ed25519 公钥。",
+    "scope": "授予主体的权限 scope；可重复指定。",
+    "service_id": "API Service ID。",
+    "session_token_file": "保存短期 Worker session token 的文件。",
+    "source": "工作流目录、包文件、已安装引用或下载地址。",
+    "state": "按 Enrollment 状态筛选，例如 pending、active 或 rejected。",
+    "subject_key_fingerprint": "将邀请绑定到指定主体公钥的 SHA-256 指纹。",
+    "task_id": "任务 ID。",
+    "timeout": "最长等待秒数，超时只停止本地等待。",
+    "traffic_rate": "每字节流量费率，单位为 microtoken；当前通常为 0。",
+    "ttl": "邀请有效秒数。",
+    "use": "完成后把新建资源设为当前 Profile 的默认值。",
+    "user_id": "用户 ID。",
+    "verification_code": "双方通过独立渠道核对的验证码。",
+    "version": "工作流版本号。",
+    "wait": "持续等待远端操作完成。",
+    "wait_interval": "等待期间查询状态的间隔秒数。",
+    "wheel": "经过审查、用于更新 Worker 的 VGen wheel 文件。",
+    "work_root": "Worker 解密和执行任务所用的临时工作目录。",
+    "worker": "Worker 名称或 ID；仅有一台自有 Worker 时可省略。",
+    "worker_id": "Worker ID。",
+    "workflow": "已安装工作流引用，格式通常为 namespace/name。",
+    "workflow_id": "工作流 ID，格式为 namespace/name。",
+    "workspace": "Workspace 名称或 ID；省略时使用 Profile 默认值。",
+    "workspace_name": "首次创建的 Workspace 名称。",
+    "yes": "不再询问确认，直接安装可用更新。",
+}
+
+
+_OPTION_HELP: dict[str, str] = {
+    "--approve": "批准该准入申请。",
+    "--reject": "拒绝该准入申请。",
+    "--version": "显示当前 VGen CLI 版本并退出。",
+}
+
+
+class _VGenHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def _get_help_string(self, action: argparse.Action) -> str:
+        help_text = action.help or ""
+        default = action.default
+        if (
+            action.option_strings
+            and default not in (None, "", [], argparse.SUPPRESS)
+            and not isinstance(default, bool)
+            and "%(default)" not in help_text
+        ):
+            return f"{help_text}（默认：%(default)s）"
+        return help_text
+
+
+def _enhance_cli_help(parser: argparse.ArgumentParser) -> None:
+    """Apply consistent, user-facing help without exposing hidden installer flags."""
+
+    def visit(current: argparse.ArgumentParser, path: tuple[str, ...]) -> None:
+        current.formatter_class = _VGenHelpFormatter
+        current._optionals.title = "选项"
+        subparser_actions = [
+            action
+            for action in current._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ]
+        current._positionals.title = "可用命令" if subparser_actions else "参数"
+        if path in _COMMAND_HELP:
+            current.description = _COMMAND_HELP[path]
+
+        for action in current._actions:
+            if action.dest == "help":
+                action.help = "显示当前命令的帮助信息并退出。"
+                continue
+            if isinstance(action, argparse._SubParsersAction):
+                action.metavar = "命令"
+                existing_choices = {choice.dest: choice for choice in action._choices_actions}
+                ordered_choices = []
+                for name in action.choices:
+                    if name not in existing_choices:
+                        choice = action._ChoicesPseudoAction(
+                            name,
+                            (),
+                            _COMMAND_HELP.get((*path, name)),
+                        )
+                        existing_choices[name] = choice
+                    ordered_choices.append(existing_choices[name])
+                action._choices_actions[:] = ordered_choices
+                for choice in action._choices_actions:
+                    child_path = (*path, choice.dest)
+                    choice.help = _COMMAND_HELP.get(child_path, choice.help)
+                for name, child in action.choices.items():
+                    visit(child, (*path, name))
+                continue
+            if action.help == argparse.SUPPRESS:
+                continue
+            option_help = next(
+                (_OPTION_HELP[option] for option in action.option_strings if option in _OPTION_HELP),
+                None,
+            )
+            action.help = option_help or _ARGUMENT_HELP.get(
+                action.dest,
+                f"设置 {action.dest.replace('_', '-')}。",
+            )
+
+    parser.description = "VGen：通过 Gateway 安全共享 GPU Worker，并使用端到端加密提交生成任务。"
+    parser.epilog = (
+        "常用流程：\n"
+        "  vgen setup --gateway https://vgen.example.com\n"
+        "  vgen gateway health\n"
+        "  vgen worker list\n"
+        "  vgen task submit '一只猫在草地上奔跑' --wait\n\n"
+        "查看某组命令：vgen <命令> --help；查看具体操作：vgen <命令> <子命令> --help。"
+    )
+    visit(parser, ())
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vgen", description="Encrypted VGen v1 CLI")
+    parser = argparse.ArgumentParser(prog="vgen")
     parser.add_argument("--version", action="version", version=f"vgen {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -3490,6 +3793,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage_show.add_argument("--workspace")
     usage_show.add_argument("--limit", type=int, default=500)
     usage_show.add_argument("--profile")
+    _enhance_cli_help(parser)
     return parser
 
 

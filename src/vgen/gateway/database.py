@@ -22,6 +22,7 @@ from typing import Any
 from vgen.protocol.ids import new_id as protocol_new_id
 
 SCHEMA_VERSION = 1
+WORKER_ONLINE_WINDOW_SECONDS = 120.0
 
 
 def new_id(prefix: str) -> str:
@@ -693,13 +694,34 @@ class GatewayDatabase:
         if os.name != "nt":
             os.chmod(destination, 0o600)
 
-    def health(self) -> dict[str, Any]:
+    def health(self, *, stamp: float | None = None) -> dict[str, Any]:
         row = self.fetchone("PRAGMA journal_mode")
         version = self.fetchone("SELECT version FROM schema_meta LIMIT 1")
+        current_time = now() if stamp is None else stamp
         counts = {
             table: int(self.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"])
-            for table in ("users", "workspaces", "workers", "tasks")
+            for table in ("users", "workspaces", "tasks")
         }
+        worker_counts = self.fetchone(
+            """SELECT COUNT(*) AS workers_total,
+                      SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS workers_active,
+                      SUM(CASE WHEN status='active' AND last_seen_at>? THEN 1 ELSE 0 END)
+                          AS workers_online,
+                      SUM(CASE WHEN status='revoked' THEN 1 ELSE 0 END) AS workers_revoked
+               FROM workers""",
+            (current_time - WORKER_ONLINE_WINDOW_SECONDS,),
+        )
+        counts.update(
+            {
+                key: int(worker_counts[key] or 0)
+                for key in (
+                    "workers_total",
+                    "workers_active",
+                    "workers_online",
+                    "workers_revoked",
+                )
+            }
+        )
         return {
             "ok": True,
             "schema_version": int(version["version"]),

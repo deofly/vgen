@@ -1025,6 +1025,87 @@
         ],
         "type": "object"
       },
+      "HealthCounts": {
+        "additionalProperties": false,
+        "properties": {
+          "tasks": {
+            "minimum": 0.0,
+            "title": "Tasks",
+            "type": "integer"
+          },
+          "users": {
+            "minimum": 0.0,
+            "title": "Users",
+            "type": "integer"
+          },
+          "workers_active": {
+            "minimum": 0.0,
+            "title": "Workers Active",
+            "type": "integer"
+          },
+          "workers_online": {
+            "minimum": 0.0,
+            "title": "Workers Online",
+            "type": "integer"
+          },
+          "workers_revoked": {
+            "minimum": 0.0,
+            "title": "Workers Revoked",
+            "type": "integer"
+          },
+          "workers_total": {
+            "minimum": 0.0,
+            "title": "Workers Total",
+            "type": "integer"
+          },
+          "workspaces": {
+            "minimum": 0.0,
+            "title": "Workspaces",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "users",
+          "workspaces",
+          "tasks",
+          "workers_total",
+          "workers_active",
+          "workers_online",
+          "workers_revoked"
+        ],
+        "title": "HealthCounts",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/HealthCounts"
+          },
+          "journal_mode": {
+            "title": "Journal Mode",
+            "type": "string"
+          },
+          "ok": {
+            "const": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "minimum": 1.0,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "schema_version",
+          "journal_mode",
+          "counts"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
       "InviteClaim": {
         "additionalProperties": false,
         "properties": {
@@ -5602,9 +5683,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Health Api V1 Health Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HealthResponse"
                 }
               }
             },
@@ -10903,9 +10982,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Health Healthz Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HealthResponse"
                 }
               }
             },

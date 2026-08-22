@@ -368,6 +368,10 @@ unset VGEN_LOCAL_BOOTSTRAP
 rm .local/vgen-dev/bootstrap-code
 ```
 
+健康响应中的 Worker 数量使用 `workers_total`、`workers_active`、`workers_online` 和
+`workers_revoked` 四个明确字段。`workers_online` 与调度器共享同一规则：状态为 active，且
+最近 120 秒内存在心跳；不要把 `workers_active` 当作实时在线数。
+
 Bootstrap code 只能经 stdin 进入 CLI，不得进入命令参数、日志、Issue、聊天或截图。
 
 ### 6.1 首次建立 Git 基线

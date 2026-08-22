@@ -153,7 +153,14 @@ sudo ./setup-gateway.sh status --domain <域名>
 curl --fail --silent https://<域名>/api/v1/health
 ```
 
-响应应包含 `"ok":true`。要把公网 Nginx 路由恢复到安装前保存的旧服务，运行：
+响应应包含 `"ok":true`。其中 Worker 统计不会再把已撤销设备混为“可用 Worker”：
+
+- `workers_total`：数据库中的全部 Worker 记录，包括已撤销记录；
+- `workers_active`：准入状态为 active 的 Worker，不代表它此刻在线；
+- `workers_online`：active 且最近 120 秒内上报过心跳，可参与当前调度；
+- `workers_revoked`：已撤销、不可再接入的 Worker。
+
+要把公网 Nginx 路由恢复到安装前保存的旧服务，运行：
 
 ```bash
 sudo ./setup-gateway.sh rollback --domain <域名>
@@ -643,13 +650,15 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
 | `340004 PATH_CONFLICT` / `340005 DIGEST_MISMATCH` | 人工检查冲突路径；Worker 不会自动覆盖或删除异常文件 |
 | Worker 更新后无法上线 | 保持前台监督器运行，等待自动回退；保留上一 runtime 和日志，不要强删 |
 
-脚本的当前精确参数可以分别查看：
+CLI 的顶层帮助会说明各命令组用途并给出常用流程；进入命令组或具体操作后，会继续显示每个
+参数的含义、安全影响和默认取值来源。无需查阅源代码：
 
 ```bash
 ./setup-gateway.sh --help
 vgen --help
 vgen broker --help
 vgen worker --help
+vgen task submit --help
 ```
 
 Windows 安装器参数可在解压目录运行：
