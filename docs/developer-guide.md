@@ -506,7 +506,7 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 
 ```bash
 ./tools/release.sh publish \
-  --version 0.7.0 \
+  --version 0.7.1 \
   --gateway https://vgen-gw.example.com \
   --releases https://vgen.example.com \
   --ssh root@ecs.example.com \
@@ -524,6 +524,10 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 `README.txt` 创建私有 Bucket、ECS caller role 权限、transfer role trust/OSS 权限和生命周期后，
 在 publish 命令增加 `--confirm-oss-configured` 重试。生成文件按本次 endpoint、Bucket、prefix、
 账号和角色计算，不使用源码常量。
+
+若安装已经写入 `/opt/vgen-v1/venv` 和 `/etc/vgen-v1/gateway.env`，但在数据库初始化前中断，
+发布修复版本时使用 `--resume-gateway`，不要再次 `--reset-test-gateway`。resume 会校验半安装边界、
+归档旧的 partial runtime、安装当前版本、验证 STS，再继续数据库、systemd 和 Nginx 初始化。
 
 开发测试环境需要先归档当前 Gateway 再从零初始化时，额外增加
 `--reset-test-gateway`。该选项只允许和 `--install-gateway` 一起使用；远端安装器先把受管

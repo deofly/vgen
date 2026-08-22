@@ -144,6 +144,10 @@ Gateway 使用 ECS 身份调用 STS，并把临时凭据进一步限制为单个
 会在创建数据库前验证 `AssumeRole`，不会上传随机探测对象。Bucket 应保持私有，并为任务前缀配置
 符合业务保留期的生命周期和未完成分片清理规则。
 
+如果安装已创建 runtime 和 `gateway.env`，但尚未创建数据库就中断，使用新发布包执行
+`setup-gateway.sh resume --domain <Gateway域名>`。通过统一发布工具恢复时使用
+`--resume-gateway`，不要再次 reset 或重复填写 OSS 参数。
+
 开发测试期需要清空 Gateway 重新体验 0→1 时，不要手工删除运行目录。使用：
 
 ```bash

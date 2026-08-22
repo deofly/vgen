@@ -203,10 +203,15 @@ def test_publish_parser_separates_gateway_install_and_upgrade_modes() -> None:
     ]
     installed = parser.parse_args([*common, "--install-gateway", "--artifact-store", "oss"])
     assert installed.install_gateway is True
+    assert installed.resume_gateway is False
     assert installed.upgrade_gateway is False
     assert installed.artifact_store == "oss"
     with pytest.raises(SystemExit):
         parser.parse_args([*common, "--install-gateway", "--upgrade-gateway"])
+    resumed = parser.parse_args([*common, "--resume-gateway"])
+    assert resumed.resume_gateway is True
+    with pytest.raises(SystemExit):
+        parser.parse_args([*common, "--resume-gateway", "--upgrade-gateway"])
     with pytest.raises(SystemExit):
         parser.parse_args([*common, "--install-gateway", "--artifact-store", "local"])
 
@@ -306,6 +311,42 @@ def test_publish_rejects_incomplete_oss_install_before_ssh(
             oss_bucket="vgen-private",
         )
     assert contacted is False
+
+
+def test_publish_can_resume_partial_gateway_without_repeating_cloud_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = TOOL.BuildResult(
+        version="0.7.1",
+        commit="a" * 40,
+        published_at="2026-08-23T00:40:00Z",
+        gateway_bundle=tmp_path / "vgen-gateway-0.7.1.tar.gz",
+        macos_bundle=tmp_path / "VGen-macOS-0.7.1.zip",
+        windows_bundle=tmp_path / "vgen-windows-worker-installer-0.7.1.zip",
+        deployment_archive=tmp_path / "vgen-public-release-0.7.1.tar.gz",
+        deployment_sha256="b" * 64,
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        TOOL, "_capture", lambda *args, **kwargs: "/tmp/vgen-release.0.7.1.ABCDEFGH"
+    )
+    monkeypatch.setattr(TOOL, "_run", lambda command, **kwargs: commands.append(command))
+    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args: None)
+    TOOL.publish_release(
+        result,
+        gateway_origin="https://vgen-gw.example.com",
+        release_origin="https://vgen.example.com",
+        ssh_target="root@ecs.example.com",
+        ssh_port=22,
+        confirmed=True,
+        gateway_action="resume",
+    )
+    gateway = next(
+        " ".join(command) for command in commands if "setup-gateway.sh" in " ".join(command)
+    )
+    assert "setup-gateway.sh resume" in gateway
+    assert "--confirm-no-active-tasks" in gateway
+    assert "--artifact-store" not in gateway
 
 
 def test_publish_generates_cloud_kit_before_resetting_test_gateway(

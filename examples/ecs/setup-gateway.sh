@@ -1012,19 +1012,7 @@ install_python_runtime() {
 }
 
 verify_existing_python_runtime() {
-  VGEN_RUNTIME_ROOT="${INSTALL_ROOT}/venv" python3.11 <<'PY'
-import os
-import stat
-from pathlib import Path
-
-root = Path(os.environ["VGEN_RUNTIME_ROOT"])
-for path in (root, *root.rglob("*")):
-    metadata = path.lstat()
-    if metadata.st_uid != 0 or metadata.st_gid != 0:
-        raise SystemExit(f"resume refused: runtime entry is not root-owned: {path}")
-    if not stat.S_ISLNK(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) & 0o022:
-        raise SystemExit(f"resume refused: runtime entry is group/other writable: {path}")
-PY
+  verify_existing_python_runtime_security
   "${INSTALL_ROOT}/venv/bin/python" -c \
     'import importlib.metadata, sys; assert importlib.metadata.version("vgen") == sys.argv[1]' \
     "${VGEN_VERSION}"
@@ -1219,7 +1207,10 @@ PY
 verify_artifact_store_access_at() {
   local runtime_root="$1"
   log "verifying ECS RAM Role can assume the configured object-transfer role"
-  runuser -u vgen -- env VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}" \
+  # gateway.env is deliberately root:root 0600. This installer preflight runs
+  # as root so it can read that file; the long-running Gateway still runs as
+  # the unprivileged vgen service user through systemd's EnvironmentFile.
+  env VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}" \
     "${runtime_root}/bin/python" - <<'PY'
 import os
 from pathlib import Path
@@ -1232,6 +1223,42 @@ for line in Path(os.environ["VGEN_GATEWAY_ENVIRONMENT_PATH"]).read_text().splitl
 OssArtifactStore.from_environment().verify_access()
 PY
   log "STS AssumeRole validation passed; no OSS object bytes were transferred"
+}
+
+prepare_resume_runtime() {
+  verify_existing_python_runtime_security
+  local installed_version backup_runtime
+  installed_version="$("${INSTALL_ROOT}/venv/bin/python" -c \
+    'import importlib.metadata; print(importlib.metadata.version("vgen"))')"
+  [[ "${installed_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+    die "resume refused: partial runtime version is invalid"
+  if [[ "${installed_version}" == "${VGEN_VERSION}" ]]; then
+    verify_existing_python_runtime
+    normalize_and_verify_python_runtime
+    return
+  fi
+  backup_runtime="${BACKUP_ROOT}/partial-runtime-${installed_version}-$(date -u +%Y%m%dT%H%M%SZ)"
+  [[ ! -e "${backup_runtime}" ]] || die "resume runtime backup already exists"
+  mv -- "${INSTALL_ROOT}/venv" "${backup_runtime}"
+  install_python_runtime
+  log "replaced incomplete Gateway runtime ${installed_version} with ${VGEN_VERSION}"
+  log "previous partial runtime retained at ${backup_runtime}"
+}
+
+verify_existing_python_runtime_security() {
+  VGEN_RUNTIME_ROOT="${INSTALL_ROOT}/venv" python3.11 <<'PY'
+import os
+import stat
+from pathlib import Path
+
+root = Path(os.environ["VGEN_RUNTIME_ROOT"])
+for path in (root, *root.rglob("*")):
+    metadata = path.lstat()
+    if metadata.st_uid != 0 or metadata.st_gid != 0:
+        raise SystemExit(f"resume refused: runtime entry is not root-owned: {path}")
+    if not stat.S_ISLNK(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit(f"resume refused: runtime entry is group/other writable: {path}")
+PY
 }
 
 initialize_gateway() {
@@ -2126,8 +2153,7 @@ resume_gateway() {
   check_legacy_task_status
   ensure_service_user_and_directories
   verify_existing_gateway_environment
-  verify_existing_python_runtime
-  normalize_and_verify_python_runtime
+  prepare_resume_runtime
   verify_artifact_store_access_at "${INSTALL_ROOT}/venv"
   initialize_gateway
   install_and_start_service

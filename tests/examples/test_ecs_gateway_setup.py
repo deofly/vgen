@@ -242,6 +242,18 @@ def test_gateway_upgrade_preserves_oss_sdk_and_probes_role_access() -> None:
     assert "local ArtifactStore" not in environment
 
 
+def test_gateway_sts_preflight_can_read_root_only_environment_and_resume_new_runtime() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+    verifier = source.split("verify_artifact_store_access_at() {", 1)[1].split("\n}", 1)[0]
+    assert 'env VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}"' in verifier
+    assert "runuser -u vgen" not in verifier
+    resume = source.split("prepare_resume_runtime() {", 1)[1].split("\n}", 1)[0]
+    assert 'mv -- "${INSTALL_ROOT}/venv" "${backup_runtime}"' in resume
+    assert "install_python_runtime" in resume
+    resume_action = source.split("resume_gateway() {", 1)[1].split("\n}", 1)[0]
+    assert "prepare_resume_runtime" in resume_action
+
+
 def test_gateway_test_reset_is_recoverable_and_does_not_touch_cloud_resources() -> None:
     source = INSTALLER.read_text(encoding="utf-8")
     body = source.split("reset_test_gateway() {", 1)[1].split("\n}", 1)[0]
@@ -413,7 +425,7 @@ def test_resume_accepts_only_the_exact_pre_database_partial_state() -> None:
     assert '[[ ! -e "${UNIT_PATH}" ]]' in source
     assert '[[ ! -e "${INSTALL_STATE_PATH}" ]]' in source
     resume_body = source.split("resume_gateway() {", 1)[1].split("\n}", 1)[0]
-    assert resume_body.index("normalize_and_verify_python_runtime") < resume_body.index(
+    assert resume_body.index("prepare_resume_runtime") < resume_body.index(
         "initialize_gateway"
     )
     assert resume_body.index("initialize_gateway") < resume_body.index("install_and_start_service")

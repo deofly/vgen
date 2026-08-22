@@ -368,8 +368,8 @@ def _validate_gateway_publish_options(
     oss_transfer_role: str | None,
     confirm_oss_configured: bool,
 ) -> None:
-    if gateway_action not in {"none", "install", "upgrade"}:
-        raise ReleaseError("Gateway action must be none, install, or upgrade")
+    if gateway_action not in {"none", "install", "resume", "upgrade"}:
+        raise ReleaseError("Gateway action must be none, install, resume, or upgrade")
     if reset_test_gateway and gateway_action != "install":
         raise ReleaseError("test reset is only valid with Gateway install")
     install_only_options = (
@@ -489,6 +489,8 @@ def publish_release(
             )
             if confirm_oss_configured:
                 action_options += " --confirm-oss-configured"
+        elif gateway_action == "resume":
+            action_options = " --confirm-no-active-tasks"
         confirmation = "--confirm-upgrade" if gateway_action == "upgrade" else ""
         setup_commands.append(
             f"{prefix}bash ./setup-gateway.sh {gateway_action} "
@@ -551,6 +553,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="initialize a new ECS Gateway before publishing the download channel",
     )
+    gateway_actions.add_argument(
+        "--resume-gateway",
+        action="store_true",
+        help="resume a safe partial Gateway initialization before publishing",
+    )
     publish.add_argument(
         "--reset-test-gateway",
         action="store_true",
@@ -587,6 +594,8 @@ def main() -> int:
         gateway_action = (
             "install"
             if arguments.install_gateway
+            else "resume"
+            if arguments.resume_gateway
             else "upgrade"
             if arguments.upgrade_gateway
             else "none"
