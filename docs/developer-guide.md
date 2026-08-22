@@ -392,6 +392,17 @@ git commit -m 'chore: establish reviewed VGen source baseline'
 `pyproject.toml` 更新到完整三段版本，并创建指向该提交的 `vX.Y.Z` tag。不要把 `dist/` 产物、
 Release 页面材料或 ECS 下载目录加入源码提交。
 
+首次为已审核提交创建发行标签时使用 annotated tag，并确认它确实指向当前 `HEAD`：
+
+```bash
+git tag -a v0.3.1 -m 'VGen 0.3.1'
+git show --no-patch v0.3.1
+test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v0.3.1)"
+```
+
+尚未公开发布的本地标签可以在修复发布阻塞后重新创建；已经推送或被 stable 引用的标签禁止移动，
+必须发布新版本。
+
 ## 7. 测试与验收
 
 每次变更先确认工作区只包含本次范围，再运行完整质量门：
@@ -480,8 +491,14 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 
 本地探索阶段可以显式增加 `--allow-untagged-candidate`，但该选项不能用于 `publish`。构建时间取
 Git 提交时间并转换成 UTC `published_at`，因此同一 tag 的重复构建保持可复现。脚本只清理
-`dist/` 下当前版本的临时派生产物，不修改源码、版本、commit 或 tag，也不覆盖已存在的不同字节
-不可变版本。
+`dist/` 下当前版本的临时派生产物和本地 staging 版本目录，不修改源码、版本、commit 或 tag；
+ECS 上已经存在的不同字节不可变版本仍会被拒绝覆盖，其他本地版本目录也不会被清理。
+
+`publish` 先完成全部本地构建，再创建远端临时目录并上传，最后才调用 ECS 发布器切换 stable。
+如果日志尚未出现 `scp`，ECS 完全未被修改；如果 ECS 发布器失败，先读取当前
+`/releases/channels/stable.json`，确认原版本仍生效后再修复和重试。ECS 发布器的内嵌校验代码兼容
+服务器自带 Python 3.6，不要求为发布流程替换系统 Python。任何失败都不得手工覆盖
+`/var/www/vgen-releases/X.Y.Z/`；远端同版本不同字节意味着必须检查是否已发布，并在已发布时升级版本号。
 
 ECS 端由包内同一份 [`examples/ecs/publish-release.sh`](../examples/ecs/publish-release.sh) 完成：
 它校验 tar 条目 allowlist、manifest、两个 ZIP 的大小和 SHA-256、Mac bootstrap pin，使用发布锁，

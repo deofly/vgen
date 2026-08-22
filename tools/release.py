@@ -182,6 +182,7 @@ def _clean_transient_outputs(version: str) -> None:
         dist / f"VGen-macOS-{version}.zip",
         dist / f"vgen-windows-worker-installer-{version}.zip",
         dist / f"vgen-public-release-{version}.tar.gz",
+        dist / "public-releases" / version,
     ):
         _remove_generated_candidate(path)
 

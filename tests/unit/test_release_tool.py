@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -146,6 +148,24 @@ def test_release_deployment_archive_is_closed_and_reproducible(tmp_path) -> None
         assert all(member.isfile() for member in archive.getmembers())
 
 
+def test_release_cleanup_replaces_only_current_local_staging(
+    tmp_path, monkeypatch
+) -> None:
+    repository = tmp_path / "repository"
+    current = repository / "dist" / "public-releases" / "0.3.1"
+    previous = repository / "dist" / "public-releases" / "0.3.0"
+    current.mkdir(parents=True)
+    previous.mkdir(parents=True)
+    (current / "manifest.json").write_text("stale", encoding="utf-8")
+    (previous / "manifest.json").write_text("published", encoding="utf-8")
+    monkeypatch.setattr(TOOL, "REPOSITORY", repository)
+
+    TOOL._clean_transient_outputs("0.3.1")
+
+    assert not current.exists()
+    assert (previous / "manifest.json").read_text(encoding="utf-8") == "published"
+
+
 def test_release_scripts_have_valid_syntax_and_help() -> None:
     for script in (WRAPPER_PATH, PUBLISHER_PATH):
         syntax = subprocess.run(
@@ -166,6 +186,16 @@ def test_release_scripts_have_valid_syntax_and_help() -> None:
     )
     assert publisher_help.returncode == 0
     assert "switches stable.json last" in publisher_help.stdout
+
+
+def test_ecs_publisher_inline_python_supports_python_36() -> None:
+    source = PUBLISHER_PATH.read_text(encoding="utf-8")
+    inline_blocks = re.findall(
+        r"python3 -I -B <<'PY'\n(.*?)\nPY(?:\n|$)", source, flags=re.DOTALL
+    )
+    assert len(inline_blocks) == 3
+    for inline_python in inline_blocks:
+        ast.parse(inline_python, filename=str(PUBLISHER_PATH), feature_version=(3, 6))
 
 
 def test_release_baseline_and_one_command_flow_are_documented() -> None:

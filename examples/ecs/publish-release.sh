@@ -187,7 +187,10 @@ with tarfile.open(archive_path, "r:gz") as archive:
         if source is None:
             raise SystemExit("deployment archive entry could not be read")
         with source, target.open("xb") as destination:
-            while block := source.read(1024 * 1024):
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
                 destination.write(block)
         target.chmod(0o755 if member.name == "install-macos.sh" else 0o644)
 
