@@ -146,7 +146,8 @@ fi
 # replaces the placeholder with the reviewed HTTPS download origin. Keeping it
 # in a separate 0600 file lets `vgen upgrade` remain pinned when a Gateway
 # endpoint moves to another domain.
-if [[ "${RELEASE_ORIGIN}" != "__VGEN_RELEASE_ORIGIN__" ]]; then
+UNCONFIGURED_RELEASE_ORIGIN="__VGEN_RELEASE_""ORIGIN__"
+if [[ "${RELEASE_ORIGIN}" != "${UNCONFIGURED_RELEASE_ORIGIN}" ]]; then
   RELEASE_SOURCE_PATH="${INSTALL_BASE}/release-source.json"
   VGEN_RELEASE_SOURCE_PATH="${RELEASE_SOURCE_PATH}" \
   VGEN_RELEASE_ORIGIN_VALUE="${RELEASE_ORIGIN}" "${PYTHON_BIN}" -I -B <<'PY'
