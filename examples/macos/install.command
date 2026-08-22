@@ -178,7 +178,10 @@ fi
 # Gateway session or read private key material from Keychain.
 if "${RELEASE_DIR}/bin/python" -I -B "${VGEN_BIN}" profile show >/dev/null 2>&1; then
   printf '\n✓ 已保留现有 VGen 身份、Gateway Profile 和 Home Broker 配置\n'
-  printf '  CLI 升级完成，不需要重新输入恢复词或 Bootstrap code。\n'
+  if ! "${RELEASE_DIR}/bin/python" -I -B "${VGEN_BIN}" broker service-refresh; then
+    fail "CLI 已安装，但 Home Broker 未能切换到新版本。请查看上方错误后重新运行。"
+  fi
+  printf '  CLI 和 Home Broker 升级完成，不需要重新输入恢复词或 Bootstrap code。\n'
   exit 0
 fi
 

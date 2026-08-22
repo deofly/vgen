@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -223,3 +224,65 @@ def install_macos_broker_service(
         loaded=loaded,
         error=error,
     )
+
+
+def inspect_macos_broker_service(
+    *,
+    launch_agents_directory: Path | None = None,
+    launchctl: str = "/bin/launchctl",
+) -> dict[str, object]:
+    """Inspect the managed LaunchAgent without executing its configured program."""
+
+    if sys.platform != "darwin":
+        return {"supported": False, "platform": sys.platform}
+    agents = launch_agents_directory or Path.home() / "Library" / "LaunchAgents"
+    plist_path = agents / f"{LABEL}.plist"
+    result: dict[str, object] = {
+        "supported": True,
+        "configured": False,
+        "managed": False,
+        "loaded": False,
+        "state": "not_configured",
+        "plist_path": str(plist_path),
+        "runtime_version": None,
+    }
+    if plist_path.is_symlink() or not plist_path.is_file():
+        return result
+    try:
+        payload = plistlib.loads(plist_path.read_bytes())
+    except (OSError, plistlib.InvalidFileException):
+        result.update({"configured": True, "state": "invalid_plist"})
+        return result
+    result["configured"] = True
+    result["managed"] = _is_managed_payload(payload)
+    arguments = payload.get("ProgramArguments") if isinstance(payload, dict) else None
+    if not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments):
+        result["state"] = "invalid_arguments"
+        return result
+    if arguments:
+        executable = arguments[0]
+        result["python_executable"] = executable
+        match = re.search(r"/releases/(\d+\.\d+\.\d+)(?:-[^/]+)?/bin/python$", executable)
+        if match:
+            result["runtime_version"] = match.group(1)
+    for flag, key in (
+        ("--profile", "profile"),
+        ("--broker-id", "broker_id"),
+        ("--broker-device-id", "broker_device_id"),
+    ):
+        if flag in arguments:
+            index = arguments.index(flag) + 1
+            if index < len(arguments):
+                result[key] = arguments[index]
+
+    service = f"gui/{os.getuid()}/{LABEL}"
+    launchd = _run_launchctl([launchctl, "print", service])
+    result["loaded"] = launchd.returncode == 0
+    if launchd.returncode != 0:
+        result["state"] = "stopped"
+        return result
+    state = re.search(r"(?m)^\s*state = ([^\s]+)\s*$", launchd.stdout or "")
+    pid = re.search(r"(?m)^\s*pid = ([0-9]+)\s*$", launchd.stdout or "")
+    result["state"] = state.group(1) if state else "loaded"
+    result["pid"] = int(pid.group(1)) if pid else None
+    return result

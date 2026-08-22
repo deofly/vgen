@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from pydantic import ValidationError
 
+from vgen.gateway.database import GatewayDatabase
 from vgen.gateway.schemas import (
     ArtifactPrepare,
     OutputArtifact,
@@ -10,6 +13,40 @@ from vgen.gateway.schemas import (
     TaskPreflight,
     TaskPrepare,
 )
+
+
+def test_existing_gateway_adds_broker_runtime_columns(tmp_path) -> None:
+    path = tmp_path / "gateway.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE broker_devices (
+           id TEXT PRIMARY KEY,
+           broker_id TEXT NOT NULL,
+           device_id TEXT NOT NULL,
+           status TEXT NOT NULL,
+           approved_by_user_id TEXT NOT NULL,
+           created_at REAL NOT NULL,
+           revoked_at REAL,
+           UNIQUE(broker_id, device_id))"""
+    )
+    connection.commit()
+    connection.close()
+
+    database = GatewayDatabase(str(path))
+    try:
+        columns = {
+            row["name"] for row in database.fetchall("PRAGMA table_info(broker_devices)")
+        }
+    finally:
+        database.close()
+
+    assert {
+        "runtime_version",
+        "protocol_version",
+        "build_commit",
+        "journal_pending",
+        "heartbeat_at",
+    } <= columns
 
 
 def test_rate_proposal_is_bounded_to_sqlite_integer_range() -> None:

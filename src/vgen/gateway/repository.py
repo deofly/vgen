@@ -1787,7 +1787,17 @@ class GatewayRepository:
             self.db.fetchone("SELECT * FROM broker_devices WHERE id=?", (broker_device_id,))
         )
 
-    def broker_device_heartbeat(self, *, broker_device_id: str, user_id: str) -> dict[str, Any]:
+    def broker_device_heartbeat(
+        self,
+        *,
+        broker_device_id: str,
+        user_id: str,
+        broker_id: str,
+        runtime_version: str | None,
+        protocol_version: str,
+        build_commit: str | None,
+        journal_pending: int,
+    ) -> dict[str, Any]:
         stamp = now()
         with self.db.transaction(immediate=True) as conn:
             row = conn.execute(
@@ -1795,7 +1805,12 @@ class GatewayRepository:
                    JOIN brokers b ON b.id=bd.broker_id WHERE bd.id=? OR bd.device_id=?""",
                 (broker_device_id, broker_device_id),
             ).fetchone()
-            if row is None or row["owner_user_id"] != user_id or row["status"] != "active":
+            if (
+                row is None
+                or row["owner_user_id"] != user_id
+                or row["status"] != "active"
+                or row["broker_id"] != broker_id
+            ):
                 raise RepositoryError(
                     FORBIDDEN,
                     "BROKER_DEVICE_ACCESS_DENIED",
@@ -1803,9 +1818,27 @@ class GatewayRepository:
                     403,
                 )
             conn.execute("UPDATE devices SET last_seen_at=? WHERE id=?", (stamp, row["device_id"]))
+            conn.execute(
+                """UPDATE broker_devices
+                   SET runtime_version=?,protocol_version=?,build_commit=?,journal_pending=?,
+                       heartbeat_at=? WHERE id=?""",
+                (
+                    runtime_version,
+                    protocol_version,
+                    build_commit,
+                    journal_pending,
+                    stamp,
+                    row["id"],
+                ),
+            )
             self._expire_leases(conn, stamp)
             self._ensure_rekey_commands(conn, stamp, consumer_user_id=row["owner_user_id"])
-        return {"ok": True, "broker_device_id": broker_device_id, "last_seen_at": stamp}
+        return {
+            "ok": True,
+            "broker_device_id": broker_device_id,
+            "last_seen_at": stamp,
+            "runtime_version": runtime_version,
+        }
 
     def broker_commands(
         self, *, broker_device_id: str, user_id: str, after: str

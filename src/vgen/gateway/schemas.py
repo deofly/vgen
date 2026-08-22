@@ -138,6 +138,15 @@ class BrokerDeviceAttach(WireModel):
     device_id: str
 
 
+class BrokerHeartbeat(WireModel):
+    broker_id: str
+    status: Literal["online"] = "online"
+    runtime_version: str | None = Field(default=None, min_length=1, max_length=120)
+    protocol_version: str = Field(default="1", min_length=1, max_length=32)
+    build_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,64}$")
+    journal_pending: int = Field(default=0, ge=0)
+
+
 class CommandComplete(WireModel):
     succeeded: bool = True
     result: dict[str, Any] = Field(default_factory=dict)

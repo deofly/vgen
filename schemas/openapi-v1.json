@@ -672,6 +672,64 @@
         "title": "BrokerDeviceAttach",
         "type": "object"
       },
+      "BrokerHeartbeat": {
+        "additionalProperties": false,
+        "properties": {
+          "broker_id": {
+            "title": "Broker Id",
+            "type": "string"
+          },
+          "build_commit": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{7,64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Build Commit"
+          },
+          "journal_pending": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Journal Pending",
+            "type": "integer"
+          },
+          "protocol_version": {
+            "default": "1",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "runtime_version": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Version"
+          },
+          "status": {
+            "const": "online",
+            "default": "online",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "broker_id"
+        ],
+        "title": "BrokerHeartbeat",
+        "type": "object"
+      },
       "ChallengeRequest": {
         "additionalProperties": false,
         "properties": {
@@ -4535,6 +4593,16 @@
             "$ref": "#/components/parameters/Signature"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrokerHeartbeat"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {

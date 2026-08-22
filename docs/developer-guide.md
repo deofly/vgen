@@ -52,6 +52,12 @@ flowchart LR
 - User 可以只有 Worker、没有 Broker；Broker 与 Worker 也不需要在同一台机器。
 - `manager_broker_id` 是可空的维护委托，不改变 Worker 所有权。
 
+Broker Device heartbeat 上报产品运行版本、协议版本、可选构建 commit、journal backlog 和心跳
+时间；Gateway 将这些非敏感运维字段保存在 `broker_devices` 并由 `GET /api/v1/brokers` 返回。
+新增字段保持可空，使旧 Broker 在 Gateway 滚动升级期间仍能 heartbeat。`vgen broker status`
+展示 Gateway 观测值并标记旧版本，`vgen broker local-status` 则只读检查本机受管 LaunchAgent；
+Mac 安装器通过 `vgen broker service-refresh` 原地重载已有 Broker，不创建新 Device 或身份。
+
 Gateway 保存公钥、撤销状态、Workspace/Pool/allocation、任务状态、Worker 能力、密文引用、
 KeyEnvelope、审计和用量账本。Gateway 和 ArtifactStore 不得保存明文 prompt、私有参数、
 输入/输出媒体、恢复词、私钥、Workspace Data Key 或 Task Data Key。

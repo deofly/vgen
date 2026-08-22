@@ -53,6 +53,102 @@ def test_setup_does_not_keep_an_unconfirmed_new_identity(monkeypatch) -> None:
     assert not store.exists("default")
 
 
+def test_local_broker_status_reports_managed_runtime_version(tmp_path, monkeypatch) -> None:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    payload = launch_agent_payload(
+        python_executable=Path(
+            "/Users/test/Library/Application Support/VGen/cli/"
+            "releases/0.4.0-build123/bin/python"
+        ),
+        profile_name="home",
+        broker_id="brk_test",
+        broker_device_id="bdev_test",
+        log_directory=tmp_path / "logs",
+    )
+    (agents / "com.vgen.home-broker.plist").write_bytes(plistlib.dumps(payload))
+    monkeypatch.setattr(broker_service.sys, "platform", "darwin")
+    monkeypatch.setattr(broker_service.os, "getuid", lambda: 501)
+    monkeypatch.setattr(
+        broker_service,
+        "_run_launchctl",
+        lambda _command: broker_service.subprocess.CompletedProcess(
+            _command, 0, "state = running\npid = 4321\n", ""
+        ),
+    )
+
+    result = broker_service.inspect_macos_broker_service(
+        launch_agents_directory=agents,
+    )
+
+    assert result == {
+        "supported": True,
+        "configured": True,
+        "managed": True,
+        "loaded": True,
+        "state": "running",
+        "plist_path": str(agents / "com.vgen.home-broker.plist"),
+        "runtime_version": "0.4.0",
+        "python_executable": (
+            "/Users/test/Library/Application Support/VGen/cli/"
+            "releases/0.4.0-build123/bin/python"
+        ),
+        "profile": "home",
+        "broker_id": "brk_test",
+        "broker_device_id": "bdev_test",
+        "pid": 4321,
+    }
+
+
+def test_broker_service_refresh_reuses_existing_profile(monkeypatch, capsys) -> None:
+    from vgen.cli.main import _broker_command
+    from vgen.cli.profile import GatewayProfile
+
+    profile = GatewayProfile(
+        name="home",
+        endpoint="https://gateway.example",
+        home_broker_id="brk_test",
+        home_broker_device_id="bdev_test",
+    )
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        "vgen.cli.main.ProfileStore",
+        lambda: type("Profiles", (), {"get": lambda self, _name: profile})(),
+    )
+
+    def install(**values):  # type: ignore[no-untyped-def]
+        captured.update(values)
+        return broker_service.BrokerServiceResult(
+            label=broker_service.LABEL,
+            plist_path=Path("/tmp/com.vgen.home-broker.plist"),
+            loaded=True,
+        )
+
+    monkeypatch.setattr(broker_service, "install_macos_broker_service", install)
+    monkeypatch.setattr(
+        broker_service,
+        "inspect_macos_broker_service",
+        lambda: {"loaded": True, "runtime_version": "0.4.0"},
+    )
+
+    _broker_command(Namespace(broker_action="service-refresh", profile="home"))
+
+    assert captured == {
+        "profile_name": "home",
+        "broker_id": "brk_test",
+        "broker_device_id": "bdev_test",
+    }
+    assert json.loads(capsys.readouterr().out)["runtime_version"] == "0.4.0"
+
+
+def test_broker_upgrade_comparison_rejects_invalid_gateway_version() -> None:
+    from vgen.cli.main import _upgrade_available
+
+    assert _upgrade_available("0.3.1") is True
+    assert _upgrade_available("not-a-version") is None
+    assert _upgrade_available(None) is None
+
+
 def test_setup_does_not_save_a_new_profile_before_gateway_health_passes(
     tmp_path, monkeypatch
 ) -> None:
@@ -573,6 +669,7 @@ def test_macos_installer_is_shell_valid_and_does_not_mutate_system() -> None:
     assert ".zshrc" not in text
     assert '"${RELEASE_DIR}/bin/python" -I -B "${VGEN_BIN}" "${SETUP_ARGS[@]}" "$@"' in text
     assert '"${RELEASE_DIR}/bin/python" -I -B "${VGEN_BIN}" profile show' in text
+    assert '"${RELEASE_DIR}/bin/python" -I -B "${VGEN_BIN}" broker service-refresh' in text
     assert re.search(r'(?m)^VERSION="[0-9]', text) is None
     assert re.search(r'(?m)^WHEEL_SHA256="[0-9a-f]{64}"', text) is None
     assert 'WHEEL_CANDIDATES+=("${candidate}")' in text

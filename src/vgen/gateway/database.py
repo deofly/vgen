@@ -189,6 +189,11 @@ CREATE TABLE IF NOT EXISTS broker_devices (
     device_id TEXT NOT NULL REFERENCES devices(id),
     status TEXT NOT NULL CHECK(status IN ('active','revoked')),
     approved_by_user_id TEXT NOT NULL REFERENCES users(id),
+    runtime_version TEXT,
+    protocol_version TEXT,
+    build_commit TEXT,
+    journal_pending INTEGER,
+    heartbeat_at REAL,
     created_at REAL NOT NULL,
     revoked_at REAL,
     UNIQUE(broker_id, device_id)
@@ -588,6 +593,20 @@ class GatewayDatabase:
             }
             if "command_key" not in broker_command_columns:
                 self._conn.execute("ALTER TABLE broker_commands ADD COLUMN command_key TEXT")
+            broker_device_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(broker_devices)")
+            }
+            for column, definition in (
+                ("runtime_version", "TEXT"),
+                ("protocol_version", "TEXT"),
+                ("build_commit", "TEXT"),
+                ("journal_pending", "INTEGER"),
+                ("heartbeat_at", "REAL"),
+            ):
+                if column not in broker_device_columns:
+                    self._conn.execute(
+                        f"ALTER TABLE broker_devices ADD COLUMN {column} {definition}"
+                    )
             usage_ledger_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(usage_ledger)")
             }

@@ -25,6 +25,7 @@ def test_broker_journal_is_durable(tmp_path) -> None:
 class CommandClient:
     def __init__(self) -> None:
         self.completed: list[str] = []
+        self.heartbeats: list[dict[str, Any]] = []
 
     def request(self, method: str, path: str, *, json_body: Any = None, **_: Any) -> dict[str, Any]:
         if method == "GET":
@@ -34,6 +35,8 @@ class CommandClient:
                     {"id": "bcm_second", "command_type": "task_rekey", "payload": {}},
                 ]
             }
+        if path.endswith("/heartbeat"):
+            self.heartbeats.append(json_body)
         if path.endswith("/complete"):
             self.completed.append(path.split("/")[-2])
         return {"ok": True}
@@ -56,6 +59,16 @@ def test_broker_does_not_advance_cursor_past_failed_command(tmp_path) -> None:
     )
     daemon.run_once()
 
+    assert client.heartbeats == [
+        {
+            "broker_id": "brk_test",
+            "status": "online",
+            "runtime_version": daemon.config.runtime_version,
+            "protocol_version": "1",
+            "build_commit": daemon.config.build_commit,
+            "journal_pending": 0,
+        }
+    ]
     assert client.completed == []
     assert journal.get_state("last_command") is None
     assert journal.pending()[0]["payload"] == {

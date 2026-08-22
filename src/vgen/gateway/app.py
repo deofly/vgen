@@ -55,6 +55,7 @@ from .schemas import (
     BootstrapRequest,
     BrokerCreate,
     BrokerDeviceAttach,
+    BrokerHeartbeat,
     ChallengeRequest,
     CommandComplete,
     DeviceEnrollmentRequest,
@@ -2041,12 +2042,19 @@ def create_app(
 
     @app.post("/api/v1/broker-devices/{broker_device_id}/heartbeat", tags=["broker"])
     def broker_heartbeat(
-        broker_device_id: str, principal: Principal = Depends(user_principal)
+        broker_device_id: str,
+        payload: BrokerHeartbeat,
+        principal: Principal = Depends(user_principal),
     ) -> dict[str, Any]:
         require_scope(principal, "broker:heartbeat")
         return repository.broker_device_heartbeat(
             broker_device_id=broker_device_id,
             user_id=principal.user_id,
+            broker_id=payload.broker_id,
+            runtime_version=payload.runtime_version,
+            protocol_version=payload.protocol_version,
+            build_commit=payload.build_commit,
+            journal_pending=payload.journal_pending,
         )
 
     @app.get("/api/v1/broker-devices/{broker_device_id}/commands", tags=["broker"])

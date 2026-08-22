@@ -15,7 +15,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jsonschema import Draft202012Validator
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from vgen import __version__
 from vgen.artifacts import (
@@ -107,6 +107,15 @@ def _json(value: Any) -> None:
 
 
 LEGACY_OWNER_MIGRATION_CONFIRMATION = "MIGRATE-LEGACY-OWNER"
+
+
+def _upgrade_available(runtime_version: object) -> bool | None:
+    if not runtime_version:
+        return None
+    try:
+        return Version(str(runtime_version)) < Version(__version__)
+    except InvalidVersion:
+        return None
 
 
 def _device_registration(identity: DeviceIdentity, *, name: str) -> dict[str, Any]:
@@ -1536,6 +1545,41 @@ def _create_maintenance_job(
 
 
 def _broker_command(args: argparse.Namespace) -> None:
+    if args.broker_action == "local-status":
+        from .macos_broker_service import inspect_macos_broker_service
+
+        value = inspect_macos_broker_service()
+        value["cli_version"] = __version__
+        value["upgrade_available"] = _upgrade_available(value.get("runtime_version"))
+        _json(value)
+        return
+    if args.broker_action == "service-refresh":
+        from .macos_broker_service import (
+            inspect_macos_broker_service,
+            install_macos_broker_service,
+        )
+
+        profile = ProfileStore().get(args.profile)
+        if not profile.home_broker_id or not profile.home_broker_device_id:
+            _json(
+                {
+                    "skipped": True,
+                    "reason": "profile_has_no_home_broker",
+                    "profile": profile.name,
+                }
+            )
+            return
+        service = install_macos_broker_service(
+            profile_name=profile.name,
+            broker_id=profile.home_broker_id,
+            broker_device_id=profile.home_broker_device_id,
+        )
+        if not service.loaded:
+            raise ValueError(service.error or "Home Broker service could not be loaded")
+        value = inspect_macos_broker_service()
+        value["cli_version"] = __version__
+        _json(value)
+        return
     if args.broker_action == "serve":
         from vgen.broker.main import run_broker
 
@@ -1556,7 +1600,15 @@ def _broker_command(args: argparse.Namespace) -> None:
                 )
             )
         elif args.broker_action in {"list", "status"}:
-            _json(client.request("GET", "/api/v1/brokers"))
+            brokers = client.request("GET", "/api/v1/brokers")
+            if args.broker_action == "status" and isinstance(brokers, list):
+                for broker in brokers:
+                    for device in broker.get("devices", []):
+                        runtime_version = device.get("runtime_version")
+                        device["upgrade_available"] = _upgrade_available(runtime_version)
+                _json(brokers)
+            else:
+                _json(brokers)
         elif args.broker_action == "device":
             _json(
                 client.request(
@@ -3105,6 +3157,13 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("list", "status"):
         command = broker_sub.add_parser(action)
         command.add_argument("--profile")
+    broker_sub.add_parser(
+        "local-status", help="inspect this Mac Home Broker process and runtime version"
+    )
+    broker_refresh = broker_sub.add_parser(
+        "service-refresh", help="reload this Mac Home Broker with the current CLI version"
+    )
+    broker_refresh.add_argument("--profile")
     broker_device = broker_sub.add_parser("device")
     broker_device.add_argument("broker_id")
     broker_device.add_argument("device_id")

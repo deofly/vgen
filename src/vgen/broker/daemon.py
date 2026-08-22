@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
+from vgen import __version__
 from vgen.cli.client import GatewayClient, VgenClientError
 
 from .journal import BrokerJournal
@@ -13,11 +16,19 @@ from .journal import BrokerJournal
 logger = logging.getLogger(__name__)
 
 
+def _build_commit() -> str | None:
+    value = os.environ.get("VGEN_BUILD_COMMIT", "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{7,64}", value) else None
+
+
 @dataclass(frozen=True)
 class BrokerDaemonConfig:
     broker_id: str
     device_id: str
     poll_seconds: float = 5.0
+    runtime_version: str = __version__
+    protocol_version: str = "1"
+    build_commit: str | None = _build_commit()
 
 
 class BrokerDaemon:
@@ -55,6 +66,9 @@ class BrokerDaemon:
         payload = {
             "broker_id": self.config.broker_id,
             "status": "online",
+            "runtime_version": self.config.runtime_version,
+            "protocol_version": self.config.protocol_version,
+            "build_commit": self.config.build_commit,
             "journal_pending": len(self.journal.pending()),
         }
         try:

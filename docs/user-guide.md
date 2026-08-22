@@ -207,7 +207,13 @@ Device，并安装官方工作流清单。用户不需要复制这些资源的�
 vgen profile show
 vgen gateway health
 vgen broker status
+vgen broker local-status
 ```
+
+`broker status` 显示 Gateway 最近收到的每台 Broker Device 运行版本、协议版本、最后心跳和是否有
+可用升级；`broker local-status` 直接检查这台 Mac 的 LaunchAgent、进程 PID、实际运行版本和 CLI
+版本。升级安装器会自动执行 `broker service-refresh`，把已存在的 Home Broker 切换到新 CLI
+环境，不需要重新运行 `setup`、重新绑定设备或再次输入 Bootstrap code。
 
 ### 4.3 其他 Mac 加入并使用共享 Worker
 

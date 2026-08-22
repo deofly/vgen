@@ -148,6 +148,55 @@ def test_bootstrap_workspace_pool_and_idempotency(tmp_path) -> None:
         assert boot["user"]["is_operator"] == 1
 
 
+def test_broker_heartbeat_reports_runtime_version(tmp_path) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    with TestClient(app) as client:
+        client.headers.update({"Vgen-Protocol-Version": "1"})
+        boot, headers = bootstrap(client)
+        broker_response = client.post(
+            "/api/v1/brokers",
+            json={"name": "Home", "device_id": boot["device"]["id"]},
+            headers=headers,
+        )
+        assert broker_response.status_code == 200, broker_response.text
+        broker = broker_response.json()
+        broker_device_id = broker["broker_device"]["id"]
+
+        legacy = client.post(
+            f"/api/v1/broker-devices/{broker_device_id}/heartbeat",
+            json={"broker_id": broker["id"], "status": "online", "journal_pending": 0},
+            headers=headers,
+        )
+        assert legacy.status_code == 200, legacy.text
+        assert legacy.json()["runtime_version"] is None
+
+        heartbeat = client.post(
+            f"/api/v1/broker-devices/{broker_device_id}/heartbeat",
+            json={
+                "broker_id": broker["id"],
+                "status": "online",
+                "runtime_version": "0.4.0",
+                "protocol_version": "1",
+                "build_commit": "abcdef1234567",
+                "journal_pending": 2,
+            },
+            headers=headers,
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        listed = client.get("/api/v1/brokers", headers=headers).json()
+        device = listed[0]["devices"][0]
+        assert device["runtime_version"] == "0.4.0"
+        assert device["protocol_version"] == "1"
+        assert device["build_commit"] == "abcdef1234567"
+        assert device["journal_pending"] == 2
+        assert device["heartbeat_at"] is not None
+
+
 def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
     app = create_app(
         database_path=str(tmp_path / "gateway.db"),
