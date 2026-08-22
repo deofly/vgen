@@ -400,9 +400,9 @@ git commit -m 'chore: establish reviewed VGen source baseline'
 ```
 
 `git add -- .` 只能在前两项检查和 secret 审查完成后执行。首次提交后，每个功能或修复使用独立
-提交；发布前 `git status --porcelain=v1 --untracked-files=all` 必须没有输出。发布版本提交需把
-`pyproject.toml` 更新到完整三段版本，并创建指向该提交的 `vX.Y.Z` tag。不要把 `dist/` 产物、
-Release 页面材料或 ECS 下载目录加入源码提交。
+提交；发布前 `git status --porcelain=v1 --untracked-files=all` 必须没有输出。统一 `publish` 命令
+会更新 `pyproject.toml`、创建独立版本提交并建立指向该提交的 `vX.Y.Z` tag，不要求发布人员手工
+同步这些状态。不要把 `dist/` 产物、Release 页面材料或 ECS 下载目录加入源码提交。
 
 首次为已审核提交创建发行标签时使用 annotated tag，并确认它确实指向当前 `HEAD`：
 
@@ -461,8 +461,9 @@ Invite 过期/复用/revoke、签名重放、未审批 rate 和 upload ticket �
 
 ## 8. 版本与候选发行
 
-唯一手工维护的产品版本是 `pyproject.toml` 的 `project.version`。源码通过 TOML 读取，wheel
-通过 package metadata 读取；不要在 Python、安装器、测试或文档中增加第二个版本常量。
+唯一产品版本源是 `pyproject.toml` 的 `project.version`，由统一发布工具按 `--version` 更新。
+源码通过 TOML 读取，wheel 通过 package metadata 读取；不要在 Python、安装器、测试或文档中
+增加第二个版本常量。
 
 正式 1.0 前只使用完整三段 `0.MINOR.PATCH`：兼容 bugfix 增加 PATCH；功能或 breaking change
 增加 MINOR 并把 PATCH 归零。Alpha classifier 只表示成熟度，不要求 `a`、`b` 或 `rc` 后缀。
@@ -494,12 +495,17 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 SSH 密码或私钥。`VGEN_RELEASE_CONFIG` 可为自动化测试指定另一个绝对路径。命令行中的
 `--gateway`、`--releases`、`--ssh` 和 `--ssh-port` 始终覆盖本地配置。
 
-完成源码修改、测试、版本提交和 tag 后，在 Mac 只需执行：
+完成业务源码修改并提交、确认工作区干净后，在 Mac 只需执行：
 
 ```bash
 ./tools/release.sh publish \
   --version 0.3.1
 ```
+
+当当前产品版本较旧时，`publish` 会先展示计划并要求输入目标版本确认，然后只修改
+`pyproject.toml`，创建 `release: prepare vgen X.Y.Z` 提交和 annotated tag。若同名版本已出现在
+公网下载站或任一 Git remote，工具拒绝移动标签并要求使用新版本；尚未推送、尚未发布的错误本地
+标签可以安全修正。版本和标签已经准备完成时重跑保持幂等。
 
 脚本会要求输入下载域名确认 stable 切换。自动化环境只有在外层已经完成等价审批时才使用
 `--confirm-stable`。SSH 不是 22 端口时增加 `--ssh-port`。仅发布 CLI/Worker 下载频道时不会
@@ -565,9 +571,10 @@ ArtifactStore，也不会被上述限制删除或迁移。
 ```
 
 本地探索阶段可以显式增加 `--allow-untagged-candidate`，但该选项不能用于 `publish`。构建时间取
-Git 提交时间并转换成 UTC `published_at`，因此同一 tag 的重复构建保持可复现。脚本只清理
+Git 提交时间并转换成 UTC `published_at`，因此同一 tag 的重复构建保持可复现。`build` 只清理
 `dist/` 下当前版本的临时派生产物和本地 staging 版本目录，不修改源码、版本、commit 或 tag；
-ECS 上已经存在的不同字节不可变版本仍会被拒绝覆盖，其他本地版本目录也不会被清理。
+`publish` 仅在版本尚未准备时创建上述版本提交和标签。ECS 上已经存在的不同字节不可变版本仍会
+被拒绝覆盖，其他本地版本目录也不会被清理。
 
 新版脚本会自动清理当前版本的本地 staging。若使用旧版工具中断后看到错误路径明确位于当前仓库
 `dist/public-releases/X.Y.Z`，并且日志尚未出现 `scp`，可在仓库根目录只删除该精确本地目录后重试：

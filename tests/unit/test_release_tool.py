@@ -124,6 +124,77 @@ def test_release_preflight_requires_clean_tagged_source(tmp_path) -> None:
         TOOL._git_preflight("0.3.1", require_tag=True, repository=repository)
 
 
+def test_publish_prepares_version_commit_and_unpublished_local_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = _repository(tmp_path, version="0.7.1")
+    _git(repository, "tag", "-a", "v0.7.2", "-m", "premature tag")
+    old_head = _git(repository, "rev-parse", "HEAD")
+    monkeypatch.setattr(TOOL, "_public_version_exists", lambda *args: False)
+    monkeypatch.setattr(TOOL, "_remote_tag_locations", lambda *args, **kwargs: [])
+
+    TOOL._prepare_release_source(
+        "0.7.2",
+        release_origin="https://vgen.example.com",
+        confirmed=True,
+        repository=repository,
+    )
+
+    new_head = _git(repository, "rev-parse", "HEAD")
+    assert new_head != old_head
+    assert TOOL._project_version(repository) == "0.7.2"
+    assert _git(repository, "log", "-1", "--format=%s") == "release: prepare vgen 0.7.2"
+    assert _git(repository, "rev-list", "-n", "1", "v0.7.2") == new_head
+    assert _git(repository, "status", "--porcelain=v1") == ""
+
+    monkeypatch.setattr(
+        TOOL,
+        "_public_version_exists",
+        lambda *args: pytest.fail("an already prepared release must be idempotent"),
+    )
+    TOOL._prepare_release_source(
+        "0.7.2",
+        release_origin="https://vgen.example.com",
+        confirmed=True,
+        repository=repository,
+    )
+    assert _git(repository, "rev-parse", "HEAD") == new_head
+
+
+def test_publish_refuses_to_replace_public_or_remote_release_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_root = tmp_path / "public"
+    public_root.mkdir()
+    public_repository = _repository(public_root, version="0.7.1")
+    monkeypatch.setattr(TOOL, "_public_version_exists", lambda *args: True)
+    with pytest.raises(TOOL.ReleaseError, match="already exists on the public release site"):
+        TOOL._prepare_release_source(
+            "0.7.2",
+            release_origin="https://vgen.example.com",
+            confirmed=True,
+            repository=public_repository,
+        )
+    assert TOOL._project_version(public_repository) == "0.7.1"
+
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    remote_repository = _repository(remote_root, version="0.7.1")
+    _git(remote_repository, "tag", "v0.7.2")
+    monkeypatch.setattr(TOOL, "_public_version_exists", lambda *args: False)
+    monkeypatch.setattr(
+        TOOL, "_remote_tag_locations", lambda *args, **kwargs: ["origin"]
+    )
+    with pytest.raises(TOOL.ReleaseError, match=r"v0\.7\.2 already exists on remote"):
+        TOOL._prepare_release_source(
+            "0.7.2",
+            release_origin="https://vgen.example.com",
+            confirmed=True,
+            repository=remote_repository,
+        )
+    assert TOOL._project_version(remote_repository) == "0.7.1"
+
+
 def test_release_deployment_archive_is_closed_and_reproducible(tmp_path) -> None:
     public_root = _public_release(tmp_path)
     first = TOOL.build_deployment_archive(

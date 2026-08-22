@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tomllib
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -230,6 +231,151 @@ def _project_version(repository: Path = REPOSITORY) -> str:
     if not isinstance(value, str) or VERSION_PATTERN.fullmatch(value) is None:
         raise ReleaseError("project.version must be a complete MAJOR.MINOR.PATCH version")
     return value
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    if VERSION_PATTERN.fullmatch(value) is None:
+        raise ReleaseError("version must use MAJOR.MINOR.PATCH")
+    major, minor, patch = value.split(".")
+    return int(major), int(minor), int(patch)
+
+
+def _public_version_exists(release_origin: str, version: str) -> bool:
+    release, _ = _validated_origin(release_origin)
+    url = f"{release}/releases/{version}/manifest.json"
+    request = urllib.request.Request(url, headers={"User-Agent": "vgen-release/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read(1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise ReleaseError(
+            f"cannot verify whether VGen {version} is already public: HTTP {exc.code}"
+        ) from None
+    except OSError as exc:
+        raise ReleaseError(
+            f"cannot verify whether VGen {version} is already public: {type(exc).__name__}"
+        ) from None
+    return True
+
+
+def _remote_tag_locations(tag: str, *, repository: Path) -> list[str]:
+    remotes = _capture(["git", "remote"], cwd=repository).splitlines()
+    locations = []
+    for remote in remotes:
+        value = _capture(
+            [
+                "git",
+                "ls-remote",
+                "--tags",
+                remote,
+                f"refs/tags/{tag}",
+                f"refs/tags/{tag}^{{}}",
+            ],
+            cwd=repository,
+        )
+        if value:
+            locations.append(remote)
+    return locations
+
+
+def _replace_project_version(
+    current: str, requested: str, *, repository: Path
+) -> None:
+    path = repository / "pyproject.toml"
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseError("pyproject.toml must be a regular file, not a symlink")
+    original = path.read_text(encoding="utf-8")
+    project_start = original.find("[project]")
+    if project_start < 0:
+        raise ReleaseError("pyproject.toml has no [project] table")
+    next_table = original.find("\n[", project_start + len("[project]"))
+    project_end = len(original) if next_table < 0 else next_table + 1
+    section = original[project_start:project_end]
+    pattern = re.compile(rf'(?m)^version = "{re.escape(current)}"$')
+    replaced, count = pattern.subn(f'version = "{requested}"', section)
+    if count != 1:
+        raise ReleaseError("pyproject.toml [project] must contain exactly one current version")
+    updated = original[:project_start] + replaced + original[project_end:]
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        temporary.write_text(updated, encoding="utf-8")
+        temporary.chmod(stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _prepare_release_source(
+    version: str,
+    *,
+    release_origin: str,
+    confirmed: bool,
+    repository: Path = REPOSITORY,
+) -> None:
+    requested = _version_tuple(version)
+    dirty = _capture(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repository,
+    )
+    if dirty:
+        preview = ", ".join(line[:160] for line in dirty.splitlines()[:8])
+        raise ReleaseError(
+            "Git worktree must be clean before automatic release preparation: " + preview
+        )
+    current = _project_version(repository)
+    if _version_tuple(current) > requested:
+        raise ReleaseError(f"refusing to downgrade project.version from {current} to {version}")
+    head = _capture(["git", "rev-parse", "--verify", "HEAD"], cwd=repository)
+    tag = f"v{version}"
+    tag_target = ""
+    tag_exists = True
+    try:
+        tag_target = _capture(["git", "rev-list", "-n", "1", tag], cwd=repository)
+    except ReleaseError:
+        tag_exists = False
+    version_change = current != version
+    if not version_change and tag_exists and tag_target == head:
+        return
+    if _public_version_exists(release_origin, version):
+        raise ReleaseError(
+            f"VGen {version} already exists on the public release site; use a new version"
+        )
+    if tag_exists and (tag_target != head or version_change):
+        locations = _remote_tag_locations(tag, repository=repository)
+        if locations:
+            raise ReleaseError(
+                f"{tag} already exists on remote(s) {', '.join(locations)}; use a new version"
+            )
+    if not confirmed:
+        changes = []
+        if version_change:
+            changes.append(f"update project.version {current} -> {version} and commit it")
+        if tag_exists:
+            changes.append(f"move unpublished local tag {tag} to the release commit")
+        else:
+            changes.append(f"create annotated tag {tag}")
+        answer = input(
+            "Release preparation will " + "; ".join(changes) + f". Type {version} to continue: "
+        ).strip()
+        if answer != version:
+            raise ReleaseError("release source preparation was not confirmed")
+    if version_change:
+        _replace_project_version(current, version, repository=repository)
+        _run(["git", "add", "--", "pyproject.toml"], cwd=repository)
+        _run(
+            ["git", "commit", "-m", f"release: prepare vgen {version}"],
+            cwd=repository,
+        )
+        head = _capture(["git", "rev-parse", "--verify", "HEAD"], cwd=repository)
+    if tag_exists:
+        current_target = _capture(["git", "rev-list", "-n", "1", tag], cwd=repository)
+        if current_target != head:
+            _run(["git", "tag", "-d", tag], cwd=repository)
+            tag_exists = False
+    if not tag_exists:
+        _run(["git", "tag", "-a", tag, "-m", f"VGen {version}"], cwd=repository)
 
 
 def _validated_origin(value: str) -> tuple[str, str]:
@@ -772,6 +918,11 @@ def main() -> int:
             aliyun_account_id=arguments.aliyun_account_id,
             oss_transfer_role=arguments.oss_transfer_role,
             confirm_oss_configured=arguments.confirm_oss_configured,
+        )
+        _prepare_release_source(
+            arguments.version,
+            release_origin=targets.release_origin,
+            confirmed=arguments.confirm_stable,
         )
     require_tag = arguments.action == "publish" or not arguments.allow_untagged_candidate
     result = build_release(
