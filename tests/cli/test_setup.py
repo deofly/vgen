@@ -141,6 +141,48 @@ def test_broker_service_refresh_reuses_existing_profile(monkeypatch, capsys) -> 
     assert json.loads(capsys.readouterr().out)["runtime_version"] == "0.4.0"
 
 
+def test_broker_service_refresh_prefers_running_launch_agent_profile(
+    monkeypatch, capsys
+) -> None:
+    from vgen.cli.main import _broker_command
+    from vgen.cli.profile import GatewayProfile
+
+    selected: list[str | None] = []
+    profile = GatewayProfile(
+        name="broker-home",
+        endpoint="https://gateway.example",
+        home_broker_id="brk_test",
+        home_broker_device_id="bdev_test",
+    )
+    monkeypatch.setattr(
+        "vgen.cli.main.ProfileStore",
+        lambda: type(
+            "Profiles",
+            (),
+            {"get": lambda self, name: selected.append(name) or profile},
+        )(),
+    )
+    monkeypatch.setattr(
+        broker_service,
+        "inspect_macos_broker_service",
+        lambda: {"loaded": True, "profile": "broker-home", "runtime_version": "0.5.0"},
+    )
+    monkeypatch.setattr(
+        broker_service,
+        "install_macos_broker_service",
+        lambda **_values: broker_service.BrokerServiceResult(
+            label=broker_service.LABEL,
+            plist_path=Path("/tmp/com.vgen.home-broker.plist"),
+            loaded=True,
+        ),
+    )
+
+    _broker_command(Namespace(broker_action="service-refresh", profile=None))
+
+    assert selected == ["broker-home"]
+    assert json.loads(capsys.readouterr().out)["profile"] == "broker-home"
+
+
 def test_broker_upgrade_comparison_rejects_invalid_gateway_version() -> None:
     from vgen.cli.main import _upgrade_available
 

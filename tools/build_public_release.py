@@ -704,7 +704,17 @@ case "$answer" in
   *) printf '%s\n' 'Installation cancelled.'; exit 1 ;;
 esac
 "$WORK_DIR/VGen-macOS-$EXPECTED_VERSION/install.command" --install-only
-printf '\nNext: "%s/.local/bin/vgen" join --gateway %s\n' "$HOME" "$GATEWAY_ORIGIN"
+VGEN_BIN="$HOME/.local/bin/vgen"
+if [ ! -x "$VGEN_BIN" ] || [ "$("$VGEN_BIN" --version)" != "vgen $EXPECTED_VERSION" ]; then
+  printf '%s\n' 'The managed VGen launcher did not switch to the verified version.' >&2
+  exit 1
+fi
+if "$VGEN_BIN" profile show >/dev/null 2>&1; then
+  "$VGEN_BIN" broker service-refresh
+  printf '\nVGen CLI and Home Broker upgraded to %s.\n' "$EXPECTED_VERSION"
+else
+  printf '\nNext: "%s" join --gateway %s\n' "$VGEN_BIN" "$GATEWAY_ORIGIN"
+fi
 '''
     return script.encode("utf-8")
 

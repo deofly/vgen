@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -82,7 +83,17 @@ def _mac_bundle(
     prefix = f"VGen-macOS-{VERSION}/"
     install = b"#!/bin/sh\nset -eu\n"
     if marker is not None:
-        install += f"printf '%s' \"$1\" > {marker!s}\n".encode()
+        install += (
+            f"printf '%s' \"$1\" > {shlex.quote(str(marker))}\n"
+            'mkdir -p "$HOME/.local/bin"\n'
+            'cat > "$HOME/.local/bin/vgen" <<\'SH\'\n'
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = \"--version\" ]; then echo 'vgen {VERSION}'; exit 0; fi\n"
+            "if [ \"$1 $2\" = \"profile show\" ]; then exit 1; fi\n"
+            "exit 0\n"
+            "SH\n"
+            'chmod 755 "$HOME/.local/bin/vgen"\n'
+        ).encode()
     files = {
         "README.md": b"offline user guide\n",
         "install.command": install,
@@ -291,6 +302,7 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert '"$PYTHON_BIN" -I -B <<\'PY\'' in script
     assert "Install the CLI for the current user now? [y/N]" in script
     assert "install.command\" --install-only" in script
+    assert '"$VGEN_BIN" broker service-refresh' in script
     assert "jq" not in script
     assert "curl" not in script
     for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):

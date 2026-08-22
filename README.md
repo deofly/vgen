@@ -19,6 +19,7 @@ VGen 是一个开源的 GPU 工作流控制面，把公网 Gateway、用户的 M
 - 内置 ComfyUI Executor，参考工作流 `vgen/minimax-h3-8step` 支持 0 图 t2v、1 图首帧 i2v、
   2 图首尾帧 flf；
 - Broker 发起模型下载和纯 Python Worker wheel 更新；
+- Mac CLI/Home Broker 通过 `vgen upgrade` 校验 stable release、原子升级并在失败时回滚；
 - 同域名 public release channel，以及本机生成密钥的无凭据 Windows Worker 通用包；
 - 工作流 market/custom 隔离、不可变 digest、签名和本地执行策略；
 - 每 Attempt 可追溯 Worker、consumer channel、GPU/流量指标和 `billing_token`；
@@ -27,7 +28,7 @@ VGen 是一个开源的 GPU 工作流控制面，把公网 Gateway、用户的 M
 v1 仍采用单 Gateway/SQLite，不提供 active-active。Windows Worker 当前以前台 PowerShell
 监督器运行，尚未提供 Service、后台常驻或开机自启。SGLang Diffusion 和 Diffusers 只预留
 Executor 扩展契约，尚未交付 adapter。API Service 可以完成身份认证和最小 scope 授权，但
-0.3.0 暂不为 Service 新发 Workspace Data Key；在补齐与 User 等价的 Owner 签名准入证明前，
+当前 v1 暂不为 Service 新发 Workspace Data Key；在补齐与 User 等价的 Owner 签名准入证明前，
 Service 不能读取端到端加密的任务内容。
 
 ## 两份权威手册

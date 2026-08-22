@@ -81,6 +81,7 @@ from .service_credentials import (
 )
 from .session_store import SessionStore, StoredSession
 from .setup import setup_command
+from .upgrade import upgrade_command
 from .user_enrollment import identity_registration_claim, sign_enrollment_admission
 from .workspace_authorities import (
     PinnedInvite,
@@ -1559,7 +1560,12 @@ def _broker_command(args: argparse.Namespace) -> None:
             install_macos_broker_service,
         )
 
-        profile = ProfileStore().get(args.profile)
+        existing_service = inspect_macos_broker_service()
+        service_profile = existing_service.get("profile")
+        selected_profile = args.profile or (
+            str(service_profile) if isinstance(service_profile, str) and service_profile else None
+        )
+        profile = ProfileStore().get(selected_profile)
         if not profile.home_broker_id or not profile.home_broker_device_id:
             _json(
                 {
@@ -2930,6 +2936,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--no-broker-service", action="store_true")
     setup.add_argument("--json", action="store_true")
 
+    upgrade = sub.add_parser("upgrade", help="upgrade the managed macOS CLI and Home Broker")
+    upgrade.add_argument("--profile")
+    upgrade.add_argument("--check", action="store_true", help="only report whether an update exists")
+    upgrade.add_argument("--yes", action="store_true", help="install without an interactive prompt")
+
     identity = sub.add_parser("identity")
     identity_sub = identity.add_subparsers(dest="identity_action", required=True)
     identity_init = identity_sub.add_parser("init")
@@ -3485,6 +3496,7 @@ def build_parser() -> argparse.ArgumentParser:
 def dispatch(args: argparse.Namespace) -> None:
     handlers = {
         "setup": setup_command,
+        "upgrade": upgrade_command,
         "identity": _identity_command,
         "profile": _profile_command,
         "gateway": _gateway_command,

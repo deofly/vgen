@@ -197,9 +197,27 @@ Device，并安装官方工作流清单。用户不需要复制这些资源的�
 
 ### 4.2 升级或重装 Mac CLI
 
-下载并核对新版本 Mac ZIP，再次双击 `install.command`。只要本机现有 Profile 可读，安装器
-只更新 CLI/Home Broker 程序，保留身份、Gateway、Workspace 和 Broker 配置，不会再次要求
-恢复词或 Bootstrap code。
+首次安装包含自升级能力的版本后，后续只需运行：
+
+```bash
+vgen upgrade
+```
+
+CLI 会查询当前 Profile 所绑定 Gateway 的 stable 版本，下载并校验不可变 manifest、安装包大小、
+SHA-256、ZIP 路径和包内 `SHA256SUMS`，然后安装到新的不可变版本目录。新 CLI 校验成功后才切换
+`~/.local/bin/vgen` 并刷新 Home Broker；刷新失败时自动恢复旧 CLI 和旧 Broker。身份、Gateway、
+Workspace、Broker 配置以及旧版本目录都会保留，不需要恢复词、Bootstrap code 或再次执行
+`setup`。
+
+只检查是否有更新：
+
+```bash
+vgen upgrade --check
+```
+
+自动化环境可显式使用 `vgen upgrade --yes`；日常交互升级默认要求确认。当前 CLI 不是官方受管
+安装、安装标记损坏或升级回滚失败时，重新运行 Gateway 首页提供的一键安装命令恢复，不要手工
+修改版本目录或符号链接。直接下载并双击新版 `install.command` 仍作为恢复路径保留。
 
 完成后可以检查：
 
@@ -212,7 +230,7 @@ vgen broker local-status
 
 `broker status` 显示 Gateway 最近收到的每台 Broker Device 运行版本、协议版本、最后心跳和是否有
 可用升级；`broker local-status` 直接检查这台 Mac 的 LaunchAgent、进程 PID、实际运行版本和 CLI
-版本。升级安装器会自动执行 `broker service-refresh`，把已存在的 Home Broker 切换到新 CLI
+版本。升级器和安装器都会执行 `broker service-refresh`，把已存在的 Home Broker 切换到新 CLI
 环境，不需要重新运行 `setup`、重新绑定设备或再次输入 Bootstrap code。
 
 ### 4.3 其他 Mac 加入并使用共享 Worker

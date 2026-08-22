@@ -589,7 +589,24 @@ SHA-256；跨域 redirect、非 HTTPS（测试 loopback 除外）或 API/manifes
 工具先原子切换 bootstrap，最后原子切换 stable pointer；中间状态只会拒绝安装，不会把新
 bootstrap 配到旧 release。
 
-### 8.2 手工同步到 ECS 或 OSS
+### 8.2 Mac CLI 自升级契约
+
+`vgen upgrade` 只信任当前 Profile 的 Gateway origin，并要求 stable API、不可变 manifest 和
+Mac artifact 三者在版本、size、SHA-256 与 URL 上一致。重定向不得跨 origin；下载和解压有大小、
+条目数、重复路径、大小写冲突、symlink、加密 ZIP 和路径逃逸限制。执行前再次验证包内
+`SHA256SUMS`，不从 manifest 或 ZIP 接受任意安装命令路径。
+
+自升级只允许当前 `~/.local/bin/vgen` 指向
+`~/Library/Application Support/VGen/cli/releases/<受管版本>/bin/vgen` 且 release marker 有效的
+macOS 安装。新版本安装到独立目录，验证 `vgen --version` 后刷新 Home Broker；任何后置失败都
+原子恢复旧 launcher，并尽力用旧 CLI 重新加载 Broker。旧目录不自动删除，后续清理必须保留当前
+和最近一个可回滚版本。`--check` 不写本地状态，`--yes` 只跳过人工确认，不放宽任何校验。
+
+公网 `install-macos.sh` 仍承担第一次安装和损坏恢复。它使用 `--install-only` 安装已校验包后，
+若检测到现有 Profile，则必须自动执行 `broker service-refresh`；只有全新客户端才提示执行
+Workspace/User join。CLI 自升级不升级 Gateway 或 Windows Worker，也不修改 stable 指针。
+
+### 8.3 手工同步到 ECS 或 OSS
 
 底层 `build_public_release.py` 只准备 staging，不远程部署；统一 `release.sh publish` 已自动执行
 下面的协议。需要手工审计或故障恢复时，ECS 使用 Nginx 本地目录并按以下顺序同步：
