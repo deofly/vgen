@@ -225,6 +225,8 @@ def test_gateway_upgrade_migrates_legacy_v1_layout_with_rollback() -> None:
     )
     assert "rewrite_migrated_install_state" in migration
     assert 'usermod --home "${DATA_ROOT}" vgen' in migration
+    assert 'service_user_home_is_supported_for_layout_migration "${legacy_home}"' in source
+    assert "unsupported home directory: ${legacy_home}" in source
     assert migration.index('install -o root -g root -m 0644 "${SERVICE_SOURCE_PATH}"') < (
         migration.index('systemctl start "${SERVICE_NAME}"')
     )
@@ -240,6 +242,24 @@ def test_gateway_upgrade_migrates_legacy_v1_layout_with_rollback() -> None:
     assert 'systemctl start "${SERVICE_NAME}"' in rollback
     assert "rm -rf" not in migration
     assert "rm -rf" not in rollback
+
+
+def test_layout_migration_accepts_the_existing_system_account_home() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; service_user_home_is_supported_for_layout_migration /home/vgen',
+            "bash",
+            str(INSTALLER),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"VGEN_SETUP_LIBRARY_ONLY": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_layout_migration_rewrites_saved_nginx_backup_path(tmp_path: Path) -> None:

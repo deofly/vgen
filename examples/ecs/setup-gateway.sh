@@ -1754,6 +1754,13 @@ clear_layout_migration_traps() {
   trap - ERR INT TERM HUP
 }
 
+service_user_home_is_supported_for_layout_migration() {
+  local service_home="$1"
+  [[ "${service_home}" == "${LEGACY_V1_DATA_ROOT}" || \
+     "${service_home}" == "${DATA_ROOT}" || \
+     "${service_home}" == "/home/vgen" ]]
+}
+
 handle_layout_migration_error() {
   local status="$1"
   local rollback_ok=1
@@ -1841,8 +1848,8 @@ verify_legacy_v1_layout_for_migration() {
   verify_existing_gateway_environment "${LEGACY_V1_CONFIG_ROOT}/gateway.env"
   verify_upgrade_runtime_security "${LEGACY_V1_INSTALL_ROOT}/venv"
   legacy_home="$(getent passwd vgen | awk -F: '{print $6}')"
-  [[ "${legacy_home}" == "${LEGACY_V1_DATA_ROOT}" || "${legacy_home}" == "${DATA_ROOT}" ]] || \
-    die "layout migration refused: vgen user has an unexpected home directory"
+  service_user_home_is_supported_for_layout_migration "${legacy_home}" || \
+    die "layout migration refused: vgen user has an unsupported home directory: ${legacy_home}"
   systemctl is-active --quiet "${SERVICE_NAME}" || \
     die "layout migration refused: Gateway service is not active"
   systemctl is-enabled --quiet "${SERVICE_NAME}" || \
