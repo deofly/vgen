@@ -22,6 +22,7 @@ from vgen.artifacts import (
     ArtifactAdapterRegistry,
     HttpArtifactAdapter,
     LocalArtifactAdapter,
+    OssStsArtifactAdapter,
 )
 from vgen.executors import Executor, ExecutorRegistry
 from vgen.protocol import ErrorCode, VGenError
@@ -279,7 +280,7 @@ def _build_core(
     executor: Executor,
     session: requests.Session,
 ) -> WorkerCore:
-    adapters = [HttpArtifactAdapter(session)]
+    adapters = [HttpArtifactAdapter(session), OssStsArtifactAdapter()]
     if arguments.local_artifact_root:
         adapters.append(LocalArtifactAdapter(tuple(arguments.local_artifact_root)))
     work_root = _worker_work_root(arguments)

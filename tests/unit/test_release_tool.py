@@ -188,6 +188,171 @@ def test_release_scripts_have_valid_syntax_and_help() -> None:
     assert "switches stable.json last" in publisher_help.stdout
 
 
+def test_publish_parser_separates_gateway_install_and_upgrade_modes() -> None:
+    parser = TOOL._parser()
+    common = [
+        "publish",
+        "--version",
+        "0.7.0",
+        "--gateway",
+        "https://vgen-gw.example.com",
+        "--releases",
+        "https://vgen.example.com",
+        "--ssh",
+        "root@ecs.example.com",
+    ]
+    installed = parser.parse_args([*common, "--install-gateway", "--artifact-store", "oss"])
+    assert installed.install_gateway is True
+    assert installed.upgrade_gateway is False
+    assert installed.artifact_store == "oss"
+    with pytest.raises(SystemExit):
+        parser.parse_args([*common, "--install-gateway", "--upgrade-gateway"])
+    with pytest.raises(SystemExit):
+        parser.parse_args([*common, "--install-gateway", "--artifact-store", "local"])
+
+
+def test_publish_can_reset_and_initialize_gateway_with_oss_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = TOOL.BuildResult(
+        version="0.7.0",
+        commit="a" * 40,
+        published_at="2026-08-22T12:34:56Z",
+        gateway_bundle=tmp_path / "vgen-gateway-0.7.0.tar.gz",
+        macos_bundle=tmp_path / "VGen-macOS-0.7.0.zip",
+        windows_bundle=tmp_path / "vgen-windows-worker-installer-0.7.0.zip",
+        deployment_archive=tmp_path / "vgen-public-release-0.7.0.tar.gz",
+        deployment_sha256="b" * 64,
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        TOOL,
+        "_capture",
+        lambda *args, **kwargs: "/tmp/vgen-release.0.7.0.ABCDEFGH",
+    )
+    monkeypatch.setattr(TOOL, "_run", fake_run)
+    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args: None)
+
+    TOOL.publish_release(
+        result,
+        gateway_origin="https://vgen-gw.example.com",
+        release_origin="https://vgen.example.com",
+        ssh_target="root@ecs.example.com",
+        ssh_port=22,
+        confirmed=True,
+        gateway_action="install",
+        reset_test_gateway=True,
+        artifact_store="oss",
+        oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
+        oss_bucket="vgen-private",
+        oss_prefix="vgen/v1",
+        oss_ecs_role="VGenGatewayOssRole",
+        aliyun_account_id="1234567890123456",
+        oss_transfer_role="VGenArtifactTransferRole",
+        confirm_oss_configured=True,
+    )
+
+    ssh_commands = [" ".join(command) for command in commands if command[0] == "ssh"]
+    gateway = next(command for command in ssh_commands if "setup-gateway.sh" in command)
+    assert "setup-gateway.sh reset-test" in gateway
+    assert "--confirm-reset-test" in gateway
+    assert "setup-gateway.sh install" in gateway
+    assert "--artifact-store oss" in gateway
+    assert "--oss-bucket vgen-private" in gateway
+    assert "--oss-ecs-role VGenGatewayOssRole" in gateway
+    assert "--aliyun-account-id 1234567890123456" in gateway
+    assert "--oss-transfer-role VGenArtifactTransferRole" in gateway
+    assert "--confirm-oss-configured" in gateway
+    assert "setup-gateway.sh upgrade" not in gateway
+
+
+def test_publish_rejects_incomplete_oss_install_before_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = TOOL.BuildResult(
+        version="0.7.0",
+        commit="a" * 40,
+        published_at="2026-08-22T12:34:56Z",
+        gateway_bundle=tmp_path / "gateway.tar.gz",
+        macos_bundle=tmp_path / "mac.zip",
+        windows_bundle=tmp_path / "worker.zip",
+        deployment_archive=tmp_path / "public.tar.gz",
+        deployment_sha256="b" * 64,
+    )
+    contacted = False
+
+    def unexpected_capture(*args: object, **kwargs: object) -> str:
+        nonlocal contacted
+        contacted = True
+        return ""
+
+    monkeypatch.setattr(TOOL, "_capture", unexpected_capture)
+    with pytest.raises(TOOL.ReleaseError, match="requires endpoint, bucket, account ID"):
+        TOOL.publish_release(
+            result,
+            gateway_origin="https://vgen-gw.example.com",
+            release_origin="https://vgen.example.com",
+            ssh_target="root@ecs.example.com",
+            ssh_port=22,
+            confirmed=True,
+            gateway_action="install",
+            artifact_store="oss",
+            oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
+            oss_bucket="vgen-private",
+        )
+    assert contacted is False
+
+
+def test_publish_generates_cloud_kit_before_resetting_test_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = TOOL.BuildResult(
+        version="0.7.0",
+        commit="a" * 40,
+        published_at="2026-08-22T12:34:56Z",
+        gateway_bundle=tmp_path / "gateway.tar.gz",
+        macos_bundle=tmp_path / "mac.zip",
+        windows_bundle=tmp_path / "worker.zip",
+        deployment_archive=tmp_path / "public.tar.gz",
+        deployment_sha256="b" * 64,
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        TOOL, "_capture", lambda *args, **kwargs: "/tmp/vgen-release.0.7.0.ABCDEFGH"
+    )
+    monkeypatch.setattr(
+        TOOL,
+        "_run",
+        lambda command, **kwargs: commands.append(command),
+    )
+    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args: None)
+    TOOL.publish_release(
+        result,
+        gateway_origin="https://vgen-gw.example.com",
+        release_origin="https://vgen.example.com",
+        ssh_target="root@ecs.example.com",
+        ssh_port=22,
+        confirmed=True,
+        gateway_action="install",
+        reset_test_gateway=True,
+        artifact_store="oss",
+        oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
+        oss_bucket="vgen-private",
+        oss_ecs_role="VGenGatewayRole",
+        aliyun_account_id="1234567890123456",
+        oss_transfer_role="VGenArtifactTransferRole",
+    )
+    gateway = next(" ".join(command) for command in commands if "setup-gateway.sh" in " ".join(command))
+    assert "setup-gateway.sh reset-test" not in gateway
+    assert "setup-gateway.sh install" in gateway
+    assert "--confirm-oss-configured" not in gateway
+
+
 def test_ecs_publisher_inline_python_supports_python_36() -> None:
     source = PUBLISHER_PATH.read_text(encoding="utf-8")
     inline_blocks = re.findall(

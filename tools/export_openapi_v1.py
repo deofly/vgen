@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from vgen.gateway.app import create_app
+from vgen.gateway.artifacts import LocalArtifactStore
 
 DEFAULT_OUTPUT = Path("schemas/openapi-v1.json")
 SENSITIVE_NAMES = {
@@ -72,10 +73,11 @@ def build_contract() -> dict[str, Any]:
     bootstrap_marker = "vgen-openapi-exporter-non-runtime-marker"
     with tempfile.TemporaryDirectory(prefix="vgen-openapi-") as temporary:
         root = Path(temporary)
+        test_store = LocalArtifactStore(root / "artifacts", b"openapi-test-key" * 2)
         app = create_app(
             database_path=str(root / "gateway.db"),
             bootstrap_code=bootstrap_marker,
-            artifact_root=str(root / "artifacts"),
+            artifact_store_override=test_store,
             docs_enabled=True,
             require_request_signatures=True,
             sweep_interval_seconds=3600,

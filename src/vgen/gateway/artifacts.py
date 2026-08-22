@@ -11,8 +11,10 @@ import re
 import secrets
 import tempfile
 import time
+import urllib.parse
 from collections.abc import AsyncIterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
@@ -28,9 +30,12 @@ class TransferTicket:
     expires_at: float
     max_bytes: int
     headers: dict[str, str] | None = None
+    provider: str | None = None
+    endpoint: str | None = None
+    credentials: dict[str, str] | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "artifact_id": self.artifact_id,
             "method": self.method,
             "url": self.url,
@@ -38,6 +43,13 @@ class TransferTicket:
             "max_bytes": self.max_bytes,
             "headers": dict(self.headers or {}),
         }
+        if self.provider is not None:
+            value["provider"] = self.provider
+        if self.endpoint is not None:
+            value["endpoint"] = self.endpoint
+        if self.credentials is not None:
+            value["credentials"] = dict(self.credentials)
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,66 +247,180 @@ class LocalArtifactStore:
         return size, digest.hexdigest()
 
 
-class OssArtifactStore:
-    """Alibaba Cloud OSS ciphertext store using short-lived signed HTTP URLs.
+@dataclass(frozen=True, slots=True)
+class StsCredentials:
+    access_key_id: str
+    access_key_secret: str
+    security_token: str
+    expires_at: float
 
-    OSS credentials remain in the Gateway process. Clients and Workers receive
-    only a single-object, single-method capability URL and generic HTTP headers.
-    The URL is never persisted by this class or the Gateway repository.
-    """
+
+class StsCredentialIssuer(Protocol):
+    def assume_role(
+        self, *, role_arn: str, session_name: str, policy: str, duration_seconds: int
+    ) -> StsCredentials: ...
+
+
+class AlibabaStsCredentialIssuer:
+    """Assume a RAM role through the default Alibaba Cloud credential chain."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @classmethod
+    def from_environment(cls) -> AlibabaStsCredentialIssuer:
+        try:
+            from alibabacloud_credentials.client import Client as CredentialsClient
+            from alibabacloud_sts20150401.client import Client as StsClient
+            from alibabacloud_tea_openapi import models as open_api_models
+        except ImportError as exc:  # pragma: no cover - optional extra
+            raise RuntimeError("OSS ArtifactStore requires the vgen[oss] extra") from exc
+        region = os.getenv("VGEN_STS_REGION", "cn-hangzhou").strip()
+        endpoint = os.getenv("VGEN_STS_ENDPOINT", "sts.aliyuncs.com").strip()
+        if not re.fullmatch(r"[a-z0-9-]{2,64}", region):
+            raise RuntimeError("VGEN_STS_REGION is invalid")
+        if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", endpoint):
+            raise RuntimeError("VGEN_STS_ENDPOINT is invalid")
+        config = open_api_models.Config(
+            credential=CredentialsClient(), region_id=region, endpoint=endpoint
+        )
+        return cls(StsClient(config))
+
+    def assume_role(
+        self, *, role_arn: str, session_name: str, policy: str, duration_seconds: int
+    ) -> StsCredentials:
+        from alibabacloud_sts20150401 import models as sts_models
+
+        response = self._client.assume_role(
+            sts_models.AssumeRoleRequest(
+                role_arn=role_arn,
+                role_session_name=session_name,
+                policy=policy,
+                duration_seconds=duration_seconds,
+            )
+        )
+        credentials = getattr(getattr(response, "body", None), "credentials", None)
+        try:
+            expiration = datetime.fromisoformat(
+                str(credentials.expiration).replace("Z", "+00:00")
+            ).astimezone(UTC)
+            result = StsCredentials(
+                access_key_id=str(credentials.access_key_id),
+                access_key_secret=str(credentials.access_key_secret),
+                security_token=str(credentials.security_token),
+                expires_at=expiration.timestamp(),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError("STS AssumeRole returned invalid credentials") from exc
+        if not all((result.access_key_id, result.access_key_secret, result.security_token)):
+            raise RuntimeError("STS AssumeRole returned incomplete credentials")
+        return result
+
+
+class OssArtifactStore:
+    """Issue object-scoped OSS STS credentials without proxying artifact bytes."""
 
     store_type = "oss"
 
     def __init__(
         self,
-        bucket: Any,
+        issuer: StsCredentialIssuer,
         *,
+        endpoint: str,
+        bucket_name: str,
+        transfer_role_arn: str,
+        duration_seconds: int = 900,
         key_prefix: str = "vgen/v1",
     ) -> None:
         prefix = key_prefix.strip("/")
         if not prefix or any(part in ("", ".", "..") for part in prefix.split("/")):
             raise ValueError("OSS artifact prefix is invalid")
-        self._bucket = bucket
+        if not 900 <= duration_seconds <= 3600:
+            raise ValueError("OSS STS duration must be between 900 and 3600 seconds")
+        self._issuer = issuer
+        self._endpoint = endpoint.rstrip("/")
+        self._bucket_name = bucket_name
+        self._transfer_role_arn = transfer_role_arn
+        self._duration_seconds = duration_seconds
         self._key_prefix = prefix
 
     @classmethod
     def from_environment(cls) -> OssArtifactStore:
-        """Create the Gateway-side OSS signer without exposing credentials."""
+        """Create an STS issuer; no long-lived AccessKey is accepted or stored."""
 
         endpoint = os.getenv("VGEN_OSS_ENDPOINT", "").strip()
         bucket_name = os.getenv("VGEN_OSS_BUCKET", "").strip()
         if not endpoint or not bucket_name:
             raise RuntimeError("VGEN_OSS_ENDPOINT and VGEN_OSS_BUCKET are required")
-        if not endpoint.startswith("https://"):
-            raise RuntimeError("VGEN_OSS_ENDPOINT must use HTTPS")
+        parsed_endpoint = urllib.parse.urlsplit(endpoint)
+        if (
+            parsed_endpoint.scheme != "https"
+            or not parsed_endpoint.hostname
+            or parsed_endpoint.username is not None
+            or parsed_endpoint.password is not None
+            or parsed_endpoint.path not in {"", "/"}
+            or parsed_endpoint.query
+            or parsed_endpoint.fragment
+        ):
+            raise RuntimeError("VGEN_OSS_ENDPOINT must be a credential-free HTTPS origin")
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}[a-z0-9]", bucket_name) is None:
+            raise RuntimeError("VGEN_OSS_BUCKET is invalid")
+        role_arn = os.getenv("VGEN_OSS_TRANSFER_ROLE_ARN", "").strip()
+        if re.fullmatch(r"acs:ram::[0-9]{8,24}:role/[A-Za-z0-9_.@-]{1,64}", role_arn) is None:
+            raise RuntimeError("VGEN_OSS_TRANSFER_ROLE_ARN is invalid")
         try:
-            import oss2
-            from oss2.credentials import (
-                EcsRamRoleCredentialsProvider,
-                EnvironmentVariableCredentialsProvider,
-            )
-        except ImportError as exc:  # pragma: no cover - depends on optional extra
-            raise RuntimeError("OSS ArtifactStore requires the vgen[oss] extra") from exc
-
-        role_name = os.getenv("VGEN_OSS_ECS_ROLE", "").strip()
-        if role_name:
-            if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", role_name):
-                raise RuntimeError("VGEN_OSS_ECS_ROLE is invalid")
-            auth_host = (
-                "http://100.100.100.200/latest/meta-data/ram/security-credentials/" + role_name
-            )
-            provider = EcsRamRoleCredentialsProvider(auth_host)
-        else:
-            provider = EnvironmentVariableCredentialsProvider()
-        auth = oss2.ProviderAuth(provider)
-        bucket = oss2.Bucket(auth, endpoint, bucket_name)
-        return cls(bucket, key_prefix=os.getenv("VGEN_OSS_PREFIX", "vgen/v1"))
+            duration = int(os.getenv("VGEN_OSS_STS_DURATION_SECONDS", "900"))
+        except ValueError as exc:
+            raise RuntimeError("VGEN_OSS_STS_DURATION_SECONDS is invalid") from exc
+        return cls(
+            AlibabaStsCredentialIssuer.from_environment(),
+            endpoint=endpoint,
+            bucket_name=bucket_name,
+            transfer_role_arn=role_arn,
+            duration_seconds=duration,
+            key_prefix=os.getenv("VGEN_OSS_PREFIX", "vgen/v1"),
+        )
 
     def _object_key(self, artifact_id: str) -> str:
         if not validate_id(artifact_id, "artifact"):
             raise VGenError(ErrorCode.ARTIFACT_NOT_FOUND)
         body = artifact_id.split("_", 1)[1]
         return f"{self._key_prefix}/{body[:2]}/{artifact_id}.ciphertext"
+
+    def _policy(self, object_key: str, method: str) -> str:
+        actions = (
+            ["oss:GetObject"]
+            if method == "GET"
+            else ["oss:PutObject", "oss:AbortMultipartUpload", "oss:ListParts"]
+        )
+        return json.dumps(
+            {
+                "Version": "1",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": actions,
+                        "Resource": f"acs:oss:*:*:{self._bucket_name}/{object_key}",
+                    }
+                ],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def verify_access(self) -> None:
+        """Verify AssumeRole only; never PUT, HEAD, GET, or DELETE an OSS object."""
+
+        object_key = f"{self._key_prefix}/.validation/{secrets.token_hex(8)}.ciphertext"
+        try:
+            self._issuer.assume_role(
+                role_arn=self._transfer_role_arn,
+                session_name="vgen-config-check",
+                policy=self._policy(object_key, "GET"),
+                duration_seconds=self._duration_seconds,
+            )
+        except Exception as exc:
+            raise RuntimeError("OSS STS AssumeRole validation failed") from exc
 
     def issue_ticket(
         self,
@@ -307,50 +433,59 @@ class OssArtifactStore:
         normalized = method.upper()
         if normalized not in ("GET", "PUT") or not 1 <= ttl_seconds <= 3600 or max_bytes < 0:
             raise ValueError("invalid artifact ticket policy")
-        headers = (
-            {
-                "Content-Type": "application/octet-stream",
-                # A direct OSS capability does not pass through the Gateway,
-                # so its signed request must itself be single-use in effect.
-                # OSS rejects a second PutObject for the same immutable key
-                # when bucket versioning is disabled.
-                "x-oss-forbid-overwrite": "true",
-            }
-            if normalized == "PUT"
-            else {}
-        )
         object_key = self._object_key(artifact_id)
         try:
-            url = self._bucket.sign_url(
-                normalized,
-                object_key,
-                ttl_seconds,
-                headers=headers or None,
+            credentials = self._issuer.assume_role(
+                role_arn=self._transfer_role_arn,
+                session_name=f"vgen-{normalized.lower()}-{artifact_id[-20:]}",
+                policy=self._policy(object_key, normalized),
+                duration_seconds=self._duration_seconds,
             )
         except Exception as exc:
             raise VGenError(ErrorCode.STORAGE_UNAVAILABLE) from exc
-        if not str(url).startswith("https://"):
-            raise VGenError(ErrorCode.STORAGE_UNAVAILABLE)
         return TransferTicket(
             artifact_id=artifact_id,
             method=normalized,
-            url=str(url),
-            expires_at=time.time() + ttl_seconds,
+            url=f"oss://{self._bucket_name}/{object_key}",
+            expires_at=min(credentials.expires_at, time.time() + ttl_seconds),
             max_bytes=max_bytes,
-            headers=headers,
+            headers={},
+            provider="oss_sts",
+            endpoint=self._endpoint,
+            credentials={
+                "access_key_id": credentials.access_key_id,
+                "access_key_secret": credentials.access_key_secret,
+                "security_token": credentials.security_token,
+            },
         )
 
     def observe_upload(self, artifact_id: str, *, max_bytes: int) -> tuple[int, str | None]:
-        """HEAD a direct upload before changing Gateway artifact state."""
+        """HEAD the object using a GET-scoped STS token; no artifact bytes are transferred."""
 
+        object_key = self._object_key(artifact_id)
         try:
-            result = self._bucket.head_object(self._object_key(artifact_id))
-            size = int(result.content_length)
+            credentials = self._issuer.assume_role(
+                role_arn=self._transfer_role_arn,
+                session_name=f"vgen-head-{artifact_id[-20:]}",
+                policy=self._policy(object_key, "GET"),
+                duration_seconds=self._duration_seconds,
+            )
+            import oss2
+
+            bucket = oss2.Bucket(
+                oss2.StsAuth(
+                    credentials.access_key_id,
+                    credentials.access_key_secret,
+                    credentials.security_token,
+                ),
+                self._endpoint,
+                self._bucket_name,
+            )
+            size = int(bucket.head_object(object_key).content_length)
         except Exception as exc:
             raise VGenError(ErrorCode.STORAGE_UNAVAILABLE) from exc
         if size < 0 or size > max_bytes:
             raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
-        # OSS ETag is not a protocol-level SHA-256, so do not mislabel it.
         return size, None
 
     def verify_ticket(self, token: str, *, method: str) -> VerifiedTicket:

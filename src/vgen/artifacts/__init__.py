@@ -1,8 +1,8 @@
 """Provider-neutral artifact transfer primitives.
 
-The worker only consumes short-lived transfer tickets.  Storage provider
-credentials and provider-specific concepts (buckets, regions, STS, and so on)
-belong behind the ticket issuer on the Gateway.
+The worker only consumes short-lived transfer tickets. Provider details remain
+inside adapters; an OSS ticket may carry object-scoped STS credentials, never a
+long-lived account AccessKey.
 """
 
 from .base import (
@@ -18,6 +18,7 @@ from .base import (
 from .http import HttpArtifactAdapter
 from .local import LocalArtifactAdapter
 from .names import MEDIA_TYPE_EXTENSIONS, with_safe_media_extension
+from .oss import OssStsArtifactAdapter
 
 __all__ = [
     "ArtifactAdapterRegistry",
@@ -27,6 +28,7 @@ __all__ = [
     "ArtifactTransport",
     "HttpArtifactAdapter",
     "LocalArtifactAdapter",
+    "OssStsArtifactAdapter",
     "MEDIA_TYPE_EXTENSIONS",
     "ProgressCallback",
     "TransferReceipt",

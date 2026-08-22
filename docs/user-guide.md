@@ -107,12 +107,54 @@ tar -xzf /root/vgen-gateway-<版本>.tar.gz \
   -C /root/vgen-gateway-install --strip-components=1
 cd /root/vgen-gateway-install
 sha256sum -c SHA256SUMS
-sudo ./setup-gateway.sh install --domain <Gateway域名>
 ```
 
-按提示再次输入相同域名，并确认旧任务已结束。安装器会先验证
+校验完成后先配置下面的私有 OSS 和 RAM Role，再执行完整安装命令。安装时按提示再次输入相同
+域名，并确认旧任务已结束。安装器会先验证
 `127.0.0.1:8010`，再切换 Nginx；失败时恢复原路由。安装器不会修改 OSS、RAM Role、
 安全组或其他云权限。
+
+全新服务器只要求 Gateway 域名的 Let's Encrypt 证书已经位于
+`/etc/letsencrypt/live/<Gateway域名>/`；不要求预先创建 `/etc/nginx/conf.d/vgen.conf`。若首次
+切换失败，安装器会生成只返回 HTTPS 503 的安全占位配置，避免流量误入其他服务。
+
+Gateway **禁止把任务图片或视频放到 ECS 本地**，避免系统盘被媒体文件撑满。CLI、Windows Worker
+安装包和版本清单仍可保存在 ECS 的 `/var/www/vgen-releases`，这两类存储互不影响。
+
+第一次执行安装命令时，安装器会询问私有 Bucket、ECS RAM Role 和阿里云账号 ID，并在
+`/var/tmp/vgen-oss-setup-<Gateway域名>/` 生成当前部署专用的三份 RAM 策略、配置样例和
+`README.txt`。这些文件不含 AccessKey。按 README 在阿里云控制台完成配置后，给原命令增加
+`--confirm-oss-configured` 再运行即可：
+
+```bash
+sudo ./setup-gateway.sh install \
+  --domain <Gateway域名> \
+  --artifact-store oss \
+  --oss-endpoint https://oss-cn-hangzhou.aliyuncs.com \
+  --oss-bucket <私有Bucket> \
+  --oss-prefix vgen/v1 \
+  --oss-ecs-role <绑定到ECS的RAM Role名称> \
+  --aliyun-account-id <阿里云账号ID> \
+  --oss-transfer-role VGenArtifactTransferRole \
+  --confirm-oss-configured
+```
+
+Gateway 使用 ECS 身份调用 STS，并把临时凭据进一步限制为单个对象和单一传输方向。CLI/Worker
+直接与 OSS 传输密文；Gateway 不代理图片或视频正文，只用 HEAD 核对对象是否存在及大小。安装器
+会在创建数据库前验证 `AssumeRole`，不会上传随机探测对象。Bucket 应保持私有，并为任务前缀配置
+符合业务保留期的生命周期和未完成分片清理规则。
+
+开发测试期需要清空 Gateway 重新体验 0→1 时，不要手工删除运行目录。使用：
+
+```bash
+sudo ./setup-gateway.sh reset-test --domain <Gateway域名>
+```
+
+重置完成后重新执行上面的完整 OSS 安装命令。
+
+`reset-test` 会停止服务，并把 runtime、SQLite、Bootstrap code 和服务配置整体移动到
+`/var/backups/vgen-v1/gateway-test-reset-*`。它不会删除 Nginx、TLS 证书、下载站、RAM Role 或
+OSS 对象。正式有数据的环境不要使用该动作。
 
 ### 3.2 原地升级
 

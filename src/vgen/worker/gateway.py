@@ -768,6 +768,12 @@ def _transfer_ticket(entry: Mapping[str, Any]) -> TransferTicket:
                 if isinstance(ticket.get("headers", {}), Mapping)
                 else {}
             ),
+            endpoint=(None if ticket.get("endpoint") is None else str(ticket["endpoint"])),
+            credentials=(
+                {str(key): str(value) for key, value in ticket.get("credentials", {}).items()}
+                if isinstance(ticket.get("credentials", {}), Mapping)
+                else {}
+            ),
             expires_at=_optional_number(ticket.get("expires_at")),
             expected_size=(
                 None if ticket.get("expected_size") is None else int(ticket["expected_size"])

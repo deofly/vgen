@@ -79,12 +79,16 @@ def test_gateway_installer_has_valid_bash_syntax_and_concise_help() -> None:
 
     result = _run_installer("--help")
     assert result.returncode == 0
-    assert "sudo ./setup-gateway.sh install --domain vgen.example.com" in result.stdout
+    assert "sudo ./setup-gateway.sh install \\" in result.stdout
+    assert "--artifact-store oss" in result.stdout
+    assert "Task media must use oss" in result.stdout
+    assert "Release files remain local" in result.stdout
     assert "sudo ./setup-gateway.sh resume --domain vgen.example.com" in result.stdout
     assert "sudo ./setup-gateway.sh activate --domain vgen.example.com" in result.stdout
     assert "sudo ./setup-gateway.sh upgrade --domain vgen.example.com" in result.stdout
+    assert "sudo ./setup-gateway.sh reset-test --domain vgen.example.com" in result.stdout
     assert "Non-interactive upgrade additionally requires --confirm-upgrade" in result.stdout
-    assert "ArtifactStore is local ciphertext storage; OSS/IAM is never modified" in result.stdout
+    assert "OSS mode uses only an ECS RAM Role" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -131,6 +135,17 @@ def test_gateway_installer_has_valid_bash_syntax_and_concise_help() -> None:
             ),
             "requires --confirm-upgrade",
         ),
+        (
+            (
+                "reset-test",
+                "--domain",
+                "vgen.example.com",
+                "--confirm-domain",
+                "vgen.example.com",
+                "--confirm-no-active-tasks",
+            ),
+            "requires --confirm-reset-test",
+        ),
     ],
 )
 def test_gateway_installer_fails_closed_before_mutation(
@@ -157,8 +172,14 @@ def test_gateway_release_version_comes_from_pyproject_and_installer_bundle() -> 
     assert 'metadata.get("Version", "")' in source
     assert 'path.name != f"vgen-{version}-py3-none-any.whl"' in source
     assert "release manifest validation failed" in source
-    assert '"VGEN_ARTIFACT_STORE=local\\n"' in source
-    assert "VGEN_ARTIFACT_STORE=oss" not in source
+    assert '"VGEN_ARTIFACT_STORE=oss"' in source
+    assert '"${WHEEL_PATH}[gateway,oss]"' in source
+    assert 'VGEN_SETUP_OSS_ECS_ROLE="${OSS_ECS_ROLE}"' in source
+    assert "01-ecs-role-assume-policy.json" in source
+    assert "02-transfer-role-trust-policy.json" in source
+    assert "03-transfer-role-oss-policy.json" in source
+    assert "--confirm-oss-configured" in source
+    assert "VGEN_ARTIFACT_ROOT" not in source
     assert "source.backup(target)" in source
     assert '--resolve "${DOMAIN}:443:127.0.0.1"' in source
     assert "Next steps:" in source
@@ -166,6 +187,92 @@ def test_gateway_release_version_comes_from_pyproject_and_installer_bundle() -> 
     assert "Paste it only into the hidden VGen prompt" in source
     assert "vgen setup --gateway https://%s" in source
     assert 'readonly LEGACY_GATEWAY_BRIDGE_VERSION="2.0.0a1"' in source
+
+
+def test_gateway_installer_validates_oss_configuration_before_mutation() -> None:
+    missing_role = _run_installer(
+        "install",
+        "--domain",
+        "vgen.example.com",
+        "--confirm-domain",
+        "vgen.example.com",
+        "--confirm-no-active-tasks",
+        "--artifact-store",
+        "oss",
+        "--oss-endpoint",
+        "https://oss-cn-hangzhou.aliyuncs.com",
+        "--oss-bucket",
+        "vgen-private",
+    )
+    assert missing_role.returncode != 0
+    assert "--oss-ecs-role is required" in missing_role.stderr
+
+    prohibited_local = _run_installer(
+        "install",
+        "--domain",
+        "vgen.example.com",
+        "--confirm-domain",
+        "vgen.example.com",
+        "--confirm-no-active-tasks",
+        "--artifact-store",
+        "local",
+    )
+    assert prohibited_local.returncode != 0
+    assert "local artifact storage is prohibited" in prohibited_local.stderr
+
+    source = INSTALLER.read_text(encoding="utf-8")
+    install = source.split("install_gateway() {", 1)[1].split("\n}", 1)[0]
+    assert install.index("write_gateway_environment") < install.index(
+        'verify_artifact_store_access_at "${INSTALL_ROOT}/venv"'
+    )
+    assert install.index('verify_artifact_store_access_at "${INSTALL_ROOT}/venv"') < (
+        install.index("initialize_gateway")
+    )
+
+
+def test_gateway_upgrade_preserves_oss_sdk_and_probes_role_access() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+    stage = source.split("stage_upgrade_runtime() {", 1)[1].split("\n}", 1)[0]
+    assert '"${WHEEL_PATH}[gateway,oss]"' in stage
+    assert "verify_artifact_store_access_at" in stage
+    environment = source.split("verify_existing_gateway_environment() {", 1)[1].split(
+        "write_gateway_environment() {", 1
+    )[0]
+    assert 'values.get("VGEN_ARTIFACT_STORE") != "oss"' in environment
+    assert "local ArtifactStore" not in environment
+
+
+def test_gateway_test_reset_is_recoverable_and_does_not_touch_cloud_resources() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+    body = source.split("reset_test_gateway() {", 1)[1].split("\n}", 1)[0]
+    assert '[[ "${CONFIRM_RESET_TEST}" -eq 1 ]]' in body
+    assert '[[ "${CONFIRM_NO_ACTIVE_TASKS}" -eq 1 ]]' in body
+    assert 'systemctl disable --now "${SERVICE_NAME}"' in body
+    assert 'mv -- "${INSTALL_ROOT}"' in body
+    assert 'mv -- "${DATA_ROOT}"' in body
+    assert 'mv -- "${CONFIG_ROOT}"' in body
+    assert 'mv -- "${UNIT_PATH}"' in body
+    assert "rm -rf" not in body
+    assert "NGINX_CONFIG_PATH" not in body
+    assert "RELEASE_ROOT" not in body
+    assert "OSS objects were not changed" in body
+
+
+def test_fresh_gateway_install_can_start_without_a_legacy_nginx_virtual_host() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+    preconditions = source.split("verify_install_nginx_and_tls() {", 1)[1].split(
+        "\n}", 1
+    )[0]
+    switch = source.split("switch_nginx() {", 1)[1].split("\n}", 1)[0]
+    fallback = source.split("render_uninitialized_nginx_config() {", 1)[1].split(
+        "render_previous_gateway_nginx_config() {", 1
+    )[0]
+    assert 'if [[ ! -e "${NGINX_CONFIG_PATH}" ]]' in preconditions
+    assert "verify_gateway_tls_certificate" in preconditions
+    assert 'if [[ -e "${NGINX_CONFIG_PATH}" ]]' in switch
+    assert "render_uninitialized_nginx_config" in switch
+    assert "return 503" in fallback
+    assert "proxy_pass" not in fallback
 
 
 @pytest.mark.parametrize("installed", [VERSION, "2.0.0a1"])

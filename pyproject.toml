@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vgen"
-version = "0.6.0"
+version = "0.7.0"
 description = "Open, encrypted GPU workflow gateway, broker and worker runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,7 @@ dependencies = [
   "PyYAML>=6.0",
   "requests>=2.32",
   "rich>=13.9",
+  "oss2>=2.18",
 ]
 
 [project.optional-dependencies]
@@ -49,7 +50,8 @@ worker-comfyui = [
 ]
 oss = [
   "alibabacloud-credentials>=0.3.4",
-  "oss2>=2.18",
+  "alibabacloud-sts20150401>=1.2.0",
+  "alibabacloud-tea-openapi>=0.4.0",
 ]
 dev = [
   "build>=1.2",

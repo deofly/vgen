@@ -623,12 +623,19 @@ class ArtifactCommit(WireModel):
     media_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ArtifactUploadReceipt(WireModel):
+    artifact_id: str = Field(min_length=1, max_length=120)
+    encrypted_size: int = Field(ge=0)
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class TaskCommit(WireModel):
     encrypted_payload: str = Field(min_length=1)
     worker_tdk_envelope: str = Field(min_length=1)
     reader_envelope: str = Field(min_length=1)
     key_algorithm: str = Field(min_length=1, max_length=120)
     artifacts: list[ArtifactCommit] = Field(default_factory=list, max_length=32)
+    artifact_receipts: list[ArtifactUploadReceipt] = Field(default_factory=list, max_length=32)
 
 
 class TaskRekey(WireModel):

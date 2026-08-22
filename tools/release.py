@@ -355,6 +355,55 @@ def _verify_public_release(release_origin: str, version: str) -> None:
             response.read(1)
 
 
+def _validate_gateway_publish_options(
+    *,
+    gateway_action: str,
+    reset_test_gateway: bool,
+    artifact_store: str | None,
+    oss_endpoint: str | None,
+    oss_bucket: str | None,
+    oss_prefix: str,
+    oss_ecs_role: str | None,
+    aliyun_account_id: str | None,
+    oss_transfer_role: str | None,
+    confirm_oss_configured: bool,
+) -> None:
+    if gateway_action not in {"none", "install", "upgrade"}:
+        raise ReleaseError("Gateway action must be none, install, or upgrade")
+    if reset_test_gateway and gateway_action != "install":
+        raise ReleaseError("test reset is only valid with Gateway install")
+    install_only_options = (
+        artifact_store is not None
+        or oss_endpoint is not None
+        or oss_bucket is not None
+        or oss_prefix != "vgen/v1"
+        or oss_ecs_role is not None
+        or aliyun_account_id is not None
+        or oss_transfer_role is not None
+        or confirm_oss_configured
+    )
+    if gateway_action != "install" and install_only_options:
+        raise ReleaseError("artifact storage options require --install-gateway")
+    if gateway_action == "install":
+        if artifact_store not in {None, "oss"}:
+            raise ReleaseError("artifact store must be oss; local storage is prohibited")
+        if not all((oss_endpoint, oss_bucket, oss_ecs_role, aliyun_account_id, oss_transfer_role)):
+            raise ReleaseError(
+                "OSS Gateway install requires endpoint, bucket, account ID, and both RAM roles"
+            )
+        _validated_origin(oss_endpoint or "")
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}[a-z0-9]", oss_bucket or "") is None:
+            raise ReleaseError("OSS bucket name is invalid")
+        if re.fullmatch(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*", oss_prefix) is None:
+            raise ReleaseError("OSS prefix is invalid")
+        if re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", oss_ecs_role or "") is None:
+            raise ReleaseError("ECS RAM Role name is invalid")
+        if re.fullmatch(r"[0-9]{8,24}", aliyun_account_id or "") is None:
+            raise ReleaseError("Alibaba Cloud account ID is invalid")
+        if re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", oss_transfer_role or "") is None:
+            raise ReleaseError("OSS transfer RAM Role name is invalid")
+
+
 def publish_release(
     result: BuildResult,
     *,
@@ -363,11 +412,32 @@ def publish_release(
     ssh_target: str,
     ssh_port: int,
     confirmed: bool,
-    upgrade_gateway: bool,
+    gateway_action: str,
+    reset_test_gateway: bool = False,
+    artifact_store: str | None = None,
+    oss_endpoint: str | None = None,
+    oss_bucket: str | None = None,
+    oss_prefix: str = "vgen/v1",
+    oss_ecs_role: str | None = None,
+    aliyun_account_id: str | None = None,
+    oss_transfer_role: str | None = None,
+    confirm_oss_configured: bool = False,
 ) -> None:
     _, gateway_domain = _validated_origin(gateway_origin)
     release, release_domain = _validated_origin(release_origin)
     ssh, scp = _ssh_commands(ssh_target, ssh_port)
+    _validate_gateway_publish_options(
+        gateway_action=gateway_action,
+        reset_test_gateway=reset_test_gateway,
+        artifact_store=artifact_store,
+        oss_endpoint=oss_endpoint,
+        oss_bucket=oss_bucket,
+        oss_prefix=oss_prefix,
+        oss_ecs_role=oss_ecs_role,
+        aliyun_account_id=aliyun_account_id,
+        oss_transfer_role=oss_transfer_role,
+        confirm_oss_configured=confirm_oss_configured,
+    )
     if not confirmed:
         answer = input(
             f"Type {release_domain} to publish VGen {result.version} and switch stable: "
@@ -386,23 +456,52 @@ def publish_release(
         raise ReleaseError("SSH returned an unsafe remote staging directory")
     publisher = REPOSITORY / "examples" / "ecs" / "publish-release.sh"
     upload_sources = [str(result.deployment_archive), str(publisher)]
-    if upgrade_gateway:
+    if gateway_action != "none":
         upload_sources.append(str(result.gateway_bundle))
     _run([*scp, *upload_sources, f"{ssh_target}:{remote_dir}/"])
     remote_archive = f"{remote_dir}/{result.deployment_archive.name}"
     remote_publisher = f"{remote_dir}/{publisher.name}"
     prefix = "" if ssh_target.startswith("root@") else "sudo "
-    if upgrade_gateway:
+    if gateway_action != "none":
         remote_gateway = f"{remote_dir}/{result.gateway_bundle.name}"
         remote_gateway_root = f"{remote_dir}/gateway"
+        setup_commands: list[str] = []
+        if reset_test_gateway and confirm_oss_configured:
+            setup_commands.append(
+                f"{prefix}bash ./setup-gateway.sh reset-test "
+                f"--domain {shlex.quote(gateway_domain)} "
+                f"--confirm-domain {shlex.quote(gateway_domain)} "
+                "--confirm-no-active-tasks --confirm-reset-test"
+            )
+        action_options = ""
+        if gateway_action == "install":
+            action_options = (
+                " --confirm-no-active-tasks"
+                " --artifact-store oss"
+            )
+            action_options += (
+                f" --oss-endpoint {shlex.quote(oss_endpoint or '')}"
+                f" --oss-bucket {shlex.quote(oss_bucket or '')}"
+                f" --oss-prefix {shlex.quote(oss_prefix)}"
+                f" --oss-ecs-role {shlex.quote(oss_ecs_role or '')}"
+                f" --aliyun-account-id {shlex.quote(aliyun_account_id or '')}"
+                f" --oss-transfer-role {shlex.quote(oss_transfer_role or '')}"
+            )
+            if confirm_oss_configured:
+                action_options += " --confirm-oss-configured"
+        confirmation = "--confirm-upgrade" if gateway_action == "upgrade" else ""
+        setup_commands.append(
+            f"{prefix}bash ./setup-gateway.sh {gateway_action} "
+            f"--domain {shlex.quote(gateway_domain)} "
+            f"--confirm-domain {shlex.quote(gateway_domain)} "
+            f"{confirmation}{action_options}".strip()
+        )
         gateway_command = (
             f"mkdir -p {shlex.quote(remote_gateway_root)} && "
             f"tar -xzf {shlex.quote(remote_gateway)} "
             f"-C {shlex.quote(remote_gateway_root)} --strip-components=1 && "
             f"cd {shlex.quote(remote_gateway_root)} && "
-            f"{prefix}bash ./setup-gateway.sh upgrade "
-            f"--domain {shlex.quote(gateway_domain)} "
-            f"--confirm-domain {shlex.quote(gateway_domain)} --confirm-upgrade"
+            + " && ".join(setup_commands)
         )
         _run([*ssh, gateway_command])
     remote_command = (
@@ -441,10 +540,40 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--ssh", required=True, dest="ssh_target")
     publish.add_argument("--ssh-port", type=int, default=22)
     publish.add_argument("--confirm-stable", action="store_true")
-    publish.add_argument(
+    gateway_actions = publish.add_mutually_exclusive_group()
+    gateway_actions.add_argument(
         "--upgrade-gateway",
         action="store_true",
         help="upgrade the ECS Gateway runtime before publishing the download channel",
+    )
+    gateway_actions.add_argument(
+        "--install-gateway",
+        action="store_true",
+        help="initialize a new ECS Gateway before publishing the download channel",
+    )
+    publish.add_argument(
+        "--reset-test-gateway",
+        action="store_true",
+        help="archive an existing test Gateway before --install-gateway (destructive to live state)",
+    )
+    publish.add_argument(
+        "--artifact-store",
+        choices=("oss",),
+        default=None,
+        help="ciphertext artifact backend for a new Gateway; only oss is allowed",
+    )
+    publish.add_argument("--oss-endpoint", help="HTTPS OSS endpoint for Gateway signing")
+    publish.add_argument("--oss-bucket", help="private OSS bucket for encrypted artifacts")
+    publish.add_argument("--oss-prefix", default="vgen/v1", help="OSS object key prefix")
+    publish.add_argument("--oss-ecs-role", help="ECS RAM Role used by Gateway; no AccessKey")
+    publish.add_argument("--aliyun-account-id", help="Alibaba Cloud account ID owning the roles")
+    publish.add_argument(
+        "--oss-transfer-role", help="RAM Role assumed for object-scoped STS credentials"
+    )
+    publish.add_argument(
+        "--confirm-oss-configured",
+        action="store_true",
+        help="confirm the generated OSS/RAM setup checklist is complete",
     )
     return parser
 
@@ -453,6 +582,27 @@ def main() -> int:
     arguments = _parser().parse_args()
     if VERSION_PATTERN.fullmatch(arguments.version) is None:
         raise ReleaseError("--version must use MAJOR.MINOR.PATCH")
+    gateway_action = "none"
+    if arguments.action == "publish":
+        gateway_action = (
+            "install"
+            if arguments.install_gateway
+            else "upgrade"
+            if arguments.upgrade_gateway
+            else "none"
+        )
+        _validate_gateway_publish_options(
+            gateway_action=gateway_action,
+            reset_test_gateway=arguments.reset_test_gateway,
+            artifact_store=arguments.artifact_store,
+            oss_endpoint=arguments.oss_endpoint,
+            oss_bucket=arguments.oss_bucket,
+            oss_prefix=arguments.oss_prefix,
+            oss_ecs_role=arguments.oss_ecs_role,
+            aliyun_account_id=arguments.aliyun_account_id,
+            oss_transfer_role=arguments.oss_transfer_role,
+            confirm_oss_configured=arguments.confirm_oss_configured,
+        )
     require_tag = arguments.action == "publish" or not arguments.allow_untagged_candidate
     result = build_release(
         version=arguments.version,
@@ -473,7 +623,16 @@ def main() -> int:
             ssh_target=arguments.ssh_target,
             ssh_port=arguments.ssh_port,
             confirmed=arguments.confirm_stable,
-            upgrade_gateway=arguments.upgrade_gateway,
+            gateway_action=gateway_action,
+            reset_test_gateway=arguments.reset_test_gateway,
+            artifact_store=arguments.artifact_store,
+            oss_endpoint=arguments.oss_endpoint,
+            oss_bucket=arguments.oss_bucket,
+            oss_prefix=arguments.oss_prefix,
+            oss_ecs_role=arguments.oss_ecs_role,
+            aliyun_account_id=arguments.aliyun_account_id,
+            oss_transfer_role=arguments.oss_transfer_role,
+            confirm_oss_configured=arguments.confirm_oss_configured,
         )
         print(f"stable={result.version}")
     return 0

@@ -446,6 +446,34 @@
         "title": "ArtifactPrepare",
         "type": "object"
       },
+      "ArtifactUploadReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "content_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Content Digest",
+            "type": "string"
+          },
+          "encrypted_size": {
+            "minimum": 0.0,
+            "title": "Encrypted Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "encrypted_size",
+          "content_digest"
+        ],
+        "title": "ArtifactUploadReceipt",
+        "type": "object"
+      },
       "AttemptFinish": {
         "additionalProperties": false,
         "properties": {
@@ -1874,6 +1902,14 @@
       "TaskCommit": {
         "additionalProperties": false,
         "properties": {
+          "artifact_receipts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactUploadReceipt"
+            },
+            "maxItems": 32,
+            "title": "Artifact Receipts",
+            "type": "array"
+          },
           "artifacts": {
             "items": {
               "$ref": "#/components/schemas/ArtifactCommit"

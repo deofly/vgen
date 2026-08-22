@@ -24,9 +24,8 @@ server {
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "no-referrer" always;
 
-  # The first acceptance run uses Gateway-local ciphertext artifacts. Inputs
-  # and generated videos therefore pass through Nginx; the old 10 MiB limit is
-  # not sufficient. Application-side artifact limits still apply.
+  # Encrypted uploads use direct OSS tickets in production. Keep this limit for
+  # control-plane requests and compatibility probes; application limits still apply.
   client_max_body_size 5g;
   client_body_timeout 30m;
   send_timeout 30m;

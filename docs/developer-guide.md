@@ -279,9 +279,11 @@ point 注册；发现 descriptor 不等于允许安装，Executor/custom node �
 未知 node 或超限 graph 在联系 runtime 前失败。参考策略是
 [`examples/comfyui-minimax-h3-policy.yaml`](../examples/comfyui-minimax-h3-policy.yaml)。
 
-Artifact adapter 只暴露通用短期 HTTP ticket。Worker 不接收 OSS STS 或账号凭据。Local ticket
-必须与 Gateway 同源；非本地 ticket 必须使用公网 HTTPS。下载在解密前校验密文 size/digest；
-上传 journal 允许换 ticket 续传同一密文，而不重复推理。
+Artifact adapter 接收通用短期 ticket。OSS ticket 带仅对一个对象、一个方向有效的 STS
+AccessKeyId/AccessKeySecret/SecurityToken，敏感字段禁止进入 repr、日志和幂等记录。CLI/Worker 通过
+OSS SDK 直传直下，大文件使用 multipart/resumable；Gateway 只执行 AssumeRole 和 HEAD，不代理
+媒体正文。生产 Gateway 强制任务 Artifact 使用 OSS，本地 adapter 只允许自动化测试显式注入。
+下载在解密前校验密文 size/digest；上传 journal 可刷新 STS ticket 后续传同一密文而不重复推理。
 
 SGLang Diffusion 未来应作为本地 service adapter，Diffusers 应在隔离子进程加载 Pipeline。
 新增 adapter 不得把 engine 字段加入 Gateway Task、lease、ArtifactStore 或 usage 协议。
@@ -499,6 +501,46 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 - `pyproject.toml` 与 `--version` 一致；
 - `vX.Y.Z` tag 存在并指向当前 `HEAD`；
 - Ruff、pytest、OpenAPI 和 distribution contract 全部通过。
+
+首次初始化 Gateway 使用 `--install-gateway`，不能与 `--upgrade-gateway` 同时出现：
+
+```bash
+./tools/release.sh publish \
+  --version 0.7.0 \
+  --gateway https://vgen-gw.example.com \
+  --releases https://vgen.example.com \
+  --ssh root@ecs.example.com \
+  --install-gateway \
+  --artifact-store oss \
+  --oss-endpoint https://oss-cn-hangzhou.aliyuncs.com \
+  --oss-bucket vgen-private \
+  --oss-prefix vgen/v1 \
+  --oss-ecs-role VGenGatewayRole \
+  --aliyun-account-id 1234567890123456 \
+  --oss-transfer-role VGenArtifactTransferRole
+```
+
+首次执行会生成 `/var/tmp/vgen-oss-setup-<Gateway域名>/` 并以退出码 3 暂停。管理员按其中
+`README.txt` 创建私有 Bucket、ECS caller role 权限、transfer role trust/OSS 权限和生命周期后，
+在 publish 命令增加 `--confirm-oss-configured` 重试。生成文件按本次 endpoint、Bucket、prefix、
+账号和角色计算，不使用源码常量。
+
+开发测试环境需要先归档当前 Gateway 再从零初始化时，额外增加
+`--reset-test-gateway`。该选项只允许和 `--install-gateway` 一起使用；远端安装器先把受管
+runtime、SQLite 和配置移动到 `/var/backups/vgen-v1/`，成功后再执行新安装。它不会删除 OSS
+对象。生产数据恢复应使用数据库备份/迁移流程，禁止用 test reset。
+
+OSS 配置不是源码常量：安装器把 endpoint、私有 Bucket、对象前缀、transfer role ARN、STS region
+和 token 时长写入 root-only `gateway.env`。Gateway 通过 ECS 默认凭据链 AssumeRole；每次再用 inline
+session policy 把权限缩小到单对象 GET，或 PutObject/AbortMultipartUpload/ListParts。Worker/CLI
+拿到的是短期 STS，不是长期 AccessKey。安装/恢复只验证 AssumeRole，不传输 OSS 对象；任务提交和
+完成时 Gateway 用 HEAD 核对大小。安装/发布命令生成精确策略，但不会代替管理员修改云权限。
+
+生产 Gateway 的任务媒体没有本地 ArtifactStore 降级路径：`VGEN_ARTIFACT_STORE` 缺失、为 `local` 或 OSS
+配置不完整时，进程在创建数据库前退出。安装器只安装 `[gateway,oss]`，已有本地存储配置也不能
+通过原地升级绕过，开发测试环境必须先 `reset-test`，再以完整 OSS 配置重新初始化。
+公开 CLI/Worker 安装包仍由独立下载站本地目录 `/var/www/vgen-releases` 提供，不属于任务
+ArtifactStore，也不会被上述限制删除或迁移。
 
 只构建本地候选包而不上传：
 

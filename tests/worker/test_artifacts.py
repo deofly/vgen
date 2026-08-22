@@ -12,6 +12,7 @@ from vgen.artifacts import (
     ArtifactTransferError,
     HttpArtifactAdapter,
     LocalArtifactAdapter,
+    OssStsArtifactAdapter,
     TransferTicket,
     with_safe_media_extension,
 )
@@ -190,3 +191,66 @@ def test_transfer_error_redacts_capability_urls_and_tokens() -> None:
     )
     assert str(error) == "Artifact transfer failed."
     assert "storage.example" not in repr(error)
+
+
+def test_oss_sts_adapter_transfers_directly_with_hidden_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oss2
+
+    calls: list[tuple[str, str]] = []
+
+    class Bucket:
+        def __init__(self, auth: object, endpoint: str, name: str) -> None:
+            del auth
+            assert endpoint == "https://oss-cn-example.aliyuncs.com"
+            assert name == "vgen-private"
+
+    monkeypatch.setattr(oss2, "StsAuth", lambda *values: ("hidden", len(values)))
+    monkeypatch.setattr(oss2, "Bucket", Bucket)
+
+    def upload(bucket: object, key: str, filename: str, **kwargs: Any) -> None:
+        del bucket
+        assert Path(filename).read_bytes() == b"encrypted-video"
+        assert kwargs["headers"] == {"x-oss-forbid-overwrite": "true"}
+        calls.append(("PUT", key))
+
+    def download(bucket: object, key: str, filename: str, **kwargs: Any) -> None:
+        del bucket, kwargs
+        Path(filename).write_bytes(b"encrypted-video")
+        calls.append(("GET", key))
+
+    monkeypatch.setattr(oss2, "resumable_upload", upload)
+    monkeypatch.setattr(oss2, "resumable_download", download)
+    ticket_values = {
+        "endpoint": "https://oss-cn-example.aliyuncs.com",
+        "credentials": {
+            "access_key_id": "sts-id",
+            "access_key_secret": "sts-secret",
+            "security_token": "sts-token",
+        },
+    }
+    adapter = OssStsArtifactAdapter(multipart_threshold=1)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"encrypted-video")
+    upload_ticket = TransferTicket(
+        "oss://vgen-private/vgen/v1/artifact.ciphertext", "PUT", **ticket_values
+    )
+    adapter.upload(upload_ticket, source)
+    destination = tmp_path / "destination.bin"
+    adapter.download(
+        TransferTicket(
+            "oss://vgen-private/vgen/v1/artifact.ciphertext",
+            "GET",
+            expected_size=len(b"encrypted-video"),
+            expected_sha256=hashlib.sha256(b"encrypted-video").hexdigest(),
+            **ticket_values,
+        ),
+        destination,
+    )
+    assert destination.read_bytes() == b"encrypted-video"
+    assert calls == [
+        ("PUT", "vgen/v1/artifact.ciphertext"),
+        ("GET", "vgen/v1/artifact.ciphertext"),
+    ]
+    assert "sts-secret" not in repr(upload_ticket)

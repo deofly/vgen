@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install VGen Gateway v1 next to a legacy deployment, then switch Nginx only
 # after the new service is healthy. This script intentionally never changes
-# OSS/IAM policy and never removes or stops the legacy service.
+# OSS/IAM policy. Test reset archives only explicitly managed Gateway paths.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -38,6 +38,17 @@ CONFIRM_NO_ACTIVE_TASKS=0
 CONFIRM_ROLLBACK=0
 CONFIRM_ACTIVATE=0
 CONFIRM_UPGRADE=0
+CONFIRM_RESET_TEST=0
+ARTIFACT_STORE="oss"
+OSS_ENDPOINT=""
+OSS_BUCKET=""
+OSS_PREFIX="vgen/v1"
+OSS_ECS_ROLE=""
+OSS_ACCOUNT_ID=""
+OSS_TRANSFER_ROLE="VGenArtifactTransferRole"
+OSS_STS_REGION=""
+OSS_STS_DURATION_SECONDS="900"
+CONFIRM_OSS_CONFIGURED=0
 LEGACY_DATABASE_PATH="${LEGACY_DATABASE_DEFAULT}"
 NGINX_ROLLBACK_BACKUP=""
 NGINX_GENERATED_PATH=""
@@ -65,7 +76,15 @@ The release bundle must contain these files in the same directory:
   SHA256SUMS
 
 Install and switch HTTPS traffic:
-  sudo ./setup-gateway.sh install --domain vgen.example.com
+  sudo ./setup-gateway.sh install \
+    --domain vgen.example.com \
+    --artifact-store oss \
+    --oss-endpoint https://oss-cn-hangzhou.aliyuncs.com \
+    --oss-bucket vgen-private \
+    --oss-prefix vgen/v1 \
+    --oss-ecs-role VGenGatewayRole \
+    --aliyun-account-id 1234567890123456 \
+    --oss-transfer-role VGenArtifactTransferRole
 
 Resume only the installer-created partial state (runtime and environment exist,
 but database, Bootstrap code, systemd unit and Nginx state do not):
@@ -77,15 +96,28 @@ Activate a fully healthy Gateway after a previous Nginx switch rolled back:
 Upgrade an active Gateway in place using the reviewed release bundle:
   sudo ./setup-gateway.sh upgrade --domain vgen.example.com
 
+Archive an existing development/test Gateway before initializing it again:
+  sudo ./setup-gateway.sh reset-test --domain vgen.example.com
+
 The interactive installer asks you to re-enter the domain and confirm that old
 tasks have finished. For non-interactive automation, use explicit flags:
   sudo ./setup-gateway.sh install \
     --domain vgen.example.com \
     --confirm-domain vgen.example.com \
-    --confirm-no-active-tasks
+    --confirm-no-active-tasks \
+    --artifact-store oss \
+    --oss-endpoint https://oss-cn-hangzhou.aliyuncs.com \
+    --oss-bucket vgen-private \
+    --oss-prefix vgen/v1 \
+    --oss-ecs-role VGenGatewayRole \
+    --aliyun-account-id 1234567890123456 \
+    --oss-transfer-role VGenArtifactTransferRole \
+    --confirm-oss-configured
 
 Non-interactive activation additionally requires --confirm-activate.
 Non-interactive upgrade additionally requires --confirm-upgrade.
+Non-interactive test reset additionally requires --confirm-reset-test and
+--confirm-no-active-tasks.
 
 Show current service and endpoint status:
   sudo ./setup-gateway.sh status --domain vgen.example.com
@@ -98,6 +130,17 @@ Route Nginx back to the saved legacy configuration:
 
 Options:
   --confirm-upgrade      Explicitly approve an in-place Gateway upgrade.
+  --artifact-store TYPE  Task media must use oss. Release files remain local.
+  --oss-endpoint URL     HTTPS Alibaba Cloud OSS endpoint.
+  --oss-bucket NAME      Private bucket containing encrypted task artifacts.
+  --oss-prefix PREFIX    Object key prefix. Default: vgen/v1.
+  --oss-ecs-role NAME    ECS RAM Role used for temporary credentials. AccessKey
+                         values are intentionally not accepted by this installer.
+  --aliyun-account-id ID Alibaba Cloud account ID that owns both RAM roles.
+  --oss-transfer-role NAME  RAM Role assumed for one-object OSS STS access.
+  --sts-region REGION    STS region. Defaults to the region in the OSS endpoint.
+  --oss-sts-duration N   STS lifetime in seconds, 900..3600. Default: 900.
+  --confirm-oss-configured  Confirm the generated RAM/OSS setup checklist is done.
   --legacy-database PATH  Legacy SQLite database to back up before install.
                           Default: /opt/vgen/server/data/vgen.db
 
@@ -110,7 +153,8 @@ Safety properties:
   * upgrade keeps a WAL-consistent database snapshot and the previous runtime/config.
   * a failed upgrade restores the previous database, runtime and service configuration.
   * the legacy pre-v1 service is not stopped or deleted.
-  * ArtifactStore is local ciphertext storage; OSS/IAM is never modified.
+  * local task-media storage is prohibited; release downloads remain on ECS.
+  * OSS mode uses only an ECS RAM Role and a private bucket; IAM is never modified.
 EOF
 }
 
@@ -140,7 +184,7 @@ parse_arguments() {
   }
 
   case "$1" in
-    install|resume|activate|upgrade|status|rollback)
+    install|resume|activate|upgrade|reset-test|status|rollback)
       ACTION="$1"
       shift
       ;;
@@ -149,7 +193,7 @@ parse_arguments() {
       exit 0
       ;;
     *)
-      die "unknown action '$1'; expected install, resume, activate, upgrade, status, or rollback"
+      die "unknown action '$1'; expected install, resume, activate, upgrade, reset-test, status, or rollback"
       ;;
   esac
 
@@ -181,6 +225,59 @@ parse_arguments() {
         CONFIRM_UPGRADE=1
         shift
         ;;
+      --confirm-reset-test)
+        CONFIRM_RESET_TEST=1
+        shift
+        ;;
+      --artifact-store)
+        require_value "$1" "${2:-}"
+        ARTIFACT_STORE="$2"
+        shift 2
+        ;;
+      --oss-endpoint)
+        require_value "$1" "${2:-}"
+        OSS_ENDPOINT="$2"
+        shift 2
+        ;;
+      --oss-bucket)
+        require_value "$1" "${2:-}"
+        OSS_BUCKET="$2"
+        shift 2
+        ;;
+      --oss-prefix)
+        require_value "$1" "${2:-}"
+        OSS_PREFIX="$2"
+        shift 2
+        ;;
+      --oss-ecs-role)
+        require_value "$1" "${2:-}"
+        OSS_ECS_ROLE="$2"
+        shift 2
+        ;;
+      --aliyun-account-id)
+        require_value "$1" "${2:-}"
+        OSS_ACCOUNT_ID="$2"
+        shift 2
+        ;;
+      --oss-transfer-role)
+        require_value "$1" "${2:-}"
+        OSS_TRANSFER_ROLE="$2"
+        shift 2
+        ;;
+      --sts-region)
+        require_value "$1" "${2:-}"
+        OSS_STS_REGION="$2"
+        shift 2
+        ;;
+      --oss-sts-duration)
+        require_value "$1" "${2:-}"
+        OSS_STS_DURATION_SECONDS="$2"
+        shift 2
+        ;;
+      --confirm-oss-configured)
+        CONFIRM_OSS_CONFIGURED=1
+        shift
+        ;;
       --legacy-database)
         require_value "$1" "${2:-}"
         LEGACY_DATABASE_PATH="$2"
@@ -210,6 +307,155 @@ validate_confirmation() {
     die "--confirm-domain must exactly match --domain"
 }
 
+validate_artifact_store_options() {
+  [[ "${ARTIFACT_STORE}" == "oss" ]] || \
+    die "--artifact-store must be oss; local artifact storage is prohibited"
+  [[ "${OSS_ENDPOINT}" =~ ^https://[A-Za-z0-9.-]+$ ]] || \
+    die "--oss-endpoint must be a credential-free HTTPS origin"
+  [[ "${OSS_BUCKET}" =~ ^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$ ]] || \
+    die "--oss-bucket is invalid"
+  [[ "${OSS_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || \
+    die "--oss-prefix is invalid"
+  [[ "${OSS_ECS_ROLE}" =~ ^[A-Za-z0-9_.@-]{1,128}$ ]] || \
+    die "--oss-ecs-role is required and invalid"
+  [[ "${OSS_ACCOUNT_ID}" =~ ^[0-9]{8,24}$ ]] || \
+    die "--aliyun-account-id is required and invalid"
+  [[ "${OSS_TRANSFER_ROLE}" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]] || \
+    die "--oss-transfer-role is invalid"
+  if [[ -z "${OSS_STS_REGION}" ]]; then
+    OSS_STS_REGION="$(sed -E 's#^https://oss-([a-z0-9-]+)\..*$#\1#' <<<"${OSS_ENDPOINT}")"
+  fi
+  [[ "${OSS_STS_REGION}" =~ ^[a-z0-9-]{2,64}$ ]] || die "--sts-region is invalid"
+  [[ "${OSS_STS_DURATION_SECONDS}" =~ ^[0-9]+$ ]] || die "--oss-sts-duration is invalid"
+  (( OSS_STS_DURATION_SECONDS >= 900 && OSS_STS_DURATION_SECONDS <= 3600 )) || \
+    die "--oss-sts-duration must be between 900 and 3600"
+}
+
+collect_interactive_oss_options() {
+  [[ "${ACTION}" == "install" ]] || return 0
+  if [[ -n "${OSS_ENDPOINT}" && -n "${OSS_BUCKET}" && -n "${OSS_ECS_ROLE}" && -n "${OSS_ACCOUNT_ID}" ]]; then
+    return 0
+  fi
+  [[ -t 0 && -t 1 && -r /dev/tty && -w /dev/tty ]] || return 0
+  if [[ -z "${OSS_ENDPOINT}" ]]; then
+    printf 'OSS HTTPS endpoint (for example https://oss-cn-hangzhou.aliyuncs.com): ' >/dev/tty
+    IFS= read -r OSS_ENDPOINT </dev/tty || die "OSS configuration was cancelled"
+  fi
+  if [[ -z "${OSS_BUCKET}" ]]; then
+    printf 'Private OSS bucket name for encrypted task artifacts: ' >/dev/tty
+    IFS= read -r OSS_BUCKET </dev/tty || die "OSS configuration was cancelled"
+  fi
+  if [[ -z "${OSS_ECS_ROLE}" ]]; then
+    printf 'RAM Role name attached to this ECS instance: ' >/dev/tty
+    IFS= read -r OSS_ECS_ROLE </dev/tty || die "OSS configuration was cancelled"
+  fi
+  if [[ -z "${OSS_ACCOUNT_ID}" ]]; then
+    printf 'Alibaba Cloud account ID that owns the ECS and RAM roles: ' >/dev/tty
+    IFS= read -r OSS_ACCOUNT_ID </dev/tty || die "OSS configuration was cancelled"
+  fi
+  printf 'OSS transfer RAM Role [%s]: ' "${OSS_TRANSFER_ROLE}" >/dev/tty
+  local entered_transfer_role=""
+  IFS= read -r entered_transfer_role </dev/tty || die "OSS configuration was cancelled"
+  [[ -z "${entered_transfer_role}" ]] || OSS_TRANSFER_ROLE="${entered_transfer_role}"
+}
+
+write_oss_setup_kit() {
+  local setup_root="/var/tmp/vgen-oss-setup-${DOMAIN}"
+  [[ ! -L "${setup_root}" ]] || die "OSS setup path must not be a symbolic link"
+  install -d -o root -g root -m 0700 "${setup_root}"
+  VGEN_SETUP_ROOT="${setup_root}" \
+  VGEN_SETUP_DOMAIN="${DOMAIN}" \
+  VGEN_SETUP_OSS_ENDPOINT="${OSS_ENDPOINT}" \
+  VGEN_SETUP_OSS_BUCKET="${OSS_BUCKET}" \
+  VGEN_SETUP_OSS_PREFIX="${OSS_PREFIX}" \
+  VGEN_SETUP_OSS_ECS_ROLE="${OSS_ECS_ROLE}" \
+  VGEN_SETUP_OSS_ACCOUNT_ID="${OSS_ACCOUNT_ID}" \
+  VGEN_SETUP_OSS_TRANSFER_ROLE="${OSS_TRANSFER_ROLE}" \
+  VGEN_SETUP_STS_REGION="${OSS_STS_REGION}" \
+  VGEN_SETUP_STS_DURATION="${OSS_STS_DURATION_SECONDS}" python3.11 <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["VGEN_SETUP_ROOT"])
+account = os.environ["VGEN_SETUP_OSS_ACCOUNT_ID"]
+caller_role = os.environ["VGEN_SETUP_OSS_ECS_ROLE"]
+transfer_role = os.environ["VGEN_SETUP_OSS_TRANSFER_ROLE"]
+bucket = os.environ["VGEN_SETUP_OSS_BUCKET"]
+prefix = os.environ["VGEN_SETUP_OSS_PREFIX"]
+caller_arn = f"acs:ram::{account}:role/{caller_role}"
+transfer_arn = f"acs:ram::{account}:role/{transfer_role}"
+
+documents = {
+    "01-ecs-role-assume-policy.json": {
+        "Version": "1",
+        "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": transfer_arn}],
+    },
+    "02-transfer-role-trust-policy.json": {
+        "Version": "1",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"RAM": [caller_arn]},
+            "Action": "sts:AssumeRole",
+        }],
+    },
+    "03-transfer-role-oss-policy.json": {
+        "Version": "1",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["oss:GetObject", "oss:PutObject", "oss:AbortMultipartUpload", "oss:ListParts"],
+            "Resource": f"acs:oss:*:*:{bucket}/{prefix}/*",
+        }],
+    },
+}
+for name, value in documents.items():
+    (root / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+env = "\n".join([
+    "VGEN_ARTIFACT_STORE=oss",
+    f"VGEN_OSS_ENDPOINT={os.environ['VGEN_SETUP_OSS_ENDPOINT']}",
+    f"VGEN_OSS_BUCKET={bucket}",
+    f"VGEN_OSS_PREFIX={prefix}",
+    f"VGEN_OSS_TRANSFER_ROLE_ARN={transfer_arn}",
+    f"VGEN_OSS_STS_DURATION_SECONDS={os.environ['VGEN_SETUP_STS_DURATION']}",
+    f"VGEN_STS_REGION={os.environ['VGEN_SETUP_STS_REGION']}",
+    "VGEN_STS_ENDPOINT=sts.aliyuncs.com",
+]) + "\n"
+(root / "gateway-oss.env.example").write_text(env)
+
+readme = f"""VGen Gateway OSS initialization checklist
+
+This kit was generated for https://{os.environ['VGEN_SETUP_DOMAIN']}.
+It contains no AccessKey or other secret.
+
+1. Create or select private OSS bucket: {bucket}
+   Endpoint: {os.environ['VGEN_SETUP_OSS_ENDPOINT']}
+   Keep public access blocked. VGen stores encrypted task artifacts under: {prefix}/
+2. Attach 01-ecs-role-assume-policy.json to ECS role: {caller_role}
+3. Create RAM role: {transfer_role}
+4. Set its trust policy to 02-transfer-role-trust-policy.json
+5. Attach 03-transfer-role-oss-policy.json to that transfer role
+6. Attach ECS role {caller_role} to this Gateway ECS instance.
+7. Configure OSS lifecycle rules for prefix {prefix}/ according to your retention policy,
+   and enable cleanup of incomplete multipart uploads. Do not enable public read/write.
+8. Rerun the same install command with --confirm-oss-configured.
+
+At runtime Gateway uses its ECS role only to call STS AssumeRole. Each returned token
+is further restricted to one object and one transfer direction. CLI/Worker transfers
+task bytes directly with OSS. Gateway uses HEAD only to confirm object size.
+"""
+(root / "README.txt").write_text(readme)
+for path in root.iterdir():
+    path.chmod(0o600)
+PY
+  log "generated deployer-specific OSS/RAM setup kit: ${setup_root}"
+  log "read it with: sudo less ${setup_root}/README.txt"
+  if [[ "${CONFIRM_OSS_CONFIGURED}" -ne 1 ]]; then
+    log "configure Alibaba Cloud with that kit, then rerun with --confirm-oss-configured"
+    exit 3
+  fi
+}
+
 collect_interactive_confirmations() {
   local answer=""
   if [[ -z "${CONFIRM_DOMAIN}" ]]; then
@@ -220,7 +466,7 @@ collect_interactive_confirmations() {
   fi
   validate_confirmation
 
-  if [[ ("${ACTION}" == "install" || "${ACTION}" == "resume") && "${CONFIRM_NO_ACTIVE_TASKS}" -ne 1 ]]; then
+  if [[ ("${ACTION}" == "install" || "${ACTION}" == "resume" || "${ACTION}" == "reset-test") && "${CONFIRM_NO_ACTIVE_TASKS}" -ne 1 ]]; then
     [[ -t 0 && -t 1 && -r /dev/tty && -w /dev/tty ]] || \
       die "non-interactive ${ACTION} requires --confirm-no-active-tasks"
     printf 'Have all old tasks finished and has the old Worker been stopped? [y/N] ' >/dev/tty
@@ -276,6 +522,21 @@ collect_interactive_confirmations() {
         ;;
       *)
         die "upgrade cancelled"
+        ;;
+    esac
+  fi
+
+  if [[ "${ACTION}" == "reset-test" && "${CONFIRM_RESET_TEST}" -ne 1 ]]; then
+    [[ -t 0 && -t 1 && -r /dev/tty && -w /dev/tty ]] || \
+      die "non-interactive reset-test requires --confirm-reset-test"
+    printf 'Archive and remove the active TEST Gateway runtime and data now? [y/N] ' >/dev/tty
+    IFS= read -r answer </dev/tty || die "test reset confirmation was cancelled"
+    case "${answer}" in
+      y|Y|yes|YES|Yes)
+        CONFIRM_RESET_TEST=1
+        ;;
+      *)
+        die "test reset cancelled"
         ;;
     esac
   fi
@@ -442,6 +703,10 @@ verify_nginx_config_and_tls() {
   grep -Fq "server_name ${DOMAIN};" "${NGINX_CONFIG_PATH}" || \
     die "existing Nginx config does not declare 'server_name ${DOMAIN};'"
 
+  verify_gateway_tls_certificate
+}
+
+verify_gateway_tls_certificate() {
   local certificate_root="/etc/letsencrypt/live/${DOMAIN}"
   [[ -f "${certificate_root}/fullchain.pem" ]] || \
     die "TLS certificate not found at ${certificate_root}/fullchain.pem"
@@ -455,11 +720,30 @@ verify_legacy_nginx_and_tls() {
     die "existing Nginx config is not the expected legacy route to 127.0.0.1:8000"
 }
 
+verify_install_nginx_and_tls() {
+  verify_gateway_tls_certificate
+  if [[ ! -e "${NGINX_CONFIG_PATH}" ]]; then
+    return
+  fi
+  verify_nginx_config_and_tls
+  if grep -Fq "proxy_pass http://127.0.0.1:8000;" "${NGINX_CONFIG_PATH}"; then
+    return
+  fi
+  local expected_config
+  expected_config="$(mktemp "${NGINX_CONFIG_PATH}.install-expected.XXXXXX")"
+  render_nginx_config "${expected_config}"
+  if ! cmp --silent -- "${NGINX_CONFIG_PATH}" "${expected_config}"; then
+    rm -f -- "${expected_config}"
+    die "existing Nginx config is neither the legacy route nor deterministic VGen Gateway route"
+  fi
+  rm -f -- "${expected_config}"
+}
+
 verify_gateway_base_preconditions() {
   [[ "${CONFIRM_NO_ACTIVE_TASKS}" -eq 1 ]] || \
     die "${ACTION} requires --confirm-no-active-tasks after all old tasks have finished"
   [[ "${LEGACY_DATABASE_PATH}" == /* ]] || die "--legacy-database must be an absolute path"
-  verify_legacy_nginx_and_tls
+  verify_install_nginx_and_tls
 
   if python3.11 - "${GATEWAY_PORT}" <<'PY'
 import socket
@@ -597,8 +881,18 @@ PY
   verify_root_owned_not_writable "${backup_path}" "saved Nginx backup"
   grep -Fq "server_name ${DOMAIN};" "${backup_path}" || \
     die "activate refused: saved backup belongs to a different domain"
-  grep -Fq "proxy_pass http://127.0.0.1:8000;" "${backup_path}" || \
-    die "activate refused: saved backup is not the expected legacy route"
+  local expected_backup uninitialized_backup
+  expected_backup="$(mktemp "${NGINX_CONFIG_PATH}.activate-backup.XXXXXX")"
+  uninitialized_backup="$(mktemp "${NGINX_CONFIG_PATH}.activate-uninitialized.XXXXXX")"
+  render_nginx_config "${expected_backup}"
+  render_uninitialized_nginx_config "${uninitialized_backup}"
+  if ! grep -Fq "proxy_pass http://127.0.0.1:8000;" "${backup_path}" && \
+     ! cmp --silent -- "${backup_path}" "${expected_backup}" && \
+     ! cmp --silent -- "${backup_path}" "${uninitialized_backup}"; then
+    rm -f -- "${expected_backup}" "${uninitialized_backup}"
+    die "activate refused: saved backup is neither legacy nor a deterministic VGen baseline"
+  fi
+  rm -f -- "${expected_backup}" "${uninitialized_backup}"
   systemctl is-active --quiet "${SERVICE_NAME}" || \
     die "activate refused: Gateway service is not active"
   systemctl is-enabled --quiet "${SERVICE_NAME}" || \
@@ -664,7 +958,7 @@ ensure_service_user_and_directories() {
     die "existing user 'vgen' is not a member of group 'vgen'; inspect it manually"
   fi
   install -d -o root -g root -m 0755 "${INSTALL_ROOT}" "${RELEASE_ROOT}"
-  install -d -o vgen -g vgen -m 0700 "${DATA_ROOT}" "${DATA_ROOT}/artifacts"
+  install -d -o vgen -g vgen -m 0700 "${DATA_ROOT}"
   install -d -o root -g root -m 0700 "${CONFIG_ROOT}" "${BACKUP_ROOT}"
 }
 
@@ -712,7 +1006,7 @@ install_python_runtime() {
     umask 022
     python3.11 -m venv "${INSTALL_ROOT}/venv"
     "${INSTALL_ROOT}/venv/bin/python" -m pip install --disable-pip-version-check \
-      "${WHEEL_PATH}[gateway]"
+      "${WHEEL_PATH}[gateway,oss]"
   )
   normalize_and_verify_python_runtime
 }
@@ -859,17 +1153,23 @@ for line in Path(os.environ["VGEN_GATEWAY_ENVIRONMENT_PATH"]).read_text().splitl
     values[key] = value
 expected = {
     "VGEN_ARTIFACT_STORE",
-    "VGEN_ARTIFACT_ROOT",
     "VGEN_GATEWAY_DOCS",
     "VGEN_REQUIRE_REQUEST_SIGNATURES",
     "VGEN_ARTIFACT_TICKET_KEY",
+    "VGEN_OSS_ENDPOINT",
+    "VGEN_OSS_BUCKET",
+    "VGEN_OSS_PREFIX",
+    "VGEN_OSS_TRANSFER_ROLE_ARN",
+    "VGEN_OSS_STS_DURATION_SECONDS",
+    "VGEN_STS_REGION",
+    "VGEN_STS_ENDPOINT",
 }
-if set(values) != expected:
-    raise SystemExit(f"{action} refused: Gateway environment keys do not match the installer contract")
-if values["VGEN_ARTIFACT_STORE"] != "local":
-    raise SystemExit(f"{action} refused: ArtifactStore is not local")
-if values["VGEN_ARTIFACT_ROOT"] != "/var/lib/vgen-v1/artifacts":
-    raise SystemExit(f"{action} refused: ArtifactStore root does not match")
+if set(values) != expected or values.get("VGEN_ARTIFACT_STORE") != "oss":
+    raise SystemExit(f"{action} refused: OSS ArtifactStore configuration is required")
+if not values["VGEN_OSS_ENDPOINT"].startswith("https://"):
+    raise SystemExit(f"{action} refused: OSS endpoint must use HTTPS")
+if not values["VGEN_OSS_BUCKET"] or not values["VGEN_OSS_PREFIX"] or not values["VGEN_OSS_TRANSFER_ROLE_ARN"]:
+    raise SystemExit(f"{action} refused: OSS ArtifactStore configuration is incomplete")
 if values["VGEN_GATEWAY_DOCS"] != "0" or values["VGEN_REQUIRE_REQUEST_SIGNATURES"] != "1":
     raise SystemExit(f"{action} refused: Gateway security settings do not match")
 if len(values["VGEN_ARTIFACT_TICKET_KEY"]) < 48:
@@ -878,24 +1178,60 @@ PY
 }
 
 write_gateway_environment() {
-  VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}" python3.11 <<'PY'
+  VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}" \
+  VGEN_SETUP_ARTIFACT_STORE="${ARTIFACT_STORE}" \
+  VGEN_SETUP_OSS_ENDPOINT="${OSS_ENDPOINT}" \
+  VGEN_SETUP_OSS_BUCKET="${OSS_BUCKET}" \
+  VGEN_SETUP_OSS_PREFIX="${OSS_PREFIX}" \
+  VGEN_SETUP_OSS_TRANSFER_ROLE_ARN="acs:ram::${OSS_ACCOUNT_ID}:role/${OSS_TRANSFER_ROLE}" \
+  VGEN_SETUP_OSS_STS_DURATION="${OSS_STS_DURATION_SECONDS}" \
+  VGEN_SETUP_STS_REGION="${OSS_STS_REGION}" python3.11 <<'PY'
 import os
 import secrets
 
 destination = os.environ["VGEN_GATEWAY_ENVIRONMENT_PATH"]
-payload = (
-    "VGEN_ARTIFACT_STORE=local\n"
-    "VGEN_ARTIFACT_ROOT=/var/lib/vgen-v1/artifacts\n"
-    "VGEN_GATEWAY_DOCS=0\n"
-    "VGEN_REQUIRE_REQUEST_SIGNATURES=1\n"
-    f"VGEN_ARTIFACT_TICKET_KEY={secrets.token_urlsafe(48)}\n"
-).encode("utf-8")
+lines = [
+    "VGEN_ARTIFACT_STORE=oss",
+    f"VGEN_OSS_ENDPOINT={os.environ['VGEN_SETUP_OSS_ENDPOINT']}",
+    f"VGEN_OSS_BUCKET={os.environ['VGEN_SETUP_OSS_BUCKET']}",
+    f"VGEN_OSS_PREFIX={os.environ['VGEN_SETUP_OSS_PREFIX']}",
+    f"VGEN_OSS_TRANSFER_ROLE_ARN={os.environ['VGEN_SETUP_OSS_TRANSFER_ROLE_ARN']}",
+    f"VGEN_OSS_STS_DURATION_SECONDS={os.environ['VGEN_SETUP_OSS_STS_DURATION']}",
+    f"VGEN_STS_REGION={os.environ['VGEN_SETUP_STS_REGION']}",
+    "VGEN_STS_ENDPOINT=sts.aliyuncs.com",
+]
+lines.extend(
+    [
+        "VGEN_GATEWAY_DOCS=0",
+        "VGEN_REQUIRE_REQUEST_SIGNATURES=1",
+        f"VGEN_ARTIFACT_TICKET_KEY={secrets.token_urlsafe(48)}",
+    ]
+)
+payload = ("\n".join(lines) + "\n").encode("utf-8")
 descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 try:
     os.write(descriptor, payload)
 finally:
     os.close(descriptor)
 PY
+}
+
+verify_artifact_store_access_at() {
+  local runtime_root="$1"
+  log "verifying ECS RAM Role can assume the configured object-transfer role"
+  runuser -u vgen -- env VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}" \
+    "${runtime_root}/bin/python" - <<'PY'
+import os
+from pathlib import Path
+
+from vgen.gateway.artifacts import OssArtifactStore
+
+for line in Path(os.environ["VGEN_GATEWAY_ENVIRONMENT_PATH"]).read_text().splitlines():
+    key, value = line.split("=", 1)
+    os.environ[key] = value
+OssArtifactStore.from_environment().verify_access()
+PY
+  log "STS AssumeRole validation passed; no OSS object bytes were transferred"
 }
 
 initialize_gateway() {
@@ -1065,6 +1401,30 @@ render_nginx_config() {
   render_nginx_config_profile "$1" 0
 }
 
+render_uninitialized_nginx_config() {
+  local destination="$1"
+  cat >"${destination}" <<EOF
+# Generated by the VGen Gateway installer as a safe pre-initialization fallback.
+server {
+  listen 80;
+  server_name ${DOMAIN};
+  location /.well-known/acme-challenge/ { root /var/www/certbot; }
+  location / { return 301 https://\$host\$request_uri; }
+}
+server {
+  listen 443 ssl http2;
+  server_name ${DOMAIN};
+  ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+  location / { return 503; }
+}
+EOF
+  chmod 0600 "${destination}"
+}
+
 render_previous_gateway_nginx_config() {
   # 0.3.x through 0.5.x served public releases on the Gateway hostname.
   # Accept that exact profile only during the one-way split-domain upgrade.
@@ -1150,7 +1510,13 @@ switch_nginx() {
   else
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     backup_path="$(mktemp "${BACKUP_ROOT}/nginx-vgen-${stamp}.XXXXXX.conf")"
-    cp --preserve=mode,ownership,timestamps -- "${NGINX_CONFIG_PATH}" "${backup_path}"
+    if [[ -e "${NGINX_CONFIG_PATH}" ]]; then
+      cp --preserve=mode,ownership,timestamps -- "${NGINX_CONFIG_PATH}" "${backup_path}"
+    else
+      render_uninitialized_nginx_config "${backup_path}"
+      chown root:root "${backup_path}"
+      chmod 0644 "${backup_path}"
+    fi
     verify_nginx_backup_path "${backup_path}"
     verify_root_owned_not_writable "${backup_path}" "saved Nginx backup"
   fi
@@ -1436,9 +1802,10 @@ stage_upgrade_runtime() {
     umask 022
     python3.11 -m venv "${UPGRADE_CANDIDATE_RUNTIME}"
     "${UPGRADE_CANDIDATE_RUNTIME}/bin/python" -m pip install --disable-pip-version-check \
-      "${WHEEL_PATH}[gateway]"
+      "${WHEEL_PATH}[gateway,oss]"
   )
   normalize_and_verify_runtime_at "${UPGRADE_CANDIDATE_RUNTIME}" "${VGEN_VERSION}"
+  verify_artifact_store_access_at "${UPGRADE_CANDIDATE_RUNTIME}"
 }
 
 backup_upgrade_config_and_preflight_database() {
@@ -1582,6 +1949,7 @@ upgrade_gateway() {
   require_command cmp
   require_command cp
   require_command curl
+  require_command env
   require_command flock
   require_command grep
   require_command install
@@ -1632,6 +2000,46 @@ upgrade_gateway() {
   log "Nginx Gateway virtual host is API-only; releases use the separate download host"
 }
 
+reset_test_gateway() {
+  require_root
+  require_command flock
+  require_command install
+  require_command mktemp
+  require_command mv
+  require_command systemctl
+  [[ "${CONFIRM_RESET_TEST}" -eq 1 ]] || die "reset-test requires --confirm-reset-test"
+  [[ "${CONFIRM_NO_ACTIVE_TASKS}" -eq 1 ]] || \
+    die "reset-test requires --confirm-no-active-tasks"
+
+  acquire_mutation_lock
+  local source backup_dir found=0
+  [[ ! -L "${BACKUP_ROOT}" ]] || die "reset-test refused: backup root is a symbolic link"
+  for source in "${INSTALL_ROOT}" "${DATA_ROOT}" "${CONFIG_ROOT}" "${UNIT_PATH}"; do
+    if [[ -L "${source}" ]]; then
+      die "reset-test refused: managed path is a symbolic link: ${source}"
+    fi
+    [[ -e "${source}" ]] && found=1
+  done
+  [[ "${found}" -eq 1 ]] || die "reset-test refused: no managed Gateway installation exists"
+
+  install -d -o root -g root -m 0700 "${BACKUP_ROOT}"
+  backup_dir="$(mktemp -d "${BACKUP_ROOT}/gateway-test-reset-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  chmod 0700 "${backup_dir}"
+  systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+
+  [[ ! -e "${INSTALL_ROOT}" ]] || mv -- "${INSTALL_ROOT}" "${backup_dir}/opt-vgen-v1"
+  [[ ! -e "${DATA_ROOT}" ]] || mv -- "${DATA_ROOT}" "${backup_dir}/var-lib-vgen-v1"
+  [[ ! -e "${CONFIG_ROOT}" ]] || mv -- "${CONFIG_ROOT}" "${backup_dir}/etc-vgen-v1"
+  [[ ! -e "${UNIT_PATH}" ]] || mv -- "${UNIT_PATH}" "${backup_dir}/vgen-gateway.service"
+  systemctl daemon-reload
+  systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+
+  log "test Gateway runtime, data and service configuration were archived"
+  log "test reset backup: ${backup_dir}"
+  log "Nginx, TLS certificates, release downloads, RAM Role and OSS objects were not changed"
+  log "run the install action next to initialize a new User/Workspace database"
+}
+
 print_mac_bootstrap_steps() {
   printf '\nNext steps:\n'
   printf '  1. Start the downloaded Mac installer.\n'
@@ -1646,7 +2054,10 @@ print_mac_bootstrap_steps() {
 install_gateway() {
   require_root
   require_command awk
+  require_command cmp
+  require_command cp
   require_command curl
+  require_command env
   require_command flock
   require_command getent
   require_command grep
@@ -1666,12 +2077,15 @@ install_gateway() {
 
   acquire_mutation_lock
   verify_release_bundle
+  validate_artifact_store_options
+  write_oss_setup_kit
   verify_install_preconditions
   check_legacy_task_status
   ensure_service_user_and_directories
   backup_legacy_database
   install_python_runtime
   write_gateway_environment
+  verify_artifact_store_access_at "${INSTALL_ROOT}/venv"
   initialize_gateway
   install_and_start_service
   switch_nginx
@@ -1679,7 +2093,8 @@ install_gateway() {
   log "installation complete"
   log "bootstrap code remains protected at ${BOOTSTRAP_PATH} until the first Mac claims it"
   log "the legacy service was left untouched for rollback"
-  log "OSS/IAM was not configured; ArtifactStore is local ciphertext storage"
+  log "task artifacts use private OSS through object-scoped STS credentials"
+  log "RAM/IAM policy was not modified"
   print_mac_bootstrap_steps
 }
 
@@ -1687,6 +2102,7 @@ resume_gateway() {
   require_root
   require_command awk
   require_command curl
+  require_command env
   require_command flock
   require_command getent
   require_command grep
@@ -1712,6 +2128,7 @@ resume_gateway() {
   verify_existing_gateway_environment
   verify_existing_python_runtime
   normalize_and_verify_python_runtime
+  verify_artifact_store_access_at "${INSTALL_ROOT}/venv"
   initialize_gateway
   install_and_start_service
   switch_nginx
@@ -1719,7 +2136,7 @@ resume_gateway() {
   log "partial installation resumed successfully"
   log "bootstrap code remains protected at ${BOOTSTRAP_PATH} until the first Mac claims it"
   log "the legacy service was left untouched for rollback"
-  log "OSS/IAM was not configured; ArtifactStore is local ciphertext storage"
+  log "existing ArtifactStore configuration was preserved; RAM/IAM was not modified"
   print_mac_bootstrap_steps
 }
 
@@ -1870,6 +2287,8 @@ main() {
     install)
       collect_interactive_confirmations
       validate_confirmation
+      collect_interactive_oss_options
+      validate_artifact_store_options
       install_gateway
       ;;
     resume)
@@ -1886,6 +2305,11 @@ main() {
       collect_interactive_confirmations
       validate_confirmation
       upgrade_gateway
+      ;;
+    reset-test)
+      collect_interactive_confirmations
+      validate_confirmation
+      reset_test_gateway
       ;;
     rollback)
       collect_interactive_confirmations

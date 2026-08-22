@@ -48,14 +48,16 @@ class ArtifactDescriptor:
 class TransferTicket:
     """A short-lived, provider-neutral authorization to transfer one artifact.
 
-    A signed HTTP URL and a local ``file://`` URL use the same shape.  Future
-    S3/OSS adapters can register another URL scheme without changing a lease.
-    Secrets in ``url`` and ``headers`` must never be copied into error reports.
+    Signed HTTP, local ``file://`` and object-scoped ``oss://`` capabilities use
+    the same shape. Secrets in ``url``, ``headers`` or ``credentials`` must never
+    be copied into error reports.
     """
 
     url: str = field(repr=False)
     method: str
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    endpoint: str | None = None
+    credentials: Mapping[str, str] = field(default_factory=dict, repr=False)
     expires_at: float | None = None
     expected_size: int | None = None
     expected_sha256: str | None = None
@@ -78,6 +80,7 @@ class TransferTicket:
             object.__setattr__(self, "expected_sha256", digest)
         object.__setattr__(self, "method", method)
         object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
+        object.__setattr__(self, "credentials", MappingProxyType(dict(self.credentials)))
 
 
 @dataclass(frozen=True)

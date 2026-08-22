@@ -136,8 +136,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             not in {"0", "false", "no", "off"}
         ),
     )
-    # Local artifact capability tokens are intentionally opaque but may be
-    # carried in request paths by provider adapters. Uvicorn's stock access
+    # Artifact capability tokens are intentionally opaque but may be carried
+    # in request paths by provider adapters. Uvicorn's stock access
     # logger prints the full path, so it is disabled instead of risking a
     # signed ticket in logs. Structured audit events remain available in the
     # Gateway database.

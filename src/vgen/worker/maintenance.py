@@ -23,7 +23,12 @@ from urllib.parse import urlparse
 
 import requests
 
-from vgen.artifacts import ArtifactTransferError, HttpArtifactAdapter, TransferTicket
+from vgen.artifacts import (
+    ArtifactTransferError,
+    HttpArtifactAdapter,
+    OssStsArtifactAdapter,
+    TransferTicket,
+)
 from vgen.crypto import verify_maintenance_intent
 from vgen.protocol import ErrorCode, VGenError
 
@@ -492,7 +497,11 @@ class WorkerMaintenanceController:
                 raise WorkerUpdateError("WORKER_UPDATE_DISK_UNAVAILABLE", retryable=True) from exc
             if free < artifact_size + 32 * 1024 * 1024:
                 raise WorkerUpdateError("WORKER_UPDATE_DISK_FULL")
-            adapter = HttpArtifactAdapter(self._session)
+            adapter = (
+                OssStsArtifactAdapter()
+                if ticket.url.startswith("oss://")
+                else HttpArtifactAdapter(self._session)
+            )
 
             def progress(completed: int, total: int | None) -> None:
                 now = time.monotonic()
@@ -672,6 +681,7 @@ class WorkerMaintenanceController:
         self, ticket: TransferTicket, expected_size: int, expected_sha256: str
     ) -> None:
         parsed = urlparse(ticket.url)
+        oss_ticket = parsed.scheme == "oss"
         local_http = parsed.scheme == "http" and parsed.hostname in {
             "127.0.0.1",
             "::1",
@@ -679,7 +689,7 @@ class WorkerMaintenanceController:
         }
         if (
             ticket.method != "GET"
-            or (parsed.scheme != "https" and not local_http)
+            or (parsed.scheme != "https" and not local_http and not oss_ticket)
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
@@ -688,6 +698,28 @@ class WorkerMaintenanceController:
             or ticket.expected_sha256 != expected_sha256
         ):
             raise WorkerUpdateError("WORKER_UPDATE_TICKET_INVALID")
+        if oss_ticket:
+            endpoint = urlparse(ticket.endpoint or "")
+            if (
+                endpoint.scheme != "https"
+                or not endpoint.hostname
+                or endpoint.username is not None
+                or endpoint.password is not None
+                or endpoint.path not in {"", "/"}
+                or endpoint.query
+                or endpoint.fragment
+                or not ticket.credentials
+            ):
+                raise WorkerUpdateError("WORKER_UPDATE_TICKET_INVALID")
+            addresses = tuple(self._ticket_resolver(str(endpoint.hostname), endpoint.port or 443))
+            if not addresses:
+                raise WorkerUpdateError("WORKER_UPDATE_TICKET_UNAVAILABLE", retryable=True)
+            try:
+                if any(not ipaddress.ip_address(address).is_global for address in addresses):
+                    raise WorkerUpdateError("WORKER_UPDATE_TICKET_INVALID")
+            except ValueError as exc:
+                raise WorkerUpdateError("WORKER_UPDATE_TICKET_INVALID") from exc
+            return
         if not local_http:
             try:
                 port = parsed.port or 443

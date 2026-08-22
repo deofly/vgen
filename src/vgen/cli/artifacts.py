@@ -9,7 +9,13 @@ from typing import Any
 
 import requests
 
-from vgen.artifacts import HttpArtifactAdapter, TransferReceipt, TransferTicket
+from vgen.artifacts import (
+    ArtifactAdapterRegistry,
+    HttpArtifactAdapter,
+    OssStsArtifactAdapter,
+    TransferReceipt,
+    TransferTicket,
+)
 from vgen.crypto import decrypt_stream, encrypt_stream, encrypted_stream_size, task_aad
 
 
@@ -64,6 +70,11 @@ def _ticket(
         url=str(raw["url"]),
         method=str(raw["method"]),
         headers={str(key): str(item) for key, item in dict(raw.get("headers") or {}).items()},
+        endpoint=(None if raw.get("endpoint") is None else str(raw["endpoint"])),
+        credentials={
+            str(key): str(item)
+            for key, item in dict(raw.get("credentials") or {}).items()
+        },
         expires_at=(None if raw.get("expires_at") is None else float(raw["expires_at"])),
         expected_size=expected_size,
         expected_sha256=digest,
@@ -87,7 +98,7 @@ def encrypt_and_upload_inputs(
     by_kind = {str(item.get("kind")): item for item in prepared_tickets}
     if len(by_kind) != len(prepared_tickets):
         raise ValueError("Gateway returned duplicate input artifact tickets")
-    adapter = HttpArtifactAdapter(session)
+    adapters = ArtifactAdapterRegistry(HttpArtifactAdapter(session), OssStsArtifactAdapter())
     bindings: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="vgen-client-input-") as temporary:
         root = Path(temporary)
@@ -113,7 +124,7 @@ def encrypt_and_upload_inputs(
                         key_version=key_version,
                     ),
                 )
-            adapter.upload(
+            receipt = adapters.upload(
                 _ticket(
                     raw_ticket,
                     expected_size=encrypted.stat().st_size,
@@ -125,6 +136,8 @@ def encrypt_and_upload_inputs(
                 {
                     "input": item.name,
                     "artifact_id": artifact_id,
+                    "encrypted_size": receipt.size_bytes,
+                    "content_digest": f"sha256:{receipt.sha256}",
                 }
             )
     return bindings
@@ -153,12 +166,12 @@ def download_and_decrypt_output(
         if isinstance(metadata, Mapping) and metadata.get("media_type")
         else "application/octet-stream"
     )
-    adapter = HttpArtifactAdapter(session)
+    adapters = ArtifactAdapterRegistry(HttpArtifactAdapter(session), OssStsArtifactAdapter())
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="vgen-client-output-") as temporary:
         encrypted = Path(temporary) / "output.ciphertext"
-        receipt = adapter.download(
+        receipt = adapters.download(
             _ticket(
                 raw_ticket,
                 expected_size=(

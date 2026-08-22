@@ -10,6 +10,7 @@ import math
 import os
 import secrets
 import sqlite3
+import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -139,9 +140,13 @@ def _error_response(
 _CAPABILITY_FIELD_NAMES = frozenset(
     {
         "authorization",
+        "access_key_id",
+        "access_key_secret",
+        "credentials",
         "invite_uri",
         "join_uri",
         "secret",
+        "security_token",
         "session_token",
         "signed_url",
         "ticket",
@@ -320,14 +325,14 @@ def create_app(
         serve_files=configured_serve_release_files,
     )
 
-    db = GatewayDatabase(db_path)
-    repository = GatewayRepository(db)
-    configured_artifact_store = os.getenv("VGEN_ARTIFACT_STORE", "local").strip().lower()
+    configured_artifact_store = os.getenv("VGEN_ARTIFACT_STORE", "").strip().lower()
     if artifact_store_override is not None:
         artifact_store = artifact_store_override
     elif configured_artifact_store == "oss":
         artifact_store = OssArtifactStore.from_environment()
-    elif configured_artifact_store == "local":
+    elif configured_artifact_store == "local" and os.getenv(
+        "VGEN_ALLOW_LOCAL_ARTIFACT_STORE_FOR_TESTS", ""
+    ) == "1" and "pytest" in sys.modules:
         resolved_artifact_root = artifact_root or os.getenv(
             "VGEN_ARTIFACT_ROOT", "./data/artifacts"
         )
@@ -341,7 +346,11 @@ def create_app(
             )
         artifact_store = LocalArtifactStore(resolved_artifact_root, ticket_key)
     else:
-        raise RuntimeError("VGEN_ARTIFACT_STORE must be 'local' or 'oss'")
+        raise RuntimeError(
+            "VGEN_ARTIFACT_STORE=oss is required; local artifact storage is prohibited for task media"
+        )
+    db = GatewayDatabase(db_path)
+    repository = GatewayRepository(db)
 
     async def sweep_control_plane() -> None:
         while True:
@@ -763,23 +772,6 @@ def create_app(
                     stale["rowid"],
                 ),
             )
-
-    def reconcile_direct_upload(
-        artifact: sqlite3.Row,
-        *,
-        max_bytes: int,
-        expected_size: int | None = None,
-    ) -> None:
-        """Observe a provider-direct upload without persisting its capability URL."""
-
-        if artifact_store.store_type == "local" or artifact["state"] != "pending":
-            return
-        if artifact["store_type"] != artifact_store.store_type:
-            raise VGenError(ErrorCode.STORAGE_UNAVAILABLE)
-        size, digest = artifact_store.observe_upload(artifact["id"], max_bytes=max_bytes)
-        if expected_size is not None and size != expected_size:
-            raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
-        repository.mark_artifact_uploaded(artifact_id=artifact["id"], size=size, digest=digest)
 
     async def verify_mutation_signature(
         request: Request, session: sqlite3.Row, *, body: bytes | None = None
@@ -2623,16 +2615,38 @@ def create_app(
                 principal_id=principal.principal_id,
                 user_id=principal.user_id,
             )
-        for artifact in db.fetchall(
+        receipts = {item["artifact_id"]: item for item in data.pop("artifact_receipts")}
+        if len(receipts) != len(payload.artifact_receipts):
+            raise VGenError(
+                ErrorCode.VALIDATION_FAILED,
+                details={"reason": "duplicate_artifact_receipt"},
+            )
+        pending_inputs = db.fetchall(
             """SELECT * FROM artifacts
                WHERE task_id=? AND direction='input' AND state='pending'""",
             (task_id,),
-        ):
+        )
+        if artifact_store.store_type != "local" and len(receipts) != len(pending_inputs):
+            raise VGenError(
+                ErrorCode.VALIDATION_FAILED,
+                details={"reason": "artifact_receipts_required"},
+            )
+        for artifact in pending_inputs:
+            receipt = receipts.get(artifact["id"])
+            if receipt is None:
+                continue
             expected_size = int(artifact["encrypted_size"])
-            reconcile_direct_upload(
-                artifact,
-                max_bytes=expected_size,
-                expected_size=expected_size,
+            if int(receipt["encrypted_size"]) != expected_size:
+                raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+            observed_size, _ = artifact_store.observe_upload(
+                artifact["id"], max_bytes=expected_size
+            )
+            if observed_size != expected_size:
+                raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+            repository.mark_artifact_uploaded(
+                artifact_id=artifact["id"],
+                size=expected_size,
+                digest=str(receipt["content_digest"]).removeprefix("sha256:"),
             )
         return repository.commit_task(
             task_id=task_id,
@@ -2849,10 +2863,25 @@ def create_app(
                        WHERE id=? AND attempt_id=? AND direction='output'""",
                     (reported.artifact_id, attempt_id),
                 )
-                if artifact is not None:
-                    reconcile_direct_upload(
-                        artifact,
-                        max_bytes=100 * 1024**3,
+                if (
+                    artifact is not None
+                    and reported.encrypted_size is not None
+                    and reported.content_digest is not None
+                ):
+                    if reported.encrypted_size > 100 * 1024**3:
+                        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+                    digest = reported.content_digest.removeprefix("sha256:")
+                    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+                    observed_size, _ = artifact_store.observe_upload(
+                        artifact["id"], max_bytes=reported.encrypted_size
+                    )
+                    if observed_size != reported.encrypted_size:
+                        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+                    repository.mark_artifact_uploaded(
+                        artifact_id=artifact["id"],
+                        size=reported.encrypted_size,
+                        digest=digest,
                     )
         return repository.finish_attempt(
             attempt_id=attempt_id,

@@ -21,6 +21,7 @@ from vgen import __version__
 from vgen.artifacts import (
     ArtifactTransferError,
     HttpArtifactAdapter,
+    OssStsArtifactAdapter,
     TransferTicket,
     with_safe_media_extension,
 )
@@ -1489,6 +1490,11 @@ def _maintenance_upload_ticket(
             url=str(value["url"]),
             method=str(value["method"]),
             headers={str(key): str(item) for key, item in headers.items()},
+            endpoint=(None if value.get("endpoint") is None else str(value["endpoint"])),
+            credentials={
+                str(key): str(item)
+                for key, item in dict(value.get("credentials") or {}).items()
+            },
             expires_at=(None if value.get("expires_at") is None else float(value["expires_at"])),
             expected_size=expected_size,
             expected_sha256=expected_sha256,
@@ -1699,14 +1705,17 @@ def _broker_command(args: argparse.Namespace) -> None:
             upload_ticket = created.get("upload_ticket")
             if isinstance(upload_ticket, Mapping):
                 print(f"正在上传 Worker {artifact.version} 更新包…", file=sys.stderr)
-                HttpArtifactAdapter().upload(
-                    _maintenance_upload_ticket(
-                        upload_ticket,
-                        expected_size=artifact.size_bytes,
-                        expected_sha256=artifact.sha256,
-                    ),
-                    artifact.path,
+                ticket = _maintenance_upload_ticket(
+                    upload_ticket,
+                    expected_size=artifact.size_bytes,
+                    expected_sha256=artifact.sha256,
                 )
+                adapter = (
+                    OssStsArtifactAdapter()
+                    if ticket.url.startswith("oss://")
+                    else HttpArtifactAdapter()
+                )
+                adapter.upload(ticket, artifact.path)
                 committed = client.commit_worker_maintenance(str(created["id"]))
                 if not isinstance(committed, dict):
                     raise ValueError("Gateway returned an invalid committed maintenance job")
@@ -2828,6 +2837,14 @@ def _task_command(args: argparse.Namespace) -> None:
                     "reader_envelope": json.dumps(reader_envelope.to_dict(), separators=(",", ":")),
                     "key_algorithm": HPKE_ALGORITHM,
                     "artifacts": [],
+                    "artifact_receipts": [
+                        {
+                            "artifact_id": item["artifact_id"],
+                            "encrypted_size": item["encrypted_size"],
+                            "content_digest": item["content_digest"],
+                        }
+                        for item in uploaded
+                    ],
                 },
             )
             if not args.wait:
