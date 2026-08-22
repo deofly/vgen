@@ -20,7 +20,7 @@ VGen 是一个开源的 GPU 工作流控制面，把公网 Gateway、用户的 M
   2 图首尾帧 flf；
 - Broker 发起模型下载和纯 Python Worker wheel 更新；
 - Mac CLI/Home Broker 通过 `vgen upgrade` 校验 stable release、原子升级并在失败时回滚；
-- 同域名 public release channel，以及本机生成密钥的无凭据 Windows Worker 通用包；
+- Gateway API 与 public release 下载域名独立，以及本机生成密钥的无凭据 Windows Worker 通用包；
 - 工作流 market/custom 隔离、不可变 digest、签名和本地执行策略；
 - 每 Attempt 可追溯 Worker、consumer channel、GPU/流量指标和 `billing_token`；
 - 六位统一错误码、重试动作和 CLI exit code。

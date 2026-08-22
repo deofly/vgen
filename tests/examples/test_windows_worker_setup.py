@@ -774,8 +774,8 @@ def test_two_handbooks_are_the_only_documentation_sources_for_operations_and_rel
     assert "python tools/build_gateway_bundle.py" in developer
     assert "./examples/macos/build-bundle.sh" in developer
     assert "sha256sum -c SHA256SUMS" in user
-    assert "./setup-gateway.sh install --domain <域名>" in user
-    assert "./setup-gateway.sh upgrade --domain <域名>" in user
+    assert "./setup-gateway.sh install --domain <Gateway域名>" in user
+    assert "./setup-gateway.sh upgrade --domain <Gateway域名>" in user
     assert "健康检查失败时自动恢复旧版本" in user
     assert "sudo cat /var/lib/vgen-v1/bootstrap-code" in user
     assert "sudo rm -f /var/lib/vgen-v1/bootstrap-code" in user

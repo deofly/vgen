@@ -66,7 +66,12 @@ from .artifacts import (
     download_and_decrypt_output,
     encrypt_and_upload_inputs,
 )
-from .auth import login_service_session, login_session, login_worker_session
+from .auth import (
+    authenticate_device_session,
+    login_service_session,
+    login_session,
+    login_worker_session,
+)
 from .client import GatewayClient, VgenClientError, cli_exit_code
 from .device_migration import register_recovered_device
 from .identity_store import DeviceIdentity, DeviceIdentityStore, IdentityStoreError
@@ -491,6 +496,51 @@ def _profile_command(args: argparse.Namespace) -> None:
     elif args.profile_action == "list":
         current, profiles = store.load()
         _json({"current": current, "profiles": [asdict(item) for item in profiles.values()]})
+    elif args.profile_action == "endpoint-set":
+        current = store.get(args.profile)
+        values = asdict(current)
+        values["endpoint"] = args.endpoint
+        candidate = GatewayProfile(**values)
+
+        anonymous = GatewayClient(candidate)
+        try:
+            health = anonymous.health()
+        finally:
+            anonymous.close()
+        if health.get("ok") is not True:
+            raise ValueError("the new Gateway health check did not return ok=true")
+
+        if current.principal_type == "service":
+            credentials = _service_credentials_for_profile(current)
+            raw_session = login_service_session(
+                candidate, credentials.service_id, credentials.device_keys
+            )
+            if str(raw_session.get("service_id")) != credentials.service_id:
+                raise ValueError("the new Gateway authenticated a different API Service")
+            ServiceSessionStore().delete(current.name, credentials.service_id)
+        else:
+            identity = DeviceIdentityStore().load(current.key_ref or "default")
+            session = authenticate_device_session(candidate, identity)
+            if current.user_id and session.user_id != current.user_id:
+                raise ValueError("the new Gateway authenticated a different User")
+            expected_device_id = current.device_id or identity.device_id
+            if session.device_id != expected_device_id:
+                raise ValueError("the new Gateway authenticated a different Device")
+            SessionStore().delete(current.name)
+
+        updated = store.update_binding(current.name, endpoint=candidate.endpoint)
+        _json(
+            {
+                "profile": updated.name,
+                "endpoint": updated.endpoint,
+                "verified": True,
+                "next": (
+                    "vgen broker service-refresh --profile " + updated.name
+                    if updated.home_broker_id
+                    else None
+                ),
+            }
+        )
 
 
 def _gateway_command(args: argparse.Namespace) -> None:
@@ -2924,6 +2974,7 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("identity", "device-enroll"): "使用设备邀请把当前设备接入已有用户身份。",
     ("profile",): "管理 Gateway 地址、默认 Workspace 和本地身份的连接配置。",
     ("profile", "add"): "保存一个 Gateway 连接配置，并可设为当前默认配置。",
+    ("profile", "endpoint-set"): "验证新 Gateway 后安全更新地址，保留身份和 Workspace 绑定。",
     ("profile", "use"): "切换后续命令默认使用的 Profile。",
     ("profile", "show"): "查看指定或当前 Profile 的连接配置。",
     ("profile", "list"): "列出本机保存的全部 Profile。",
@@ -3292,6 +3343,9 @@ def build_parser() -> argparse.ArgumentParser:
     profile_show = profile_sub.add_parser("show")
     profile_show.add_argument("name", nargs="?")
     profile_sub.add_parser("list")
+    profile_endpoint_set = profile_sub.add_parser("endpoint-set")
+    profile_endpoint_set.add_argument("endpoint")
+    profile_endpoint_set.add_argument("--profile")
 
     gateway = sub.add_parser("gateway")
     gateway_sub = gateway.add_subparsers(dest="gateway_action", required=True)

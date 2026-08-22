@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+from argparse import Namespace
+from dataclasses import replace
 
 import httpx
 import pytest
 
+import vgen.cli.main as cli_main
 from vgen.cli.client import GatewayClient, VgenClientError, cli_exit_code
 from vgen.cli.profile import GatewayProfile, ProfileError, ProfileStore
+from vgen.cli.session_store import StoredSession
 
 
 def test_profile_roundtrip_and_binding(tmp_path) -> None:
@@ -39,6 +43,123 @@ def test_profile_can_bind_an_explicit_service_principal(tmp_path) -> None:
     assert bound.principal_type == "service"
     assert store.get("api").service_id == "svc_test"
     assert store.get("api").service_key_ref == "prod-api"
+
+
+def test_endpoint_set_verifies_identity_and_preserves_all_bindings(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    store = ProfileStore(tmp_path / "profiles.yaml")
+    original = GatewayProfile(
+        name="home",
+        endpoint="https://old-gateway.example",
+        user_id="usr_same",
+        device_id="dev_same",
+        default_workspace="wsp_keep",
+        default_pool="pol_keep",
+        home_broker_id="brk_keep",
+        key_ref="personal",
+    )
+    store.put(original)
+
+    class HealthyClient:
+        def __init__(self, profile) -> None:
+            assert profile.endpoint == "https://new-gateway.example"
+
+        def health(self):
+            return {"ok": True}
+
+        def close(self) -> None:
+            pass
+
+    class IdentityStore:
+        def load(self, alias):
+            assert alias == "personal"
+            return object()
+
+    deleted: list[str] = []
+
+    class Sessions:
+        def delete(self, profile_name):
+            deleted.append(profile_name)
+
+    monkeypatch.setattr(cli_main, "ProfileStore", lambda: store)
+    monkeypatch.setattr(cli_main, "GatewayClient", HealthyClient)
+    monkeypatch.setattr(cli_main, "DeviceIdentityStore", IdentityStore)
+    monkeypatch.setattr(cli_main, "SessionStore", Sessions)
+    monkeypatch.setattr(
+        cli_main,
+        "authenticate_device_session",
+        lambda profile, _identity: StoredSession(
+            token="verified",
+            expires_at=4_000_000_000,
+            user_id="usr_same",
+            device_id="dev_same",
+        ),
+    )
+
+    cli_main._profile_command(
+        Namespace(
+            profile_action="endpoint-set",
+            profile="home",
+            endpoint="https://new-gateway.example",
+        )
+    )
+
+    updated = store.get("home")
+    assert updated == replace(original, endpoint="https://new-gateway.example")
+    assert deleted == ["home"]
+    response = json.loads(capsys.readouterr().out)
+    assert response["verified"] is True
+    assert response["next"] == "vgen broker service-refresh --profile home"
+
+
+def test_endpoint_set_refuses_a_different_gateway_identity(tmp_path, monkeypatch) -> None:
+    store = ProfileStore(tmp_path / "profiles.yaml")
+    original = GatewayProfile(
+        name="home",
+        endpoint="https://old-gateway.example",
+        user_id="usr_expected",
+        device_id="dev_expected",
+    )
+    store.put(original)
+
+    class HealthyClient:
+        def __init__(self, _profile) -> None:
+            pass
+
+        def health(self):
+            return {"ok": True}
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli_main, "ProfileStore", lambda: store)
+    monkeypatch.setattr(cli_main, "GatewayClient", HealthyClient)
+    monkeypatch.setattr(
+        cli_main,
+        "DeviceIdentityStore",
+        type("IdentityStore", (), {"load": lambda self, alias: object()}),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "authenticate_device_session",
+        lambda profile, _identity: StoredSession(
+            token="wrong",
+            expires_at=4_000_000_000,
+            user_id="usr_other",
+            device_id="dev_expected",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="different User"):
+        cli_main._profile_command(
+            Namespace(
+                profile_action="endpoint-set",
+                profile="home",
+                endpoint="https://new-gateway.example",
+            )
+        )
+    assert store.get("home") == original
 
 
 def test_service_profile_requires_exactly_one_local_credential_source() -> None:

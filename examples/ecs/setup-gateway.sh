@@ -407,7 +407,13 @@ from pathlib import Path
 root = Path(os.environ["VGEN_RELEASE_ROOT"])
 manifest = Path(os.environ["VGEN_RELEASE_MANIFEST"])
 wheel_name = os.environ["VGEN_RELEASE_WHEEL_NAME"]
-expected_names = {"INSTALL.txt", "setup-gateway.sh", "vgen-gateway.service", wheel_name}
+expected_names = {
+    "INSTALL.txt",
+    "setup-gateway.sh",
+    "setup-release-site.sh",
+    "vgen-gateway.service",
+    wheel_name,
+}
 entries = {}
 for line in manifest.read_text(encoding="utf-8").splitlines():
     match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._+-]+)", line)
@@ -1054,13 +1060,15 @@ EOF
 }
 
 render_nginx_config() {
-  render_nginx_config_profile "$1" 1
+  # The Gateway hostname is API-only. Public installers are served by the
+  # independently configured release hostname.
+  render_nginx_config_profile "$1" 0
 }
 
 render_previous_gateway_nginx_config() {
-  # 0.2.x used the same deterministic Gateway proxy without public release
-  # locations. Accept that exact profile only during an in-place upgrade.
-  render_nginx_config_profile "$1" 0
+  # 0.3.x through 0.5.x served public releases on the Gateway hostname.
+  # Accept that exact profile only during the one-way split-domain upgrade.
+  render_nginx_config_profile "$1" 1
 }
 
 write_install_state() {
@@ -1621,7 +1629,7 @@ upgrade_gateway() {
   log "previous runtime retained at ${UPGRADE_PREVIOUS_RUNTIME}"
   log "database and service configuration backup retained at ${UPGRADE_BACKUP_DIR}"
   log "Bootstrap code, Gateway environment and install state were not replaced"
-  log "Nginx now serves immutable public releases from ${RELEASE_ROOT}"
+  log "Nginx Gateway virtual host is API-only; releases use the separate download host"
 }
 
 print_mac_bootstrap_steps() {

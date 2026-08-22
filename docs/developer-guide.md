@@ -485,11 +485,12 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 ```bash
 ./tools/release.sh publish \
   --version 0.3.1 \
-  --gateway https://vgen.example.com \
+  --gateway https://vgen-gw.example.com \
+  --releases https://vgen.example.com \
   --ssh root@ecs.example.com
 ```
 
-脚本会要求输入 Gateway 域名确认 stable 切换。自动化环境只有在外层已经完成等价审批时才使用
+脚本会要求输入下载域名确认 stable 切换。自动化环境只有在外层已经完成等价审批时才使用
 `--confirm-stable`。SSH 不是 22 端口时增加 `--ssh-port`。仅发布 CLI/Worker 下载频道时不会
 重启 Gateway；当同一版本包含 Gateway 服务端变更时增加 `--upgrade-gateway`，脚本会先运行
 受备份和健康检查保护的 Gateway 原地升级，成功后才切换下载频道。正式 `publish` 固定要求：
@@ -504,7 +505,8 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 ```bash
 ./tools/release.sh build \
   --version 0.3.1 \
-  --gateway https://vgen.example.com
+  --gateway https://vgen-gw.example.com \
+  --releases https://vgen.example.com
 ```
 
 本地探索阶段可以显式增加 `--allow-untagged-candidate`，但该选项不能用于 `publish`。构建时间取
@@ -547,7 +549,9 @@ python tools/check_distribution.py dist
 
 ```bash
 python tools/build_gateway_bundle.py
-./examples/macos/build-bundle.sh --gateway https://gateway.example.com
+./examples/macos/build-bundle.sh \
+  --gateway https://gateway.example.com \
+  --release-origin https://downloads.example.com
 PYTHONPATH=src python -m vgen worker installer-bundle \
   --gateway-url https://gateway.example.com \
   --output dist/vgen-windows-worker-installer-$(python tools/project_version.py).zip
@@ -565,6 +569,7 @@ Windows 通用 ZIP 不包含 Worker ID、私钥、session 或 Invite，可以由
 ```bash
 python tools/build_public_release.py \
   --gateway-origin https://gateway.example.com \
+  --release-origin https://downloads.example.com \
   --published-at 2026-08-22T12:34:56Z
 ```
 
@@ -588,15 +593,16 @@ public-releases/
 `manifest.json` 固化 size/SHA-256；`stable.json` 固化原始 manifest 摘要。
 
 `install-macos.sh` 是无凭据的 mutable bootstrap，由同一次构建生成。它不依赖 `jq`，使用安装
-本就需要的 Python 3.11 读取同源 stable API，再校验不可变 manifest 摘要、Mac ZIP size 和
+本就需要的 Python 3.11 从固定 release origin 读取静态 stable pointer，再校验不可变 manifest 摘要、Mac ZIP size 和
 SHA-256；跨域 redirect、非 HTTPS（测试 loopback 除外）或 API/manifest 不一致都 fail closed。
 工具先原子切换 bootstrap，最后原子切换 stable pointer；中间状态只会拒绝安装，不会把新
 bootstrap 配到旧 release。
 
 ### 8.2 Mac CLI 自升级契约
 
-`vgen upgrade` 只信任当前 Profile 的 Gateway origin，并要求 stable API、不可变 manifest 和
-Mac artifact 三者在版本、size、SHA-256 与 URL 上一致。重定向不得跨 origin；下载和解压有大小、
+`vgen upgrade` 只信任首装器写入、权限为 `0600` 的 `release-source.json`，不从当前 Profile
+推导下载站。stable pointer、不可变 manifest 和 Mac artifact 必须在版本、size 与 SHA-256 上
+一致。重定向不得跨 release origin；下载和解压有大小、
 条目数、重复路径、大小写冲突、symlink、加密 ZIP 和路径逃逸限制。执行前再次验证包内
 `SHA256SUMS`，不从 manifest 或 ZIP 接受任意安装命令路径。
 
@@ -624,7 +630,7 @@ Workspace/User join。脚本必须从 `/dev/tty` 读取人工确认，不能从�
    `/var/www/vgen-releases/X.Y.Z` 已存在，只允许逐文件 size/SHA-256 完全一致，不能覆盖；
 2. 原子安装 `/var/www/vgen-releases/install-macos.sh`，权限 `0755`；
 3. 最后原子安装 `/var/www/vgen-releases/channels/stable.json`，权限 `0644`；
-4. 分别请求 stable API、bootstrap、immutable manifest 和两个 ZIP，核对状态、cache header、
+4. 分别请求 static stable pointer、bootstrap、immutable manifest 和两个 ZIP，核对状态、cache header、
    size 和 SHA-256。
 
 可以用 `rsync`/`scp` 传到私有暂存目录，但版本目录进入 `/var/www/vgen-releases` 后不得使用
@@ -634,8 +640,8 @@ Workspace/User join。脚本必须从 `/dev/tty` 读取人工确认，不能从�
 
 OSS/CDN 同样先上传版本目录并设置 immutable，再上传 bootstrap，最后上传 stable pointer；
 对象 metadata 必须保留对应 Content-Type 和 Cache-Control。若下载字节实际保存在 OSS，公网
-仍需通过 Gateway 同一 origin 的 `/releases/...` 反向代理或 CDN 路由提供；bootstrap 会拒绝
-重定向到另一个 OSS 域名。Gateway 进程只读取小型 manifest，不需要获得 OSS 账号密钥。
+应通过独立 release origin 的 `/releases/...` 提供；bootstrap 会拒绝重定向到另一个未固定
+域名。Gateway 进程不读取 release manifest，也不需要获得 OSS 账号密钥。
 
 部署前把将要上传的 staging 另存为不可写验收记录。同步失败时不要回写旧版本目录；保留旧
 stable pointer 或将 pointer 原子恢复到上一个已验证 manifest 即可。任何凭据、Invite、私密
@@ -667,7 +673,7 @@ Mac bundle 包含 `install.command`、用户手册、wheel、`SHA256SUMS` 和可
 不得使用 sudo、修改 shell rc 或把 secret 放入 LaunchAgent；已有 profile 时只升级程序，不得
 重新 bootstrap 或创建第二个身份。
 
-Gateway 的 Nginx release 路由只公开两个 no-cache 精确路径：
+独立下载站的 Nginx release 路由只公开两个 no-cache 精确路径：
 `/releases/channels/stable.json`、`/releases/install-macos.sh`，以及受限的不可变
 `/releases/<version>/<filename>`。固定 bootstrap 必须先下载、再由用户阅读和运行；文档和
 安装页不得推荐 `curl | sh`。

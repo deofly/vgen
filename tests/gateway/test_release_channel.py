@@ -248,12 +248,16 @@ def test_gateway_cli_exposes_release_configuration_without_enabling_fallback_by_
 
 
 def test_ecs_nginx_serves_only_constrained_release_paths_with_correct_caches() -> None:
-    source = (ROOT / "examples" / "ecs" / "nginx-vgen.conf.example").read_text(
+    gateway_source = (ROOT / "examples" / "ecs" / "nginx-vgen.conf.example").read_text(
         encoding="utf-8"
     )
+    source = (
+        ROOT / "examples" / "ecs" / "nginx-vgen-releases.conf.example"
+    ).read_text(encoding="utf-8")
     unit = (ROOT / "examples" / "ecs" / "vgen-gateway.service").read_text(encoding="utf-8")
     installer = (ROOT / "examples" / "ecs" / "setup-gateway.sh").read_text(encoding="utf-8")
     assert "location = /releases/channels/stable.json" in source
+    assert "/releases/" not in gateway_source
     assert "location = /releases/install-macos.sh" in source
     assert "alias /var/www/vgen-releases/install-macos.sh;" in source
     assert "location = /releases/install-macos.sh" in installer

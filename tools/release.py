@@ -99,7 +99,7 @@ def _validated_origin(value: str) -> tuple[str, str]:
         parsed = urllib.parse.urlsplit(origin)
         _ = parsed.port
     except ValueError as exc:
-        raise ReleaseError("Gateway origin is invalid") from exc
+        raise ReleaseError("origin is invalid") from exc
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -109,7 +109,7 @@ def _validated_origin(value: str) -> tuple[str, str]:
         or parsed.query
         or parsed.fragment
     ):
-        raise ReleaseError("Gateway origin must be a credential-free HTTPS origin")
+        raise ReleaseError("origin must be a credential-free HTTPS origin")
     return origin, parsed.hostname.lower()
 
 
@@ -227,9 +227,11 @@ def build_release(
     *,
     version: str,
     gateway_origin: str,
+    release_origin: str,
     require_tag: bool,
 ) -> BuildResult:
-    origin, _ = _validated_origin(gateway_origin)
+    gateway, _ = _validated_origin(gateway_origin)
+    release, _ = _validated_origin(release_origin)
     commit, published_at = _git_preflight(version, require_tag=require_tag)
     _clean_transient_outputs(version)
     python = sys.executable
@@ -241,7 +243,16 @@ def build_release(
     _run([python, "-m", "build"])
     _run([python, "tools/check_distribution.py", "dist"])
     _run([python, "tools/build_gateway_bundle.py"])
-    _run(["bash", "examples/macos/build-bundle.sh", "--gateway", origin])
+    _run(
+        [
+            "bash",
+            "examples/macos/build-bundle.sh",
+            "--gateway",
+            gateway,
+            "--release-origin",
+            release,
+        ]
+    )
 
     wheel = dist / f"vgen-{version}-py3-none-any.whl"
     windows = dist / f"vgen-windows-worker-installer-{version}.zip"
@@ -255,7 +266,7 @@ def build_release(
             "worker",
             "installer-bundle",
             "--gateway-url",
-            origin,
+            gateway,
             "--worker-wheel",
             str(wheel),
             "--output",
@@ -273,7 +284,9 @@ def build_release(
             "--published-at",
             published_at,
             "--gateway-origin",
-            origin,
+            gateway,
+            "--release-origin",
+            release,
             "--mac-bundle",
             str(macos),
             "--windows-worker-bundle",
@@ -305,7 +318,7 @@ def _ssh_commands(target: str, port: int) -> tuple[list[str], list[str]]:
     return ["ssh", "-p", str(port), target], ["scp", "-P", str(port)]
 
 
-def _verify_public_release(origin: str, version: str) -> None:
+def _verify_public_release(release_origin: str, version: str) -> None:
     def read(url: str, limit: int) -> bytes:
         request = urllib.request.Request(url, headers={"User-Agent": "vgen-release/1"})
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -314,21 +327,26 @@ def _verify_public_release(origin: str, version: str) -> None:
             raise ReleaseError(f"public verification response exceeded its limit: {url}")
         return value
 
-    stable = json.loads(read(f"{origin}/api/v1/releases/channels/stable", 1024 * 1024))
-    if not isinstance(stable, dict) or stable.get("version") != version:
-        raise ReleaseError("public stable API did not switch to the requested version")
-    read(f"{origin}/releases/install-macos.sh", 2 * 1024 * 1024)
-    read(f"{origin}/releases/{version}/manifest.json", 1024 * 1024)
-    artifacts = stable.get("artifacts")
+    stable = json.loads(
+        read(f"{release_origin}/releases/channels/stable.json", 1024 * 1024)
+    )
+    if (
+        not isinstance(stable, dict)
+        or set(stable) != {"schema_version", "channel", "version", "manifest_sha256"}
+        or stable.get("version") != version
+    ):
+        raise ReleaseError("public stable pointer did not switch to the requested version")
+    read(f"{release_origin}/releases/install-macos.sh", 2 * 1024 * 1024)
+    manifest = json.loads(
+        read(f"{release_origin}/releases/{version}/manifest.json", 1024 * 1024)
+    )
+    artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) != 2:
-        raise ReleaseError("public stable API does not contain the two expected installers")
-    origin_key = urllib.parse.urlsplit(origin)[:2]
+        raise ReleaseError("public manifest does not contain the two expected installers")
     for artifact in artifacts:
-        if not isinstance(artifact, dict) or not isinstance(artifact.get("url"), str):
-            raise ReleaseError("public stable API contains invalid artifact metadata")
-        url = urllib.parse.urljoin(f"{origin}/", artifact["url"])
-        if urllib.parse.urlsplit(url)[:2] != origin_key:
-            raise ReleaseError("public artifact URL escaped the Gateway origin")
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("filename"), str):
+            raise ReleaseError("public manifest contains invalid artifact metadata")
+        url = f"{release_origin}/releases/{version}/{artifact['filename']}"
         request = urllib.request.Request(
             url,
             headers={"Range": "bytes=0-0", "User-Agent": "vgen-release/1"},
@@ -341,18 +359,20 @@ def publish_release(
     result: BuildResult,
     *,
     gateway_origin: str,
+    release_origin: str,
     ssh_target: str,
     ssh_port: int,
     confirmed: bool,
     upgrade_gateway: bool,
 ) -> None:
-    origin, domain = _validated_origin(gateway_origin)
+    _, gateway_domain = _validated_origin(gateway_origin)
+    release, release_domain = _validated_origin(release_origin)
     ssh, scp = _ssh_commands(ssh_target, ssh_port)
     if not confirmed:
         answer = input(
-            f"Type {domain} to publish VGen {result.version} and switch stable: "
+            f"Type {release_domain} to publish VGen {result.version} and switch stable: "
         ).strip()
-        if answer != domain:
+        if answer != release_domain:
             raise ReleaseError("stable publication was not confirmed")
 
     remote_dir = _capture(
@@ -381,18 +401,18 @@ def publish_release(
             f"-C {shlex.quote(remote_gateway_root)} --strip-components=1 && "
             f"cd {shlex.quote(remote_gateway_root)} && "
             f"{prefix}bash ./setup-gateway.sh upgrade "
-            f"--domain {shlex.quote(domain)} "
-            f"--confirm-domain {shlex.quote(domain)} --confirm-upgrade"
+            f"--domain {shlex.quote(gateway_domain)} "
+            f"--confirm-domain {shlex.quote(gateway_domain)} --confirm-upgrade"
         )
         _run([*ssh, gateway_command])
     remote_command = (
         f"{prefix}bash {shlex.quote(remote_publisher)} "
         f"--archive {shlex.quote(remote_archive)} "
         f"--version {shlex.quote(result.version)} "
-        f"--domain {shlex.quote(domain)} --confirm-stable"
+        f"--domain {shlex.quote(release_domain)} --confirm-stable"
     )
     _run([*ssh, remote_command])
-    _verify_public_release(origin, result.version)
+    _verify_public_release(release, result.version)
     cleanup = f"rm -rf -- {shlex.quote(remote_dir)}"
     _run([*ssh, cleanup])
 
@@ -406,6 +426,7 @@ def _parser() -> argparse.ArgumentParser:
     build = subcommands.add_parser("build", help="build a reviewed local release candidate")
     build.add_argument("--version", required=True)
     build.add_argument("--gateway", required=True, dest="gateway_origin")
+    build.add_argument("--releases", required=True, dest="release_origin")
     build.add_argument(
         "--allow-untagged-candidate",
         action="store_true",
@@ -416,6 +437,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     publish.add_argument("--version", required=True)
     publish.add_argument("--gateway", required=True, dest="gateway_origin")
+    publish.add_argument("--releases", required=True, dest="release_origin")
     publish.add_argument("--ssh", required=True, dest="ssh_target")
     publish.add_argument("--ssh-port", type=int, default=22)
     publish.add_argument("--confirm-stable", action="store_true")
@@ -435,6 +457,7 @@ def main() -> int:
     result = build_release(
         version=arguments.version,
         gateway_origin=arguments.gateway_origin,
+        release_origin=arguments.release_origin,
         require_tag=require_tag,
     )
     print(f"release_version={result.version}")
@@ -446,6 +469,7 @@ def main() -> int:
         publish_release(
             result,
             gateway_origin=arguments.gateway_origin,
+            release_origin=arguments.release_origin,
             ssh_target=arguments.ssh_target,
             ssh_port=arguments.ssh_port,
             confirmed=arguments.confirm_stable,

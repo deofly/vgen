@@ -8,8 +8,10 @@ from .profile import GatewayProfile, ProfileStore
 from .session_store import SessionStore, StoredSession
 
 
-def login_session(profile: GatewayProfile, identity: DeviceIdentity) -> StoredSession:
-    """Exchange a signed, one-use challenge for a 15-minute session."""
+def authenticate_device_session(
+    profile: GatewayProfile, identity: DeviceIdentity
+) -> StoredSession:
+    """Authenticate a Device without mutating any local Profile or session state."""
 
     anonymous = GatewayClient(profile)
     try:
@@ -49,6 +51,13 @@ def login_session(profile: GatewayProfile, identity: DeviceIdentity) -> StoredSe
         user_id=response.get("user_id"),
         device_id=response.get("device_id") or profile.device_id or identity.device_id,
     )
+    return session
+
+
+def login_session(profile: GatewayProfile, identity: DeviceIdentity) -> StoredSession:
+    """Exchange a signed, one-use challenge for a stored 15-minute session."""
+
+    session = authenticate_device_session(profile, identity)
     SessionStore().save(profile.name, session)
     ProfileStore().update_binding(
         profile.name,

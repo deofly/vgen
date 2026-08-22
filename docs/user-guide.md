@@ -7,7 +7,8 @@ Broker、Windows GPU Worker、模型下载、Worker 更新以及真实视频任�
 文中的占位符含义如下：
 
 - `<版本>`：下载包的版本，例如 `0.3.0`；
-- `<域名>`：Gateway 的小写 DNS 域名，例如 `vgen.example.com`，**不带** `https://`；
+- `<Gateway域名>`：API 控制面的 DNS 域名，例如 `vgen-gw.example.com`，**不带** `https://`；
+- `<下载域名>`：CLI/Worker 安装包站点，例如 `vgen.example.com`，可与 Gateway 独立迁移；
 - `<job_id>`、`<worker_id>`、`<enrollment_id>`：CLI 输出的真实 ID，不要连尖括号一起输入。
 
 ## 1. 三端架构和安装顺序
@@ -24,7 +25,7 @@ ECS Gateway（公网 HTTPS 控制面和密文任务状态）
 
 1. 在 ECS 全新安装或升级 Gateway，并确认公网健康；
 2. 在 Mac 安装 CLI/Home Broker，完成首次身份和 Workspace 初始化；
-3. 其他 Mac 从同一 Gateway 域名安装 CLI，用一次性邀请加入 Workspace；
+3. 其他 Mac 从下载域名安装 CLI，再通过 Gateway 域名加入 Workspace；
 4. 在 Windows 安装 ComfyUI Desktop 或解压 ComfyUI Portable；
 5. Windows 下载无凭据通用 Worker ZIP，用一次性邀请登记并启动 Worker；
 6. Worker 缺模型时，由管理员 Mac 上的 Broker 发起模型下载；
@@ -67,10 +68,12 @@ Gateway 包解压后还要校验包内文件：
 sha256sum -c SHA256SUMS
 ```
 
-公开安装包由同域名 `/releases/<版本>/` 提供；`/api/v1/releases/channels/stable` 返回当前
-版本、大小和 SHA-256。Mac 还提供固定的 `/releases/install-macos.sh` 引导入口。先下载并
-阅读它，再单独运行，**不要使用 `curl | sh`**。该脚本读取同源 stable API，校验不可变版本
-清单的摘要、Mac ZIP 的大小和 SHA-256，并拒绝跨域或非 HTTPS 下载。
+VGen 使用两个独立 HTTPS origin：`https://<Gateway域名>` 只提供 `/api/v1`，
+`https://<下载域名>` 只提供公开安装包。下载站的 `/releases/channels/stable.json` 指向当前
+不可变版本，`/releases/install-macos.sh` 是固定引导入口。先下载并阅读它，再单独运行，
+**不要使用 `curl | sh`**。脚本只从已固定的下载 origin 读取 stable、manifest 和 ZIP，校验
+摘要、大小与 SHA-256，并拒绝跨域或非 HTTPS 下载。以后把下载站迁到 OSS/CDN 不需要修改
+Gateway Profile。
 
 Mac 安装器还会校验 ZIP 内的 `SHA256SUMS` 和 wheel 元数据。这些 HTTPS + SHA-256 检查能
 发现传输、缓存或存储篡改，但不是发行者数字签名。目前 ZIP 尚未提供 Apple notarization，
@@ -80,8 +83,19 @@ Windows ZIP 也尚未提供 Authenticode；正式对外发行前仍需补齐。
 
 ## 3. ECS Gateway
 
-以下命令中的每个 `setup-gateway.sh` 动作都明确携带 `--domain <域名>`。如果当前 SSH
+以下命令中的每个 `setup-gateway.sh` 动作都明确携带 `--domain <Gateway域名>`。如果当前 SSH
 用户是 `root`，可以省略 `sudo`。
+
+先把 `<Gateway域名>` 和 `<下载域名>` 的 DNS 都指向 ECS，并分别准备有效证书。Gateway 安装包
+同时包含下载站配置器；首次解压后运行一次：
+
+```bash
+sudo ./setup-release-site.sh install --domain <下载域名>
+```
+
+它只配置 `https://<下载域名>/releases/` 的只读静态路由，不代理 `/api/v1`。Gateway 安装器则
+只为 `<Gateway域名>` 配置 API 反向代理。两个域名可以在同一台 ECS 上，后续也可只把下载域名
+迁到 OSS/CDN。
 
 ### 3.1 全新安装
 
@@ -93,7 +107,7 @@ tar -xzf /root/vgen-gateway-<版本>.tar.gz \
   -C /root/vgen-gateway-install --strip-components=1
 cd /root/vgen-gateway-install
 sha256sum -c SHA256SUMS
-sudo ./setup-gateway.sh install --domain <域名>
+sudo ./setup-gateway.sh install --domain <Gateway域名>
 ```
 
 按提示再次输入相同域名，并确认旧任务已结束。安装器会先验证
@@ -110,7 +124,7 @@ tar -xzf /root/vgen-gateway-<版本>.tar.gz \
   -C /root/vgen-gateway-upgrade --strip-components=1
 cd /root/vgen-gateway-upgrade
 sha256sum -c SHA256SUMS
-sudo ./setup-gateway.sh upgrade --domain <域名>
+sudo ./setup-gateway.sh upgrade --domain <Gateway域名>
 ```
 
 升级会备份数据库、runtime 和配置，健康检查失败时自动恢复旧版本。重复升级到已经健康运行
@@ -137,20 +151,20 @@ legacy TOFU 警告，要求核对 Gateway、Workspace、User 和 root key ID 并
 时才运行：
 
 ```bash
-sudo ./setup-gateway.sh resume --domain <域名>
+sudo ./setup-gateway.sh resume --domain <Gateway域名>
 ```
 
 Gateway 本机已经健康，但先前 Nginx 切换因为短暂 502 回滚时运行：
 
 ```bash
-sudo ./setup-gateway.sh activate --domain <域名>
+sudo ./setup-gateway.sh activate --domain <Gateway域名>
 ```
 
 查看服务、安装状态和公网健康：
 
 ```bash
-sudo ./setup-gateway.sh status --domain <域名>
-curl --fail --silent https://<域名>/api/v1/health
+sudo ./setup-gateway.sh status --domain <Gateway域名>
+curl --fail --silent https://<Gateway域名>/api/v1/health
 ```
 
 响应应包含 `"ok":true`。其中 Worker 统计不会再把已撤销设备混为“可用 Worker”：
@@ -163,7 +177,7 @@ curl --fail --silent https://<域名>/api/v1/health
 要把公网 Nginx 路由恢复到安装前保存的旧服务，运行：
 
 ```bash
-sudo ./setup-gateway.sh rollback --domain <域名>
+sudo ./setup-gateway.sh rollback --domain <Gateway域名>
 ```
 
 `rollback` 只恢复保存的旧 Nginx 路由，不删除 v1 数据，也不是任意数据库版本降级工具。
@@ -210,7 +224,7 @@ Device，并安装官方工作流清单。用户不需要复制这些资源的�
 vgen upgrade
 ```
 
-CLI 会查询当前 Profile 所绑定 Gateway 的 stable 版本，下载并校验不可变 manifest、安装包大小、
+CLI 会查询首装时固定的下载站 stable 版本，下载并校验不可变 manifest、安装包大小、
 SHA-256、ZIP 路径和包内 `SHA256SUMS`，然后安装到新的不可变版本目录。新 CLI 校验成功后才切换
 `~/.local/bin/vgen` 并刷新 Home Broker；刷新失败时自动恢复旧 CLI 和旧 Broker。身份、Gateway、
 Workspace、Broker 配置以及旧版本目录都会保留，不需要恢复词、Bootstrap code 或再次执行
@@ -225,6 +239,17 @@ vgen upgrade --check
 自动化环境可显式使用 `vgen upgrade --yes`；日常交互升级默认要求确认。当前 CLI 不是官方受管
 安装、安装标记损坏或升级回滚失败时，重新运行 Gateway 首页提供的一键安装命令恢复，不要手工
 修改版本目录或符号链接。直接下载并双击新版 `install.command` 仍作为恢复路径保留。
+
+Gateway 域名迁移时使用下面的安全命令；它先访问新地址，并用现有设备私钥认证为同一个
+User/Device（Service Profile 则认证同一个 Service），成功后才保留全部 Workspace/Broker
+绑定并更新 endpoint：
+
+```bash
+vgen profile endpoint-set https://<新Gateway域名> --profile home
+vgen broker service-refresh --profile home
+```
+
+下载域名不保存在 Profile 中，Gateway endpoint 变更不会改变 `vgen upgrade` 的可信下载源。
 
 完成后可以检查：
 
@@ -271,10 +296,10 @@ Owner 完成下面的密钥核验。
 
 ```bash
 curl --fail --location --output install-macos.sh \
-  https://<域名>/releases/install-macos.sh
+  https://<下载域名>/releases/install-macos.sh
 less install-macos.sh
 sh install-macos.sh
-"$HOME/.local/bin/vgen" join --gateway https://<域名>
+"$HOME/.local/bin/vgen" join --gateway https://<Gateway域名>
 ```
 
 全新 User 的 `join` 会在本机生成用户和设备密钥，显示需要离线保存的 24 个恢复词；已有 User
@@ -325,7 +350,7 @@ vgen worker invite --name "Windows GPU Worker" --pool "默认 GPU 池"
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing `
-  "https://<域名>/releases/<版本>/vgen-windows-worker-installer-<版本>.zip" `
+  "https://<下载域名>/releases/<版本>/vgen-windows-worker-installer-<版本>.zip" `
   -OutFile ".\vgen-windows-worker-installer-<版本>.zip"
 Expand-Archive ".\vgen-windows-worker-installer-<版本>.zip" ".\VGen-Worker"
 Set-Location ".\VGen-Worker"
@@ -631,9 +656,9 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
 
 | 现象 | 处理 |
 |---|---|
-| `--domain is required` | 在每个 Gateway 脚本动作后明确加 `--domain <域名>`，域名不带 `https://` |
-| 公网 `/api/v1/health` 失败 | 在 ECS 运行 `sudo ./setup-gateway.sh status --domain <域名>`；未恢复健康前不要初始化客户端 |
-| Nginx 切换后持续 502 | 本机 Gateway 已健康且脚本明确回滚路由时使用 `activate --domain <域名>`；否则先检查 systemd/Nginx，必要时 `rollback --domain <域名>` |
+| `--domain is required` | 在每个 Gateway 脚本动作后明确加 `--domain <Gateway域名>`，域名不带 `https://` |
+| 公网 `/api/v1/health` 失败 | 在 ECS 运行 `sudo ./setup-gateway.sh status --domain <Gateway域名>`；未恢复健康前不要初始化客户端 |
+| Nginx 切换后持续 502 | 本机 Gateway 已健康且脚本明确回滚路由时使用 `activate --domain <Gateway域名>`；否则先检查 systemd/Nginx，必要时 `rollback --domain <Gateway域名>` |
 | Mac 已有身份却再次要求 Bootstrap | 立即停止，不要创建第二个身份；先运行 `vgen profile show` |
 | Windows 找到多套 ComfyUI | 在窗口中选择正确实例；没有目标时进入手动模式并粘贴应用或数据目录 |
 | Desktop 自定义 data root 无法识别 | 按提示粘贴数据目录，或显式传 `-ComfyUIDataRoot`；不要把代码目录硬当数据目录 |

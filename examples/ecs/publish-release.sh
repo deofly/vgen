@@ -36,7 +36,7 @@ checks the public HTTPS endpoints. A failed public check restores the channel.
 Options:
   --archive PATH       Reviewed vgen-public-release-X.Y.Z.tar.gz
   --version X.Y.Z      Exact immutable release version
-  --domain HOST        Existing lowercase Gateway DNS hostname
+  --domain HOST        Existing lowercase download-site DNS hostname
   --confirm-stable     Non-interactive approval of the stable switch
   -h, --help           Show this help
 EOF
@@ -348,7 +348,7 @@ log "stable pointer switched to ${VERSION}"
 if [[ "${TESTING}" != "1" || "${VGEN_SKIP_PUBLIC_CHECK:-0}" != "1" ]]; then
   STABLE_RESPONSE="$(mktemp "/tmp/vgen-stable-response.${VERSION}.XXXXXXXX")"
   curl --fail --silent --show-error --max-time 20 \
-    "https://${DOMAIN}/api/v1/releases/channels/stable" >"${STABLE_RESPONSE}"
+    "https://${DOMAIN}/releases/channels/stable.json" >"${STABLE_RESPONSE}"
   VGEN_STABLE_RESPONSE="${STABLE_RESPONSE}" VGEN_RELEASE_VERSION="${VERSION}" \
     python3 -I -B <<'PY'
 import json
@@ -356,8 +356,12 @@ import os
 from pathlib import Path
 
 payload = json.loads(Path(os.environ["VGEN_STABLE_RESPONSE"]).read_bytes())
-if not isinstance(payload, dict) or payload.get("version") != os.environ["VGEN_RELEASE_VERSION"]:
-    raise SystemExit("public stable API did not switch to the requested version")
+if (
+    not isinstance(payload, dict)
+    or set(payload) != {"schema_version", "channel", "version", "manifest_sha256"}
+    or payload.get("version") != os.environ["VGEN_RELEASE_VERSION"]
+):
+    raise SystemExit("public stable pointer did not switch to the requested version")
 PY
   rm -f -- "${STABLE_RESPONSE}"
   curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \

@@ -247,6 +247,7 @@ def _build(
     tmp_path: Path,
     *,
     origin: str = "https://gateway.example",
+    release_origin: str | None = None,
     marker: Path | None = None,
 ):
     mac, windows = _inputs(tmp_path, marker=marker, gateway_url=origin)
@@ -254,6 +255,7 @@ def _build(
         version=VERSION,
         published_at=PUBLISHED_AT,
         gateway_origin=origin,
+        release_origin=release_origin or origin,
         macos_bundle=mac,
         windows_worker_bundle=windows,
         output_root=tmp_path / "public-releases",
@@ -303,7 +305,7 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert stat.S_IMODE(result.macos_bootstrap.stat().st_mode) == 0o755
     assert "https://gateway.example" in script
     assert result.manifest_sha256 in script
-    assert "/api/v1/releases/channels/stable" in script
+    assert "/releases/channels/stable.json" in script
     assert "version manifest SHA-256 mismatch" in script
     assert "macOS artifact size or SHA-256 mismatch" in script
     assert "cross-origin release redirect refused" in script
@@ -317,6 +319,19 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert "curl" not in script
     for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):
         assert secret_word not in script
+
+
+def test_gateway_and_release_origins_are_independent(tmp_path: Path) -> None:
+    result = _build(
+        tmp_path,
+        origin="https://gateway.example",
+        release_origin="https://downloads.example",
+    )
+    script = result.macos_bootstrap.read_text(encoding="utf-8")
+    assert "GATEWAY_ORIGIN=https://gateway.example" in script
+    assert "RELEASE_ORIGIN=https://downloads.example" in script
+    assert 'stable_url = origin + "/releases/channels/stable.json"' in script
+    assert 'configured_gateway != gateway_origin' in script
 
 
 def test_bootstrap_is_replaced_before_stable_pointer_and_mismatch_fails_closed(
@@ -357,6 +372,7 @@ def test_bootstrap_is_replaced_before_stable_pointer_and_mismatch_fails_closed(
         version=VERSION,
         published_at=PUBLISHED_AT,
         gateway_origin="https://gateway.example",
+        release_origin="https://gateway.example",
         macos_bundle=mac,
         windows_worker_bundle=windows,
         output_root=root,
@@ -379,6 +395,7 @@ def test_bootstrap_downloads_same_origin_validates_and_runs_install_command(
         version=VERSION,
         published_at=PUBLISHED_AT,
         gateway_origin=origin,
+        release_origin=origin,
         macos_bundle=mac,
         windows_worker_bundle=windows,
         output_root=serve_root,
@@ -424,6 +441,7 @@ def test_bootstrap_rejects_manifest_digest_or_artifact_hash_mismatch(
         version=VERSION,
         published_at=PUBLISHED_AT,
         gateway_origin=origin,
+        release_origin=origin,
         macos_bundle=mac,
         windows_worker_bundle=windows,
         output_root=serve_root,
@@ -463,6 +481,7 @@ def test_bootstrap_rejects_cross_origin_artifact_redirect(tmp_path: Path) -> Non
         version=VERSION,
         published_at=PUBLISHED_AT,
         gateway_origin=origin,
+        release_origin=origin,
         macos_bundle=mac,
         windows_worker_bundle=windows,
         output_root=serve_root,
@@ -488,6 +507,7 @@ def test_refuses_symlinks_credentials_duplicates_and_nonidentical_version(tmp_pa
             version=VERSION,
             published_at=PUBLISHED_AT,
             gateway_origin="https://gateway.example",
+            release_origin="https://gateway.example",
             macos_bundle=linked,
             windows_worker_bundle=windows,
             output_root=tmp_path / "symlink-output",
@@ -517,6 +537,7 @@ def test_refuses_symlinks_credentials_duplicates_and_nonidentical_version(tmp_pa
         version=VERSION,
         published_at=PUBLISHED_AT,
         gateway_origin="https://gateway.example",
+        release_origin="https://gateway.example",
         macos_bundle=mac,
         windows_worker_bundle=windows,
         output_root=tmp_path / "immutable-output",
@@ -527,6 +548,7 @@ def test_refuses_symlinks_credentials_duplicates_and_nonidentical_version(tmp_pa
             version=VERSION,
             published_at=PUBLISHED_AT,
             gateway_origin="https://gateway.example",
+            release_origin="https://gateway.example",
             macos_bundle=mac,
             windows_worker_bundle=windows,
             output_root=result.root,
@@ -576,6 +598,7 @@ def test_public_installers_must_contain_the_exact_same_reviewed_wheel(tmp_path: 
             version=VERSION,
             published_at=PUBLISHED_AT,
             gateway_origin="https://gateway.example",
+            release_origin="https://gateway.example",
             macos_bundle=mac,
             windows_worker_bundle=windows,
             output_root=tmp_path / "public-releases",
@@ -634,6 +657,7 @@ def test_refuses_artifact_that_changes_while_being_staged(
             version=VERSION,
             published_at=PUBLISHED_AT,
             gateway_origin="https://gateway.example",
+            release_origin="https://gateway.example",
             macos_bundle=mac,
             windows_worker_bundle=windows,
             output_root=tmp_path / "public-releases",
@@ -650,5 +674,5 @@ def test_refuses_artifact_that_changes_while_being_staged(
     ),
 )
 def test_rejects_insecure_or_non_origin_gateway(origin: str) -> None:
-    with pytest.raises(MODULE.PublicReleaseBuildError, match="Gateway origin"):
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="origin"):
         MODULE._validated_gateway_origin(origin)

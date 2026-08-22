@@ -7,6 +7,7 @@ INSTALL_BASE="${HOME}/Library/Application Support/VGen/cli"
 LAUNCHER_DIR="${HOME}/.local/bin"
 LAUNCHER_PATH="${LAUNCHER_DIR}/vgen"
 INSTALL_ONLY=0
+RELEASE_ORIGIN="__VGEN_RELEASE_ORIGIN__"
 
 if [[ "${1:-}" == "--install-only" ]]; then
   INSTALL_ONLY=1
@@ -139,6 +140,48 @@ else
   fi
   printf '%s' "${WHEEL_SHA256}" >"${MARKER_PATH}"
   chmod 600 "${MARKER_PATH}"
+fi
+
+# The release origin is independent from every Gateway Profile. A built bundle
+# replaces the placeholder with the reviewed HTTPS download origin. Keeping it
+# in a separate 0600 file lets `vgen upgrade` remain pinned when a Gateway
+# endpoint moves to another domain.
+if [[ "${RELEASE_ORIGIN}" != "__VGEN_RELEASE_ORIGIN__" ]]; then
+  RELEASE_SOURCE_PATH="${INSTALL_BASE}/release-source.json"
+  VGEN_RELEASE_SOURCE_PATH="${RELEASE_SOURCE_PATH}" \
+  VGEN_RELEASE_ORIGIN_VALUE="${RELEASE_ORIGIN}" "${PYTHON_BIN}" -I -B <<'PY'
+import json
+import os
+import tempfile
+from pathlib import Path
+
+path = Path(os.environ["VGEN_RELEASE_SOURCE_PATH"])
+origin = os.environ["VGEN_RELEASE_ORIGIN_VALUE"]
+expected = {"schema_version": 1, "release_origin": origin}
+path.parent.mkdir(parents=True, exist_ok=True)
+if path.exists() or path.is_symlink():
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("unsafe managed release-source path")
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("unreadable managed release source") from exc
+    if current != expected:
+        raise SystemExit("managed release origin differs from this reviewed installer")
+else:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".release-source-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(expected, handle, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+PY
 fi
 
 VGEN_BIN="${RELEASE_DIR}/bin/vgen"

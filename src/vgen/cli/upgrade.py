@@ -34,7 +34,7 @@ class UpgradeError(ValueError):
 
 
 class UpgradeNetworkError(TimeoutError):
-    """The configured Gateway release channel could not be reached."""
+    """The configured release source could not be reached."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +55,57 @@ def _same_origin(url: str, endpoint: str) -> bool:
     return _origin_key(url) == _origin_key(endpoint)
 
 
+def _validated_release_origin(value: str) -> str:
+    candidate = value.strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(candidate)
+    loopback = (parsed.hostname or "").lower() in {"127.0.0.1", "::1", "localhost"}
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or (parsed.scheme != "https" and not loopback)
+    ):
+        raise UpgradeError("release origin must be a credential-free HTTPS origin")
+    return candidate
+
+
+def _release_source_path() -> Path:
+    return (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "VGen"
+        / "cli"
+        / "release-source.json"
+    )
+
+
+def _configured_release_origin(legacy_gateway_endpoint: str) -> str:
+    """Read the installer-pinned release origin, with a v0.5 legacy bridge."""
+
+    path = _release_source_path()
+    if not path.exists():
+        return _validated_release_origin(legacy_gateway_endpoint)
+    if path.is_symlink() or not path.is_file():
+        raise UpgradeError("managed release source is not a regular file")
+    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) & 0o077:
+        raise UpgradeError("managed release source permissions are too broad")
+    try:
+        value = _json_object(path.read_bytes(), label="managed release source")
+    except OSError as exc:
+        raise UpgradeError("managed release source could not be read") from exc
+    if set(value) != {"schema_version", "release_origin"} or value.get("schema_version") != 1:
+        raise UpgradeError("managed release source contract is invalid")
+    release_origin = value.get("release_origin")
+    if not isinstance(release_origin, str):
+        raise UpgradeError("managed release origin is invalid")
+    return _validated_release_origin(release_origin)
+
+
 class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
     def __init__(self, endpoint: str) -> None:
         super().__init__()
@@ -71,13 +122,13 @@ class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
 
 def _fetch(opener, url: str, *, endpoint: str, limit: int, accept: str) -> bytes:  # type: ignore[no-untyped-def]
     if not _same_origin(url, endpoint):
-        raise UpgradeError("release URL is not on the configured Gateway origin")
+        raise UpgradeError("release URL is not on the configured release origin")
     request = urllib.request.Request(url, headers={"Accept": accept})
     try:
         with opener.open(request, timeout=30) as response:
             value = response.read(limit + 1)
     except (OSError, urllib.error.URLError) as exc:
-        raise UpgradeNetworkError("could not download release metadata from the Gateway") from exc
+        raise UpgradeNetworkError("could not download metadata from the release source") from exc
     if len(value) > limit:
         raise UpgradeError("release metadata exceeded its size limit")
     return value
@@ -101,13 +152,13 @@ def _json_object(raw: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _candidate(endpoint: str, opener) -> UpgradeCandidate:  # type: ignore[no-untyped-def]
-    stable_url = f"{endpoint}/api/v1/releases/channels/stable"
+def _candidate(release_origin: str, opener) -> UpgradeCandidate:  # type: ignore[no-untyped-def]
+    stable_url = f"{release_origin}/releases/channels/stable.json"
     stable = _json_object(
         _fetch(
             opener,
             stable_url,
-            endpoint=endpoint,
+            endpoint=release_origin,
             limit=_MAX_METADATA_BYTES,
             accept="application/json",
         ),
@@ -122,15 +173,15 @@ def _candidate(endpoint: str, opener) -> UpgradeCandidate:  # type: ignore[no-un
         or _VERSION.fullmatch(version) is None
         or not isinstance(manifest_digest, str)
         or _SHA256.fullmatch(manifest_digest) is None
-        or not isinstance(stable.get("artifacts"), list)
+        or set(stable) != {"schema_version", "channel", "version", "manifest_sha256"}
     ):
         raise UpgradeError("stable release metadata contract is invalid")
 
-    manifest_url = f"{endpoint}/releases/{version}/manifest.json"
+    manifest_url = f"{release_origin}/releases/{version}/manifest.json"
     manifest_bytes = _fetch(
         opener,
         manifest_url,
-        endpoint=endpoint,
+        endpoint=release_origin,
         limit=_MAX_METADATA_BYTES,
         accept="application/json",
     )
@@ -154,15 +205,9 @@ def _candidate(endpoint: str, opener) -> UpgradeCandidate:  # type: ignore[no-un
         and item.get("kind") == "cli-installer"
         and item.get("platform") == "macos"
     ]
-    api_matches = [
-        item
-        for item in stable["artifacts"]
-        if isinstance(item, dict) and item.get("name") == "macos-cli"
-    ]
-    if len(immutable_matches) != 1 or len(api_matches) != 1:
+    if len(immutable_matches) != 1:
         raise UpgradeError("release has no unique macOS CLI artifact")
     artifact = immutable_matches[0]
-    api_artifact = api_matches[0]
     expected_keys = {
         "name",
         "kind",
@@ -172,14 +217,11 @@ def _candidate(endpoint: str, opener) -> UpgradeCandidate:  # type: ignore[no-un
         "sha256",
         "content_type",
     }
-    if set(artifact) != expected_keys or any(
-        api_artifact.get(key) != artifact.get(key) for key in expected_keys
-    ):
-        raise UpgradeError("stable and immutable macOS artifact metadata disagree")
+    if set(artifact) != expected_keys:
+        raise UpgradeError("immutable macOS artifact metadata is invalid")
     filename = artifact.get("filename")
     size = artifact.get("size")
     digest = artifact.get("sha256")
-    url = api_artifact.get("url")
     if (
         filename != f"VGen-macOS-{version}.zip"
         or isinstance(size, bool)
@@ -187,16 +229,15 @@ def _candidate(endpoint: str, opener) -> UpgradeCandidate:  # type: ignore[no-un
         or not 1 <= size <= _MAX_ARTIFACT_BYTES
         or not isinstance(digest, str)
         or _SHA256.fullmatch(digest) is None
-        or not isinstance(url, str)
     ):
         raise UpgradeError("macOS CLI artifact metadata is invalid")
-    artifact_url = urllib.parse.urljoin(f"{endpoint}/", url)
-    if not _same_origin(artifact_url, endpoint):
-        raise UpgradeError("macOS CLI artifact URL is not on the Gateway origin")
+    artifact_url = f"{release_origin}/releases/{version}/{filename}"
+    if not _same_origin(artifact_url, release_origin):
+        raise UpgradeError("macOS CLI artifact URL is not on the pinned release origin")
     return UpgradeCandidate(version, artifact_url, filename, size, digest)
 
 
-def _download(opener, candidate: UpgradeCandidate, destination: Path, endpoint: str) -> None:  # type: ignore[no-untyped-def]
+def _download(opener, candidate: UpgradeCandidate, destination: Path, release_origin: str) -> None:  # type: ignore[no-untyped-def]
     request = urllib.request.Request(
         candidate.artifact_url, headers={"Accept": "application/zip"}
     )
@@ -224,7 +265,7 @@ def _download(opener, candidate: UpgradeCandidate, destination: Path, endpoint: 
         raise UpgradeNetworkError("could not download the macOS CLI artifact") from exc
     if downloaded != candidate.size or digest.hexdigest() != candidate.sha256:
         raise UpgradeError("macOS CLI artifact size or SHA-256 does not match")
-    if not _same_origin(candidate.artifact_url, endpoint):
+    if not _same_origin(candidate.artifact_url, release_origin):
         raise UpgradeError("macOS CLI artifact origin changed during download")
 
 
@@ -349,9 +390,9 @@ def upgrade_cli(
 ) -> dict[str, Any]:
     if sys.platform != "darwin":
         raise UpgradeError("self-upgrade currently supports macOS only")
-    endpoint = profile.endpoint
-    opener = urllib.request.build_opener(_SameOriginRedirects(endpoint))
-    candidate = _candidate(endpoint, opener)
+    release_origin = _configured_release_origin(profile.endpoint)
+    opener = urllib.request.build_opener(_SameOriginRedirects(release_origin))
+    candidate = _candidate(release_origin, opener)
     try:
         current = Version(__version__)
         available = Version(candidate.version)
@@ -378,7 +419,7 @@ def upgrade_cli(
     with tempfile.TemporaryDirectory(prefix="vgen-upgrade-") as temporary:
         work = Path(temporary)
         archive = work / candidate.filename
-        _download(opener, candidate, archive, endpoint)
+        _download(opener, candidate, archive, release_origin)
         bundle = _extract_bundle(archive, work, candidate.version)
         installer = bundle / "install.command"
         try:

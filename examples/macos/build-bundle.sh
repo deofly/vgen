@@ -7,14 +7,30 @@ VERSION="$(python3 -I -B "${ROOT_DIR}/tools/project_version.py")"
 OUTPUT_DIR="${ROOT_DIR}/dist/VGen-macOS-${VERSION}"
 OUTPUT_ZIP="${ROOT_DIR}/dist/VGen-macOS-${VERSION}.zip"
 GATEWAY_URL=""
+RELEASE_ORIGIN=""
 
-if [[ "${1:-}" == "--gateway" ]]; then
-  GATEWAY_URL="${2:-}"
-  shift 2
-fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gateway)
+      GATEWAY_URL="${2:-}"
+      shift 2
+      ;;
+    --release-origin)
+      RELEASE_ORIGIN="${2:-}"
+      shift 2
+      ;;
+    *)
+      printf 'usage: %s [--gateway https://gateway.example] [--release-origin https://download.example]\n' "$0" >&2
+      exit 2
+      ;;
+  esac
+done
 if [[ "$#" -ne 0 ]]; then
-  printf 'usage: %s [--gateway https://gateway.example]\n' "$0" >&2
+  printf 'usage: %s [--gateway https://gateway.example] [--release-origin https://download.example]\n' "$0" >&2
   exit 2
+fi
+if [[ -z "${RELEASE_ORIGIN}" ]]; then
+  RELEASE_ORIGIN="${GATEWAY_URL}"
 fi
 
 WHEEL="${ROOT_DIR}/dist/vgen-${VERSION}-py3-none-any.whl"
@@ -65,7 +81,35 @@ if "Tag: py3-none-any" not in wheel_metadata.splitlines():
 PY
 
 mkdir -p "${OUTPUT_DIR}"
-cp "${ROOT_DIR}/examples/macos/install.command" "${OUTPUT_DIR}/install.command"
+VGEN_INSTALL_TEMPLATE="${ROOT_DIR}/examples/macos/install.command" \
+VGEN_INSTALL_OUTPUT="${OUTPUT_DIR}/install.command" \
+VGEN_RELEASE_ORIGIN_VALUE="${RELEASE_ORIGIN}" python3 -I -B <<'PY'
+import os
+from pathlib import Path
+from urllib.parse import urlsplit
+
+source = Path(os.environ["VGEN_INSTALL_TEMPLATE"])
+destination = Path(os.environ["VGEN_INSTALL_OUTPUT"])
+origin = os.environ["VGEN_RELEASE_ORIGIN_VALUE"].strip().rstrip("/")
+parsed = urlsplit(origin)
+loopback = (parsed.hostname or "").lower() in {"127.0.0.1", "::1", "localhost"}
+if (
+    parsed.scheme not in {"http", "https"}
+    or not parsed.hostname
+    or parsed.username is not None
+    or parsed.password is not None
+    or parsed.path not in {"", "/"}
+    or parsed.query
+    or parsed.fragment
+    or (parsed.scheme != "https" and not loopback)
+):
+    raise SystemExit("--release-origin must be a credential-free HTTPS origin")
+template = source.read_text(encoding="utf-8")
+token = "__VGEN_RELEASE_ORIGIN__"
+if template.count(token) != 1:
+    raise SystemExit("install.command release-origin placeholder is invalid")
+destination.write_text(template.replace(token, origin), encoding="utf-8")
+PY
 # The bundle keeps an offline README, but its content comes from the single
 # user-guide source instead of a separately maintained component document.
 cp "${ROOT_DIR}/docs/user-guide.md" "${OUTPUT_DIR}/README.md"

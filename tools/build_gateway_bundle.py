@@ -114,8 +114,9 @@ def build_bundle(*, repository: Path, wheel: Path, output: Path) -> Path:
     wheel_name = f"vgen-{version}-py3-none-any.whl"
     bundle_name = f"vgen-gateway-{version}"
     installer = repository / "examples" / "ecs" / "setup-gateway.sh"
+    release_site_installer = repository / "examples" / "ecs" / "setup-release-site.sh"
     service = repository / "examples" / "ecs" / "vgen-gateway.service"
-    for source in (wheel, installer, service):
+    for source in (wheel, installer, release_site_installer, service):
         if not source.is_file():
             raise FileNotFoundError(source)
 
@@ -129,6 +130,7 @@ def build_bundle(*, repository: Path, wheel: Path, output: Path) -> Path:
         destinations = {
             wheel: bundle_root / wheel_name,
             installer: bundle_root / "setup-gateway.sh",
+            release_site_installer: bundle_root / "setup-release-site.sh",
             service: bundle_root / "vgen-gateway.service",
         }
         for source, destination in destinations.items():

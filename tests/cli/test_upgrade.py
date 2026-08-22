@@ -63,16 +63,16 @@ def _release_metadata(endpoint: str, version: str = "0.5.0") -> tuple[Opener, by
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode()
     stable = {
-        **manifest,
+        "schema_version": 1,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "channel": "stable",
-        "artifacts": [{**metadata, "url": f"/releases/{version}/{filename}"}],
+        "version": version,
     }
     stable_bytes = (json.dumps(stable, separators=(",", ":")) + "\n").encode()
     return (
         Opener(
             {
-                f"{endpoint}/api/v1/releases/channels/stable": stable_bytes,
+                f"{endpoint}/releases/channels/stable.json": stable_bytes,
                 f"{endpoint}/releases/{version}/manifest.json": manifest_bytes,
                 f"{endpoint}/releases/{version}/{filename}": artifact,
             }
@@ -111,6 +111,42 @@ def test_upgrade_candidate_is_bound_to_stable_manifest() -> None:
     assert candidate.size == len(artifact)
     assert candidate.artifact_url == (
         "https://gateway.example/releases/0.5.0/VGen-macOS-0.5.0.zip"
+    )
+
+
+def test_upgrade_uses_pinned_release_origin_independent_of_gateway(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "release-source.json"
+    source.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "release_origin": "https://downloads.example",
+            }
+        ),
+        encoding="utf-8",
+    )
+    source.chmod(0o600)
+    monkeypatch.setattr(upgrade, "_release_source_path", lambda: source)
+
+    assert (
+        upgrade._configured_release_origin("https://gateway.example")
+        == "https://downloads.example"
+    )
+
+
+def test_upgrade_legacy_bridge_falls_back_to_gateway_when_source_is_absent(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        upgrade,
+        "_release_source_path",
+        lambda: tmp_path / "not-installed-yet.json",
+    )
+    assert (
+        upgrade._configured_release_origin("https://gateway.example")
+        == "https://gateway.example"
     )
 
 

@@ -123,7 +123,7 @@ def _validated_gateway_origin(value: str) -> str:
         parsed = urlsplit(candidate)
         port = parsed.port
     except ValueError as exc:
-        raise PublicReleaseBuildError("Gateway origin is invalid") from exc
+        raise PublicReleaseBuildError("origin is invalid") from exc
     loopback = (parsed.hostname or "").lower() in {"127.0.0.1", "::1", "localhost"}
     if (
         parsed.scheme not in {"http", "https"}
@@ -137,7 +137,7 @@ def _validated_gateway_origin(value: str) -> str:
         or port is None and parsed.netloc.endswith(":")
     ):
         raise PublicReleaseBuildError(
-            "Gateway origin must be an HTTPS origin without credentials, path, query, or fragment"
+            "origin must be HTTPS without credentials, path, query, or fragment"
         )
     return candidate
 
@@ -427,19 +427,27 @@ def _atomic_public_file(path: Path, content: bytes, *, mode: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _macos_bootstrap(*, gateway_origin: str, version: str, manifest_sha256: str) -> bytes:
-    origin = shlex.quote(gateway_origin)
+def _macos_bootstrap(
+    *,
+    gateway_origin: str,
+    release_origin: str,
+    version: str,
+    manifest_sha256: str,
+) -> bytes:
+    gateway = shlex.quote(gateway_origin)
+    release = shlex.quote(release_origin)
     expected_version = shlex.quote(version)
     expected_manifest = shlex.quote(manifest_sha256)
     script = f'''#!/bin/sh
 set -eu
 umask 077
 
-GATEWAY_ORIGIN={origin}
+GATEWAY_ORIGIN={gateway}
+RELEASE_ORIGIN={release}
 EXPECTED_VERSION={expected_version}
 EXPECTED_MANIFEST_SHA256={expected_manifest}
-readonly GATEWAY_ORIGIN EXPECTED_VERSION EXPECTED_MANIFEST_SHA256
-export GATEWAY_ORIGIN EXPECTED_VERSION EXPECTED_MANIFEST_SHA256
+readonly GATEWAY_ORIGIN RELEASE_ORIGIN EXPECTED_VERSION EXPECTED_MANIFEST_SHA256
+export GATEWAY_ORIGIN RELEASE_ORIGIN EXPECTED_VERSION EXPECTED_MANIFEST_SHA256
 
 PYTHON_BIN=""
 for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
@@ -472,7 +480,8 @@ import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 
-origin = os.environ["GATEWAY_ORIGIN"]
+gateway_origin = os.environ["GATEWAY_ORIGIN"]
+origin = os.environ["RELEASE_ORIGIN"]
 expected_version = os.environ["EXPECTED_VERSION"]
 expected_manifest_sha256 = os.environ["EXPECTED_MANIFEST_SHA256"]
 work = Path(os.environ["VGEN_BOOTSTRAP_WORK_DIR"])
@@ -480,7 +489,7 @@ origin_parts = urllib.parse.urlsplit(origin)
 origin_key = (origin_parts.scheme, origin_parts.hostname, origin_parts.port)
 loopback = (origin_parts.hostname or "").lower() in {{"127.0.0.1", "::1", "localhost"}}
 if origin_parts.scheme != "https" and not (origin_parts.scheme == "http" and loopback):
-    raise SystemExit("VGen Gateway must use HTTPS")
+    raise SystemExit("VGen release origin must use HTTPS")
 
 
 def same_origin(url):
@@ -514,13 +523,15 @@ def fetch(url, limit):
     return data
 
 
-stable_url = origin + "/api/v1/releases/channels/stable"
+stable_url = origin + "/releases/channels/stable.json"
 try:
     stable = json.loads(fetch(stable_url, 1024 * 1024))
 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
     raise SystemExit("could not read the stable VGen release metadata") from exc
 if (
     not isinstance(stable, dict)
+    or set(stable) != {{"schema_version", "channel", "version", "manifest_sha256"}}
+    or stable.get("schema_version") != 1
     or stable.get("channel") != "stable"
     or stable.get("version") != expected_version
     or stable.get("manifest_sha256") != expected_manifest_sha256
@@ -571,20 +582,7 @@ if (
     or any(character not in "0123456789abcdef" for character in digest)
 ):
     raise SystemExit("macOS artifact metadata is invalid")
-api_matches = [
-    item
-    for item in stable.get("artifacts", [])
-    if isinstance(item, dict) and item.get("name") == "macos-cli"
-]
-if len(api_matches) != 1 or any(
-    api_matches[0].get(key) != artifact.get(key)
-    for key in ("kind", "platform", "filename", "size", "sha256", "content_type")
-):
-    raise SystemExit("stable API and immutable manifest disagree")
-
-artifact_url = urllib.parse.urljoin(
-    origin + "/", str(api_matches[0].get("url") or "/releases/" + expected_version + "/" + filename)
-)
+artifact_url = origin + "/releases/" + expected_version + "/" + filename
 if not same_origin(artifact_url):
     raise SystemExit("cross-origin macOS artifact URL refused")
 archive_path = work / filename
@@ -660,7 +658,7 @@ try:
                 configured_gateway = archive.read(entries[optional_gateway]).decode("utf-8").strip()
             except UnicodeDecodeError as exc:
                 raise SystemExit("macOS gateway-default.txt is unreadable") from exc
-            if configured_gateway != origin:
+            if configured_gateway != gateway_origin:
                 raise SystemExit("macOS gateway-default.txt does not match this Gateway")
         try:
             checksum_lines = archive.read(entries[prefix + "SHA256SUMS"]).decode("ascii").splitlines()
@@ -696,7 +694,7 @@ except (OSError, zipfile.BadZipFile) as exc:
     raise SystemExit("could not safely extract the macOS CLI bundle") from exc
 PY
 
-printf '\nVerified VGen macOS %s from %s.\n' "$EXPECTED_VERSION" "$GATEWAY_ORIGIN"
+printf '\nVerified VGen macOS %s from %s.\n' "$EXPECTED_VERSION" "$RELEASE_ORIGIN"
 if [ "${{VGEN_INSTALL_YES:-0}}" = '1' ]; then
   answer=y
 else
@@ -734,6 +732,7 @@ def build_public_release(
     version: str,
     published_at: str,
     gateway_origin: str,
+    release_origin: str,
     macos_bundle: Path,
     windows_worker_bundle: Path,
     output_root: Path,
@@ -742,6 +741,7 @@ def build_public_release(
         raise PublicReleaseBuildError("version must be MAJOR.MINOR.PATCH")
     published_at = _validated_published_at(published_at)
     gateway_origin = _validated_gateway_origin(gateway_origin)
+    release_origin = _validated_gateway_origin(release_origin)
     macos_bundle = _regular_source(macos_bundle, label="macOS CLI bundle")
     windows_worker_bundle = _regular_source(
         windows_worker_bundle, label="Windows Worker bundle"
@@ -829,6 +829,7 @@ def build_public_release(
 
     bootstrap = _macos_bootstrap(
         gateway_origin=gateway_origin,
+        release_origin=release_origin,
         version=version,
         manifest_sha256=manifest_sha256,
     )
@@ -865,6 +866,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", default=version)
     parser.add_argument("--published-at", required=True, metavar="YYYY-MM-DDTHH:MM:SSZ")
     parser.add_argument("--gateway-origin", required=True, metavar="https://gateway.example")
+    parser.add_argument("--release-origin", required=True, metavar="https://download.example")
     parser.add_argument("--mac-bundle", type=Path)
     parser.add_argument("--windows-worker-bundle", type=Path)
     parser.add_argument(
@@ -888,6 +890,7 @@ def main() -> int:
         version=version,
         published_at=arguments.published_at,
         gateway_origin=arguments.gateway_origin,
+        release_origin=arguments.release_origin,
         macos_bundle=macos_bundle,
         windows_worker_bundle=windows_bundle,
         output_root=arguments.output_root,
