@@ -735,11 +735,10 @@ Gateway bundle 包含 `INSTALL.txt`、`setup-gateway.sh`、wheel、systemd unit 
 `SHA256SUMS`。脚本管理 `/opt/vgen`、`/var/lib/vgen`、`/etc/vgen` 和
 `/etc/nginx/conf.d/vgen.conf`，但不修改 OSS、RAM Role、安全组或其他云权限。升级必须先对
 数据库副本做预检和一致性备份，服务/Nginx 健康失败时恢复旧 runtime、数据库和 route。
-早期 `/opt|etc|var/lib|var/backups/vgen-v1` 布局只作为一次性升级来源：迁移必须先验证旧服务、
-数据库、权限、OSS 环境和公网健康，停止服务后移动目录并修正 virtualenv、systemd、安装状态和
-服务用户 home；任何失败都恢复旧布局。新安装和已迁移状态不得重新创建带 `v1` 的目录。
-历史内部版本 `2.0.0a1` 是版本策略切换前的明确迁移源；兼容代码只能精确 allowlist 这个值，
-不得放宽为接受任意 PEP 440 预发布版或绕过正常的降级保护。
+安装器只接受正式的 `MAJOR.MINOR.PATCH` 版本和上述固定目录。开发测试阶段产生的不一致目录、
+预发布版本或服务账号配置不进入兼容矩阵，也不能走 `upgrade`；清空该测试 ECS 的旧 Gateway
+状态后，使用当前发行包执行全新 `install`。进入正式使用后，`reset-test` 只处理安装器创建的
+固定目录，正常版本升级继续使用带数据库备份和失败回滚的 `upgrade`。
 
 Mac bundle 包含 `install.command`、用户手册、wheel、`SHA256SUMS` 和可选默认 Gateway。安装器
 不得使用 sudo、修改 shell rc 或把 secret 放入 LaunchAgent；已有 profile 时只升级程序，不得

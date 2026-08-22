@@ -175,12 +175,6 @@ sudo ./setup-gateway.sh upgrade --domain <Gateway域名>
 升级会备份数据库、runtime 和配置，健康检查失败时自动恢复旧版本。重复升级到已经健康运行
 的同一版本是安全的幂等操作。
 
-早期测试安装使用过 `/opt/vgen-v1`、`/etc/vgen-v1`、`/var/lib/vgen-v1` 和
-`/var/backups/vgen-v1`。首次使用新版安装器执行 `upgrade` 时，会在停止 Gateway 后自动迁移到
-稳定的 `/opt/vgen`、`/etc/vgen`、`/var/lib/vgen` 和 `/var/backups/vgen`，同步 systemd unit、
-虚拟环境路径、服务用户 home 和安装状态；迁移失败会恢复旧目录并重新启动旧服务。`/api/v1`
-是 API 兼容版本，不受服务器目录改名影响。
-
 从 0.2.2 升级到 0.3.0 后，先在 Workspace Owner 的 Mac 升级 CLI，再运行一次：
 
 ```bash
@@ -190,11 +184,6 @@ vgen workspace owner-migrate
 已有可验证 Owner genesis/pin 时命令只报告当前状态；真正的旧 Workspace 会显示一次
 legacy TOFU 警告，要求核对 Gateway、Workspace、User 和 root key ID 并输入确认词。完成前，
 邀请 User、发放或轮换 Workspace key 都会默认拒绝，不会静默信任 Gateway 的 Owner 字段。
-
-早期内部测试 Gateway 使用过 `2.0.0a1` 标识，之后项目正式改用 `0.MINOR.PATCH`。从该
-历史版本升级必须使用 `0.2.2` 或更高版本的安装包；安装器只把**完全匹配的** `2.0.0a1`
-视为迁移前版本。其他预发布字符串、未知版本和真正的高版本降级仍会被拒绝。不要手工修改
-已安装 wheel 的 metadata、Gateway 数据库或包内 `SHA256SUMS`。
 
 ### 3.3 中断恢复、状态和路由回滚
 

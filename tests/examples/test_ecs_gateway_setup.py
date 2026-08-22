@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import json
 import os
 import sqlite3
 import stat
@@ -190,7 +189,8 @@ def test_gateway_release_version_comes_from_pyproject_and_installer_bundle() -> 
     assert "sudo cat %s" in source
     assert "Paste it only into the hidden VGen prompt" in source
     assert "vgen setup --gateway https://%s" in source
-    assert 'readonly LEGACY_GATEWAY_BRIDGE_VERSION="2.0.0a1"' in source
+    assert "LEGACY_GATEWAY_BRIDGE_VERSION" not in source
+    assert "LEGACY_V1_" not in source
     assert 'readonly INSTALL_ROOT="/opt/vgen"' in source
     assert 'readonly DATA_ROOT="/var/lib/vgen"' in source
     assert 'readonly CONFIG_ROOT="/etc/vgen"' in source
@@ -199,130 +199,9 @@ def test_gateway_release_version_comes_from_pyproject_and_installer_bundle() -> 
     assert "EnvironmentFile=/etc/vgen/gateway.env" in unit
     assert "--database /var/lib/vgen/vgen-gateway.db" in unit
     assert "ReadWritePaths=/var/lib/vgen" in unit
-
-
-def test_gateway_upgrade_migrates_legacy_v1_layout_with_rollback() -> None:
-    source = INSTALLER.read_text(encoding="utf-8")
-    migration = source.split("migrate_legacy_v1_layout_if_needed() {", 1)[1].split(
-        "\n}", 1
-    )[0]
-    rollback = source.split("handle_layout_migration_error() {", 1)[1].split(
-        "\n}", 1
-    )[0]
-    upgrade = source.split("upgrade_gateway() {", 1)[1].split("\n}", 1)[0]
-
-    assert upgrade.index("verify_release_bundle") < upgrade.index(
-        "migrate_legacy_v1_layout_if_needed"
-    )
-    assert upgrade.index("migrate_legacy_v1_layout_if_needed") < upgrade.index(
-        "verify_upgrade_preconditions"
-    )
-    assert migration.index("verify_legacy_v1_layout_for_migration") < migration.index(
-        'systemctl stop "${SERVICE_NAME}"'
-    )
-    assert migration.index('mv -- "${LEGACY_V1_INSTALL_ROOT}" "${INSTALL_ROOT}"') < (
-        migration.index("relocate_python_runtime_scripts")
-    )
-    assert "rewrite_migrated_install_state" in migration
-    assert 'usermod --home "${DATA_ROOT}" vgen' in migration
-    assert 'service_user_home_is_supported_for_layout_migration "${legacy_home}"' in source
-    assert "unsupported home directory: ${legacy_home}" in source
-    assert migration.index('install -o root -g root -m 0644 "${SERVICE_SOURCE_PATH}"') < (
-        migration.index('systemctl start "${SERVICE_NAME}"')
-    )
-    assert "gateway_local_health_with_retry" in migration
-    assert "gateway_https_health_with_retry" in migration
-    assert "trap 'handle_layout_migration_error $?' ERR" in migration
-
-    assert 'mv -- "${CONFIG_ROOT}" "${LEGACY_V1_CONFIG_ROOT}"' in rollback
-    assert 'mv -- "${DATA_ROOT}" "${LEGACY_V1_DATA_ROOT}"' in rollback
-    assert 'mv -- "${INSTALL_ROOT}" "${LEGACY_V1_INSTALL_ROOT}"' in rollback
-    assert 'mv -- "${BACKUP_ROOT}" "${LEGACY_V1_BACKUP_ROOT}"' in rollback
-    assert 'usermod --home "${LEGACY_V1_DATA_ROOT}" vgen' in rollback
-    assert 'systemctl start "${SERVICE_NAME}"' in rollback
-    assert "rm -rf" not in migration
-    assert "rm -rf" not in rollback
-
-
-def test_layout_migration_accepts_the_existing_system_account_home() -> None:
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            'source "$1"; service_user_home_is_supported_for_layout_migration /home/vgen',
-            "bash",
-            str(INSTALLER),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=os.environ | {"VGEN_SETUP_LIBRARY_ONLY": "1"},
-    )
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_layout_migration_rewrites_saved_nginx_backup_path(tmp_path: Path) -> None:
-    old_backup_root = tmp_path / "backups" / "vgen-v1"
-    new_backup_root = tmp_path / "backups" / "vgen"
-    old_backup_root.mkdir(parents=True)
-    new_backup_root.mkdir()
-    backup_name = "nginx-vgen-20260823T010203Z.ABC123.conf"
-    (new_backup_root / backup_name).write_text("reviewed nginx backup\n", encoding="utf-8")
-    config_root = tmp_path / "config"
-    config_root.mkdir()
-    state = config_root / "install-state.json"
-    state.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "domain": "vgen-gw.example.com",
-                "nginx_config": "/etc/nginx/conf.d/vgen.conf",
-                "nginx_backup": str(old_backup_root / backup_name),
-                "installed_at": "2026-08-23T01:02:03+00:00",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    state.chmod(0o600)
-    installer = tmp_path / "setup-gateway.sh"
-    source = INSTALLER.read_text(encoding="utf-8")
-    source = source.replace(
-        'readonly BACKUP_ROOT="/var/backups/vgen"',
-        f'readonly BACKUP_ROOT={str(new_backup_root)!r}',
-    ).replace(
-        'readonly LEGACY_V1_BACKUP_ROOT="/var/backups/vgen-v1"',
-        f'readonly LEGACY_V1_BACKUP_ROOT={str(old_backup_root)!r}',
-    )
-    installer.write_text(source, encoding="utf-8")
-    command_root = tmp_path / "commands"
-    command_root.mkdir()
-    (command_root / "python3.11").symlink_to(sys.executable)
-
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            'source "$1"; chown() { :; }; rewrite_migrated_install_state "$2"',
-            "bash",
-            str(installer),
-            str(state),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=os.environ
-        | {
-            "PATH": f"{command_root}:{os.environ['PATH']}",
-            "VGEN_SETUP_LIBRARY_ONLY": "1",
-        },
-    )
-
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(state.read_text(encoding="utf-8"))
-    assert payload["nginx_backup"] == str(new_backup_root / backup_name)
-    assert stat.S_IMODE(state.stat().st_mode) == 0o600
+    assert 'usermod --home "${DATA_ROOT}" --shell /usr/sbin/nologin vgen' in source
+    assert 'verify_service_user_configuration' in source
+    assert 'Gateway service user home must be ${DATA_ROOT}' in source
 
 
 def test_gateway_installer_validates_oss_configuration_before_mutation() -> None:
@@ -423,10 +302,8 @@ def test_fresh_gateway_install_can_start_without_a_legacy_nginx_virtual_host() -
     assert "proxy_pass" not in fallback
 
 
-@pytest.mark.parametrize("installed", [VERSION, "2.0.0a1"])
-def test_gateway_runtime_version_accepts_release_and_exact_legacy_bridge(
-    tmp_path: Path, installed: str
-) -> None:
+def test_gateway_runtime_version_accepts_release(tmp_path: Path) -> None:
+    installed = VERSION
     runtime, packages = _runtime_with_distribution(tmp_path, installed)
     result = subprocess.run(
         [
@@ -450,8 +327,8 @@ def test_gateway_runtime_version_accepts_release_and_exact_legacy_bridge(
     assert result.stdout.strip() == installed
 
 
-@pytest.mark.parametrize("installed", ["2.0.0a2", "0.2.1rc1"])
-def test_gateway_runtime_version_rejects_every_other_prerelease(
+@pytest.mark.parametrize("installed", ["2.0.0a1", "2.0.0a2", "0.2.1rc1"])
+def test_gateway_runtime_version_rejects_prerelease_versions(
     tmp_path: Path, installed: str
 ) -> None:
     runtime, packages = _runtime_with_distribution(tmp_path, installed)
@@ -480,13 +357,12 @@ def test_gateway_runtime_version_rejects_every_other_prerelease(
 @pytest.mark.parametrize(
     ("installed", "expected"),
     [
-        ("2.0.0a1", "-1"),
         ("0.2.0", "-1"),
         (VERSION, "0"),
         ("2.0.0", "1"),
     ],
 )
-def test_gateway_upgrade_orders_only_the_exact_legacy_version_as_a_predecessor(
+def test_gateway_upgrade_orders_release_versions(
     tmp_path: Path, installed: str, expected: str
 ) -> None:
     commands = tmp_path / "commands"

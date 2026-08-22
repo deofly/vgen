@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install VGen Gateway next to a legacy deployment, then switch Nginx only
-# after the new service is healthy. This script intentionally never changes
-# OSS/IAM policy. Test reset archives only explicitly managed Gateway paths.
+# Install or upgrade VGen Gateway, then switch Nginx only after the service is
+# healthy. This script intentionally never changes OSS/IAM policy. Test reset
+# archives only explicitly managed Gateway paths.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -14,18 +14,12 @@ readonly DATA_ROOT="/var/lib/vgen"
 readonly RELEASE_ROOT="/var/www/vgen-releases"
 readonly CONFIG_ROOT="/etc/vgen"
 readonly BACKUP_ROOT="/var/backups/vgen"
-readonly LEGACY_V1_INSTALL_ROOT="/opt/vgen-v1"
-readonly LEGACY_V1_DATA_ROOT="/var/lib/vgen-v1"
-readonly LEGACY_V1_CONFIG_ROOT="/etc/vgen-v1"
-readonly LEGACY_V1_BACKUP_ROOT="/var/backups/vgen-v1"
 readonly DATABASE_PATH="${DATA_ROOT}/vgen-gateway.db"
 readonly BOOTSTRAP_PATH="${DATA_ROOT}/bootstrap-code"
 readonly ENVIRONMENT_PATH="${CONFIG_ROOT}/gateway.env"
 readonly UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}"
 readonly NGINX_CONFIG_PATH="/etc/nginx/conf.d/vgen.conf"
 readonly INSTALL_STATE_PATH="${CONFIG_ROOT}/install-state.json"
-readonly LEGACY_DATABASE_DEFAULT="/opt/vgen/server/data/vgen.db"
-readonly LEGACY_GATEWAY_BRIDGE_VERSION="2.0.0a1"
 readonly GATEWAY_PORT="8010"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -53,7 +47,6 @@ OSS_TRANSFER_ROLE="VGenArtifactTransferRole"
 OSS_STS_REGION=""
 OSS_STS_DURATION_SECONDS="900"
 CONFIRM_OSS_CONFIGURED=0
-LEGACY_DATABASE_PATH="${LEGACY_DATABASE_DEFAULT}"
 NGINX_ROLLBACK_BACKUP=""
 NGINX_GENERATED_PATH=""
 NGINX_REPLACED=0
@@ -68,13 +61,6 @@ UPGRADE_DATABASE_BACKUP=""
 UPGRADE_CONFIG_BACKED_UP=0
 UPGRADE_OLD_RUNTIME_MOVED=0
 UPGRADE_NGINX_REPLACED=0
-LAYOUT_MIGRATION_BACKUP_DIR=""
-LAYOUT_INSTALL_MOVED=0
-LAYOUT_DATA_MOVED=0
-LAYOUT_CONFIG_MOVED=0
-LAYOUT_BACKUP_MOVED=0
-LAYOUT_USER_HOME_MOVED=0
-LAYOUT_UNIT_REPLACED=0
 
 usage() {
   cat <<'EOF'
@@ -133,7 +119,7 @@ Non-interactive test reset additionally requires --confirm-reset-test and
 Show current service and endpoint status:
   sudo ./setup-gateway.sh status --domain vgen.example.com
 
-Route Nginx back to the saved legacy configuration:
+Route Nginx back to the saved previous configuration:
   sudo ./setup-gateway.sh rollback \
     --domain vgen.example.com \
     --confirm-domain vgen.example.com \
@@ -152,18 +138,13 @@ Options:
   --sts-region REGION    STS region. Defaults to the region in the OSS endpoint.
   --oss-sts-duration N   STS lifetime in seconds, 900..3600. Default: 900.
   --confirm-oss-configured  Confirm the generated RAM/OSS setup checklist is done.
-  --legacy-database PATH  Legacy SQLite database to back up before install.
-                          Default: /opt/vgen/server/data/vgen.db
-
 Safety properties:
   * The domain must be provided twice and match exactly.
   * install requires an explicit confirmation that no task is active.
-  * the legacy SQLite database is backed up with SQLite's online backup API.
-  * the v1 service is checked on 127.0.0.1:8010 before Nginx is changed.
-  * HTTPS health retries for at most 30 seconds before restoring the legacy route.
+  * Gateway is checked on 127.0.0.1:8010 before Nginx is changed.
+  * HTTPS health retries for at most 30 seconds before restoring the previous route.
   * upgrade keeps a WAL-consistent database snapshot and the previous runtime/config.
   * a failed upgrade restores the previous database, runtime and service configuration.
-  * the legacy pre-v1 service is not stopped or deleted.
   * local task-media storage is prohibited; release downloads remain on ECS.
   * OSS mode uses only an ECS RAM Role and a private bucket; IAM is never modified.
 EOF
@@ -288,11 +269,6 @@ parse_arguments() {
       --confirm-oss-configured)
         CONFIRM_OSS_CONFIGURED=1
         shift
-        ;;
-      --legacy-database)
-        require_value "$1" "${2:-}"
-        LEGACY_DATABASE_PATH="$2"
-        shift 2
         ;;
       -h|--help)
         usage
@@ -495,7 +471,7 @@ collect_interactive_confirmations() {
   if [[ "${ACTION}" == "rollback" && "${CONFIRM_ROLLBACK}" -ne 1 ]]; then
     [[ -t 0 && -t 1 && -r /dev/tty && -w /dev/tty ]] || \
       die "non-interactive rollback requires --confirm-rollback"
-    printf 'Route public traffic back to the saved legacy service? [y/N] ' >/dev/tty
+    printf 'Route public traffic back to the saved previous configuration? [y/N] ' >/dev/tty
     IFS= read -r answer </dev/tty || die "rollback confirmation was cancelled"
     case "${answer}" in
       y|Y|yes|YES|Yes)
@@ -510,7 +486,7 @@ collect_interactive_confirmations() {
   if [[ "${ACTION}" == "activate" && "${CONFIRM_ACTIVATE}" -ne 1 ]]; then
     [[ -t 0 && -t 1 && -r /dev/tty && -w /dev/tty ]] || \
       die "non-interactive activate requires --confirm-activate"
-    printf 'Activate public HTTPS traffic on Gateway v1 now? [y/N] ' >/dev/tty
+    printf 'Activate public HTTPS traffic on Gateway now? [y/N] ' >/dev/tty
     IFS= read -r answer </dev/tty || die "activation confirmation was cancelled"
     case "${answer}" in
       y|Y|yes|YES|Yes)
@@ -725,27 +701,18 @@ verify_gateway_tls_certificate() {
     die "TLS private key not found at ${certificate_root}/privkey.pem"
 }
 
-verify_legacy_nginx_and_tls() {
-  verify_nginx_config_and_tls
-  grep -Fq "proxy_pass http://127.0.0.1:8000;" "${NGINX_CONFIG_PATH}" || \
-    die "existing Nginx config is not the expected legacy route to 127.0.0.1:8000"
-}
-
 verify_install_nginx_and_tls() {
   verify_gateway_tls_certificate
   if [[ ! -e "${NGINX_CONFIG_PATH}" ]]; then
     return
   fi
   verify_nginx_config_and_tls
-  if grep -Fq "proxy_pass http://127.0.0.1:8000;" "${NGINX_CONFIG_PATH}"; then
-    return
-  fi
   local expected_config
   expected_config="$(mktemp "${NGINX_CONFIG_PATH}.install-expected.XXXXXX")"
   render_nginx_config "${expected_config}"
   if ! cmp --silent -- "${NGINX_CONFIG_PATH}" "${expected_config}"; then
     rm -f -- "${expected_config}"
-    die "existing Nginx config is neither the legacy route nor deterministic VGen Gateway route"
+    die "existing Nginx config is not the deterministic VGen Gateway route"
   fi
   rm -f -- "${expected_config}"
 }
@@ -753,7 +720,6 @@ verify_install_nginx_and_tls() {
 verify_gateway_base_preconditions() {
   [[ "${CONFIRM_NO_ACTIVE_TASKS}" -eq 1 ]] || \
     die "${ACTION} requires --confirm-no-active-tasks after all old tasks have finished"
-  [[ "${LEGACY_DATABASE_PATH}" == /* ]] || die "--legacy-database must be an absolute path"
   verify_install_nginx_and_tls
 
   if python3.11 - "${GATEWAY_PORT}" <<'PY'
@@ -888,7 +854,7 @@ PY
     die "activate refused: install state names an unexpected Nginx config"
   verify_nginx_backup_path "${backup_path}"
   [[ -f "${backup_path}" && ! -L "${backup_path}" ]] || \
-    die "activate refused: saved legacy Nginx backup is missing or unsafe"
+    die "activate refused: saved Nginx backup is missing or unsafe"
   verify_root_owned_not_writable "${backup_path}" "saved Nginx backup"
   grep -Fq "server_name ${DOMAIN};" "${backup_path}" || \
     die "activate refused: saved backup belongs to a different domain"
@@ -897,11 +863,10 @@ PY
   uninitialized_backup="$(mktemp "${NGINX_CONFIG_PATH}.activate-uninitialized.XXXXXX")"
   render_nginx_config "${expected_backup}"
   render_uninitialized_nginx_config "${uninitialized_backup}"
-  if ! grep -Fq "proxy_pass http://127.0.0.1:8000;" "${backup_path}" && \
-     ! cmp --silent -- "${backup_path}" "${expected_backup}" && \
+  if ! cmp --silent -- "${backup_path}" "${expected_backup}" && \
      ! cmp --silent -- "${backup_path}" "${uninitialized_backup}"; then
     rm -f -- "${expected_backup}" "${uninitialized_backup}"
-    die "activate refused: saved backup is neither legacy nor a deterministic VGen baseline"
+    die "activate refused: saved backup is not a deterministic VGen baseline"
   fi
   rm -f -- "${expected_backup}" "${uninitialized_backup}"
   systemctl is-active --quiet "${SERVICE_NAME}" || \
@@ -918,7 +883,7 @@ PY
     ACTIVATION_ALREADY_ACTIVE=1
   else
     rm -f -- "${expected_config}"
-    die "activate refused: current Nginx config is neither the saved legacy baseline nor deterministic v1"
+    die "activate refused: current Nginx config is neither the saved baseline nor deterministic Gateway config"
   fi
   rm -f -- "${expected_config}"
   ACTIVATION_BACKUP_PATH="${backup_path}"
@@ -929,37 +894,8 @@ PY
   fi
 }
 
-check_legacy_task_status() {
-  local status_file
-  status_file="$(mktemp /tmp/vgen-legacy-status.XXXXXX)"
-  if curl --noproxy '*' --fail --silent --show-error --max-time 10 \
-    "https://${DOMAIN}/api/status" >"${status_file}"; then
-    if ! python3.11 - "${status_file}" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    payload = json.load(handle)
-workers = payload.get("workers")
-if not isinstance(workers, list):
-    raise SystemExit(2)
-busy = [worker for worker in workers if worker.get("current_task") is not None]
-if busy:
-    print(f"legacy endpoint reports {len(busy)} active task(s)", file=sys.stderr)
-    raise SystemExit(1)
-PY
-    then
-      rm -f -- "${status_file}"
-      die "legacy task status is busy or invalid; stop and inspect before installing"
-    fi
-    log "legacy endpoint reports no active task"
-  else
-    warn "legacy /api/status could not be read; relying on your explicit no-active-task confirmation"
-  fi
-  rm -f -- "${status_file}"
-}
-
 ensure_service_user_and_directories() {
+  local service_home service_shell
   if ! getent group vgen >/dev/null 2>&1; then
     groupadd --system vgen
   fi
@@ -968,47 +904,28 @@ ensure_service_user_and_directories() {
   elif ! id -nG vgen | tr ' ' '\n' | grep -Fxq vgen; then
     die "existing user 'vgen' is not a member of group 'vgen'; inspect it manually"
   fi
+  service_home="$(getent passwd vgen | awk -F: '{print $6}')"
+  service_shell="$(getent passwd vgen | awk -F: '{print $7}')"
+  if [[ "${service_home}" != "${DATA_ROOT}" || \
+        "${service_shell}" != "/usr/sbin/nologin" ]]; then
+    usermod --home "${DATA_ROOT}" --shell /usr/sbin/nologin vgen
+  fi
   install -d -o root -g root -m 0755 "${INSTALL_ROOT}" "${RELEASE_ROOT}"
   install -d -o vgen -g vgen -m 0700 "${DATA_ROOT}"
   install -d -o root -g root -m 0700 "${CONFIG_ROOT}" "${BACKUP_ROOT}"
 }
 
-backup_legacy_database() {
-  if [[ ! -e "${LEGACY_DATABASE_PATH}" ]]; then
-    warn "legacy database does not exist at ${LEGACY_DATABASE_PATH}; no legacy database backup was created"
-    return
-  fi
-  [[ -f "${LEGACY_DATABASE_PATH}" && ! -L "${LEGACY_DATABASE_PATH}" ]] || \
-    die "legacy database must be a regular file, not a symlink"
-
-  local stamp backup_path
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  backup_path="${BACKUP_ROOT}/legacy-vgen-${stamp}-$$.db"
-  VGEN_LEGACY_DATABASE="${LEGACY_DATABASE_PATH}" \
-  VGEN_LEGACY_BACKUP="${backup_path}" \
-    python3.11 <<'PY'
-import os
-import sqlite3
-from pathlib import Path
-
-source_path = Path(os.environ["VGEN_LEGACY_DATABASE"])
-backup_path = Path(os.environ["VGEN_LEGACY_BACKUP"])
-descriptor = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-os.close(descriptor)
-source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
-target = sqlite3.connect(backup_path)
-try:
-    source.backup(target)
-    result = target.execute("PRAGMA quick_check").fetchone()[0]
-    if result != "ok":
-        raise SystemExit(f"legacy backup quick_check failed: {result}")
-finally:
-    target.close()
-    source.close()
-os.chmod(backup_path, 0o600)
-PY
-  log "legacy SQLite backup: ${backup_path}"
-  log "legacy SQLite backup SHA-256: $(sha256_of "${backup_path}")"
+verify_service_user_configuration() {
+  local service_home service_shell
+  id vgen >/dev/null 2>&1 || die "Gateway service user 'vgen' does not exist"
+  id -nG vgen | tr ' ' '\n' | grep -Fxq vgen || \
+    die "Gateway service user is not a member of group 'vgen'"
+  service_home="$(getent passwd vgen | awk -F: '{print $6}')"
+  service_shell="$(getent passwd vgen | awk -F: '{print $7}')"
+  [[ "${service_home}" == "${DATA_ROOT}" ]] || \
+    die "Gateway service user home must be ${DATA_ROOT}"
+  [[ "${service_shell}" == "/usr/sbin/nologin" ]] || \
+    die "Gateway service user shell must be /usr/sbin/nologin"
 }
 
 install_python_runtime() {
@@ -1290,14 +1207,14 @@ install_and_start_service() {
   for ((attempt = 1; attempt <= 30; attempt++)); do
     if curl --fail --silent --show-error --max-time 2 \
       "http://127.0.0.1:${GATEWAY_PORT}/api/v1/health" | health_payload_is_ok; then
-      log "Gateway v1 is healthy on 127.0.0.1:${GATEWAY_PORT}"
+      log "Gateway is healthy on 127.0.0.1:${GATEWAY_PORT}"
       return
     fi
     sleep 1
   done
   systemctl --no-pager --full status "${SERVICE_NAME}" || true
   journalctl -u "${SERVICE_NAME}" -n 50 --no-pager || true
-  die "Gateway v1 did not become healthy; Nginx was not changed"
+  die "Gateway did not become healthy; Nginx was not changed"
 }
 
 health_payload_is_ok() {
@@ -1358,7 +1275,7 @@ render_nginx_config_profile() {
   local destination="$1"
   local include_public_releases="$2"
   cat >"${destination}" <<EOF
-# Generated by the VGen Gateway v1 safe installer for ${DOMAIN}.
+# Generated by the VGen Gateway installer for ${DOMAIN}.
 server {
   listen 80;
   server_name ${DOMAIN};
@@ -1515,7 +1432,7 @@ atomic_replace_nginx_config() {
 
 restore_nginx_config() {
   local backup_path="$1"
-  log "restoring legacy Nginx route"
+  log "restoring previous Nginx route"
   verify_nginx_backup_path "${backup_path}" || return 1
   atomic_replace_nginx_config "${backup_path}" || return 1
   nginx -t || return 1
@@ -1530,7 +1447,7 @@ handle_nginx_switch_error() {
   local status="$1"
   clear_nginx_switch_traps
   if [[ "${NGINX_REPLACED}" -eq 1 && -n "${NGINX_ROLLBACK_BACKUP}" ]]; then
-    warn "an unexpected error occurred while switching Nginx; restoring the legacy route"
+    warn "an unexpected error occurred while switching Nginx; restoring the previous route"
     restore_nginx_config "${NGINX_ROLLBACK_BACKUP}" || \
       warn "automatic Nginx restoration failed; restore ${NGINX_ROLLBACK_BACKUP} manually"
   fi
@@ -1582,46 +1499,43 @@ switch_nginx() {
   if ! nginx -t; then
     clear_nginx_switch_traps
     restore_nginx_config "${backup_path}" || \
-      die "generated config failed and automatic legacy restoration also failed; restore ${backup_path} manually"
+      die "generated config failed and automatic restoration also failed; restore ${backup_path} manually"
     NGINX_REPLACED=0
-    die "generated Nginx configuration failed validation; legacy route was restored"
+    die "generated Nginx configuration failed validation; previous route was restored"
   fi
   if ! systemctl reload nginx; then
     clear_nginx_switch_traps
     restore_nginx_config "${backup_path}" || \
-      die "Nginx reload failed and automatic legacy restoration also failed; restore ${backup_path} manually"
+      die "Nginx reload failed and automatic restoration also failed; restore ${backup_path} manually"
     NGINX_REPLACED=0
-    die "Nginx reload failed; legacy route was restored"
+    die "Nginx reload failed; previous route was restored"
   fi
   if ! gateway_https_health_with_retry; then
     clear_nginx_switch_traps
     restore_nginx_config "${backup_path}" || \
-      die "HTTPS health failed and automatic legacy restoration also failed; restore ${backup_path} manually"
+      die "HTTPS health failed and automatic restoration also failed; restore ${backup_path} manually"
     NGINX_REPLACED=0
-    die "Gateway HTTPS health check failed; legacy route was restored"
+    die "Gateway HTTPS health check failed; previous route was restored"
   fi
   NGINX_REPLACED=0
   clear_nginx_switch_traps
 
-  log "Nginx now routes https://${DOMAIN} to Gateway v1"
-  log "legacy Nginx backup: ${backup_path}"
+  log "Nginx now routes https://${DOMAIN} to Gateway"
+  log "previous Nginx backup: ${backup_path}"
 }
 
 read_runtime_version() {
   local runtime_root="$1"
-  VGEN_LEGACY_GATEWAY_BRIDGE_VERSION="${LEGACY_GATEWAY_BRIDGE_VERSION}" \
-    "${runtime_root}/bin/python" -c '
+  "${runtime_root}/bin/python" -c '
 import importlib.metadata
-import os
 import re
 
 version = importlib.metadata.version("vgen")
-legacy_bridge_version = os.environ["VGEN_LEGACY_GATEWAY_BRIDGE_VERSION"]
 release = re.fullmatch(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
     version,
 )
-if release is None and version != legacy_bridge_version:
+if release is None:
     raise SystemExit("installed VGen version is not a supported release version")
 print(version)
 '
@@ -1630,18 +1544,9 @@ print(version)
 compare_release_versions() {
   local installed="$1"
   local target="$2"
-  VGEN_LEGACY_GATEWAY_BRIDGE_VERSION="${LEGACY_GATEWAY_BRIDGE_VERSION}" \
-    python3.11 - "${installed}" "${target}" <<'PY'
-import os
+  python3.11 - "${installed}" "${target}" <<'PY'
 import sys
 
-legacy_bridge_version = os.environ["VGEN_LEGACY_GATEWAY_BRIDGE_VERSION"]
-if sys.argv[1] == legacy_bridge_version:
-    # 2.0.0a1 was the internal identifier used before VGen adopted the
-    # 0.MINOR.PATCH product line. It is an explicit predecessor, not a newer
-    # 2.x release and not permission for generic pre-release downgrades.
-    print(-1)
-    raise SystemExit(0)
 installed = tuple(int(part) for part in sys.argv[1].split("."))
 target = tuple(int(part) for part in sys.argv[2].split("."))
 print(-1 if installed < target else (1 if installed > target else 0))
@@ -1705,229 +1610,13 @@ PY
     die "upgrade refused: install state names an unexpected Nginx config"
   verify_nginx_backup_path "${backup_path}"
   [[ -f "${backup_path}" && ! -L "${backup_path}" ]] || \
-    die "upgrade refused: saved legacy Nginx backup is missing or unsafe"
+    die "upgrade refused: saved Nginx backup is missing or unsafe"
   verify_root_owned_not_writable "${backup_path}" "saved Nginx backup"
-}
-
-rewrite_migrated_install_state() {
-  local state_path="$1"
-  VGEN_LAYOUT_STATE_PATH="${state_path}" \
-  VGEN_LAYOUT_OLD_BACKUP_ROOT="${LEGACY_V1_BACKUP_ROOT}" \
-  VGEN_LAYOUT_NEW_BACKUP_ROOT="${BACKUP_ROOT}" python3.11 <<'PY'
-import json
-import os
-import stat
-import tempfile
-from pathlib import Path
-
-path = Path(os.environ["VGEN_LAYOUT_STATE_PATH"])
-old_root = Path(os.environ["VGEN_LAYOUT_OLD_BACKUP_ROOT"])
-new_root = Path(os.environ["VGEN_LAYOUT_NEW_BACKUP_ROOT"])
-payload = json.loads(path.read_text(encoding="utf-8"))
-backup = Path(payload.get("nginx_backup", ""))
-try:
-    relative = backup.relative_to(old_root)
-except ValueError as exc:
-    raise SystemExit("layout migration refused: install state backup is outside the legacy root") from exc
-destination = new_root / relative
-if not destination.is_file() or destination.is_symlink():
-    raise SystemExit("layout migration refused: migrated Nginx backup is missing or unsafe")
-payload["nginx_backup"] = str(destination)
-descriptor, temporary_name = tempfile.mkstemp(prefix=".install-state.layout-", dir=path.parent)
-temporary = Path(temporary_name)
-try:
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
-    os.replace(temporary, path)
-finally:
-    temporary.unlink(missing_ok=True)
-PY
-  chown root:root "${state_path}"
-  chmod 0600 "${state_path}"
-}
-
-clear_layout_migration_traps() {
-  trap - ERR INT TERM HUP
-}
-
-service_user_home_is_supported_for_layout_migration() {
-  local service_home="$1"
-  [[ "${service_home}" == "${LEGACY_V1_DATA_ROOT}" || \
-     "${service_home}" == "${DATA_ROOT}" || \
-     "${service_home}" == "/home/vgen" ]]
-}
-
-handle_layout_migration_error() {
-  local status="$1"
-  local rollback_ok=1
-  clear_layout_migration_traps
-  set +e
-  ((status == 0)) && status=1
-  warn "Gateway layout migration failed; restoring the /vgen-v1 directories"
-  systemctl stop "${SERVICE_NAME}" || rollback_ok=0
-
-  if [[ "${LAYOUT_UNIT_REPLACED}" -eq 1 ]]; then
-    install -o root -g root -m 0644 \
-      "${LAYOUT_MIGRATION_BACKUP_DIR}/vgen-gateway.service" "${UNIT_PATH}" || rollback_ok=0
-  fi
-  if [[ "${LAYOUT_CONFIG_MOVED}" -eq 1 && -d "${CONFIG_ROOT}" ]]; then
-    mv -- "${CONFIG_ROOT}" "${LEGACY_V1_CONFIG_ROOT}" || rollback_ok=0
-    if [[ -f "${LAYOUT_MIGRATION_BACKUP_DIR}/install-state.json" ]]; then
-      install -o root -g root -m 0600 \
-        "${LAYOUT_MIGRATION_BACKUP_DIR}/install-state.json" \
-        "${LEGACY_V1_CONFIG_ROOT}/install-state.json" || rollback_ok=0
-    fi
-  fi
-  if [[ "${LAYOUT_DATA_MOVED}" -eq 1 && -d "${DATA_ROOT}" ]]; then
-    mv -- "${DATA_ROOT}" "${LEGACY_V1_DATA_ROOT}" || rollback_ok=0
-  fi
-  if [[ "${LAYOUT_INSTALL_MOVED}" -eq 1 && -d "${INSTALL_ROOT}" ]]; then
-    mv -- "${INSTALL_ROOT}" "${LEGACY_V1_INSTALL_ROOT}" || rollback_ok=0
-    relocate_python_runtime_scripts \
-      "${INSTALL_ROOT}/venv" "${LEGACY_V1_INSTALL_ROOT}/venv" || rollback_ok=0
-  fi
-  if [[ "${LAYOUT_BACKUP_MOVED}" -eq 1 && -d "${BACKUP_ROOT}" ]]; then
-    mv -- "${BACKUP_ROOT}" "${LEGACY_V1_BACKUP_ROOT}" || rollback_ok=0
-  elif [[ -d "${BACKUP_ROOT}" ]]; then
-    rmdir -- "${BACKUP_ROOT}" 2>/dev/null || true
-  fi
-  if [[ "${LAYOUT_USER_HOME_MOVED}" -eq 1 ]]; then
-    usermod --home "${LEGACY_V1_DATA_ROOT}" vgen || rollback_ok=0
-  fi
-  systemctl daemon-reload || rollback_ok=0
-  systemctl start "${SERVICE_NAME}" || rollback_ok=0
-  gateway_local_health_with_retry || rollback_ok=0
-  gateway_https_health_with_retry || rollback_ok=0
-  if [[ "${rollback_ok}" -eq 1 ]]; then
-    warn "legacy /vgen-v1 layout was restored and Gateway health passed"
-  else
-    warn "layout restoration needs manual inspection; backup: ${LAYOUT_MIGRATION_BACKUP_DIR}"
-  fi
-  exit "${status}"
-}
-
-verify_legacy_v1_layout_for_migration() {
-  local new_path legacy_path legacy_home
-  for new_path in "${INSTALL_ROOT}" "${DATA_ROOT}" "${CONFIG_ROOT}" "${BACKUP_ROOT}"; do
-    [[ ! -e "${new_path}" && ! -L "${new_path}" ]] || \
-      die "layout migration refused: new and /vgen-v1 paths are mixed: ${new_path}"
-  done
-  for legacy_path in \
-    "${LEGACY_V1_INSTALL_ROOT}" "${LEGACY_V1_DATA_ROOT}" "${LEGACY_V1_CONFIG_ROOT}"; do
-    [[ -d "${legacy_path}" && ! -L "${legacy_path}" ]] || \
-      die "layout migration refused: legacy directory is missing or unsafe: ${legacy_path}"
-  done
-  [[ -d "${LEGACY_V1_INSTALL_ROOT}/venv" && \
-     ! -L "${LEGACY_V1_INSTALL_ROOT}/venv" ]] || \
-    die "layout migration refused: legacy runtime is missing or unsafe"
-  [[ -f "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" && \
-     ! -L "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" ]] || \
-    die "layout migration refused: legacy database is missing or unsafe"
-  [[ -f "${LEGACY_V1_CONFIG_ROOT}/gateway.env" && \
-     ! -L "${LEGACY_V1_CONFIG_ROOT}/gateway.env" ]] || \
-    die "layout migration refused: legacy Gateway environment is missing or unsafe"
-  [[ -f "${LEGACY_V1_CONFIG_ROOT}/install-state.json" && \
-     ! -L "${LEGACY_V1_CONFIG_ROOT}/install-state.json" ]] || \
-    die "layout migration refused: legacy install state is missing or unsafe"
-  [[ -f "${UNIT_PATH}" && ! -L "${UNIT_PATH}" ]] || \
-    die "layout migration refused: systemd unit is missing or unsafe"
-  [[ "$(stat -c '%a %U:%G' "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db")" == \
-     "600 vgen:vgen" ]] || die "layout migration refused: legacy database permissions do not match"
-  [[ "$(stat -c '%a %U:%G' "${LEGACY_V1_CONFIG_ROOT}/install-state.json")" == \
-     "600 root:root" ]] || die "layout migration refused: legacy install state permissions do not match"
-  [[ "$(stat -c '%a %U:%G' "${UNIT_PATH}")" == "644 root:root" ]] || \
-    die "layout migration refused: systemd unit permissions do not match"
-  grep -Fq "ExecStart=${LEGACY_V1_INSTALL_ROOT}/venv/bin/vgen-gateway" "${UNIT_PATH}" || \
-    die "layout migration refused: systemd unit does not use the legacy managed runtime"
-  grep -Fq -- "--database ${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" "${UNIT_PATH}" || \
-    die "layout migration refused: systemd unit does not use the legacy managed database"
-  verify_existing_gateway_environment "${LEGACY_V1_CONFIG_ROOT}/gateway.env"
-  verify_upgrade_runtime_security "${LEGACY_V1_INSTALL_ROOT}/venv"
-  legacy_home="$(getent passwd vgen | awk -F: '{print $6}')"
-  service_user_home_is_supported_for_layout_migration "${legacy_home}" || \
-    die "layout migration refused: vgen user has an unsupported home directory: ${legacy_home}"
-  systemctl is-active --quiet "${SERVICE_NAME}" || \
-    die "layout migration refused: Gateway service is not active"
-  systemctl is-enabled --quiet "${SERVICE_NAME}" || \
-    die "layout migration refused: Gateway service is not enabled"
-  runuser -u vgen -- "${LEGACY_V1_INSTALL_ROOT}/venv/bin/vgen-gateway" \
-    --database "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" doctor >/dev/null
-  gateway_local_health_with_retry || die "layout migration refused: local Gateway health is not ready"
-  gateway_https_health_with_retry || die "layout migration refused: public Gateway health is not ready"
-}
-
-migrate_legacy_v1_layout_if_needed() {
-  local legacy_count=0 legacy_path stamp retained_backup legacy_home
-  for legacy_path in \
-    "${LEGACY_V1_INSTALL_ROOT}" "${LEGACY_V1_DATA_ROOT}" "${LEGACY_V1_CONFIG_ROOT}"; do
-    [[ ! -e "${legacy_path}" && ! -L "${legacy_path}" ]] || legacy_count=$((legacy_count + 1))
-  done
-  if [[ "${legacy_count}" -eq 0 ]]; then
-    return
-  fi
-  [[ "${legacy_count}" -eq 3 ]] || \
-    die "layout migration refused: incomplete /vgen-v1 installation"
-  log "migrating Gateway directories from /vgen-v1 to stable /vgen paths"
-  verify_legacy_v1_layout_for_migration
-
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  LAYOUT_MIGRATION_BACKUP_DIR="$(mktemp -d "/var/backups/.vgen-layout-${stamp}.XXXXXX")"
-  chmod 0700 "${LAYOUT_MIGRATION_BACKUP_DIR}"
-  cp --preserve=mode,ownership,timestamps -- "${UNIT_PATH}" \
-    "${LAYOUT_MIGRATION_BACKUP_DIR}/vgen-gateway.service"
-  cp --preserve=mode,ownership,timestamps -- \
-    "${LEGACY_V1_CONFIG_ROOT}/install-state.json" \
-    "${LAYOUT_MIGRATION_BACKUP_DIR}/install-state.json"
-
-  trap 'handle_layout_migration_error $?' ERR
-  trap 'handle_layout_migration_error 130' INT
-  trap 'handle_layout_migration_error 143' TERM
-  trap 'handle_layout_migration_error 129' HUP
-  systemctl stop "${SERVICE_NAME}"
-  mv -- "${LEGACY_V1_INSTALL_ROOT}" "${INSTALL_ROOT}"
-  LAYOUT_INSTALL_MOVED=1
-  mv -- "${LEGACY_V1_DATA_ROOT}" "${DATA_ROOT}"
-  LAYOUT_DATA_MOVED=1
-  mv -- "${LEGACY_V1_CONFIG_ROOT}" "${CONFIG_ROOT}"
-  LAYOUT_CONFIG_MOVED=1
-  if [[ -d "${LEGACY_V1_BACKUP_ROOT}" && ! -L "${LEGACY_V1_BACKUP_ROOT}" ]]; then
-    mv -- "${LEGACY_V1_BACKUP_ROOT}" "${BACKUP_ROOT}"
-    LAYOUT_BACKUP_MOVED=1
-  else
-    [[ ! -e "${LEGACY_V1_BACKUP_ROOT}" && ! -L "${LEGACY_V1_BACKUP_ROOT}" ]] || false
-    install -d -o root -g root -m 0700 "${BACKUP_ROOT}"
-  fi
-  relocate_python_runtime_scripts \
-    "${LEGACY_V1_INSTALL_ROOT}/venv" "${INSTALL_ROOT}/venv"
-  rewrite_migrated_install_state "${INSTALL_STATE_PATH}"
-  legacy_home="$(getent passwd vgen | awk -F: '{print $6}')"
-  if [[ "${legacy_home}" == "${LEGACY_V1_DATA_ROOT}" ]]; then
-    usermod --home "${DATA_ROOT}" vgen
-    LAYOUT_USER_HOME_MOVED=1
-  fi
-  install -o root -g root -m 0644 "${SERVICE_SOURCE_PATH}" "${UNIT_PATH}"
-  LAYOUT_UNIT_REPLACED=1
-  systemctl daemon-reload
-  systemctl start "${SERVICE_NAME}"
-  gateway_local_health_with_retry
-  gateway_https_health_with_retry
-  clear_layout_migration_traps
-
-  retained_backup="${BACKUP_ROOT}/layout-migration-${stamp}"
-  [[ ! -e "${retained_backup}" && ! -L "${retained_backup}" ]] || \
-    die "layout migration backup destination already exists"
-  mv -- "${LAYOUT_MIGRATION_BACKUP_DIR}" "${retained_backup}"
-  LAYOUT_MIGRATION_BACKUP_DIR="${retained_backup}"
-  log "Gateway directory layout migration completed"
-  log "layout migration backup: ${LAYOUT_MIGRATION_BACKUP_DIR}"
 }
 
 verify_upgrade_preconditions() {
   [[ "${CONFIRM_UPGRADE}" -eq 1 ]] || die "upgrade requires --confirm-upgrade"
+  verify_service_user_configuration
   verify_nginx_config_and_tls
   [[ -d "${INSTALL_ROOT}/venv" && ! -L "${INSTALL_ROOT}/venv" ]] || \
     die "upgrade refused: active Gateway runtime is missing or unsafe"
@@ -2210,6 +1899,7 @@ upgrade_gateway() {
   require_command flock
   require_command getent
   require_command grep
+  require_command id
   require_command install
   require_command mktemp
   require_command mv
@@ -2220,11 +1910,10 @@ upgrade_gateway() {
   require_command sha256sum
   require_command stat
   require_command systemctl
-  require_command usermod
+  require_command tr
 
   acquire_mutation_lock
   verify_release_bundle
-  migrate_legacy_v1_layout_if_needed
   verify_upgrade_preconditions
   if [[ "${UPGRADE_ALREADY_TARGET}" -eq 1 ]]; then
     log "Gateway ${VGEN_VERSION} is already installed and healthy locally and publicly"
@@ -2334,15 +2023,14 @@ install_gateway() {
   require_command systemctl
   require_command tr
   require_command useradd
+  require_command usermod
 
   acquire_mutation_lock
   verify_release_bundle
   validate_artifact_store_options
   write_oss_setup_kit
   verify_install_preconditions
-  check_legacy_task_status
   ensure_service_user_and_directories
-  backup_legacy_database
   install_python_runtime
   write_gateway_environment
   verify_artifact_store_access_at "${INSTALL_ROOT}/venv"
@@ -2352,7 +2040,6 @@ install_gateway() {
 
   log "installation complete"
   log "bootstrap code remains protected at ${BOOTSTRAP_PATH} until the first Mac claims it"
-  log "the legacy service was left untouched for rollback"
   log "task artifacts use private OSS through object-scoped STS credentials"
   log "RAM/IAM policy was not modified"
   print_mac_bootstrap_steps
@@ -2379,11 +2066,11 @@ resume_gateway() {
   require_command systemctl
   require_command tr
   require_command useradd
+  require_command usermod
 
   acquire_mutation_lock
   verify_release_bundle
   verify_resume_preconditions
-  check_legacy_task_status
   ensure_service_user_and_directories
   verify_existing_gateway_environment
   prepare_resume_runtime
@@ -2394,7 +2081,6 @@ resume_gateway() {
 
   log "partial installation resumed successfully"
   log "bootstrap code remains protected at ${BOOTSTRAP_PATH} until the first Mac claims it"
-  log "the legacy service was left untouched for rollback"
   log "existing ArtifactStore configuration was preserved; RAM/IAM was not modified"
   print_mac_bootstrap_steps
 }
@@ -2421,7 +2107,7 @@ activate_gateway() {
   verify_existing_python_runtime
 
   if [[ "${ACTIVATION_ALREADY_ACTIVE}" -eq 1 ]]; then
-    log "Gateway v1 is already active with the deterministic Nginx config and strict health"
+    log "Gateway is already active with the deterministic Nginx config and strict health"
     log "no files or services were changed"
     print_mac_bootstrap_steps
     return
@@ -2429,8 +2115,8 @@ activate_gateway() {
 
   switch_nginx "${ACTIVATION_BACKUP_PATH}" 1
 
-  log "Gateway v1 public HTTPS activation completed"
-  log "existing install state and legacy backup were reused without modification"
+  log "Gateway public HTTPS activation completed"
+  log "existing install state and previous backup were reused without modification"
   print_mac_bootstrap_steps
 }
 
@@ -2491,17 +2177,17 @@ rollback_gateway_route() {
     atomic_replace_nginx_config "${current_copy}" || true
     rm -f -- "${current_copy}"
     nginx -t || true
-    die "saved legacy Nginx configuration is invalid; current v1 route was preserved"
+    die "saved Nginx configuration is invalid; current Gateway route was preserved"
   fi
   if ! systemctl reload nginx; then
     atomic_replace_nginx_config "${current_copy}" || true
     nginx -t && systemctl reload nginx || true
     rm -f -- "${current_copy}"
-    die "legacy Nginx reload failed; current v1 route was restored"
+    die "previous Nginx reload failed; current Gateway route was restored"
   fi
   rm -f -- "${current_copy}"
-  log "Nginx route was rolled back to the saved legacy configuration"
-  log "Gateway v1 is still running locally on 127.0.0.1:${GATEWAY_PORT} for inspection"
+  log "Nginx route was rolled back to the saved previous configuration"
+  log "Gateway is still running locally on 127.0.0.1:${GATEWAY_PORT} for inspection"
 }
 
 show_status() {
@@ -2517,16 +2203,14 @@ show_status() {
   fi
   printf 'gateway_service='
   systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true
-  printf 'legacy_service='
-  systemctl is-active vgen-server.service 2>/dev/null || true
-  printf 'local_v1_health='
+  printf 'local_api_v1_health='
   if curl --fail --silent --max-time 3 \
     "http://127.0.0.1:${GATEWAY_PORT}/api/v1/health" >/dev/null; then
     printf 'ok\n'
   else
     printf 'unavailable\n'
   fi
-  printf 'public_v1_health='
+  printf 'public_api_v1_health='
   if curl --fail --silent --max-time 10 "https://${DOMAIN}/api/v1/health" >/dev/null; then
     printf 'ok\n'
   else
