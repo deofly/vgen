@@ -174,8 +174,13 @@ def _inputs(
 
 
 def _release_server(
-    serve_root: Path, *, artifact_redirect: str | None = None
+    serve_root: Path,
+    *,
+    artifact_redirect: str | None = None,
+    artifact_failures: int = 0,
 ) -> ThreadingHTTPServer:
+    state = {"artifact_failures": artifact_failures}
+
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             super().__init__(*args, directory=str(serve_root), **kwargs)
@@ -208,6 +213,12 @@ def _release_server(
                 self.wfile.write(body)
                 return
             mac_path = f"/releases/{VERSION}/VGen-macOS-{VERSION}.zip"
+            if self.path == mac_path and state["artifact_failures"] > 0:
+                state["artifact_failures"] -= 1
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if artifact_redirect and self.path == mac_path:
                 self.send_response(302)
                 self.send_header("Location", artifact_redirect)
@@ -312,6 +323,9 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert '"$candidate" -I -B -c' in script
     assert '"$PYTHON_BIN" -I -B <<\'PY\'' in script
     assert "Install the CLI for the current user now? [y/N]" in script
+    assert 'status("Checking the latest VGen release...")' in script
+    assert "Download interrupted; retrying" in script
+    assert 'status("Download complete; verifying the package...")' in script
     assert "read -r answer 2>/dev/null </dev/tty" in script
     assert "install.command\" --install-only" in script
     assert '"$VGEN_BIN" broker service-refresh' in script
@@ -423,7 +437,74 @@ def test_bootstrap_downloads_same_origin_validates_and_runs_install_command(
     assert marker.read_text(encoding="utf-8") == "--install-only"
     assert not attack_marker.exists()
     assert "Next:" in completed.stdout
+    assert "[vgen] Checking the latest VGen release..." in completed.stderr
+    assert "[vgen] Downloading VGen macOS" in completed.stderr
+    assert "[vgen] Download complete; verifying the package..." in completed.stderr
     assert set(Path(tempfile.gettempdir()).glob("vgen-macos-install.*")) == temporary_before
+
+
+def test_bootstrap_retries_a_transient_artifact_download(tmp_path: Path) -> None:
+    marker = tmp_path / "installed.txt"
+    serve_root = tmp_path / "serve"
+    serve_root.mkdir()
+    server = _release_server(serve_root, artifact_failures=1)
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    mac, windows = _inputs(tmp_path, marker=marker, gateway_url=origin)
+    result = MODULE.build_public_release(
+        version=VERSION,
+        published_at=PUBLISHED_AT,
+        gateway_origin=origin,
+        release_origin=origin,
+        macos_bundle=mac,
+        windows_worker_bundle=windows,
+        output_root=serve_root,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        completed = _run_bootstrap(
+            result.macos_bootstrap,
+            home=tmp_path / "home",
+            piped=True,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "--install-only"
+    assert "[vgen] Download interrupted; retrying (1/3)..." in completed.stderr
+
+
+def test_bootstrap_reports_the_final_artifact_download_reason(tmp_path: Path) -> None:
+    serve_root = tmp_path / "serve"
+    serve_root.mkdir()
+    server = _release_server(serve_root, artifact_failures=3)
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    mac, windows = _inputs(tmp_path, gateway_url=origin)
+    result = MODULE.build_public_release(
+        version=VERSION,
+        published_at=PUBLISHED_AT,
+        gateway_origin=origin,
+        release_origin=origin,
+        macos_bundle=mac,
+        windows_worker_bundle=windows,
+        output_root=serve_root,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        completed = _run_bootstrap(
+            result.macos_bootstrap,
+            home=tmp_path / "home",
+            piped=True,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+    assert completed.returncode != 0
+    assert "after 3 attempt(s): HTTP 503" in completed.stderr
 
 
 @pytest.mark.parametrize("tamper", ("manifest", "artifact"))

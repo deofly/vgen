@@ -474,6 +474,7 @@ import os
 import re
 import stat
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -512,6 +513,21 @@ class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
 opener = urllib.request.build_opener(SameOriginRedirects())
 
 
+def status(message):
+    print("[vgen] " + message, file=sys.stderr, flush=True)
+
+
+def error_summary(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {{exc.code}}"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    detail = " ".join(str(reason).split())
+    detail = "".join(character if character.isprintable() else "?" for character in detail)
+    if detail:
+        return f"{{type(exc).__name__}}: {{detail[:200]}}"
+    return type(exc).__name__
+
+
 def fetch(url, limit):
     if not same_origin(url):
         raise SystemExit("cross-origin release URL refused")
@@ -523,6 +539,7 @@ def fetch(url, limit):
     return data
 
 
+status("Checking the latest VGen release...")
 stable_url = origin + "/releases/channels/stable.json"
 try:
     stable = json.loads(fetch(stable_url, 1024 * 1024))
@@ -587,28 +604,47 @@ if not same_origin(artifact_url):
     raise SystemExit("cross-origin macOS artifact URL refused")
 archive_path = work / filename
 request = urllib.request.Request(artifact_url, headers={{"Accept": "application/zip"}})
-try:
-    with opener.open(request, timeout=60) as response, archive_path.open("xb") as output:
-        content_length = response.headers.get("Content-Length")
-        if content_length is not None and int(content_length) != size:
-            raise SystemExit("macOS artifact Content-Length mismatch")
-        hasher = hashlib.sha256()
-        downloaded = 0
-        while True:
-            block = response.read(min(1024 * 1024, size - downloaded + 1))
-            if not block:
-                break
-            downloaded += len(block)
-            if downloaded > size:
-                raise SystemExit("macOS artifact exceeded its declared size")
-            hasher.update(block)
-            output.write(block)
-        output.flush()
-        os.fsync(output.fileno())
-except (OSError, ValueError) as exc:
-    raise SystemExit("could not download the macOS CLI bundle") from exc
+status(
+    f"Downloading VGen macOS {{expected_version}} "
+    f"({{(size + 1023) // 1024}} KiB)..."
+)
+downloaded = 0
+hasher = hashlib.sha256()
+for attempt in range(1, 4):
+    archive_path.unlink(missing_ok=True)
+    downloaded = 0
+    hasher = hashlib.sha256()
+    try:
+        with opener.open(request, timeout=60) as response, archive_path.open("xb") as output:
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) != size:
+                raise ValueError("Content-Length mismatch")
+            while True:
+                block = response.read(min(1024 * 1024, size - downloaded + 1))
+                if not block:
+                    break
+                downloaded += len(block)
+                if downloaded > size:
+                    raise ValueError("download exceeded its declared size")
+                hasher.update(block)
+                output.write(block)
+            output.flush()
+            os.fsync(output.fileno())
+        break
+    except (OSError, ValueError) as exc:
+        archive_path.unlink(missing_ok=True)
+        http_code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+        retryable = http_code is None or http_code in {{408, 429}} or http_code >= 500
+        if attempt == 3 or not retryable:
+            raise SystemExit(
+                "could not download the macOS CLI bundle after "
+                f"{{attempt}} attempt(s): {{error_summary(exc)}}"
+            ) from None
+        status(f"Download interrupted; retrying ({{attempt}}/3)...")
+        time.sleep(attempt)
 if downloaded != size or hasher.hexdigest() != digest:
     raise SystemExit("macOS artifact size or SHA-256 mismatch")
+status("Download complete; verifying the package...")
 
 prefix = "VGen-macOS-" + expected_version + "/"
 try:

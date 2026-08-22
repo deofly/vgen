@@ -70,10 +70,9 @@ sha256sum -c SHA256SUMS
 
 VGen 使用两个独立 HTTPS origin：`https://<Gateway域名>` 只提供 `/api/v1`，
 `https://<下载域名>` 只提供公开安装包。下载站的 `/releases/channels/stable.json` 指向当前
-不可变版本，`/releases/install-macos.sh` 是固定引导入口。先下载并阅读它，再单独运行，
-**不要使用 `curl | sh`**。脚本只从已固定的下载 origin 读取 stable、manifest 和 ZIP，校验
-摘要、大小与 SHA-256，并拒绝跨域或非 HTTPS 下载。以后把下载站迁到 OSS/CDN 不需要修改
-Gateway Profile。
+不可变版本，`/releases/install-macos.sh` 是固定的一键安装入口。用户只需复制一条命令；脚本会
+从已固定的下载 origin 读取 stable、manifest 和 ZIP，自动校验摘要、大小与 SHA-256，并拒绝
+跨域或非 HTTPS 下载。以后把下载站迁到 OSS/CDN 不需要修改 Gateway Profile。
 
 Mac 安装器还会校验 ZIP 内的 `SHA256SUMS` 和 wheel 元数据。这些 HTTPS + SHA-256 检查能
 发现传输、缓存或存储篡改，但不是发行者数字签名。目前 ZIP 尚未提供 Apple notarization，
@@ -341,11 +340,8 @@ Owner 完成下面的密钥核验。
 新 Mac 只安装 CLI，不安装 Home Broker、Worker、ComfyUI 或 Docker：
 
 ```bash
-curl --fail --location --output install-macos.sh \
-  https://<下载域名>/releases/install-macos.sh
-less install-macos.sh
-sh install-macos.sh
-"$HOME/.local/bin/vgen" join --gateway https://<Gateway域名>
+curl -fsSL https://vgen.zcbiz.com/releases/install-macos.sh | bash
+vgen join --gateway https://vgen-gw.zcbiz.com
 ```
 
 全新 User 的 `join` 会在本机生成用户和设备密钥，显示需要离线保存的 24 个恢复词；已有 User
