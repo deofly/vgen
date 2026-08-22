@@ -156,7 +156,7 @@ sudo ./setup-gateway.sh reset-test --domain <Gateway域名>
 重置完成后重新执行上面的完整 OSS 安装命令。
 
 `reset-test` 会停止服务，并把 runtime、SQLite、Bootstrap code 和服务配置整体移动到
-`/var/backups/vgen-v1/gateway-test-reset-*`。它不会删除 Nginx、TLS 证书、下载站、RAM Role 或
+`/var/backups/vgen/gateway-test-reset-*`。它不会删除 Nginx、TLS 证书、下载站、RAM Role 或
 OSS 对象。正式有数据的环境不要使用该动作。
 
 ### 3.2 原地升级
@@ -174,6 +174,12 @@ sudo ./setup-gateway.sh upgrade --domain <Gateway域名>
 
 升级会备份数据库、runtime 和配置，健康检查失败时自动恢复旧版本。重复升级到已经健康运行
 的同一版本是安全的幂等操作。
+
+早期测试安装使用过 `/opt/vgen-v1`、`/etc/vgen-v1`、`/var/lib/vgen-v1` 和
+`/var/backups/vgen-v1`。首次使用新版安装器执行 `upgrade` 时，会在停止 Gateway 后自动迁移到
+稳定的 `/opt/vgen`、`/etc/vgen`、`/var/lib/vgen` 和 `/var/backups/vgen`，同步 systemd unit、
+虚拟环境路径、服务用户 home 和安装状态；迁移失败会恢复旧目录并重新启动旧服务。`/api/v1`
+是 API 兼容版本，不受服务器目录改名影响。
 
 从 0.2.2 升级到 0.3.0 后，先在 Workspace Owner 的 Mac 升级 CLI，再运行一次：
 
@@ -234,14 +240,14 @@ sudo ./setup-gateway.sh rollback --domain <Gateway域名>
 再在 ECS 显示：
 
 ```bash
-sudo cat /var/lib/vgen-v1/bootstrap-code
+sudo cat /var/lib/vgen/bootstrap-code
 ```
 
 只把它粘贴进 VGen 的隐藏提示，不要放到命令、聊天、截图或 shell history。Mac 初始化成功
 后删除服务器上已失效的副本：
 
 ```bash
-sudo rm -f /var/lib/vgen-v1/bootstrap-code
+sudo rm -f /var/lib/vgen/bootstrap-code
 ```
 
 <!-- VGEN_GATEWAY_INSTALL_END -->
@@ -253,7 +259,8 @@ sudo rm -f /var/lib/vgen-v1/bootstrap-code
 1. 核对 `VGen-macOS-<版本>.zip` 的发行页 SHA-256，然后解压；
 2. 双击 `install.command`；如果 Gatekeeper 首次阻止，右键文件并选择“打开”；
 3. 按提示填写显示名称，离线、按顺序抄写 24 个恢复词并完成确认；
-4. 隐藏输入框出现后，按第 3.4 节读取并粘贴一次性 Bootstrap code；
+4. 提示 Bootstrap code 时，新开终端 SSH 登录 Gateway ECS，执行
+   `sudo cat /var/lib/vgen/bootstrap-code`，再回到隐藏输入框粘贴；
 5. 等待安装器明确显示初始化完成且 Home Broker 已真实上线。
 
 安装器会创建用户身份、默认 Workspace、默认 GPU Pool、Logical Home Broker 和 Broker

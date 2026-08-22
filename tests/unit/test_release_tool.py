@@ -258,6 +258,9 @@ def test_release_scripts_have_valid_syntax_and_help() -> None:
     )
     assert publisher_help.returncode == 0
     assert "switches stable.json last" in publisher_help.stdout
+    publisher_source = PUBLISHER_PATH.read_text(encoding="utf-8")
+    assert 'readonly DEFAULT_BACKUP_ROOT="/var/backups/vgen"' in publisher_source
+    assert "/var/backups/vgen-v1" not in publisher_source
 
 
 def test_release_configure_writes_private_config_and_publish_uses_it(

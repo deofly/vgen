@@ -93,6 +93,19 @@ def _signer(identity: DeviceIdentity):  # type: ignore[no-untyped-def]
     return sign
 
 
+def prompt_bootstrap_code() -> str:
+    print(
+        "\n首次初始化需要部署 Gateway 的 ECS 上生成的一次性 Bootstrap code。\n"
+        "请新开一个终端，SSH 登录 Gateway ECS，然后执行：\n\n"
+        "  sudo cat /var/lib/vgen/bootstrap-code\n\n"
+        "复制命令输出，回到这里粘贴。如果你没有 ECS SSH 权限，请联系 Gateway 管理员。\n"
+        "初始化成功后，管理员可在 ECS 删除已使用的文件：\n\n"
+        "  sudo rm -f /var/lib/vgen/bootstrap-code\n",
+        file=sys.stderr,
+    )
+    return getpass.getpass("Bootstrap code（粘贴后按回车，输入不会显示）: ").strip()
+
+
 def _read_bootstrap_code(args: Any) -> str:
     if args.bootstrap_code_file is not None:
         path = Path(args.bootstrap_code_file).expanduser()
@@ -106,7 +119,7 @@ def _read_bootstrap_code(args: Any) -> str:
     elif args.non_interactive:
         raise ValueError("非交互初始化需要 --bootstrap-code-file 或 --bootstrap-code-stdin")
     else:
-        code = getpass.getpass("粘贴 ECS 上的一次性 Bootstrap code（输入不会显示）: ").strip()
+        code = prompt_bootstrap_code()
     if not code:
         raise ValueError("Bootstrap code 不能为空")
     return code

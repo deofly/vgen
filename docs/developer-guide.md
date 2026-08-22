@@ -540,13 +540,13 @@ SSH 密码或私钥。`VGEN_RELEASE_CONFIG` 可为自动化测试指定另一个
 在 publish 命令增加 `--confirm-oss-configured` 重试。生成文件按本次 endpoint、Bucket、prefix、
 账号和角色计算，不使用源码常量。
 
-若安装已经写入 `/opt/vgen-v1/venv` 和 `/etc/vgen-v1/gateway.env`，但在数据库初始化前中断，
+若安装已经写入 `/opt/vgen/venv` 和 `/etc/vgen/gateway.env`，但在数据库初始化前中断，
 发布修复版本时使用 `--resume-gateway`，不要再次 `--reset-test-gateway`。resume 会校验半安装边界、
 归档旧的 partial runtime、安装当前版本、验证 STS，再继续数据库、systemd 和 Nginx 初始化。
 
 开发测试环境需要先归档当前 Gateway 再从零初始化时，额外增加
 `--reset-test-gateway`。该选项只允许和 `--install-gateway` 一起使用；远端安装器先把受管
-runtime、SQLite 和配置移动到 `/var/backups/vgen-v1/`，成功后再执行新安装。它不会删除 OSS
+runtime、SQLite 和配置移动到 `/var/backups/vgen/`，成功后再执行新安装。它不会删除 OSS
 对象。生产数据恢复应使用数据库备份/迁移流程，禁止用 test reset。
 
 OSS 配置不是源码常量：安装器把 endpoint、私有 Bucket、对象前缀、transfer role ARN、STS region
@@ -676,9 +676,16 @@ macOS 安装。新版本安装到独立目录，验证 `vgen --version` 后刷�
 
 公网 `install-macos.sh` 仍承担第一次安装和损坏恢复。它使用 `--install-only` 安装已校验包后，
 若检测到现有 Profile，则必须自动执行 `broker service-refresh`；只有全新客户端才提示执行
-Workspace/User join。脚本必须从 `/dev/tty` 读取人工确认，不能从标准输入读取，否则
-`curl ... | sh` 会把后续脚本文本误当成用户输入；无终端自动化只能显式设置
-`VGEN_INSTALL_YES=1`。CLI 自升级不升级 Gateway 或 Windows Worker，也不修改 stable 指针。
+Workspace/User join。面向用户的文档和安装页统一使用兼容性更好的标准输入管道写法：
+
+```bash
+curl -fsSL https://<下载域名>/releases/install-macos.sh | bash
+```
+
+不要再展示依赖 Bash/Zsh 进程替换的 `bash <(curl ...)` 作为标准安装命令。由于 Bash 的标准输入
+正在接收脚本，安装器必须从 `/dev/tty` 读取人工确认，不能使用普通 `read`，否则可能把尚未执行的
+脚本文本误当成用户输入；无终端自动化只能显式设置 `VGEN_INSTALL_YES=1`。CLI 自升级不升级
+Gateway 或 Windows Worker，也不修改 stable 指针。
 
 ### 8.3 手工同步到 ECS 或 OSS
 
@@ -725,9 +732,12 @@ Worker ZIP 都不得进入该目录。
 ## 9. 安装器和参考部署的开发边界
 
 Gateway bundle 包含 `INSTALL.txt`、`setup-gateway.sh`、wheel、systemd unit 和
-`SHA256SUMS`。脚本管理 `/opt/vgen-v1`、`/var/lib/vgen-v1`、`/etc/vgen-v1` 和
+`SHA256SUMS`。脚本管理 `/opt/vgen`、`/var/lib/vgen`、`/etc/vgen` 和
 `/etc/nginx/conf.d/vgen.conf`，但不修改 OSS、RAM Role、安全组或其他云权限。升级必须先对
 数据库副本做预检和一致性备份，服务/Nginx 健康失败时恢复旧 runtime、数据库和 route。
+早期 `/opt|etc|var/lib|var/backups/vgen-v1` 布局只作为一次性升级来源：迁移必须先验证旧服务、
+数据库、权限、OSS 环境和公网健康，停止服务后移动目录并修正 virtualenv、systemd、安装状态和
+服务用户 home；任何失败都恢复旧布局。新安装和已迁移状态不得重新创建带 `v1` 的目录。
 历史内部版本 `2.0.0a1` 是版本策略切换前的明确迁移源；兼容代码只能精确 allowlist 这个值，
 不得放宽为接受任意 PEP 440 预发布版或绕过正常的降级保护。
 

@@ -53,6 +53,34 @@ def test_setup_does_not_keep_an_unconfirmed_new_identity(monkeypatch) -> None:
     assert not store.exists("default")
 
 
+def test_interactive_bootstrap_prompt_explains_where_to_find_code(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        cli_setup.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or "bootstrap-secret",
+    )
+
+    code = cli_setup._read_bootstrap_code(
+        Namespace(
+            bootstrap_code_file=None,
+            bootstrap_code_stdin=False,
+            non_interactive=False,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert code == "bootstrap-secret"
+    assert "SSH 登录 Gateway ECS" in captured.err
+    assert "sudo cat /var/lib/vgen/bootstrap-code" in captured.err
+    assert "联系 Gateway 管理员" in captured.err
+    assert "sudo rm -f /var/lib/vgen/bootstrap-code" in captured.err
+    assert "bootstrap-secret" not in captured.err
+    assert prompts == ["Bootstrap code（粘贴后按回车，输入不会显示）: "]
+
+
 def test_local_broker_status_reports_managed_runtime_version(tmp_path, monkeypatch) -> None:
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install VGen Gateway v1 next to a legacy deployment, then switch Nginx only
+# Install VGen Gateway next to a legacy deployment, then switch Nginx only
 # after the new service is healthy. This script intentionally never changes
 # OSS/IAM policy. Test reset archives only explicitly managed Gateway paths.
 
@@ -9,11 +9,15 @@ umask 077
 
 readonly SERVICE_NAME="vgen-gateway.service"
 readonly MANIFEST_NAME="SHA256SUMS"
-readonly INSTALL_ROOT="/opt/vgen-v1"
-readonly DATA_ROOT="/var/lib/vgen-v1"
+readonly INSTALL_ROOT="/opt/vgen"
+readonly DATA_ROOT="/var/lib/vgen"
 readonly RELEASE_ROOT="/var/www/vgen-releases"
-readonly CONFIG_ROOT="/etc/vgen-v1"
-readonly BACKUP_ROOT="/var/backups/vgen-v1"
+readonly CONFIG_ROOT="/etc/vgen"
+readonly BACKUP_ROOT="/var/backups/vgen"
+readonly LEGACY_V1_INSTALL_ROOT="/opt/vgen-v1"
+readonly LEGACY_V1_DATA_ROOT="/var/lib/vgen-v1"
+readonly LEGACY_V1_CONFIG_ROOT="/etc/vgen-v1"
+readonly LEGACY_V1_BACKUP_ROOT="/var/backups/vgen-v1"
 readonly DATABASE_PATH="${DATA_ROOT}/vgen-gateway.db"
 readonly BOOTSTRAP_PATH="${DATA_ROOT}/bootstrap-code"
 readonly ENVIRONMENT_PATH="${CONFIG_ROOT}/gateway.env"
@@ -64,10 +68,17 @@ UPGRADE_DATABASE_BACKUP=""
 UPGRADE_CONFIG_BACKED_UP=0
 UPGRADE_OLD_RUNTIME_MOVED=0
 UPGRADE_NGINX_REPLACED=0
+LAYOUT_MIGRATION_BACKUP_DIR=""
+LAYOUT_INSTALL_MOVED=0
+LAYOUT_DATA_MOVED=0
+LAYOUT_CONFIG_MOVED=0
+LAYOUT_BACKUP_MOVED=0
+LAYOUT_USER_HOME_MOVED=0
+LAYOUT_UNIT_REPLACED=0
 
 usage() {
   cat <<'EOF'
-VGen Gateway v1 safe installer
+VGen Gateway safe installer
 
 The release bundle must contain these files in the same directory:
   setup-gateway.sh
@@ -1121,11 +1132,12 @@ make_runtime_tree_readable() {
 }
 
 verify_existing_gateway_environment() {
-  [[ "$(stat -c '%a' "${ENVIRONMENT_PATH}")" == "600" ]] || \
-    die "${ACTION} refused: ${ENVIRONMENT_PATH} must have mode 0600"
-  [[ "$(stat -c '%U:%G' "${ENVIRONMENT_PATH}")" == "root:root" ]] || \
-    die "${ACTION} refused: ${ENVIRONMENT_PATH} must be owned by root:root"
-  VGEN_GATEWAY_ENVIRONMENT_PATH="${ENVIRONMENT_PATH}" VGEN_SETUP_ACTION="${ACTION}" \
+  local environment_path="${1:-${ENVIRONMENT_PATH}}"
+  [[ "$(stat -c '%a' "${environment_path}")" == "600" ]] || \
+    die "${ACTION} refused: ${environment_path} must have mode 0600"
+  [[ "$(stat -c '%U:%G' "${environment_path}")" == "root:root" ]] || \
+    die "${ACTION} refused: ${environment_path} must be owned by root:root"
+  VGEN_GATEWAY_ENVIRONMENT_PATH="${environment_path}" VGEN_SETUP_ACTION="${ACTION}" \
     python3.11 <<'PY'
 import os
 from pathlib import Path
@@ -1637,7 +1649,8 @@ PY
 }
 
 verify_upgrade_runtime_security() {
-  VGEN_RUNTIME_ROOT="${INSTALL_ROOT}/venv" python3.11 <<'PY'
+  local runtime_root="${1:-${INSTALL_ROOT}/venv}"
+  VGEN_RUNTIME_ROOT="${runtime_root}" python3.11 <<'PY'
 import os
 import stat
 from pathlib import Path
@@ -1652,12 +1665,12 @@ for path in (root, *root.rglob("*")):
     if not stat.S_ISLNK(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) & 0o022:
         raise SystemExit(f"upgrade refused: runtime entry is group/other writable: {path}")
 PY
-  [[ -f "${INSTALL_ROOT}/venv/bin/vgen-gateway" && \
-     ! -L "${INSTALL_ROOT}/venv/bin/vgen-gateway" ]] || \
+  [[ -f "${runtime_root}/bin/vgen-gateway" && \
+     ! -L "${runtime_root}/bin/vgen-gateway" ]] || \
     die "upgrade refused: active vgen-gateway executable is missing or unsafe"
-  runuser -u vgen -- test -x "${INSTALL_ROOT}/venv/bin/python"
-  runuser -u vgen -- "${INSTALL_ROOT}/venv/bin/vgen-gateway" --help >/dev/null
-  INSTALLED_VGEN_VERSION="$(read_runtime_version "${INSTALL_ROOT}/venv")"
+  runuser -u vgen -- test -x "${runtime_root}/bin/python"
+  runuser -u vgen -- "${runtime_root}/bin/vgen-gateway" --help >/dev/null
+  INSTALLED_VGEN_VERSION="$(read_runtime_version "${runtime_root}")"
 }
 
 verify_upgrade_install_state() {
@@ -1696,6 +1709,216 @@ PY
   verify_root_owned_not_writable "${backup_path}" "saved Nginx backup"
 }
 
+rewrite_migrated_install_state() {
+  local state_path="$1"
+  VGEN_LAYOUT_STATE_PATH="${state_path}" \
+  VGEN_LAYOUT_OLD_BACKUP_ROOT="${LEGACY_V1_BACKUP_ROOT}" \
+  VGEN_LAYOUT_NEW_BACKUP_ROOT="${BACKUP_ROOT}" python3.11 <<'PY'
+import json
+import os
+import stat
+import tempfile
+from pathlib import Path
+
+path = Path(os.environ["VGEN_LAYOUT_STATE_PATH"])
+old_root = Path(os.environ["VGEN_LAYOUT_OLD_BACKUP_ROOT"])
+new_root = Path(os.environ["VGEN_LAYOUT_NEW_BACKUP_ROOT"])
+payload = json.loads(path.read_text(encoding="utf-8"))
+backup = Path(payload.get("nginx_backup", ""))
+try:
+    relative = backup.relative_to(old_root)
+except ValueError as exc:
+    raise SystemExit("layout migration refused: install state backup is outside the legacy root") from exc
+destination = new_root / relative
+if not destination.is_file() or destination.is_symlink():
+    raise SystemExit("layout migration refused: migrated Nginx backup is missing or unsafe")
+payload["nginx_backup"] = str(destination)
+descriptor, temporary_name = tempfile.mkstemp(prefix=".install-state.layout-", dir=path.parent)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+    os.replace(temporary, path)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+  chown root:root "${state_path}"
+  chmod 0600 "${state_path}"
+}
+
+clear_layout_migration_traps() {
+  trap - ERR INT TERM HUP
+}
+
+handle_layout_migration_error() {
+  local status="$1"
+  local rollback_ok=1
+  clear_layout_migration_traps
+  set +e
+  ((status == 0)) && status=1
+  warn "Gateway layout migration failed; restoring the /vgen-v1 directories"
+  systemctl stop "${SERVICE_NAME}" || rollback_ok=0
+
+  if [[ "${LAYOUT_UNIT_REPLACED}" -eq 1 ]]; then
+    install -o root -g root -m 0644 \
+      "${LAYOUT_MIGRATION_BACKUP_DIR}/vgen-gateway.service" "${UNIT_PATH}" || rollback_ok=0
+  fi
+  if [[ "${LAYOUT_CONFIG_MOVED}" -eq 1 && -d "${CONFIG_ROOT}" ]]; then
+    mv -- "${CONFIG_ROOT}" "${LEGACY_V1_CONFIG_ROOT}" || rollback_ok=0
+    if [[ -f "${LAYOUT_MIGRATION_BACKUP_DIR}/install-state.json" ]]; then
+      install -o root -g root -m 0600 \
+        "${LAYOUT_MIGRATION_BACKUP_DIR}/install-state.json" \
+        "${LEGACY_V1_CONFIG_ROOT}/install-state.json" || rollback_ok=0
+    fi
+  fi
+  if [[ "${LAYOUT_DATA_MOVED}" -eq 1 && -d "${DATA_ROOT}" ]]; then
+    mv -- "${DATA_ROOT}" "${LEGACY_V1_DATA_ROOT}" || rollback_ok=0
+  fi
+  if [[ "${LAYOUT_INSTALL_MOVED}" -eq 1 && -d "${INSTALL_ROOT}" ]]; then
+    mv -- "${INSTALL_ROOT}" "${LEGACY_V1_INSTALL_ROOT}" || rollback_ok=0
+    relocate_python_runtime_scripts \
+      "${INSTALL_ROOT}/venv" "${LEGACY_V1_INSTALL_ROOT}/venv" || rollback_ok=0
+  fi
+  if [[ "${LAYOUT_BACKUP_MOVED}" -eq 1 && -d "${BACKUP_ROOT}" ]]; then
+    mv -- "${BACKUP_ROOT}" "${LEGACY_V1_BACKUP_ROOT}" || rollback_ok=0
+  elif [[ -d "${BACKUP_ROOT}" ]]; then
+    rmdir -- "${BACKUP_ROOT}" 2>/dev/null || true
+  fi
+  if [[ "${LAYOUT_USER_HOME_MOVED}" -eq 1 ]]; then
+    usermod --home "${LEGACY_V1_DATA_ROOT}" vgen || rollback_ok=0
+  fi
+  systemctl daemon-reload || rollback_ok=0
+  systemctl start "${SERVICE_NAME}" || rollback_ok=0
+  gateway_local_health_with_retry || rollback_ok=0
+  gateway_https_health_with_retry || rollback_ok=0
+  if [[ "${rollback_ok}" -eq 1 ]]; then
+    warn "legacy /vgen-v1 layout was restored and Gateway health passed"
+  else
+    warn "layout restoration needs manual inspection; backup: ${LAYOUT_MIGRATION_BACKUP_DIR}"
+  fi
+  exit "${status}"
+}
+
+verify_legacy_v1_layout_for_migration() {
+  local new_path legacy_path legacy_home
+  for new_path in "${INSTALL_ROOT}" "${DATA_ROOT}" "${CONFIG_ROOT}" "${BACKUP_ROOT}"; do
+    [[ ! -e "${new_path}" && ! -L "${new_path}" ]] || \
+      die "layout migration refused: new and /vgen-v1 paths are mixed: ${new_path}"
+  done
+  for legacy_path in \
+    "${LEGACY_V1_INSTALL_ROOT}" "${LEGACY_V1_DATA_ROOT}" "${LEGACY_V1_CONFIG_ROOT}"; do
+    [[ -d "${legacy_path}" && ! -L "${legacy_path}" ]] || \
+      die "layout migration refused: legacy directory is missing or unsafe: ${legacy_path}"
+  done
+  [[ -d "${LEGACY_V1_INSTALL_ROOT}/venv" && \
+     ! -L "${LEGACY_V1_INSTALL_ROOT}/venv" ]] || \
+    die "layout migration refused: legacy runtime is missing or unsafe"
+  [[ -f "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" && \
+     ! -L "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" ]] || \
+    die "layout migration refused: legacy database is missing or unsafe"
+  [[ -f "${LEGACY_V1_CONFIG_ROOT}/gateway.env" && \
+     ! -L "${LEGACY_V1_CONFIG_ROOT}/gateway.env" ]] || \
+    die "layout migration refused: legacy Gateway environment is missing or unsafe"
+  [[ -f "${LEGACY_V1_CONFIG_ROOT}/install-state.json" && \
+     ! -L "${LEGACY_V1_CONFIG_ROOT}/install-state.json" ]] || \
+    die "layout migration refused: legacy install state is missing or unsafe"
+  [[ -f "${UNIT_PATH}" && ! -L "${UNIT_PATH}" ]] || \
+    die "layout migration refused: systemd unit is missing or unsafe"
+  [[ "$(stat -c '%a %U:%G' "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db")" == \
+     "600 vgen:vgen" ]] || die "layout migration refused: legacy database permissions do not match"
+  [[ "$(stat -c '%a %U:%G' "${LEGACY_V1_CONFIG_ROOT}/install-state.json")" == \
+     "600 root:root" ]] || die "layout migration refused: legacy install state permissions do not match"
+  [[ "$(stat -c '%a %U:%G' "${UNIT_PATH}")" == "644 root:root" ]] || \
+    die "layout migration refused: systemd unit permissions do not match"
+  grep -Fq "ExecStart=${LEGACY_V1_INSTALL_ROOT}/venv/bin/vgen-gateway" "${UNIT_PATH}" || \
+    die "layout migration refused: systemd unit does not use the legacy managed runtime"
+  grep -Fq -- "--database ${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" "${UNIT_PATH}" || \
+    die "layout migration refused: systemd unit does not use the legacy managed database"
+  verify_existing_gateway_environment "${LEGACY_V1_CONFIG_ROOT}/gateway.env"
+  verify_upgrade_runtime_security "${LEGACY_V1_INSTALL_ROOT}/venv"
+  legacy_home="$(getent passwd vgen | awk -F: '{print $6}')"
+  [[ "${legacy_home}" == "${LEGACY_V1_DATA_ROOT}" || "${legacy_home}" == "${DATA_ROOT}" ]] || \
+    die "layout migration refused: vgen user has an unexpected home directory"
+  systemctl is-active --quiet "${SERVICE_NAME}" || \
+    die "layout migration refused: Gateway service is not active"
+  systemctl is-enabled --quiet "${SERVICE_NAME}" || \
+    die "layout migration refused: Gateway service is not enabled"
+  runuser -u vgen -- "${LEGACY_V1_INSTALL_ROOT}/venv/bin/vgen-gateway" \
+    --database "${LEGACY_V1_DATA_ROOT}/vgen-gateway.db" doctor >/dev/null
+  gateway_local_health_with_retry || die "layout migration refused: local Gateway health is not ready"
+  gateway_https_health_with_retry || die "layout migration refused: public Gateway health is not ready"
+}
+
+migrate_legacy_v1_layout_if_needed() {
+  local legacy_count=0 legacy_path stamp retained_backup legacy_home
+  for legacy_path in \
+    "${LEGACY_V1_INSTALL_ROOT}" "${LEGACY_V1_DATA_ROOT}" "${LEGACY_V1_CONFIG_ROOT}"; do
+    [[ ! -e "${legacy_path}" && ! -L "${legacy_path}" ]] || legacy_count=$((legacy_count + 1))
+  done
+  if [[ "${legacy_count}" -eq 0 ]]; then
+    return
+  fi
+  [[ "${legacy_count}" -eq 3 ]] || \
+    die "layout migration refused: incomplete /vgen-v1 installation"
+  log "migrating Gateway directories from /vgen-v1 to stable /vgen paths"
+  verify_legacy_v1_layout_for_migration
+
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  LAYOUT_MIGRATION_BACKUP_DIR="$(mktemp -d "/var/backups/.vgen-layout-${stamp}.XXXXXX")"
+  chmod 0700 "${LAYOUT_MIGRATION_BACKUP_DIR}"
+  cp --preserve=mode,ownership,timestamps -- "${UNIT_PATH}" \
+    "${LAYOUT_MIGRATION_BACKUP_DIR}/vgen-gateway.service"
+  cp --preserve=mode,ownership,timestamps -- \
+    "${LEGACY_V1_CONFIG_ROOT}/install-state.json" \
+    "${LAYOUT_MIGRATION_BACKUP_DIR}/install-state.json"
+
+  trap 'handle_layout_migration_error $?' ERR
+  trap 'handle_layout_migration_error 130' INT
+  trap 'handle_layout_migration_error 143' TERM
+  trap 'handle_layout_migration_error 129' HUP
+  systemctl stop "${SERVICE_NAME}"
+  mv -- "${LEGACY_V1_INSTALL_ROOT}" "${INSTALL_ROOT}"
+  LAYOUT_INSTALL_MOVED=1
+  mv -- "${LEGACY_V1_DATA_ROOT}" "${DATA_ROOT}"
+  LAYOUT_DATA_MOVED=1
+  mv -- "${LEGACY_V1_CONFIG_ROOT}" "${CONFIG_ROOT}"
+  LAYOUT_CONFIG_MOVED=1
+  if [[ -d "${LEGACY_V1_BACKUP_ROOT}" && ! -L "${LEGACY_V1_BACKUP_ROOT}" ]]; then
+    mv -- "${LEGACY_V1_BACKUP_ROOT}" "${BACKUP_ROOT}"
+    LAYOUT_BACKUP_MOVED=1
+  else
+    [[ ! -e "${LEGACY_V1_BACKUP_ROOT}" && ! -L "${LEGACY_V1_BACKUP_ROOT}" ]] || false
+    install -d -o root -g root -m 0700 "${BACKUP_ROOT}"
+  fi
+  relocate_python_runtime_scripts \
+    "${LEGACY_V1_INSTALL_ROOT}/venv" "${INSTALL_ROOT}/venv"
+  rewrite_migrated_install_state "${INSTALL_STATE_PATH}"
+  legacy_home="$(getent passwd vgen | awk -F: '{print $6}')"
+  if [[ "${legacy_home}" == "${LEGACY_V1_DATA_ROOT}" ]]; then
+    usermod --home "${DATA_ROOT}" vgen
+    LAYOUT_USER_HOME_MOVED=1
+  fi
+  install -o root -g root -m 0644 "${SERVICE_SOURCE_PATH}" "${UNIT_PATH}"
+  LAYOUT_UNIT_REPLACED=1
+  systemctl daemon-reload
+  systemctl start "${SERVICE_NAME}"
+  gateway_local_health_with_retry
+  gateway_https_health_with_retry
+  clear_layout_migration_traps
+
+  retained_backup="${BACKUP_ROOT}/layout-migration-${stamp}"
+  [[ ! -e "${retained_backup}" && ! -L "${retained_backup}" ]] || \
+    die "layout migration backup destination already exists"
+  mv -- "${LAYOUT_MIGRATION_BACKUP_DIR}" "${retained_backup}"
+  LAYOUT_MIGRATION_BACKUP_DIR="${retained_backup}"
+  log "Gateway directory layout migration completed"
+  log "layout migration backup: ${LAYOUT_MIGRATION_BACKUP_DIR}"
+}
+
 verify_upgrade_preconditions() {
   [[ "${CONFIRM_UPGRADE}" -eq 1 ]] || die "upgrade requires --confirm-upgrade"
   verify_nginx_config_and_tls
@@ -1722,9 +1945,9 @@ verify_upgrade_preconditions() {
       die "upgrade refused: Bootstrap code permissions do not match"
   fi
   verify_root_owned_not_writable "${NGINX_CONFIG_PATH}" "current Nginx config"
-  grep -Fq "ExecStart=/opt/vgen-v1/venv/bin/vgen-gateway" "${UNIT_PATH}" || \
+  grep -Fq "ExecStart=${INSTALL_ROOT}/venv/bin/vgen-gateway" "${UNIT_PATH}" || \
     die "upgrade refused: current systemd unit does not use the managed runtime"
-  grep -Fq -- "--database /var/lib/vgen-v1/vgen-gateway.db" "${UNIT_PATH}" || \
+  grep -Fq -- "--database ${DATABASE_PATH}" "${UNIT_PATH}" || \
     die "upgrade refused: current systemd unit does not use the managed database"
   verify_existing_gateway_environment
   verify_upgrade_runtime_security
@@ -1978,6 +2201,7 @@ upgrade_gateway() {
   require_command curl
   require_command env
   require_command flock
+  require_command getent
   require_command grep
   require_command install
   require_command mktemp
@@ -1989,9 +2213,11 @@ upgrade_gateway() {
   require_command sha256sum
   require_command stat
   require_command systemctl
+  require_command usermod
 
   acquire_mutation_lock
   verify_release_bundle
+  migrate_legacy_v1_layout_if_needed
   verify_upgrade_preconditions
   if [[ "${UPGRADE_ALREADY_TARGET}" -eq 1 ]]; then
     log "Gateway ${VGEN_VERSION} is already installed and healthy locally and publicly"
@@ -2054,9 +2280,9 @@ reset_test_gateway() {
   chmod 0700 "${backup_dir}"
   systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
 
-  [[ ! -e "${INSTALL_ROOT}" ]] || mv -- "${INSTALL_ROOT}" "${backup_dir}/opt-vgen-v1"
-  [[ ! -e "${DATA_ROOT}" ]] || mv -- "${DATA_ROOT}" "${backup_dir}/var-lib-vgen-v1"
-  [[ ! -e "${CONFIG_ROOT}" ]] || mv -- "${CONFIG_ROOT}" "${backup_dir}/etc-vgen-v1"
+  [[ ! -e "${INSTALL_ROOT}" ]] || mv -- "${INSTALL_ROOT}" "${backup_dir}/opt-vgen"
+  [[ ! -e "${DATA_ROOT}" ]] || mv -- "${DATA_ROOT}" "${backup_dir}/var-lib-vgen"
+  [[ ! -e "${CONFIG_ROOT}" ]] || mv -- "${CONFIG_ROOT}" "${backup_dir}/etc-vgen"
   [[ ! -e "${UNIT_PATH}" ]] || mv -- "${UNIT_PATH}" "${backup_dir}/vgen-gateway.service"
   systemctl daemon-reload
   systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true

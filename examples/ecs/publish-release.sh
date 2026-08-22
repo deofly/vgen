@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 readonly DEFAULT_RELEASE_ROOT="/var/www/vgen-releases"
-readonly DEFAULT_BACKUP_ROOT="/var/backups/vgen-v1"
+readonly DEFAULT_BACKUP_ROOT="/var/backups/vgen"
 readonly DEFAULT_LOCK_PATH="/run/lock/vgen-public-release.lock"
 
 ARCHIVE=""

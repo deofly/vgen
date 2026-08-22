@@ -279,4 +279,8 @@ def test_ecs_nginx_serves_only_constrained_release_paths_with_correct_caches() -
     assert "location /releases/ {\n    return 404;" in source
     assert "autoindex" not in source
     assert "--release-root /var/www/vgen-releases" in unit
+    assert "WorkingDirectory=/opt/vgen" in unit
+    assert "EnvironmentFile=/etc/vgen/gateway.env" in unit
+    assert "--database /var/lib/vgen/vgen-gateway.db" in unit
+    assert "/vgen-v1" not in unit
     assert 'readonly RELEASE_ROOT="/var/www/vgen-releases"' in installer

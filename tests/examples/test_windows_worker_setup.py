@@ -778,8 +778,8 @@ def test_two_handbooks_are_the_only_documentation_sources_for_operations_and_rel
     assert "--artifact-store oss" in user
     assert "./setup-gateway.sh upgrade --domain <Gateway域名>" in user
     assert "健康检查失败时自动恢复旧版本" in user
-    assert "sudo cat /var/lib/vgen-v1/bootstrap-code" in user
-    assert "sudo rm -f /var/lib/vgen-v1/bootstrap-code" in user
+    assert "sudo cat /var/lib/vgen/bootstrap-code" in user
+    assert "sudo rm -f /var/lib/vgen/bootstrap-code" in user
     assert "start-worker.cmd" in user
     assert "%LOCALAPPDATA%\\VGen" in user
     assert "vgen broker model-install" in user

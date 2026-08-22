@@ -86,7 +86,7 @@ from .service_credentials import (
     StoredServiceSession,
 )
 from .session_store import SessionStore, StoredSession
-from .setup import setup_command
+from .setup import prompt_bootstrap_code, setup_command
 from .upgrade import upgrade_command
 from .user_enrollment import identity_registration_claim, sign_enrollment_admission
 from .workspace_authorities import (
@@ -555,9 +555,7 @@ def _gateway_command(args: argparse.Namespace) -> None:
     if args.gateway_action != "bootstrap":
         raise ValueError("unsupported gateway action")
     profile, identity = _profile_and_identity(args.profile)
-    code = (
-        sys.stdin.read().strip() if not sys.stdin.isatty() else getpass.getpass("Bootstrap code: ")
-    )
+    code = sys.stdin.read().strip() if not sys.stdin.isatty() else prompt_bootstrap_code()
     client = GatewayClient(profile)
     try:
         response = client.request(
