@@ -178,6 +178,7 @@ def test_release_scripts_have_valid_syntax_and_help() -> None:
         [str(WRAPPER_PATH), "--help"], check=False, capture_output=True, text=True
     )
     assert help_result.returncode == 0
+    assert "configure" in help_result.stdout
     assert "build" in help_result.stdout
     assert "publish" in help_result.stdout
 
@@ -186,6 +187,103 @@ def test_release_scripts_have_valid_syntax_and_help() -> None:
     )
     assert publisher_help.returncode == 0
     assert "switches stable.json last" in publisher_help.stdout
+
+
+def test_release_configure_writes_private_config_and_publish_uses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config" / "release.toml"
+    monkeypatch.setenv("VGEN_RELEASE_CONFIG", str(config_path))
+    parser = TOOL._parser()
+    configured = parser.parse_args(
+        [
+            "configure",
+            "--gateway",
+            "https://vgen-gw.example.com/",
+            "--releases",
+            "https://vgen.example.com/",
+            "--ssh",
+            "root@ecs.example.com",
+            "--ssh-port",
+            "2222",
+        ]
+    )
+    config = TOOL._validated_release_config(
+        gateway=configured.gateway_origin,
+        releases=configured.release_origin,
+        ssh=configured.ssh_target,
+        ssh_port=configured.ssh_port,
+    )
+    assert TOOL._write_release_config(config) == config_path
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert TOOL._read_release_config() == TOOL.ReleaseConfig(
+        gateway_origin="https://vgen-gw.example.com",
+        release_origin="https://vgen.example.com",
+        ssh_target="root@ecs.example.com",
+        ssh_port=2222,
+    )
+
+    publish = parser.parse_args(["publish", "--version", "0.7.2"])
+    assert TOOL._resolved_release_config(publish, require_ssh=True) == config
+
+
+def test_release_flags_override_saved_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "release.toml"
+    monkeypatch.setenv("VGEN_RELEASE_CONFIG", str(config_path))
+    TOOL._write_release_config(
+        TOOL.ReleaseConfig(
+            gateway_origin="https://saved-gw.example.com",
+            release_origin="https://saved.example.com",
+            ssh_target="saved@example.com",
+            ssh_port=22,
+        )
+    )
+    arguments = TOOL._parser().parse_args(
+        [
+            "publish",
+            "--version",
+            "0.7.2",
+            "--gateway",
+            "https://override-gw.example.com",
+            "--releases",
+            "https://override.example.com",
+            "--ssh",
+            "root@override.example.com",
+            "--ssh-port",
+            "2200",
+        ]
+    )
+    assert TOOL._resolved_release_config(arguments, require_ssh=True) == TOOL.ReleaseConfig(
+        gateway_origin="https://override-gw.example.com",
+        release_origin="https://override.example.com",
+        ssh_target="root@override.example.com",
+        ssh_port=2200,
+    )
+
+
+def test_release_config_rejects_loose_permissions_and_missing_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "release.toml"
+    monkeypatch.setenv("VGEN_RELEASE_CONFIG", str(config_path))
+    config_path.write_text(
+        'schema_version = 1\n'
+        'gateway = "https://vgen-gw.example.com"\n'
+        'releases = "https://vgen.example.com"\n'
+        'ssh = "root@ecs.example.com"\n'
+        "ssh_port = 22\n",
+        encoding="utf-8",
+    )
+    config_path.chmod(0o644)
+    with pytest.raises(TOOL.ReleaseError, match="permissions must be 0600"):
+        TOOL._read_release_config()
+
+    config_path.unlink()
+    arguments = TOOL._parser().parse_args(["publish", "--version", "0.7.2"])
+    with pytest.raises(TOOL.ReleaseError, match="run ./tools/release.sh configure"):
+        TOOL._resolved_release_config(arguments, require_ssh=True)
 
 
 def test_publish_parser_separates_gateway_install_and_upgrade_modes() -> None:

@@ -10,8 +10,10 @@ import io
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -44,6 +46,143 @@ class BuildResult:
     windows_bundle: Path
     deployment_archive: Path
     deployment_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseConfig:
+    gateway_origin: str
+    release_origin: str
+    ssh_target: str
+    ssh_port: int = 22
+
+
+def _release_config_path() -> Path:
+    override = os.environ.get("VGEN_RELEASE_CONFIG")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ReleaseError("VGEN_RELEASE_CONFIG must be an absolute path")
+        return path
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return root / "vgen" / "release.toml"
+
+
+def _validated_ssh_target(value: str) -> str:
+    target = value.strip()
+    if SSH_TARGET_PATTERN.fullmatch(target) is None:
+        raise ReleaseError("SSH target must use the form user@hostname or hostname")
+    return target
+
+
+def _validated_ssh_port(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
+        raise ReleaseError("SSH port must be between 1 and 65535")
+    return value
+
+
+def _validated_release_config(
+    *, gateway: object, releases: object, ssh: object, ssh_port: object
+) -> ReleaseConfig:
+    if not all(isinstance(value, str) for value in (gateway, releases, ssh)):
+        raise ReleaseError("release config origins and SSH target must be strings")
+    gateway_origin, _ = _validated_origin(str(gateway))
+    release_origin, _ = _validated_origin(str(releases))
+    return ReleaseConfig(
+        gateway_origin=gateway_origin,
+        release_origin=release_origin,
+        ssh_target=_validated_ssh_target(str(ssh)),
+        ssh_port=_validated_ssh_port(ssh_port),
+    )
+
+
+def _read_release_config() -> ReleaseConfig | None:
+    path = _release_config_path()
+    if not path.exists():
+        return None
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"cannot inspect release config: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise ReleaseError(f"release config must be a regular file, not a symlink: {path}")
+    if os.name != "nt" and metadata.st_mode & 0o077:
+        raise ReleaseError(f"release config permissions must be 0600: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise ReleaseError(f"release config must be owned by the current user: {path}")
+    try:
+        with path.open("rb") as handle:
+            value = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ReleaseError(f"cannot read release config: {path}") from exc
+    if set(value) != {"schema_version", "gateway", "releases", "ssh", "ssh_port"}:
+        raise ReleaseError(f"release config has unknown or missing fields: {path}")
+    if value.get("schema_version") != 1:
+        raise ReleaseError(f"release config schema_version must be 1: {path}")
+    return _validated_release_config(
+        gateway=value.get("gateway"),
+        releases=value.get("releases"),
+        ssh=value.get("ssh"),
+        ssh_port=value.get("ssh_port"),
+    )
+
+
+def _write_release_config(config: ReleaseConfig) -> Path:
+    path = _release_config_path()
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise ReleaseError(f"refusing to replace non-regular release config: {path}")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    content = (
+        "schema_version = 1\n"
+        f"gateway = {json.dumps(config.gateway_origin)}\n"
+        f"releases = {json.dumps(config.release_origin)}\n"
+        f"ssh = {json.dumps(config.ssh_target)}\n"
+        f"ssh_port = {config.ssh_port}\n"
+    ).encode()
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = -1
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _resolved_release_config(arguments: argparse.Namespace, *, require_ssh: bool) -> ReleaseConfig:
+    saved = _read_release_config()
+    gateway = arguments.gateway_origin or (saved.gateway_origin if saved else None)
+    releases = arguments.release_origin or (saved.release_origin if saved else None)
+    ssh = getattr(arguments, "ssh_target", None) or (saved.ssh_target if saved else None)
+    explicit_port = getattr(arguments, "ssh_port", None)
+    ssh_port = explicit_port if explicit_port is not None else (saved.ssh_port if saved else 22)
+    missing = []
+    if gateway is None:
+        missing.append("--gateway")
+    if releases is None:
+        missing.append("--releases")
+    if require_ssh and ssh is None:
+        missing.append("--ssh")
+    if missing:
+        raise ReleaseError(
+            "missing release target "
+            + ", ".join(missing)
+            + "; run ./tools/release.sh configure once or pass it explicitly"
+        )
+    return _validated_release_config(
+        gateway=gateway,
+        releases=releases,
+        ssh=ssh or "localhost",
+        ssh_port=ssh_port,
+    )
 
 
 def _run(
@@ -311,10 +450,8 @@ def build_release(
 
 
 def _ssh_commands(target: str, port: int) -> tuple[list[str], list[str]]:
-    if SSH_TARGET_PATTERN.fullmatch(target) is None:
-        raise ReleaseError("SSH target must use the form user@hostname or hostname")
-    if not 1 <= port <= 65535:
-        raise ReleaseError("SSH port must be between 1 and 65535")
+    target = _validated_ssh_target(target)
+    port = _validated_ssh_port(port)
     return ["ssh", "-p", str(port), target], ["scp", "-P", str(port)]
 
 
@@ -524,10 +661,17 @@ def _parser() -> argparse.ArgumentParser:
         description="Build all VGen artifacts and optionally publish stable through ECS."
     )
     subcommands = parser.add_subparsers(dest="action", required=True)
+    configure = subcommands.add_parser(
+        "configure", help="save the default Gateway, release site, and SSH target"
+    )
+    configure.add_argument("--gateway", required=True, dest="gateway_origin")
+    configure.add_argument("--releases", required=True, dest="release_origin")
+    configure.add_argument("--ssh", required=True, dest="ssh_target")
+    configure.add_argument("--ssh-port", type=int, default=22)
     build = subcommands.add_parser("build", help="build a reviewed local release candidate")
     build.add_argument("--version", required=True)
-    build.add_argument("--gateway", required=True, dest="gateway_origin")
-    build.add_argument("--releases", required=True, dest="release_origin")
+    build.add_argument("--gateway", dest="gateway_origin")
+    build.add_argument("--releases", dest="release_origin")
     build.add_argument(
         "--allow-untagged-candidate",
         action="store_true",
@@ -537,10 +681,10 @@ def _parser() -> argparse.ArgumentParser:
         "publish", help="build, upload, atomically switch stable, and verify"
     )
     publish.add_argument("--version", required=True)
-    publish.add_argument("--gateway", required=True, dest="gateway_origin")
-    publish.add_argument("--releases", required=True, dest="release_origin")
-    publish.add_argument("--ssh", required=True, dest="ssh_target")
-    publish.add_argument("--ssh-port", type=int, default=22)
+    publish.add_argument("--gateway", dest="gateway_origin")
+    publish.add_argument("--releases", dest="release_origin")
+    publish.add_argument("--ssh", dest="ssh_target")
+    publish.add_argument("--ssh-port", type=int)
     publish.add_argument("--confirm-stable", action="store_true")
     gateway_actions = publish.add_mutually_exclusive_group()
     gateway_actions.add_argument(
@@ -587,8 +731,25 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     arguments = _parser().parse_args()
+    if arguments.action == "configure":
+        config = _validated_release_config(
+            gateway=arguments.gateway_origin,
+            releases=arguments.release_origin,
+            ssh=arguments.ssh_target,
+            ssh_port=arguments.ssh_port,
+        )
+        path = _write_release_config(config)
+        print(f"release_config={path}")
+        print(f"gateway={config.gateway_origin}")
+        print(f"releases={config.release_origin}")
+        print(f"ssh={config.ssh_target}")
+        print(f"ssh_port={config.ssh_port}")
+        return 0
     if VERSION_PATTERN.fullmatch(arguments.version) is None:
         raise ReleaseError("--version must use MAJOR.MINOR.PATCH")
+    targets = _resolved_release_config(
+        arguments, require_ssh=arguments.action == "publish"
+    )
     gateway_action = "none"
     if arguments.action == "publish":
         gateway_action = (
@@ -615,8 +776,8 @@ def main() -> int:
     require_tag = arguments.action == "publish" or not arguments.allow_untagged_candidate
     result = build_release(
         version=arguments.version,
-        gateway_origin=arguments.gateway_origin,
-        release_origin=arguments.release_origin,
+        gateway_origin=targets.gateway_origin,
+        release_origin=targets.release_origin,
         require_tag=require_tag,
     )
     print(f"release_version={result.version}")
@@ -627,10 +788,10 @@ def main() -> int:
     if arguments.action == "publish":
         publish_release(
             result,
-            gateway_origin=arguments.gateway_origin,
-            release_origin=arguments.release_origin,
-            ssh_target=arguments.ssh_target,
-            ssh_port=arguments.ssh_port,
+            gateway_origin=targets.gateway_origin,
+            release_origin=targets.release_origin,
+            ssh_target=targets.ssh_target,
+            ssh_port=targets.ssh_port,
             confirmed=arguments.confirm_stable,
             gateway_action=gateway_action,
             reset_test_gateway=arguments.reset_test_gateway,

@@ -481,15 +481,24 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 
 ### 8.1 统一构建和发布入口
 
-日常发行不需要逐条运行下文的底层构建器。完成源码修改、测试、版本提交和 tag 后，在 Mac
-执行一个命令即可完成质量门、全部产物构建、SCP 上传、ECS 原子发布、stable 切换和公网验证：
+日常发行不需要逐条运行下文的底层构建器。第一次在发布用 Mac 上配置默认目标：
 
 ```bash
-./tools/release.sh publish \
-  --version 0.3.1 \
+./tools/release.sh configure \
   --gateway https://vgen-gw.example.com \
   --releases https://vgen.example.com \
   --ssh root@ecs.example.com
+```
+
+配置写入当前用户的 `~/.config/vgen/release.toml`，权限固定为 `0600`，不会提交到 Git，也不保存
+SSH 密码或私钥。`VGEN_RELEASE_CONFIG` 可为自动化测试指定另一个绝对路径。命令行中的
+`--gateway`、`--releases`、`--ssh` 和 `--ssh-port` 始终覆盖本地配置。
+
+完成源码修改、测试、版本提交和 tag 后，在 Mac 只需执行：
+
+```bash
+./tools/release.sh publish \
+  --version 0.3.1
 ```
 
 脚本会要求输入下载域名确认 stable 切换。自动化环境只有在外层已经完成等价审批时才使用
@@ -721,8 +730,9 @@ Mac bundle 包含 `install.command`、用户手册、wheel、`SHA256SUMS` 和可
 
 独立下载站的 Nginx release 路由只公开两个 no-cache 精确路径：
 `/releases/channels/stable.json`、`/releases/install-macos.sh`，以及受限的不可变
-`/releases/<version>/<filename>`。固定 bootstrap 必须先下载、再由用户阅读和运行；文档和
-安装页不得推荐 `curl | sh`。
+`/releases/<version>/<filename>`。用户文档和安装页提供固定 bootstrap 的一键安装命令；
+bootstrap 必须继续固定 release origin、校验不可变 manifest 和安装包摘要，并从 `/dev/tty`
+读取确认，避免把管道中的脚本文本误当作用户输入。
 
 Windows 安装器必须支持 PowerShell 5.1，自动识别 AppData、Program Files、Program Files
 (x86)、Desktop installation records、Standalone、adopted/ComfyBuilder 和 Portable。无法唯一
