@@ -403,6 +403,14 @@ test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v0.3.1)"
 尚未公开发布的本地标签可以在修复发布阻塞后重新创建；已经推送或被 stable 引用的标签禁止移动，
 必须发布新版本。
 
+仅当标签从未推送、对应版本也从未被 stable 引用时，可以把它重新指向修复后的当前提交：
+
+```bash
+git tag -d v0.3.1
+git tag -a v0.3.1 -m 'VGen 0.3.1'
+test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v0.3.1)"
+```
+
 ## 7. 测试与验收
 
 每次变更先确认工作区只包含本次范围，再运行完整质量门：
@@ -493,6 +501,17 @@ API、OpenAPI、Executor descriptor、workflow release、DB schema、credential/
 Git 提交时间并转换成 UTC `published_at`，因此同一 tag 的重复构建保持可复现。脚本只清理
 `dist/` 下当前版本的临时派生产物和本地 staging 版本目录，不修改源码、版本、commit 或 tag；
 ECS 上已经存在的不同字节不可变版本仍会被拒绝覆盖，其他本地版本目录也不会被清理。
+
+新版脚本会自动清理当前版本的本地 staging。若使用旧版工具中断后看到错误路径明确位于当前仓库
+`dist/public-releases/X.Y.Z`，并且日志尚未出现 `scp`，可在仓库根目录只删除该精确本地目录后重试：
+
+```bash
+test "$PWD" = "$(git rev-parse --show-toplevel)" && \
+  rm -rf -- "$PWD/dist/public-releases/0.3.1"
+```
+
+不得删除整个 `dist/public-releases/`，也不得把这条命令改成 ECS 上的
+`/var/www/vgen-releases/X.Y.Z/`。
 
 `publish` 先完成全部本地构建，再创建远端临时目录并上传，最后才调用 ECS 发布器切换 stable。
 如果日志尚未出现 `scp`，ECS 完全未被修改；如果 ECS 发布器失败，先读取当前

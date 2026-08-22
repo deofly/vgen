@@ -204,6 +204,9 @@ def test_release_baseline_and_one_command_flow_are_documented() -> None:
     assert "/:memory:" in gitignore.splitlines()
     assert "git status --short --ignored" in guide
     assert "git diff --cached --check" in guide
+    assert "git tag -a v0.3.1" in guide
+    assert 'rm -rf -- "$PWD/dist/public-releases/0.3.1"' in guide
+    assert "不得删除整个 `dist/public-releases/`" in guide
     assert "./tools/release.sh publish" in guide
     assert "--upgrade-gateway" in guide
     assert "stable.json" in guide
