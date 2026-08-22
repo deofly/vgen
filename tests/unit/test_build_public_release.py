@@ -220,15 +220,24 @@ def _release_server(
     return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 
 
-def _run_bootstrap(script: Path, *, home: Path, answer: str = "n\n") -> subprocess.CompletedProcess:
+def _run_bootstrap(
+    script: Path,
+    *,
+    home: Path,
+    answer: str = "n\n",
+    piped: bool = False,
+) -> subprocess.CompletedProcess:
     home.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "HOME": str(home)}
+    if piped:
+        env["VGEN_INSTALL_YES"] = "1"
     return subprocess.run(
-        ["/bin/sh", str(script)],
-        input=answer,
+        ["/bin/sh"] if piped else ["/bin/sh", str(script)],
+        input=script.read_text(encoding="utf-8") if piped else answer,
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "HOME": str(home)},
+        env=env,
         cwd=home,
         timeout=30,
     )
@@ -301,6 +310,7 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert '"$candidate" -I -B -c' in script
     assert '"$PYTHON_BIN" -I -B <<\'PY\'' in script
     assert "Install the CLI for the current user now? [y/N]" in script
+    assert "read -r answer 2>/dev/null </dev/tty" in script
     assert "install.command\" --install-only" in script
     assert '"$VGEN_BIN" broker service-refresh' in script
     assert "jq" not in script
@@ -386,7 +396,7 @@ def test_bootstrap_downloads_same_origin_validates_and_runs_install_command(
         completed = _run_bootstrap(
             result.macos_bootstrap,
             home=bootstrap_home,
-            answer="y\n",
+            piped=True,
         )
     finally:
         server.shutdown()

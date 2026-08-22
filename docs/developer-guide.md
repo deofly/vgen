@@ -604,7 +604,9 @@ macOS 安装。新版本安装到独立目录，验证 `vgen --version` 后刷�
 
 公网 `install-macos.sh` 仍承担第一次安装和损坏恢复。它使用 `--install-only` 安装已校验包后，
 若检测到现有 Profile，则必须自动执行 `broker service-refresh`；只有全新客户端才提示执行
-Workspace/User join。CLI 自升级不升级 Gateway 或 Windows Worker，也不修改 stable 指针。
+Workspace/User join。脚本必须从 `/dev/tty` 读取人工确认，不能从标准输入读取，否则
+`curl ... | sh` 会把后续脚本文本误当成用户输入；无终端自动化只能显式设置
+`VGEN_INSTALL_YES=1`。CLI 自升级不升级 Gateway 或 Windows Worker，也不修改 stable 指针。
 
 ### 8.3 手工同步到 ECS 或 OSS
 

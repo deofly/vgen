@@ -697,8 +697,18 @@ except (OSError, zipfile.BadZipFile) as exc:
 PY
 
 printf '\nVerified VGen macOS %s from %s.\n' "$EXPECTED_VERSION" "$GATEWAY_ORIGIN"
-printf 'Install the CLI for the current user now? [y/N] '
-IFS= read -r answer
+if [ "${{VGEN_INSTALL_YES:-0}}" = '1' ]; then
+  answer=y
+else
+  if ! printf 'Install the CLI for the current user now? [y/N] ' 2>/dev/null >/dev/tty; then
+    printf '%s\n' 'An interactive terminal is required; rerun from a terminal or set VGEN_INSTALL_YES=1.' >&2
+    exit 1
+  fi
+  if ! IFS= read -r answer 2>/dev/null </dev/tty; then
+    printf '%s\n' 'Could not read installation confirmation from the terminal.' >&2
+    exit 1
+  fi
+fi
 case "$answer" in
   y|Y) ;;
   *) printf '%s\n' 'Installation cancelled.'; exit 1 ;;
