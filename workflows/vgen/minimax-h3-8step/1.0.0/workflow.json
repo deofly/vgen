@@ -1,0 +1,232 @@
+{
+ "1": {
+  "inputs": {
+   "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "class_type": "UNETLoader",
+  "_meta": {
+   "title": "UNet加载器"
+  }
+ },
+ "2": {
+  "inputs": {
+   "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+   "strength_model": 1,
+   "model": [
+    "1",
+    0
+   ]
+  },
+  "class_type": "LoraLoaderBypassModelOnly",
+  "_meta": {
+   "title": "加载LoRA（旁路，仅模型）（用于调试）"
+  }
+ },
+ "3": {
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  },
+  "class_type": "CLIPLoader",
+  "_meta": {
+   "title": "加载CLIP"
+  }
+ },
+ "4": {
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  },
+  "class_type": "VAELoader",
+  "_meta": {
+   "title": "加载VAE"
+  }
+ },
+ "5": {
+  "inputs": {
+   "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "class_type": "VAELoader",
+  "_meta": {
+   "title": "加载VAE"
+  }
+ },
+ "6": {
+  "inputs": {
+   "prompt": "一位穿黑色针织连衣裙的长发女性,手持手机面对镜头微笑说话,手机屏幕显示 21:45 和 2026年8月15日,屏幕内容全程保持清晰稳定不变;人物轻微自然晃动,镜头固定不动;她开口用中文说:“现在是2026年8月15日21点45分”,声音温柔清晰,口型与语音严格同步。",
+   "width": 768,
+   "height": 1344,
+   "length": 124,
+   "output_resolution": "custom",
+   "task_type": "auto",
+   "audio_mode": "native",
+   "audio_denoise_strength": 1,
+   "add_source_as_reference": false,
+   "prompt_primary_audio_ordinal": 0,
+   "strict_prompt_tags": true,
+   "ref_image_size": "match",
+   "reference_video_policy": "official_2_to_15s",
+   "clip": [
+    "3",
+    0
+   ],
+   "video_vae": [
+    "4",
+    0
+   ],
+   "audio_vae": [
+    "5",
+    0
+   ],
+   "first_frame": [
+    "14",
+    0
+   ],
+   "last_frame": [
+    "15",
+    0
+   ]
+  },
+  "class_type": "MiniMaxH3AudioConditioningT8",
+  "_meta": {
+   "title": "LATENT"
+  }
+ },
+ "7": {
+  "inputs": {
+   "steps": 8,
+   "shift_video": 12,
+   "shift_audio": 3,
+   "model": [
+    "2",
+    0
+   ],
+   "av_latent": [
+    "6",
+    1
+   ]
+  },
+  "class_type": "MiniMaxH3DualClockSamplerT8",
+  "_meta": {
+   "title": "SAMPLER"
+  }
+ },
+ "8": {
+  "inputs": {
+   "model": [
+    "7",
+    0
+   ],
+   "conditioning": [
+    "6",
+    0
+   ]
+  },
+  "class_type": "BasicGuider",
+  "_meta": {
+   "title": "基本引导器"
+  }
+ },
+ "9": {
+  "inputs": {
+   "noise_seed": 123456789
+  },
+  "class_type": "RandomNoise",
+  "_meta": {
+   "title": "NOISE"
+  }
+ },
+ "10": {
+  "inputs": {
+   "noise": [
+    "9",
+    0
+   ],
+   "guider": [
+    "8",
+    0
+   ],
+   "sampler": [
+    "7",
+    1
+   ],
+   "sigmas": [
+    "7",
+    2
+   ],
+   "latent_image": [
+    "6",
+    1
+   ]
+  },
+  "class_type": "SamplerCustomAdvanced",
+  "_meta": {
+   "title": "自定义采样器（高级）"
+  }
+ },
+ "11": {
+  "inputs": {
+   "av_latent": [
+    "10",
+    0
+   ],
+   "video_vae": [
+    "4",
+    0
+   ],
+   "audio_vae": [
+    "5",
+    0
+   ]
+  },
+  "class_type": "MiniMaxH3AVDecodeT8",
+  "_meta": {
+   "title": "MiniMax H3 AV Decode (T8)"
+  }
+ },
+ "12": {
+  "inputs": {
+   "frame_rate": 24,
+   "loop_count": 0,
+   "filename_prefix": "MiniMaxH3/h3_8step",
+   "format": "video/h264-mp4",
+   "pix_fmt": "yuv420p",
+   "crf": 19,
+   "save_metadata": true,
+   "trim_to_audio": false,
+   "pingpong": false,
+   "save_output": true,
+   "images": [
+    "11",
+    0
+   ],
+   "audio": [
+    "11",
+    1
+   ]
+  },
+  "class_type": "VHS_VideoCombine",
+  "_meta": {
+   "title": "VIDEO_OUTPUT"
+  }
+ },
+ "14": {
+  "inputs": {
+   "image": "__FIRST_FRAME_REQUIRED_WHEN_CONNECTED__.png"
+  },
+  "class_type": "LoadImage",
+  "_meta": {
+   "title": "INPUT_IMAGE"
+  }
+ },
+ "15": {
+  "inputs": {
+   "image": "__LAST_FRAME_REQUIRED_WHEN_CONNECTED__.png"
+  },
+  "class_type": "LoadImage",
+  "_meta": {
+   "title": "LAST_IMAGE"
+  }
+ }
+}

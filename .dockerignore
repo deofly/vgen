@@ -1,0 +1,10 @@
+# The reference image installs only the Python distribution.  A whitelist
+# prevents local databases, credentials, legacy v0 sources, and generated
+# artifacts from being sent to a Docker daemon (which may be remote).
+**
+!pyproject.toml
+!README.md
+!LICENSE
+!NOTICE
+!src/
+!src/**

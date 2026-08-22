@@ -1,0 +1,3476 @@
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import sys
+import time
+import uuid
+from collections.abc import Mapping
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from jsonschema import Draft202012Validator
+from packaging.version import Version
+
+from vgen import __version__
+from vgen.artifacts import (
+    ArtifactTransferError,
+    HttpArtifactAdapter,
+    TransferTicket,
+    with_safe_media_extension,
+)
+from vgen.crypto import (
+    HPKE_ALGORITHM,
+    DeviceKeys,
+    PayloadCiphertext,
+    b64url_decode,
+    b64url_encode,
+    build_allocation_proof_payload,
+    build_maintenance_intent_payload,
+    canonical_json,
+    device_key_id,
+    encrypt_payload,
+    export_recovery_file,
+    generate_task_data_key,
+    sign_allocation_proof,
+    sign_http_request,
+    sign_key_manifest,
+    sign_maintenance_intent,
+    sign_message,
+    task_aad,
+    unwrap_task_key_for_workspace,
+    verify_allocation_proof,
+    verify_key_manifest,
+    wrap_task_key,
+    wrap_task_key_for_workspace,
+)
+from vgen.market import WorkflowRegistry
+from vgen.market.builder import build_comfy_graph, load_json
+from vgen.market.models import WorkflowManifest, WorkflowVariant
+from vgen.market.registry import (
+    RegistryError,
+    build_archive,
+    sign_package,
+    validate_package,
+)
+from vgen.protocol import ErrorCode, VGenError, get_error_spec, new_id
+from vgen.protocol.user_enrollment import user_verification_code
+
+from .artifacts import (
+    LocalTaskInput,
+    download_and_decrypt_output,
+    encrypt_and_upload_inputs,
+)
+from .auth import login_service_session, login_session, login_worker_session
+from .client import GatewayClient, VgenClientError, cli_exit_code
+from .device_migration import register_recovered_device
+from .identity_store import DeviceIdentity, DeviceIdentityStore, IdentityStoreError
+from .join import join_command
+from .profile import GatewayProfile, ProfileError, ProfileStore
+from .service_credentials import (
+    ServiceCredentialError,
+    ServiceCredentials,
+    ServiceCredentialStore,
+    ServiceSessionStore,
+    StoredServiceSession,
+)
+from .session_store import SessionStore, StoredSession
+from .setup import setup_command
+from .user_enrollment import identity_registration_claim, sign_enrollment_admission
+from .workspace_authorities import (
+    PinnedInvite,
+    WorkspaceAuthorityError,
+    WorkspaceAuthorityStore,
+    decorate_invite_uri,
+    parse_pinned_invite_uri,
+)
+from .workspace_envelopes import (
+    LegacyOwnerMigrationRequired,
+    grant_workspace_key,
+    initialize_workspace_keys,
+    migrate_legacy_workspace_owner,
+    require_local_workspace_owner,
+    rotate_workspace_key,
+    sync_service_workspace_key,
+    sync_workspace_key,
+)
+from .workspace_keys import WorkspaceKeyError, WorkspaceKeyStore
+
+
+def _json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+LEGACY_OWNER_MIGRATION_CONFIRMATION = "MIGRATE-LEGACY-OWNER"
+
+
+def _device_registration(identity: DeviceIdentity, *, name: str) -> dict[str, Any]:
+    certificate = identity.certificate.to_dict()
+    return {
+        "root_key_id": identity.root_key_id,
+        "device_id": identity.device_id,
+        "device_name": name,
+        "device_signing_public_key": certificate["payload"]["signing_public_key"],
+        "device_encryption_public_key": certificate["payload"]["encryption_public_key"],
+        "device_certificate": certificate,
+        "root_signing_public_key": identity.root_signing_public_key,
+        "root_encryption_public_key": identity.root_encryption_public_key,
+    }
+
+
+def _signer(identity: DeviceIdentity):  # type: ignore[no-untyped-def]
+    def sign(method: str, path: str, body: bytes) -> dict[str, str]:
+        return sign_http_request(
+            identity.device_keys,
+            method=method,
+            path=path,
+            body=body,
+        ).to_headers()
+
+    return sign
+
+
+def _profile_and_identity(profile_name: str | None = None) -> tuple[GatewayProfile, DeviceIdentity]:
+    profile = ProfileStore().get(profile_name)
+    if profile.principal_type != "device":
+        raise ValueError("this command requires a User Device profile")
+    identity = DeviceIdentityStore().load(profile.key_ref or "default")
+    return profile, identity
+
+
+def _service_credentials_for_profile(profile: GatewayProfile) -> ServiceCredentials:
+    if profile.principal_type != "service" or not profile.service_id:
+        raise ValueError("profile is not bound to an API Service")
+    credentials = ServiceCredentialStore().load(
+        profile.service_key_ref or profile.service_id,
+        file_path=(
+            Path(profile.service_credentials_file) if profile.service_credentials_file else None
+        ),
+    )
+    if credentials.service_id != profile.service_id:
+        raise ServiceCredentialError(
+            "Service credentials do not match the Service bound to this profile."
+        )
+    return credentials
+
+
+def _service_signer(credentials: ServiceCredentials):  # type: ignore[no-untyped-def]
+    def sign(method: str, path: str, body: bytes) -> dict[str, str]:
+        return sign_http_request(
+            credentials.device_keys,
+            method=method,
+            path=path,
+            body=body,
+        ).to_headers()
+
+    return sign
+
+
+def _login_and_store_service_session(
+    profile: GatewayProfile, credentials: ServiceCredentials
+) -> StoredServiceSession:
+    raw = login_service_session(profile, credentials.service_id, credentials.device_keys)
+    session = StoredServiceSession(
+        token=str(raw["token"]),
+        expires_at=float(raw["expires_at"]),
+        service_id=str(raw["service_id"]),
+    )
+    if session.service_id != credentials.service_id:
+        raise ServiceCredentialError("Gateway returned a session for a different Service.")
+    ServiceSessionStore().save(profile.name, session)
+    return session
+
+
+def _client(profile_name: str | None = None, *, login: bool = True) -> GatewayClient:
+    profile = ProfileStore().get(profile_name)
+    if profile.principal_type == "service":
+        if not login:
+            return GatewayClient(profile)
+        credentials = _service_credentials_for_profile(profile)
+        session = ServiceSessionStore().load(profile.name, credentials.service_id)
+        if session is None:
+            session = _login_and_store_service_session(profile, credentials)
+
+        def refresh() -> str:
+            return _login_and_store_service_session(profile, credentials).token
+
+        return GatewayClient(
+            profile,
+            session_token=session.token,
+            signer=_service_signer(credentials),
+            token_refresher=refresh,
+        )
+    profile, identity = _profile_and_identity(profile.name)
+    session = SessionStore().load(profile.name)
+    if session is None and login:
+        session = login_session(profile, identity)
+    return GatewayClient(
+        profile,
+        session_token=session.token if session else None,
+        signer=_signer(identity) if session else None,
+        token_refresher=(lambda: login_session(profile, identity).token) if login else None,
+    )
+
+
+def _read_invite() -> PinnedInvite:
+    value = sys.stdin.read().strip()
+    return parse_pinned_invite_uri(value)
+
+
+def _read_worker_invite(*, from_stdin: bool) -> PinnedInvite:
+    if from_stdin:
+        value = sys.stdin.read().strip()
+    else:
+        if not sys.stdin.isatty():
+            raise ValueError(
+                "a hidden Invite prompt requires a terminal; use --invite-stdin for automation"
+            )
+        value = getpass.getpass("Paste the one-time Worker Invite (input hidden): ").strip()
+    if not value:
+        raise ValueError("Worker Invite is required")
+    return parse_pinned_invite_uri(value)
+
+
+def _pin_invite_authority(
+    invite: PinnedInvite, response_workspace_id: str, response_issuer_user_id: str
+) -> None:
+    if response_workspace_id != invite.authority.workspace_id:
+        raise ValueError("Gateway enrollment Workspace does not match the trusted Invite URI")
+    if response_issuer_user_id != invite.authority.user_id:
+        raise ValueError("Gateway enrollment issuer does not match the trusted Invite URI")
+    WorkspaceAuthorityStore().pin(
+        workspace_id=invite.authority.workspace_id,
+        user_id=invite.authority.user_id,
+        root_signing_public_key=invite.authority.root_signing_public_key,
+        root_key_id=invite.authority.root_key_id,
+        source=invite.authority.source,
+    )
+
+
+def _identity_command(args: argparse.Namespace) -> None:
+    store = DeviceIdentityStore()
+    if args.identity_action == "init":
+        bundle, identity = store.initialize(args.alias, overwrite=args.overwrite)
+        if args.dangerously_export_recovery:
+            target = Path(args.dangerously_export_recovery).expanduser()
+            if target.exists():
+                raise ValueError(f"refusing to overwrite recovery file: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(export_recovery_file(bundle.mnemonic))
+        print("Recovery phrase (shown once; keep it offline):", file=sys.stderr)
+        print(bundle.mnemonic)
+        _json(
+            {
+                "alias": args.alias,
+                "device_id": identity.device_id,
+                "root_key_id": identity.root_key_id,
+            }
+        )
+        return
+    if args.identity_action == "recover":
+        if args.private_key_file:
+            identity = store.recover_file(
+                Path(args.private_key_file).expanduser().read_bytes(),
+                args.alias,
+                overwrite=args.overwrite,
+            )
+        else:
+            if sys.stdin.isatty():
+                mnemonic = getpass.getpass("24-word recovery phrase: ")
+            else:
+                mnemonic = sys.stdin.read().strip()
+            identity = store.recover_mnemonic(
+                mnemonic,
+                args.alias,
+                overwrite=args.overwrite,
+            )
+        session = None
+        if args.profile:
+            profile = ProfileStore().get(args.profile)
+            session = register_recovered_device(profile, identity, device_name=args.device_name)
+        _json(
+            {
+                "alias": args.alias,
+                "device_id": identity.device_id,
+                "root_key_id": identity.root_key_id,
+                "profile": args.profile,
+                "user_id": session.user_id if session else None,
+            }
+        )
+        return
+    if args.identity_action in {"show", "device"}:
+        identity = store.load(args.alias)
+        signing_public_key = identity.certificate.to_dict()["payload"]["signing_public_key"]
+        _json(
+            {
+                "alias": identity.alias,
+                "device_id": identity.device_id,
+                "device_key_id": identity.device_keys.key_id,
+                "device_key_fingerprint": hashlib.sha256(signing_public_key.encode()).hexdigest(),
+                "root_key_id": identity.root_key_id,
+                "certificate": identity.certificate.to_dict(),
+            }
+        )
+        return
+    if args.identity_action == "revoke":
+        profile, identity = _profile_and_identity(args.profile)
+        client = _client(profile.name)
+        device_id = args.device_id or profile.device_id or identity.device_id
+        try:
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/devices/{device_id}/revoke",
+                    json_body={},
+                    idempotency_key=f"device-revoke:{device_id}",
+                )
+            )
+        finally:
+            client.close()
+        if args.forget_local:
+            SessionStore().delete(profile.name)
+            if device_id == identity.device_id:
+                store.delete(identity.alias)
+        return
+    if args.identity_action == "login":
+        profile, identity = _profile_and_identity(args.profile)
+        session = login_session(profile, identity)
+        _json(
+            {
+                "profile": profile.name,
+                "user_id": session.user_id,
+                "device_id": session.device_id,
+                "expires_at": session.expires_at,
+            }
+        )
+        return
+    if args.identity_action == "logout":
+        profile = ProfileStore().get(args.profile)
+        SessionStore().delete(profile.name)
+        _json({"profile": profile.name, "logged_out": True})
+        return
+    if args.identity_action == "enroll":
+        invite = _read_invite()
+        invite_id, secret = invite.invite_id, invite.secret
+        profile, identity = _profile_and_identity(args.profile)
+        claim, proof_signature = identity_registration_claim(
+            identity,
+            invite_id=invite_id,
+            display_name=args.display_name,
+            device_name=args.device_name,
+        )
+        client = GatewayClient(profile)
+        try:
+            response = client.request(
+                "POST",
+                "/api/v1/auth/enroll",
+                json_body={
+                    "invite_id": invite_id,
+                    "secret": secret,
+                    "claim": claim,
+                    "proof_signature": proof_signature,
+                },
+                auth=False,
+            )
+        finally:
+            client.close()
+        _pin_invite_authority(
+            invite,
+            str(response["enrollment"]["workspace_id"]),
+            str(response["enrollment"]["issuer_user_id"]),
+        )
+        WorkspaceAuthorityStore().pin_owner(
+            workspace_id=invite.authority.workspace_id,
+            user_id=invite.authority.user_id,
+            root_signing_public_key=invite.authority.root_signing_public_key,
+            root_key_id=invite.authority.root_key_id,
+            source=invite.authority.source,
+        )
+        profile = ProfileStore().update_binding(
+            profile.name,
+            user_id=response["user"]["id"],
+            device_id=response["device"]["id"],
+        )
+        session = login_session(profile, identity)
+        _json(
+            {
+                "profile": profile.name,
+                "user_id": session.user_id,
+                "device_id": session.device_id,
+                "enrollment": response["enrollment"],
+                "verification_code": user_verification_code(claim),
+            }
+        )
+        return
+    if args.identity_action == "device-enroll":
+        invite = _read_invite()
+        invite_id, secret = invite.invite_id, invite.secret
+        profile, identity = _profile_and_identity(args.profile)
+        proof_signature = b64url_encode(
+            sign_message(
+                identity.device_keys.signing_private_key,
+                canonical_json(
+                    {
+                        "version": 1,
+                        "invite_id": invite_id,
+                        "device_id": identity.device_id,
+                    }
+                ),
+                context=b"vgen-device-enrollment-v1",
+            )
+        )
+        client = GatewayClient(profile)
+        try:
+            response = client.request(
+                "POST",
+                "/api/v1/devices/enroll",
+                json_body={
+                    "invite_id": invite_id,
+                    "secret": secret,
+                    **_device_registration(identity, name=args.device_name),
+                    "proof_signature": proof_signature,
+                },
+                auth=False,
+            )
+        finally:
+            client.close()
+        _pin_invite_authority(
+            invite,
+            str(response["enrollment"]["workspace_id"]),
+            str(response["enrollment"]["issuer_user_id"]),
+        )
+        profile = ProfileStore().update_binding(
+            profile.name,
+            user_id=response["user_id"],
+            device_id=response["device_id"],
+        )
+        if response["enrollment"]["state"] == "active":
+            session = login_session(profile, identity)
+            response["session"] = {
+                "expires_at": session.expires_at,
+                "device_id": session.device_id,
+            }
+        _json(response)
+        return
+    raise ValueError("unsupported identity action")
+
+
+def _profile_command(args: argparse.Namespace) -> None:
+    store = ProfileStore()
+    if args.profile_action == "add":
+        profile = GatewayProfile(
+            name=args.name,
+            endpoint=args.endpoint,
+            default_workspace=args.workspace,
+            key_ref=args.identity,
+        )
+        store.put(profile, make_current=not args.no_use)
+        _json(asdict(profile))
+    elif args.profile_action == "use":
+        store.use(args.name)
+        _json({"current": args.name})
+    elif args.profile_action == "show":
+        _json(asdict(store.get(args.name)))
+    elif args.profile_action == "list":
+        current, profiles = store.load()
+        _json({"current": current, "profiles": [asdict(item) for item in profiles.values()]})
+
+
+def _gateway_command(args: argparse.Namespace) -> None:
+    if args.gateway_action == "health":
+        client = _client(args.profile, login=False)
+        try:
+            _json(client.health())
+        finally:
+            client.close()
+        return
+    if args.gateway_action != "bootstrap":
+        raise ValueError("unsupported gateway action")
+    profile, identity = _profile_and_identity(args.profile)
+    code = (
+        sys.stdin.read().strip() if not sys.stdin.isatty() else getpass.getpass("Bootstrap code: ")
+    )
+    client = GatewayClient(profile)
+    try:
+        response = client.request(
+            "POST",
+            "/api/v1/auth/bootstrap",
+            json_body={
+                "bootstrap_code": code,
+                "display_name": args.display_name,
+                **_device_registration(identity, name=args.device_name),
+            },
+            auth=False,
+        )
+    finally:
+        client.close()
+    session_data = response.get("session") or response
+    session = StoredSession(
+        token=str(session_data.get("token") or response.get("session_token")),
+        expires_at=float(session_data.get("expires_at") or response["expires_at"]),
+        user_id=response.get("user_id") or response.get("user", {}).get("id"),
+        device_id=response.get("device_id") or response.get("device", {}).get("id"),
+    )
+    SessionStore().save(profile.name, session)
+    ProfileStore().update_binding(
+        profile.name, user_id=session.user_id, device_id=session.device_id
+    )
+    _json({"profile": profile.name, "user_id": session.user_id, "device_id": session.device_id})
+
+
+def _service_command(args: argparse.Namespace) -> None:
+    profile_store = ProfileStore()
+    profile = profile_store.get(args.profile)
+    credential_store = ServiceCredentialStore()
+    if args.service_action == "enroll":
+        invite = _read_invite()
+        invite_id, secret = invite.invite_id, invite.secret
+        keys = DeviceKeys.generate()
+        signing_public_key = b64url_encode(keys.signing_public_bytes())
+        encryption_public_key = b64url_encode(keys.encryption_public_bytes())
+        claim = {
+            "version": 1,
+            "invite_id": invite_id,
+            "name": args.name,
+            "signing_public_key": signing_public_key,
+            "encryption_public_key": encryption_public_key,
+        }
+        proof_signature = b64url_encode(
+            sign_message(
+                keys.signing_private_key,
+                canonical_json(claim),
+                context=b"vgen-service-enrollment-v1",
+            )
+        )
+        anonymous = GatewayClient(profile)
+        try:
+            response = anonymous.request(
+                "POST",
+                "/api/v1/auth/services/enroll",
+                json_body={
+                    **claim,
+                    "secret": secret,
+                    "proof_signature": proof_signature,
+                },
+                auth=False,
+            )
+        finally:
+            anonymous.close()
+        service = response["service"]
+        enrollment = response["enrollment"]
+        _pin_invite_authority(
+            invite,
+            str(service["workspace_id"]),
+            str(enrollment["issuer_user_id"]),
+        )
+        WorkspaceAuthorityStore().pin_owner(
+            workspace_id=invite.authority.workspace_id,
+            user_id=invite.authority.user_id,
+            root_signing_public_key=invite.authority.root_signing_public_key,
+            root_key_id=invite.authority.root_key_id,
+            source=invite.authority.source,
+        )
+        credentials = ServiceCredentials.generate(
+            service_id=str(service["id"]),
+            workspace_id=str(service["workspace_id"]),
+            name=str(service["name"]),
+            scopes=list(service["scopes"]),
+            enrollment_id=str(enrollment["id"]),
+            device_keys=keys,
+        )
+        account = args.credentials_account or credentials.service_id
+        credential_file = args.credentials_file
+        credential_store.save(
+            account,
+            credentials,
+            file_path=credential_file,
+            overwrite=args.overwrite,
+        )
+        if args.use:
+            profile = profile_store.update_binding(
+                profile.name,
+                principal_type="service",
+                service_id=credentials.service_id,
+                service_key_ref=None if credential_file else account,
+                service_credentials_file=(
+                    str(credential_file.expanduser().resolve()) if credential_file else None
+                ),
+                default_workspace=credentials.workspace_id,
+            )
+        session = None
+        if service["status"] == "active":
+            session = _login_and_store_service_session(profile, credentials)
+        _json(
+            {
+                **credentials.public_info(),
+                "status": service["status"],
+                "profile": profile.name,
+                "profile_bound": args.use,
+                "credentials": (
+                    str(credential_file.expanduser().resolve())
+                    if credential_file
+                    else f"os-keyring:{account}"
+                ),
+                "session_expires_at": session.expires_at if session else None,
+                "approval_required": service["status"] == "pending",
+            }
+        )
+        return
+
+    if args.service_action == "use":
+        credential_file = args.credentials_file
+        account = args.credentials_account or args.service_id
+        credentials = credential_store.load(account, file_path=credential_file)
+        if credentials.service_id != args.service_id:
+            raise ServiceCredentialError(
+                "Service credentials do not match the requested Service ID."
+            )
+        updated = profile_store.update_binding(
+            profile.name,
+            principal_type="service",
+            service_id=credentials.service_id,
+            service_key_ref=None if credential_file else account,
+            service_credentials_file=(
+                str(credential_file.expanduser().resolve()) if credential_file else None
+            ),
+            default_workspace=credentials.workspace_id,
+        )
+        _json(
+            {
+                "profile": updated.name,
+                "principal_type": updated.principal_type,
+                **credentials.public_info(),
+            }
+        )
+        return
+
+    credentials = _service_credentials_for_profile(profile)
+    if args.service_action == "login":
+        session = _login_and_store_service_session(profile, credentials)
+        _json(
+            {
+                "profile": profile.name,
+                "service_id": credentials.service_id,
+                "expires_at": session.expires_at,
+            }
+        )
+    elif args.service_action == "logout":
+        ServiceSessionStore().delete(profile.name, credentials.service_id)
+        _json(
+            {
+                "profile": profile.name,
+                "service_id": credentials.service_id,
+                "logged_out": True,
+            }
+        )
+    elif args.service_action == "show":
+        session = ServiceSessionStore().load(profile.name, credentials.service_id)
+        _json(
+            {
+                "profile": profile.name,
+                **credentials.public_info(),
+                "session_expires_at": session.expires_at if session else None,
+            }
+        )
+    elif args.service_action == "key-sync":
+        client = _client(profile.name)
+        try:
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            if workspace_id != credentials.workspace_id:
+                raise ValueError("Service credentials belong to a different Workspace")
+            _json(
+                sync_service_workspace_key(
+                    client,
+                    credentials.device_keys,
+                    workspace_id=workspace_id,
+                    service_id=credentials.service_id,
+                    key_version=args.key_version,
+                )
+            )
+        finally:
+            client.close()
+    elif args.service_action == "revoke-local":
+        ServiceSessionStore().delete(profile.name, credentials.service_id)
+        credential_store.delete(
+            profile.service_key_ref or credentials.service_id,
+            file_path=(
+                Path(profile.service_credentials_file) if profile.service_credentials_file else None
+            ),
+        )
+        profile_store.update_binding(
+            profile.name,
+            principal_type="device",
+            service_id=None,
+            service_key_ref=None,
+            service_credentials_file=None,
+        )
+        _json(
+            {
+                "profile": profile.name,
+                "service_id": credentials.service_id,
+                "local_credentials_removed": True,
+                "gateway_principal_revoked": False,
+            }
+        )
+    else:
+        raise ValueError("unsupported Service action")
+
+
+def _grant_approved_enrollment_workspace_key(
+    client: GatewayClient,
+    identity: DeviceIdentity,
+    enrollment: dict[str, Any],
+    *,
+    verification_code: str,
+    admission_already_stored: bool = False,
+    owner_user_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Grant the current Workspace key as part of an approval CLI flow.
+
+    Approval is already committed when this helper runs.  A missing local
+    admin key is therefore reported as a resumable follow-up instead of making
+    the successful enrollment decision look as if it failed.
+    """
+
+    if enrollment.get("state") != "active" or enrollment.get("kind") not in {
+        "user",
+        "workspace_member",
+    }:
+        return None
+    workspace_id = str(enrollment.get("workspace_id") or "")
+    recipient_id = str(enrollment.get("subject_user_id") or "")
+    if not workspace_id or not recipient_id:
+        return {
+            "granted": False,
+            "reason": "Gateway did not return the approved User/Workspace binding",
+        }
+    pinned_owner_user_id = require_local_workspace_owner(
+        client, identity, workspace_id=workspace_id
+    )
+    admission_owner_user_id = str(owner_user_id or enrollment.get("issuer_user_id") or "")
+    if not admission_owner_user_id:
+        return {"granted": False, "reason": "Enrollment has no Workspace Owner binding"}
+    if admission_owner_user_id != pinned_owner_user_id:
+        raise ValueError("Enrollment Owner does not match the locally pinned Workspace Owner")
+    signed_admission = sign_enrollment_admission(
+        identity,
+        workspace_id=workspace_id,
+        owner_user_id=admission_owner_user_id,
+        enrollment=enrollment,
+        verification_code=verification_code,
+    )
+    if not admission_already_stored:
+        client.request(
+            "POST",
+            f"/api/v1/workspaces/{workspace_id}/recipient-admissions",
+            json_body={
+                "enrollment_id": enrollment["id"],
+                "signed_admission": signed_admission,
+            },
+            idempotency_key=f"workspace-recipient-admission:{enrollment['id']}",
+        )
+    workspaces = client.request("GET", "/api/v1/workspaces")
+    workspace = next(
+        (
+            item
+            for item in workspaces
+            if isinstance(item, dict) and str(item.get("id")) == workspace_id
+        ),
+        None,
+    )
+    if workspace is None:
+        return {"granted": False, "reason": "Workspace is not visible to this admin"}
+    key_version = int(workspace.get("key_version") or 1)
+    try:
+        workspace_key = WorkspaceKeyStore().load(workspace_id, key_version)
+    except WorkspaceKeyError:
+        return {
+            "granted": False,
+            "reason": "Workspace key is unavailable on this admin device",
+            "next": (
+                f"vgen workspace key-grant {recipient_id} --recipient-type user_recovery "
+                f"--workspace {workspace_id} --key-version {key_version}"
+            ),
+        }
+    user_grant = grant_workspace_key(
+        client,
+        identity,
+        workspace_id=workspace_id,
+        recipient_type="user_recovery",
+        recipient_id=recipient_id,
+        key_version=key_version,
+        workspace_key=workspace_key,
+    )
+    device_id = str(enrollment.get("subject_id") or "")
+    device_grant = (
+        grant_workspace_key(
+            client,
+            identity,
+            workspace_id=workspace_id,
+            recipient_type="device",
+            recipient_id=device_id,
+            key_version=key_version,
+            workspace_key=workspace_key,
+        )
+        if device_id
+        else None
+    )
+    return {
+        "granted": True,
+        "recipient_type": "user_recovery",
+        "recipient_id": recipient_id,
+        "key_version": key_version,
+        "envelope_id": user_grant.get("id"),
+        "device_envelope_id": device_grant.get("id") if device_grant else None,
+    }
+
+
+def _read_user_verification_code(value: str | None) -> str:
+    if value:
+        return value
+    if not sys.stdin.isatty():
+        raise ValueError("非交互核验必须显式提供 --verification-code")
+    code = input("请输入对方通过可信渠道提供的五组 User 核验码: ").strip()
+    if not code:
+        raise ValueError("User 核验码不能为空")
+    return code
+
+
+def _confirm_legacy_owner_migration(
+    *,
+    endpoint: str,
+    workspace_id: str,
+    user_id: str,
+    root_key_id: str,
+    accept_legacy_tofu: bool,
+) -> None:
+    print("警告：这是一次不可自动验证的 legacy Workspace Owner TOFU 迁移。", file=sys.stderr)
+    print(f"Gateway endpoint: {endpoint}", file=sys.stderr)
+    print(f"Workspace: {workspace_id}", file=sys.stderr)
+    print(f"User: {user_id}", file=sys.stderr)
+    print(f"Owner root key ID: {root_key_id}", file=sys.stderr)
+    print(
+        "请先独立确认 Gateway 域名、Workspace 和本机恢复身份；本地 pin 写入后不可替换。",
+        file=sys.stderr,
+    )
+    if accept_legacy_tofu:
+        return
+    if not sys.stdin.isatty():
+        raise ValueError(
+            "非交互 legacy Owner 迁移必须显式提供 --accept-legacy-tofu"
+        )
+    confirmation = input(
+        f"请输入 {LEGACY_OWNER_MIGRATION_CONFIRMATION} 继续: "
+    ).strip()
+    if confirmation != LEGACY_OWNER_MIGRATION_CONFIRMATION:
+        raise ValueError("legacy Owner 迁移确认词不匹配，未写入任何 pin")
+
+
+def _wait_for_invite_claim(
+    client: GatewayClient,
+    *,
+    workspace_id: str,
+    enrollment_id: str,
+    timeout: float,
+    interval: float,
+) -> dict[str, Any]:
+    if timeout <= 0 or interval <= 0:
+        raise ValueError("Invite wait timeout and interval must be positive")
+    deadline = time.monotonic() + timeout
+    while True:
+        enrollments = client.request(
+            "GET",
+            f"/api/v1/workspaces/{workspace_id}/enrollments",
+        )
+        enrollment = next(
+            (
+                item
+                for item in enrollments
+                if isinstance(item, dict) and item.get("id") == enrollment_id
+            ),
+            None,
+        )
+        if enrollment is None:
+            raise ValueError("Gateway 返回的 Invite 不在当前 Workspace 中")
+        state = str(enrollment.get("state") or "")
+        if state != "issued":
+            return enrollment
+        if time.monotonic() >= deadline:
+            raise ValueError(
+                "等待对方领取 Invite 超时；对方领取后可运行 "
+                f"vgen workspace key-grant-enrollment {enrollment_id}"
+            )
+        time.sleep(interval)
+
+
+def _workspace_command(args: argparse.Namespace) -> None:
+    client = _client(args.profile)
+    try:
+        profile = client.profile
+        if args.workspace_action == "create":
+            workspace = client.create_workspace(
+                {"name": args.name, "founder_broker_id": args.broker_id}
+            )
+            _, identity = _profile_and_identity(profile.name)
+            WorkspaceAuthorityStore().pin(
+                workspace_id=str(workspace["id"]),
+                user_id=str(workspace["owner_user_id"]),
+                root_signing_public_key=identity.root_signing_public_key,
+                root_key_id=identity.root_key_id,
+                source="workspace_creation",
+            )
+            WorkspaceAuthorityStore().pin_owner(
+                workspace_id=str(workspace["id"]),
+                user_id=str(workspace["owner_user_id"]),
+                root_signing_public_key=identity.root_signing_public_key,
+                root_key_id=identity.root_key_id,
+                source="workspace_creation",
+            )
+            workspace["key_envelopes"] = initialize_workspace_keys(client, identity, workspace)
+            if args.use:
+                ProfileStore().update_binding(profile.name, default_workspace=workspace["id"])
+            _json(workspace)
+        elif args.workspace_action == "list":
+            _json(client.request("GET", "/api/v1/workspaces"))
+        elif args.workspace_action == "pool-create":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            policy = json.loads(args.policy) if args.policy else {}
+            _json(client.create_pool(workspace_id, {"name": args.name, "policy": policy}))
+        elif args.workspace_action == "pool-list":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _json(client.request("GET", f"/api/v1/workspaces/{workspace_id}/pools"))
+        elif args.workspace_action == "owner-migrate":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            if not profile.user_id:
+                raise ValueError("profile is not bound to a User")
+            _, identity = _profile_and_identity(profile.name)
+            try:
+                owner_user_id = require_local_workspace_owner(
+                    client, identity, workspace_id=workspace_id
+                )
+            except LegacyOwnerMigrationRequired:
+                _confirm_legacy_owner_migration(
+                    endpoint=profile.endpoint,
+                    workspace_id=workspace_id,
+                    user_id=profile.user_id,
+                    root_key_id=identity.root_key_id,
+                    accept_legacy_tofu=args.accept_legacy_tofu,
+                )
+                result = migrate_legacy_workspace_owner(
+                    client,
+                    identity,
+                    workspace_id=workspace_id,
+                )
+            else:
+                pin = WorkspaceAuthorityStore().load_owner(workspace_id)
+                result = {
+                    "workspace_id": workspace_id,
+                    "owner_user_id": owner_user_id,
+                    "owner_root_key_id": identity.root_key_id,
+                    "migrated": False,
+                    "source": pin.source if pin is not None else "verified_genesis_admission",
+                }
+            _json(result)
+        elif args.workspace_action == "key-sync":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            if not profile.user_id:
+                raise ValueError("profile is not bound to a User")
+            _, identity = _profile_and_identity(profile.name)
+            _json(
+                sync_workspace_key(
+                    client,
+                    identity,
+                    workspace_id=workspace_id,
+                    user_id=profile.user_id,
+                    key_version=args.key_version,
+                )
+            )
+        elif args.workspace_action == "key-grant":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _, identity = _profile_and_identity(profile.name)
+            key_version = args.key_version or 1
+            _json(
+                grant_workspace_key(
+                    client,
+                    identity,
+                    workspace_id=workspace_id,
+                    recipient_type=args.recipient_type,
+                    recipient_id=args.recipient_id,
+                    key_version=key_version,
+                    workspace_key=WorkspaceKeyStore().load(workspace_id, key_version),
+                )
+            )
+        elif args.workspace_action == "key-grant-enrollment":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            enrollments = client.request(
+                "GET",
+                f"/api/v1/workspaces/{workspace_id}/enrollments",
+            )
+            enrollment = next(
+                (
+                    item
+                    for item in enrollments
+                    if isinstance(item, dict) and item.get("id") == args.enrollment_id
+                ),
+                None,
+            )
+            if enrollment is None:
+                raise ValueError("这个 Workspace 中找不到指定的 Enrollment")
+            if enrollment.get("state") != "active":
+                raise ValueError(
+                    "Enrollment 尚未激活；invite_approval 请先运行 workspace decide --approve"
+                )
+            _, identity = _profile_and_identity(profile.name)
+            key_grant = _grant_approved_enrollment_workspace_key(
+                client,
+                identity,
+                enrollment,
+                verification_code=_read_user_verification_code(
+                    getattr(args, "verification_code", None)
+                ),
+                owner_user_id=profile.user_id,
+            )
+            if key_grant is None:
+                raise ValueError("这个 Enrollment 不对应 User Workspace 成员")
+            _json(
+                {
+                    "enrollment_id": args.enrollment_id,
+                    "workspace_id": workspace_id,
+                    "workspace_key_grant": key_grant,
+                }
+            )
+        elif args.workspace_action == "key-rotate":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _, identity = _profile_and_identity(profile.name)
+            _json(
+                rotate_workspace_key(
+                    client,
+                    identity,
+                    workspace_id=workspace_id,
+                    expected_key_version=args.expected_key_version,
+                )
+            )
+        elif args.workspace_action == "authority-pin":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            pin = WorkspaceAuthorityStore().pin(
+                workspace_id=workspace_id,
+                user_id=args.user_id,
+                root_signing_public_key=args.root_signing_public_key,
+                root_key_id=args.root_key_id,
+                source="explicit_out_of_band",
+            )
+            _json(asdict(pin))
+        elif args.workspace_action == "invite":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _, identity = _profile_and_identity(profile.name)
+            if args.kind in {"user", "workspace_member", "service"}:
+                require_local_workspace_owner(
+                    client, identity, workspace_id=workspace_id
+                )
+            result = client.request(
+                "POST",
+                f"/api/v1/workspaces/{workspace_id}/invites",
+                json_body={
+                    "kind": args.kind,
+                    "method": args.method,
+                    "relationship": args.relationship,
+                    "scopes": args.scope,
+                    "subject_key_fingerprint": args.subject_key_fingerprint,
+                    "ttl_seconds": args.ttl,
+                },
+            )
+            if not profile.user_id:
+                raise ValueError("profile is not bound to a User")
+            enrollment = result.get("enrollment") or {}
+            if (
+                str(enrollment.get("workspace_id")) != workspace_id
+                or str(enrollment.get("issuer_user_id")) != profile.user_id
+            ):
+                raise ValueError("Gateway Invite response does not match the local issuer")
+            invite_uri = decorate_invite_uri(
+                str(result["invite_uri"]),
+                workspace_id=workspace_id,
+                issuer_user_id=profile.user_id,
+                identity=identity.root_keys,
+            )
+            # stdout intentionally contains only the complete URI so it can be
+            # copied through a trusted channel without status text.  The URI
+            # must never be written to application logs.
+            print(invite_uri, flush=True)
+            if args.wait:
+                enrollment = _wait_for_invite_claim(
+                    client,
+                    workspace_id=workspace_id,
+                    enrollment_id=str(result["enrollment"]["id"]),
+                    timeout=args.timeout,
+                    interval=args.wait_interval,
+                )
+                if enrollment.get("state") == "pending":
+                    print(
+                        "对方已领取邀请，正在等待批准。请运行：\n"
+                        f"vgen workspace decide {enrollment['id']} --approve "
+                        "--verification-code <五组核验码>",
+                        file=sys.stderr,
+                    )
+                elif enrollment.get("state") == "active":
+                    key_grant = _grant_approved_enrollment_workspace_key(
+                        client,
+                        identity,
+                        enrollment,
+                        verification_code=_read_user_verification_code(
+                            getattr(args, "verification_code", None)
+                        ),
+                        owner_user_id=profile.user_id,
+                    )
+                    if key_grant is not None and key_grant.get("granted"):
+                        print("对方已加入，Workspace 加密密钥已自动发放。", file=sys.stderr)
+                    elif key_grant is not None:
+                        print(
+                            "对方已加入，但加密密钥尚未发放："
+                            f"{key_grant.get('reason') or 'unknown reason'}",
+                            file=sys.stderr,
+                        )
+        elif args.workspace_action == "apply":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _, identity = _profile_and_identity(profile.name)
+            application_id = new_id("application")
+            claim, proof_signature = identity_registration_claim(
+                identity,
+                invite_id=application_id,
+                display_name=(args.display_name or getpass.getuser() or "VGen User"),
+                device_name=(args.device_name or identity.alias or "Device"),
+            )
+            _json(
+                client.request(
+                    "POST",
+                    "/api/v1/applications",
+                    json_body={
+                        "application_id": application_id,
+                        "workspace_id": workspace_id,
+                        "pool_id": args.pool,
+                        "kind": args.kind,
+                        "relationship": args.relationship,
+                        "claim": claim,
+                        "proof_signature": proof_signature,
+                    },
+                )
+            )
+        elif args.workspace_action == "decide":
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            enrollments = client.request(
+                "GET", f"/api/v1/workspaces/{workspace_id}/enrollments"
+            )
+            enrollment = next(
+                (
+                    item
+                    for item in enrollments
+                    if isinstance(item, dict) and item.get("id") == args.enrollment_id
+                ),
+                None,
+            )
+            if enrollment is None:
+                raise ValueError("这个 Workspace 中找不到指定的 Enrollment")
+            signed_admission = None
+            verification_code = None
+            if args.approve and enrollment.get("kind") in {"user", "workspace_member"}:
+                verification_code = _read_user_verification_code(
+                    getattr(args, "verification_code", None)
+                )
+                _, identity = _profile_and_identity(profile.name)
+                require_local_workspace_owner(
+                    client, identity, workspace_id=workspace_id
+                )
+                signed_admission = sign_enrollment_admission(
+                    identity,
+                    workspace_id=workspace_id,
+                    owner_user_id=str(profile.user_id or ""),
+                    enrollment=enrollment,
+                    verification_code=verification_code,
+                )
+            result = client.request(
+                "POST",
+                f"/api/v1/enrollments/{args.enrollment_id}/decision",
+                json_body={
+                    "approve": args.approve,
+                    "signed_admission": signed_admission,
+                },
+            )
+            if args.approve and verification_code is not None:
+                _, identity = _profile_and_identity(profile.name)
+                key_grant = _grant_approved_enrollment_workspace_key(
+                    client,
+                    identity,
+                    result,
+                    verification_code=verification_code,
+                    admission_already_stored=True,
+                    owner_user_id=profile.user_id,
+                )
+                if key_grant is not None:
+                    result["workspace_key_grant"] = key_grant
+            _json(result)
+        elif args.workspace_action in {"enrollment-list", "allocation-list", "audit"}:
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            if args.workspace_action == "enrollment-list":
+                _json(
+                    client.request(
+                        "GET",
+                        f"/api/v1/workspaces/{workspace_id}/enrollments",
+                        params={"state": args.state} if args.state else None,
+                    )
+                )
+            elif args.workspace_action == "allocation-list":
+                _json(
+                    client.request(
+                        "GET",
+                        f"/api/v1/workspaces/{workspace_id}/worker-allocations",
+                    )
+                )
+            else:
+                _json(
+                    client.request(
+                        "GET",
+                        f"/api/v1/workspaces/{workspace_id}/audit",
+                        params={"limit": args.limit},
+                    )
+                )
+    finally:
+        client.close()
+
+
+_MAINTENANCE_INTENT_TTL_SECONDS = 24 * 60 * 60
+_MAINTENANCE_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "expired"})
+
+
+def _maintenance_broker_id(client: GatewayClient, requested: str | None) -> str:
+    if client.profile.principal_type != "device":
+        raise ValueError("Worker maintenance requires a User Device profile")
+    broker_id = requested or client.profile.home_broker_id
+    if not broker_id:
+        raise ValueError(
+            "no Home Broker is selected; run `vgen setup` or pass --broker explicitly"
+        )
+    return str(broker_id)
+
+
+def _select_owned_worker(client: GatewayClient, selector: str | None) -> dict[str, Any]:
+    workers = client.request("GET", "/api/v1/workers")
+    if not isinstance(workers, list):
+        raise ValueError("Gateway returned an invalid Worker list")
+    active = [item for item in workers if isinstance(item, dict) and item.get("status") != "revoked"]
+    if selector:
+        matches = [
+            worker
+            for worker in active
+            if selector in {str(worker.get("id") or ""), str(worker.get("name") or "")}
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise ValueError(f"no owned Worker matches: {selector}")
+        raise ValueError(f"more than one owned Worker is named: {selector}; use its Worker ID")
+    if len(active) == 1:
+        return active[0]
+    if not active:
+        raise ValueError("this User has no active Worker")
+    choices = ", ".join(
+        f"{worker.get('name') or 'unnamed'} ({worker.get('id')})" for worker in active
+    )
+    raise ValueError(f"choose a Worker with --worker; available Workers: {choices}")
+
+
+def _ensure_broker_manages_worker(
+    client: GatewayClient,
+    worker: Mapping[str, Any],
+    broker_id: str,
+) -> dict[str, Any]:
+    manager = worker.get("manager_broker_id")
+    if manager == broker_id:
+        return dict(worker)
+    if manager:
+        raise ValueError(
+            "the selected Worker is managed by another Broker; use `vgen worker manager-set` "
+            "explicitly before changing its maintenance authority"
+        )
+    raise ValueError(
+        "the selected Worker has no manager Broker; bind it explicitly with "
+        "`vgen worker manager-set` before authorizing remote maintenance"
+    )
+
+
+def _maintenance_authorization(
+    identity: DeviceIdentity,
+    *,
+    worker_id: str,
+    broker_id: str,
+    spec: Mapping[str, Any],
+    issued_at: int | None = None,
+) -> dict[str, Any]:
+    issued = int(time.time()) if issued_at is None else int(issued_at)
+    action = str(spec.get("kind") or "")
+    payload = build_maintenance_intent_payload(
+        worker_id=worker_id,
+        broker_id=broker_id,
+        kind=action,
+        spec=spec,
+        device_id=identity.device_id,
+        issued_at=issued,
+        expires_at=issued + _MAINTENANCE_INTENT_TTL_SECONDS,
+        nonce=uuid.uuid4().hex,
+    )
+    return sign_maintenance_intent(identity.device_keys, identity.certificate, payload)
+
+
+def _wait_for_maintenance(
+    client: GatewayClient,
+    job_id: str,
+    *,
+    interval: float,
+    timeout: float,
+) -> dict[str, Any]:
+    if interval <= 0 or timeout <= 0:
+        raise ValueError("maintenance wait interval and timeout must be positive")
+    deadline = time.monotonic() + timeout
+    last_state: str | None = None
+    while True:
+        job = client.get_worker_maintenance(job_id)
+        if not isinstance(job, dict):
+            raise ValueError("Gateway returned an invalid maintenance job")
+        state = str(job.get("state") or "unknown")
+        if state != last_state:
+            print(f"维护任务状态：{state}", file=sys.stderr)
+            last_state = state
+        if state in _MAINTENANCE_TERMINAL_STATES:
+            return job
+        if time.monotonic() >= deadline:
+            raise TimeoutError("maintenance wait timed out")
+        time.sleep(interval)
+
+
+def _raise_for_unsuccessful_maintenance(job: Mapping[str, Any]) -> None:
+    """Turn a terminal maintenance result into the stable CLI exit contract."""
+
+    state = str(job.get("state") or "")
+    if state == "succeeded":
+        return
+    result = job.get("result")
+    raw_code = result.get("error_code") if isinstance(result, Mapping) else None
+    if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+        code = raw_code
+    elif state == "expired":
+        code = int(ErrorCode.MAINTENANCE_LEASE_LOST)
+    elif state == "cancelled":
+        code = int(ErrorCode.WORKER_MAINTENANCE_STATE_CONFLICT)
+    else:
+        code = int(ErrorCode.INTERNAL_ERROR)
+    try:
+        spec = get_error_spec(code)
+    except ValueError:
+        spec = get_error_spec(ErrorCode.INTERNAL_ERROR)
+        code = int(spec.code)
+    raise VgenClientError(
+        code,
+        spec.code.name,
+        spec.message,
+        retry_action=spec.retry_action.value,
+    )
+
+
+def _maintenance_upload_ticket(
+    value: Mapping[str, Any],
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> TransferTicket:
+    max_bytes = value.get("max_bytes")
+    if max_bytes is not None and (
+        not isinstance(max_bytes, int)
+        or isinstance(max_bytes, bool)
+        or max_bytes < expected_size
+    ):
+        raise ValueError("Gateway maintenance upload ticket is smaller than the update wheel")
+    headers = value.get("headers") or {}
+    if not isinstance(headers, Mapping):
+        raise ValueError("Gateway maintenance upload ticket headers are invalid")
+    try:
+        return TransferTicket(
+            url=str(value["url"]),
+            method=str(value["method"]),
+            headers={str(key): str(item) for key, item in headers.items()},
+            expires_at=(None if value.get("expires_at") is None else float(value["expires_at"])),
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            media_type="application/octet-stream",
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Gateway returned an invalid maintenance upload ticket") from exc
+
+
+def _worker_capability_model_digests(worker: Mapping[str, Any]) -> set[str]:
+    capabilities = worker.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return set()
+    candidates: list[Any] = [capabilities.get("model_digests")]
+    executors = capabilities.get("executors")
+    if isinstance(executors, list):
+        for executor in executors:
+            if not isinstance(executor, Mapping):
+                continue
+            nested = executor.get("capabilities")
+            if isinstance(nested, Mapping):
+                candidates.append(nested.get("model_digests"))
+    result: set[str] = set()
+    for values in candidates:
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            normalized = value.lower()
+            if not normalized.startswith("sha256:"):
+                normalized = "sha256:" + normalized
+            if len(normalized) == 71 and all(character in "0123456789abcdef" for character in normalized[7:]):
+                result.add(normalized)
+    return result
+
+
+def _accepted_model_licenses(
+    models: list[Any],
+    accepted: list[str],
+    *,
+    accepted_at: int,
+) -> list[dict[str, Any]]:
+    required = {str(model.license) for model in models}
+    supplied = set(accepted)
+    unexpected = supplied - required
+    if unexpected:
+        raise ValueError(
+            "--accept-license contains a license not required by the selected models: "
+            + ", ".join(sorted(unexpected))
+        )
+    missing = sorted(required - supplied)
+    if missing and not sys.stdin.isatty():
+        flags = " ".join(f"--accept-license {item}" for item in missing)
+        raise ValueError(f"explicit model license acceptance is required: {flags}")
+    for license_id in missing:
+        print(f"模型许可证：{license_id}", file=sys.stderr)
+        confirmation = input(f"请输入完整许可证标识 `{license_id}` 以确认接受：").strip()
+        if confirmation != license_id:
+            raise ValueError(f"license acceptance was not confirmed for {license_id}")
+        supplied.add(license_id)
+    acceptances: list[dict[str, Any]] = []
+    for model in models:
+        revision = str(model.revision or "")
+        if not revision:
+            raise ValueError("model installation requires an immutable model revision")
+        acceptances.append(
+            {
+                "model_digest": "sha256:" + str(model.sha256),
+                "license_id": str(model.license),
+                "revision": revision,
+                "accepted_at": accepted_at,
+            }
+        )
+    return acceptances
+
+
+def _create_maintenance_job(
+    client: GatewayClient,
+    identity: DeviceIdentity,
+    *,
+    broker_id: str,
+    worker: Mapping[str, Any],
+    spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    worker_id = str(worker.get("id") or "")
+    if not worker_id:
+        raise ValueError("Gateway Worker response has no Worker ID")
+    authorization = _maintenance_authorization(
+        identity,
+        worker_id=worker_id,
+        broker_id=broker_id,
+        spec=spec,
+    )
+    created = client.create_worker_maintenance(
+        broker_id=broker_id,
+        worker_id=worker_id,
+        spec=spec,
+        authorization=authorization,
+        idempotency_key=f"maintenance:{worker_id}:{spec['kind']}:{uuid.uuid4().hex}",
+    )
+    if not isinstance(created, dict) or not created.get("id"):
+        raise ValueError("Gateway returned an invalid maintenance job")
+    return created
+
+
+def _broker_command(args: argparse.Namespace) -> None:
+    if args.broker_action == "serve":
+        from vgen.broker.main import run_broker
+
+        run_broker(args)
+        return
+    client = _client(args.profile)
+    try:
+        if args.broker_action == "create":
+            identity = DeviceIdentityStore().load(client.profile.key_ref or "default")
+            _json(
+                client.request(
+                    "POST",
+                    "/api/v1/brokers",
+                    json_body={
+                        "name": args.name,
+                        "device_id": client.profile.device_id or identity.device_id,
+                    },
+                )
+            )
+        elif args.broker_action in {"list", "status"}:
+            _json(client.request("GET", "/api/v1/brokers"))
+        elif args.broker_action == "device":
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/brokers/{args.broker_id}/devices",
+                    json_body={"device_id": args.device_id},
+                    idempotency_key=f"broker-device:{args.broker_id}:{args.device_id}",
+                )
+            )
+        elif args.broker_action == "worker-update":
+            from .worker_bundle import inspect_worker_update_wheel
+
+            broker_id = _maintenance_broker_id(client, args.broker)
+            worker = _select_owned_worker(client, args.worker)
+            worker = _ensure_broker_manages_worker(client, worker, broker_id)
+            artifact = inspect_worker_update_wheel(args.wheel)
+            spec = {
+                "kind": "worker_update",
+                "target_version": artifact.version,
+                "artifact_sha256": artifact.sha256,
+                "artifact_size": artifact.size_bytes,
+                "apply": "on_idle",
+            }
+            _, identity = _profile_and_identity(client.profile.name)
+            created = _create_maintenance_job(
+                client,
+                identity,
+                broker_id=broker_id,
+                worker=worker,
+                spec=spec,
+            )
+            upload_ticket = created.get("upload_ticket")
+            if isinstance(upload_ticket, Mapping):
+                print(f"正在上传 Worker {artifact.version} 更新包…", file=sys.stderr)
+                HttpArtifactAdapter().upload(
+                    _maintenance_upload_ticket(
+                        upload_ticket,
+                        expected_size=artifact.size_bytes,
+                        expected_sha256=artifact.sha256,
+                    ),
+                    artifact.path,
+                )
+                committed = client.commit_worker_maintenance(str(created["id"]))
+                if not isinstance(committed, dict):
+                    raise ValueError("Gateway returned an invalid committed maintenance job")
+            elif created.get("state") in {"queued", "leased", "running", "restarting"}:
+                # A prior invocation may already have uploaded and committed the
+                # same digest. The Gateway deduplicates that active job and must
+                # not mint a second upload capability.
+                committed = created
+            else:
+                raise ValueError("Gateway update job has no upload ticket")
+            result = (
+                _wait_for_maintenance(
+                    client,
+                    str(committed.get("id") or created["id"]),
+                    interval=args.interval,
+                    timeout=args.timeout,
+                )
+                if args.wait
+                else committed
+            )
+            _json(result)
+            if args.wait:
+                _raise_for_unsuccessful_maintenance(result)
+        elif args.broker_action == "model-install":
+            broker_id = _maintenance_broker_id(client, args.broker)
+            worker = _select_owned_worker(client, args.worker)
+            worker = _ensure_broker_manages_worker(client, worker, broker_id)
+            manifest, _, digest = _resolve_workflow(args.workflow)
+            executor_type = str(worker.get("executor_type") or "")
+            variants = [
+                variant for variant in manifest.variants if variant.executor_type == executor_type
+            ]
+            if not variants:
+                raise ValueError(
+                    f"workflow has no {executor_type or 'selected Worker'} executor variant"
+                )
+            if len(variants) > 1:
+                raise ValueError("workflow has more than one matching executor variant")
+            installed_digests = _worker_capability_model_digests(worker)
+            missing = [
+                model
+                for model in variants[0].models
+                if "sha256:" + model.sha256 not in installed_digests
+            ]
+            if not missing:
+                _json(
+                    {
+                        "worker_id": worker["id"],
+                        "workflow": f"{manifest.id}@{manifest.version}",
+                        "state": "already_satisfied",
+                        "missing_models": 0,
+                    }
+                )
+                return
+            gated = [model.filename for model in missing if model.gated]
+            if gated:
+                raise ValueError(
+                    "gated models require Worker-local credentials and cannot be installed by a Broker: "
+                    + ", ".join(gated)
+                )
+            total_bytes = sum(int(model.size) for model in missing)
+            print(
+                f"将安装 {len(missing)} 个缺失模型，共 {total_bytes / 1_000_000_000:.2f} GB。",
+                file=sys.stderr,
+            )
+            print(
+                "需要接受的模型许可证：" + "、".join(sorted({model.license for model in missing})),
+                file=sys.stderr,
+            )
+            accepted_at = int(time.time())
+            acceptances = _accepted_model_licenses(
+                missing,
+                args.accept_license,
+                accepted_at=accepted_at,
+            )
+            spec = {
+                "kind": "model_install",
+                "workflow_ref": f"{manifest.id}@{manifest.version}",
+                "workflow_digest": f"sha256:{digest}",
+                "model_digests": ["sha256:" + model.sha256 for model in missing],
+                "license_acceptances": acceptances,
+            }
+            _, identity = _profile_and_identity(client.profile.name)
+            created = _create_maintenance_job(
+                client,
+                identity,
+                broker_id=broker_id,
+                worker=worker,
+                spec=spec,
+            )
+            result = (
+                _wait_for_maintenance(
+                    client,
+                    str(created["id"]),
+                    interval=args.interval,
+                    timeout=args.timeout,
+                )
+                if args.wait
+                else created
+            )
+            _json(result)
+            if args.wait:
+                _raise_for_unsuccessful_maintenance(result)
+        elif args.broker_action == "maintenance-list":
+            worker = _select_owned_worker(client, args.worker)
+            _json(client.list_worker_maintenance(str(worker["id"])))
+        elif args.broker_action == "maintenance-show":
+            _json(client.get_worker_maintenance(args.job_id))
+        elif args.broker_action == "maintenance-cancel":
+            _json(client.cancel_worker_maintenance(args.job_id))
+    finally:
+        client.close()
+
+
+def _worker_command(args: argparse.Namespace) -> None:
+    if args.worker_action == "serve":
+        from vgen.worker.main import run as run_worker
+
+        worker_args = ["serve"]
+        for name in (
+            "gateway_url",
+            "worker_id",
+            "identity_account",
+            "executor",
+            "comfy_url",
+        ):
+            value = getattr(args, name)
+            if value is not None:
+                worker_args.extend([f"--{name.replace('_', '-')}", str(value)])
+        for name in (
+            "identity_file",
+            "credentials_file",
+            "session_token_file",
+            "comfy_output_dir",
+            "comfy_model_root",
+            "comfy_policy_file",
+            "work_root",
+        ):
+            value = getattr(args, name)
+            if value is not None:
+                worker_args.extend([f"--{name.replace('_', '-')}", str(value)])
+        for root in args.local_artifact_root:
+            worker_args.extend(["--local-artifact-root", str(root)])
+        worker_args.extend(["--lease-ttl", str(args.lease_ttl)])
+        worker_args.extend(["--interval", str(args.interval)])
+        for name in ("credentials_keyring", "announce", "allow_http", "once", "json"):
+            if getattr(args, name):
+                worker_args.append(f"--{name.replace('_', '-')}")
+        code = run_worker(worker_args)
+        if code:
+            raise SystemExit(code)
+        return
+
+    if args.worker_action == "bundle":
+        from .worker_bundle import create_windows_worker_bundle
+
+        client = _client(args.profile)
+        try:
+            workspace_id = client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError(
+                    "the selected profile has no default Workspace; run `vgen workspace create --use`"
+                )
+            _, owner_identity = _profile_and_identity(client.profile.name)
+            result = create_windows_worker_bundle(
+                client,
+                owner_identity,
+                worker_name=args.name,
+                workspace_id=workspace_id,
+                pool=args.pool,
+                default_pool=getattr(client.profile, "default_pool", None),
+                output=args.output,
+                comfyui_root=args.comfyui_root,
+                compute_rate=args.compute_rate,
+                traffic_rate=args.traffic_rate,
+                manager_broker_id=getattr(client.profile, "home_broker_id", None),
+                wheel_path=args.worker_wheel,
+                overwrite=args.overwrite,
+            )
+            _json(result.public_dict())
+        finally:
+            client.close()
+        return
+
+    if args.worker_action == "installer-bundle":
+        from .worker_bundle import create_public_windows_worker_installer_bundle
+
+        gateway_url = args.gateway_url
+        if not gateway_url:
+            gateway_url = ProfileStore().get(args.profile).endpoint
+        result = create_public_windows_worker_installer_bundle(
+            gateway_url=gateway_url,
+            output=args.output,
+            wheel_path=args.worker_wheel,
+            overwrite=args.overwrite,
+        )
+        _json(result.public_dict())
+        return
+
+    if args.worker_action == "claim-invite":
+        from .worker_enrollment import enroll_worker_from_invite
+
+        invite = _read_worker_invite(from_stdin=args.invite_stdin)
+        result = enroll_worker_from_invite(
+            gateway_url=args.gateway_url,
+            invite=invite,
+            name=args.name,
+            identity_file=args.identity_file,
+            credentials_file=args.credentials_file,
+            executor_type=args.executor,
+            executor_version=args.executor_version,
+            capacity=args.capacity,
+            wait=args.wait,
+            interval=args.interval,
+            timeout=args.timeout,
+        )
+        _json(result.public_dict())
+        return
+
+    from vgen.worker.credentials import (
+        WorkerCredentialError,
+        WorkerCredentials,
+        WorkerIdentityStore,
+        save_worker_credentials_file,
+        save_worker_credentials_keyring,
+    )
+
+    client = _client(args.profile)
+    try:
+        if args.worker_action == "invite":
+            if args.compute_rate < 0 or args.traffic_rate < 0:
+                raise ValueError("Worker rates cannot be negative")
+            workspace_id = client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError(
+                    "the selected profile has no default Workspace; run `vgen workspace create --use`"
+                )
+            pool_id = _resolve_pool_id(
+                client,
+                workspace_id=workspace_id,
+                requested=args.pool,
+            )
+            _, owner_identity = _profile_and_identity(args.profile)
+            response = client.request(
+                "POST",
+                f"/api/v1/workspaces/{workspace_id}/worker-invites",
+                json_body={
+                    "method": "invite_approval",
+                    "pool_id": pool_id,
+                    "name": args.name,
+                    "executor_type": "comfyui",
+                    "executor_version": "1.1.0",
+                    "capacity": 1,
+                    "manager_broker_id": (
+                        args.manager_broker
+                        or getattr(client.profile, "home_broker_id", None)
+                    ),
+                    "rate_microtokens_per_gpu_second": args.compute_rate,
+                    "traffic_microtokens_per_gib": args.traffic_rate,
+                    "ttl_seconds": args.ttl,
+                },
+                idempotency_key=f"worker-invite:{uuid.uuid4()}",
+            )
+            enrollment = response.get("enrollment") if isinstance(response, dict) else None
+            if (
+                not isinstance(enrollment, dict)
+                or str(enrollment.get("workspace_id")) != workspace_id
+                or str(enrollment.get("issuer_user_id")) != client.profile.user_id
+                or str(enrollment.get("pool_id")) != pool_id
+            ):
+                raise ValueError("Gateway returned an invalid Worker Invite")
+            _json(
+                {
+                    "enrollment_id": str(enrollment["id"]),
+                    "enrollment": enrollment,
+                    "invite_uri": decorate_invite_uri(
+                        str(response["invite_uri"]),
+                        workspace_id=workspace_id,
+                        issuer_user_id=str(client.profile.user_id),
+                        identity=owner_identity.root_keys,
+                    ),
+                    "next": (
+                        "Paste this once into enroll-worker.ps1; compare the verification "
+                        "code shown on Windows, then run "
+                        f"`vgen worker approve-enrollment {enrollment['id']} --code <CODE>`."
+                    ),
+                }
+            )
+        elif args.worker_action == "approve-enrollment":
+            from .worker_enrollment import require_pending_worker_claim
+
+            workspace_id = client.profile.default_workspace
+            issuer_user_id = client.profile.user_id
+            if not workspace_id or not issuer_user_id:
+                raise ValueError("the selected profile has no Workspace/User binding")
+            pending = client.request(
+                "GET",
+                f"/api/v1/worker-enrollments/{args.enrollment_id}",
+            )
+            claim = require_pending_worker_claim(
+                pending,
+                enrollment_id=args.enrollment_id,
+                workspace_id=workspace_id,
+                issuer_user_id=issuer_user_id,
+                approval_code=args.code,
+            )
+            allocation = pending.get("allocation")
+            if not isinstance(allocation, dict):
+                raise ValueError("Gateway returned no provisional Worker allocation")
+            _, owner_identity = _profile_and_identity(args.profile)
+            owner_certificate = sign_key_manifest(
+                owner_identity.root_keys,
+                {
+                    "version": 1,
+                    "kind": "vgen-worker-owner-certificate",
+                    "owner_root_key_id": owner_identity.root_key_id,
+                    "worker_key_id": claim["worker_key_id"],
+                    "worker_signing_public_key": claim["signing_public_key"],
+                    "worker_encryption_public_key": claim["encryption_public_key"],
+                    "issued_at": int(time.time()),
+                },
+            )
+            try:
+                proof_payload = build_allocation_proof_payload(
+                    allocation_id=str(allocation["id"]),
+                    workspace_id=str(allocation["workspace_id"]),
+                    pool_id=str(allocation["pool_id"]),
+                    worker_id=str(allocation["worker_id"]),
+                    worker_signing_public_key=str(claim["signing_public_key"]),
+                    worker_encryption_public_key=str(claim["encryption_public_key"]),
+                    worker_certificate=owner_certificate,
+                    owner_consent_at=float(allocation["owner_consent_at"]),
+                    approver_root_key_id=owner_identity.root_key_id,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Gateway returned an invalid provisional Worker allocation") from exc
+            response = client.request(
+                "POST",
+                f"/api/v1/worker-enrollments/{args.enrollment_id}/decision",
+                json_body={
+                    "approve": True,
+                    "owner_certificate": json.dumps(
+                        owner_certificate,
+                        separators=(",", ":"),
+                    ),
+                    "allocation_proof": sign_allocation_proof(
+                        owner_identity.root_keys,
+                        proof_payload,
+                    ),
+                },
+                idempotency_key=f"worker-enrollment-approve:{args.enrollment_id}",
+            )
+            _json(response)
+        elif args.worker_action == "enroll":
+            identity_store = WorkerIdentityStore()
+            account = args.identity_account
+            try:
+                identity = identity_store.load(account, file_path=args.identity_file)
+            except WorkerCredentialError:
+                if not args.generate_identity:
+                    raise
+                identity = identity_store.generate(account, file_path=args.identity_file)
+            owner_identity = DeviceIdentityStore().load(client.profile.key_ref or "default")
+            owner_certificate = sign_key_manifest(
+                owner_identity.root_keys,
+                {
+                    "version": 1,
+                    "kind": "vgen-worker-owner-certificate",
+                    "owner_root_key_id": owner_identity.root_key_id,
+                    "worker_key_id": identity.key_id,
+                    "worker_signing_public_key": identity.public_info()["signing_public_key"],
+                    "worker_encryption_public_key": identity.public_info()["encryption_public_key"],
+                    "issued_at": int(time.time()),
+                },
+            )
+            response = client.request(
+                "POST",
+                "/api/v1/workers",
+                json_body=identity.public_registration(
+                    name=args.name,
+                    executor_type=args.executor,
+                    executor_version=args.executor_version,
+                    manager_broker_id=(
+                        args.manager_broker or getattr(client.profile, "home_broker_id", None)
+                    ),
+                    capacity=args.capacity,
+                    certificate=json.dumps(owner_certificate, separators=(",", ":")),
+                ),
+                idempotency_key=args.idempotency_key or f"worker:{identity.key_id}",
+            )
+            session = login_worker_session(client.profile, response["id"], identity.device_keys)
+            token = str(session["token"])
+            credentials = WorkerCredentials(
+                response["id"],
+                identity.device_keys,
+                token,
+                owner_root_signing_public_key=owner_identity.root_signing_public_key,
+            )
+            if args.credentials_file:
+                save_worker_credentials_file(
+                    Path(args.credentials_file), credentials, overwrite=args.overwrite
+                )
+                storage = str(Path(args.credentials_file).expanduser().resolve())
+            else:
+                save_worker_credentials_keyring(credentials)
+                storage = "os-keyring"
+            _json(
+                {
+                    "worker_id": response["id"],
+                    "status": response["status"],
+                    "session_expires_at": session.get("expires_at"),
+                    "credentials": storage,
+                    "serve": (
+                        f"vgen-worker serve --gateway-url {client.profile.endpoint} "
+                        f"--worker-id {response['id']} --credentials-keyring"
+                    ),
+                }
+            )
+        elif args.worker_action == "manager-set":
+            broker_id = _maintenance_broker_id(client, args.broker)
+            worker = _select_owned_worker(client, args.worker)
+            manager = worker.get("manager_broker_id")
+            if manager == broker_id:
+                _json(worker)
+            else:
+                _json(client.set_worker_manager(str(worker["id"]), broker_id))
+        elif args.worker_action == "list":
+            params = {"workspace_id": args.workspace} if args.workspace else None
+            _json(client.request("GET", "/api/v1/workers", params=params))
+        elif args.worker_action == "offer":
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/workers/{args.worker_id}/offer",
+                    json_body={"pool_id": args.pool},
+                    idempotency_key=f"worker-offer:{args.worker_id}:{args.pool}",
+                )
+            )
+        elif args.worker_action == "approve-allocation":
+            allocation = client.request("GET", f"/api/v1/worker-allocations/{args.allocation_id}")
+            worker = allocation.get("worker")
+            if not isinstance(worker, dict):
+                raise ValueError("Gateway allocation response has no Worker key manifest")
+            _, identity = _profile_and_identity(args.profile)
+            proof_payload = build_allocation_proof_payload(
+                allocation_id=str(allocation["id"]),
+                workspace_id=str(allocation["workspace_id"]),
+                pool_id=str(allocation["pool_id"]),
+                worker_id=str(allocation["worker_id"]),
+                worker_signing_public_key=str(worker["signing_public_key"]),
+                worker_encryption_public_key=str(worker["encryption_public_key"]),
+                worker_certificate=worker["certificate"],
+                owner_consent_at=float(allocation["owner_consent_at"]),
+                approver_root_key_id=identity.root_key_id,
+            )
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/worker-allocations/{args.allocation_id}/approve",
+                    json_body={"proof": sign_allocation_proof(identity.root_keys, proof_payload)},
+                    idempotency_key=(
+                        f"allocation-approve:{args.allocation_id}:"
+                        f"{proof_payload['owner_consent_at_ms']}"
+                    ),
+                )
+            )
+        elif args.worker_action in {"leave", "revoke"}:
+            force = args.worker_action == "revoke" or args.force
+            suffix = "revoke" if args.worker_action == "revoke" else "leave"
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/workers/{args.worker_id}/{suffix}",
+                    json_body={} if suffix == "revoke" else {"force": force},
+                    idempotency_key=f"worker-{suffix}:{args.worker_id}",
+                )
+            )
+        elif args.worker_action == "rate-propose":
+            workspace_id = args.workspace or client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/workers/{args.worker_id}/rates",
+                    json_body={
+                        "workspace_id": workspace_id,
+                        "rate_microtokens_per_gpu_second": args.compute_rate,
+                        "traffic_microtokens_per_gib": args.traffic_rate,
+                    },
+                    idempotency_key=(
+                        f"worker-rate:{args.worker_id}:{workspace_id}:"
+                        f"{args.compute_rate}:{args.traffic_rate}"
+                    ),
+                )
+            )
+        elif args.worker_action == "rate-approve":
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/rates/{args.rate_id}/approve",
+                    json_body={},
+                    idempotency_key=f"rate-approve:{args.rate_id}",
+                )
+            )
+    finally:
+        client.close()
+
+
+def _workflow_command(args: argparse.Namespace) -> None:
+    registry = WorkflowRegistry()
+    if args.workflow_action == "install":
+        result = registry.install(
+            args.source,
+            allow_unsigned=args.allow_unsigned,
+            expected_publisher_key=args.publisher_key,
+        )
+        _json(
+            {
+                "id": result.manifest.id,
+                "version": result.manifest.version,
+                "digest": f"sha256:{result.digest}",
+                "signed": result.signed,
+                "path": str(result.path),
+            }
+        )
+    elif args.workflow_action == "custom":
+        source = Path(args.source).expanduser().resolve()
+        manifest, _, _ = validate_package(source, allow_unsigned=True)
+        if manifest.provenance != "custom":
+            raise RegistryError("custom install requires manifest provenance: custom")
+        result = registry.install(source, allow_unsigned=args.allow_unsigned)
+        _json(
+            {
+                "id": result.manifest.id,
+                "version": result.manifest.version,
+                "digest": f"sha256:{result.digest}",
+                "signed": result.signed,
+                "provenance": "custom",
+                "path": str(result.path),
+            }
+        )
+    elif args.workflow_action == "list":
+        _json(
+            [
+                {
+                    "id": item.manifest.id,
+                    "version": item.manifest.version,
+                    "digest": f"sha256:{item.digest}",
+                    "signed": item.signed,
+                    "provenance": item.manifest.provenance,
+                    "path": str(item.path),
+                }
+                for item in registry.installed()
+            ]
+        )
+    elif args.workflow_action in {"show", "verify"}:
+        source = Path(args.source).expanduser().resolve()
+        manifest, digest, signed = validate_package(source, allow_unsigned=True)
+        _json(
+            {
+                "manifest": manifest.model_dump(mode="json"),
+                "digest": f"sha256:{digest}",
+                "signed": signed,
+            }
+        )
+    elif args.workflow_action == "search":
+        _json(registry.search_index(args.index, args.query))
+    elif args.workflow_action == "remove":
+        registry.remove(args.workflow_id, args.version, provenance=args.provenance)
+        _json({"removed": f"{args.workflow_id}@{args.version}"})
+    elif args.workflow_action == "sign":
+        key = Ed25519PrivateKey.from_private_bytes(
+            b64url_decode(
+                Path(args.key_file).read_text(encoding="ascii").strip(), expected_length=32
+            )
+        )
+        digest = sign_package(Path(args.source).resolve(), key)
+        _json({"digest": f"sha256:{digest}", "signed": True})
+    elif args.workflow_action == "package":
+        output = build_archive(Path(args.source).resolve(), Path(args.output).resolve())
+        _json({"archive": str(output)})
+    elif args.workflow_action == "publish":
+        output = build_archive(Path(args.source).resolve(), Path(args.output).resolve())
+        manifest, digest, signed = validate_package(Path(args.source).resolve())
+        _json(
+            {
+                "id": manifest.id,
+                "version": manifest.version,
+                "digest": f"sha256:{digest}",
+                "signed": signed,
+                "archive": str(output),
+            }
+        )
+    elif args.workflow_action == "update":
+        installed = [
+            item
+            for item in registry.installed()
+            if item.manifest.id == args.workflow_id and item.manifest.provenance == "market"
+        ]
+        if not installed:
+            raise RegistryError("market workflow is not installed")
+        current = max(Version(item.manifest.version) for item in installed)
+        candidates = [
+            entry
+            for entry in registry.search_index(args.index, args.workflow_id)
+            if entry.get("id") == args.workflow_id
+            and entry.get("source")
+            and Version(str(entry.get("version"))) > current
+        ]
+        if not candidates:
+            _json({"id": args.workflow_id, "updated": False, "version": str(current)})
+            return
+        selected = max(candidates, key=lambda entry: Version(str(entry["version"])))
+        publisher_keys = {item.manifest.publisher.public_key for item in installed}
+        if len(publisher_keys) != 1 or None in publisher_keys:
+            raise RegistryError("installed market releases have no single trusted publisher key")
+        result = registry.install(
+            str(selected["source"]),
+            expected_digest=str(selected.get("digest") or "") or None,
+            expected_publisher_key=next(iter(publisher_keys)),
+        )
+        _json(
+            {
+                "id": result.manifest.id,
+                "updated": True,
+                "version": result.manifest.version,
+                "digest": f"sha256:{result.digest}",
+            }
+        )
+
+
+def _resolve_workflow(reference: str) -> tuple[WorkflowManifest, Path, str]:
+    workflow_id, separator, version = reference.partition("@")
+    matches = [
+        item
+        for item in WorkflowRegistry().installed()
+        if item.manifest.id == workflow_id and (not separator or item.manifest.version == version)
+    ]
+    if not matches:
+        raise RegistryError(f"workflow is not installed: {reference}")
+    selected = max(matches, key=lambda item: Version(item.manifest.version))
+    return selected.manifest, selected.path, selected.digest
+
+
+def _effective_parameters(manifest: WorkflowManifest, args: argparse.Namespace) -> dict[str, Any]:
+    schema = manifest.parameters
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    parameters = {
+        name: definition["default"]
+        for name, definition in properties.items()
+        if isinstance(definition, dict) and "default" in definition
+    }
+    parameters["prompt"] = args.prompt
+    for item in args.parameter:
+        name, separator, raw = item.partition("=")
+        if not separator or not name:
+            raise ValueError(f"parameter must use name=value: {item}")
+        try:
+            parameters[name] = json.loads(raw)
+        except json.JSONDecodeError:
+            parameters[name] = raw
+    if args.image:
+        parameters["image"] = Path(args.image).name
+    if args.last_image:
+        if not args.image:
+            raise ValueError("--last-image requires --image")
+        parameters["last_image"] = Path(args.last_image).name
+    unknown = sorted(set(parameters) - set(properties))
+    if unknown:
+        raise ValueError(f"workflow does not define parameters: {unknown}")
+    errors = sorted(
+        Draft202012Validator(schema).iter_errors(parameters),
+        key=lambda error: tuple(str(item) for item in error.absolute_path),
+    )
+    if errors:
+        error = errors[0]
+        location = ".".join(str(item) for item in error.absolute_path) or "parameters"
+        raise ValueError(f"workflow parameter validation failed at {location} ({error.validator})")
+    return parameters
+
+
+def _local_task_inputs(args: argparse.Namespace) -> list[LocalTaskInput]:
+    values: list[LocalTaskInput] = []
+    if args.image:
+        values.append(LocalTaskInput.from_path("image", args.image))
+    if args.last_image:
+        values.append(LocalTaskInput.from_path("last_image", args.last_image))
+    return values
+
+
+def _workflow_public_requirements(
+    variant: WorkflowVariant,
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    """Build the exact public-only requirement set shared by preflight and submit."""
+
+    return {
+        "operation": operation,
+        "payload_format": variant.payload_format,
+        **(
+            {"executor_min_version": variant.executor_min_version}
+            if variant.executor_min_version is not None
+            else {}
+        ),
+        **(
+            {"runtime_min_version": variant.runtime_min_version}
+            if variant.runtime_min_version is not None
+            else {}
+        ),
+        **(
+            {"min_vram_bytes": variant.min_vram_bytes}
+            if variant.min_vram_bytes is not None
+            else {}
+        ),
+        **(
+            {"min_ram_bytes": variant.min_ram_bytes}
+            if variant.min_ram_bytes is not None
+            else {}
+        ),
+        "model_digests": [
+            model.sha256
+            if model.sha256.startswith("sha256:")
+            else f"sha256:{model.sha256}"
+            for model in variant.models
+        ],
+    }
+
+
+_PREFLIGHT_MESSAGES = {
+    "ready": (
+        "当前有匹配的 Worker 和已审批费率，可以提交任务。",
+        'vgen task submit "描述你想生成的视频" --wait',
+    ),
+    "no_allocated_worker": (
+        "这个资源池还没有已授权的 Worker。",
+        "请 Workspace 管理员先邀请或分配 Worker 到该资源池。",
+    ),
+    "worker_offline_or_busy": (
+        "资源池里的 Worker 当前离线、维护中或已满载。",
+        "请确认 Worker 正在运行，或稍后重新预检。",
+    ),
+    "capability_mismatch": (
+        "在线 Worker 的执行器、模型、版本、内存或显存不满足这个工作流。",
+        "请在 Worker 安装所需模型/执行器，完成心跳上报后重新预检。",
+    ),
+    "rate_not_approved": (
+        "已有匹配 Worker，但它在这个 Workspace 的费率尚未审批。",
+        "请 Workspace 管理员审批该 Worker 的费率后重新预检。",
+    ),
+}
+
+
+def _comfy_input_bindings(
+    mapping: dict[str, Any], uploaded: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    for item in uploaded:
+        name = item["input"]
+        rule = mapping.get(name)
+        if not isinstance(rule, dict):
+            raise ValueError(f"workflow has no input mapping for {name}")
+        fields = rule.get("input")
+        fields = [fields] if isinstance(fields, str) else list(fields or [])
+        if not fields:
+            raise ValueError(f"workflow input mapping has no field for {name}")
+        binding = {"input": name, "field": str(fields[0])}
+        if rule.get("node") is not None:
+            binding["node_id"] = str(rule["node"])
+        elif rule.get("title") is not None:
+            binding["node_title"] = str(rule["title"])
+        else:
+            raise ValueError(f"workflow input mapping has no node selector for {name}")
+        bindings.append(binding)
+    return bindings
+
+
+def _task_reader_context(
+    client: GatewayClient, task_id: str
+) -> tuple[dict[str, Any], bytes, str, int]:
+    reader = client.request("GET", f"/api/v1/tasks/{task_id}/reader-envelope")
+    workspace_id = str(reader["workspace_id"])
+    content_attempt_id = str(reader.get("content_attempt_id") or reader.get("attempt_id") or "")
+    if not content_attempt_id:
+        raise ValueError("Gateway reader envelope has no content_attempt_id")
+    key_version = int(reader.get("key_version", 1))
+    raw_envelope = reader.get("reader_envelope")
+    if not isinstance(raw_envelope, str) or not raw_envelope:
+        raise ValueError("task has no Workspace reader envelope")
+    try:
+        envelope = PayloadCiphertext.from_dict(json.loads(raw_envelope))
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("task Workspace reader envelope is invalid") from exc
+    aad = task_aad(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        attempt_id=content_attempt_id,
+        key_version=key_version,
+    )
+    task_data_key = unwrap_task_key_for_workspace(
+        WorkspaceKeyStore().load(workspace_id, key_version),
+        envelope,
+        aad=aad,
+    )
+    return reader, task_data_key, content_attempt_id, key_version
+
+
+def _verify_prepared_worker_certificate(worker: Mapping[str, Any]) -> None:
+    raw_certificate = worker.get("certificate")
+    raw_root_key = worker.get("owner_root_signing_public_key")
+    try:
+        certificate = (
+            json.loads(raw_certificate) if isinstance(raw_certificate, str) else raw_certificate
+        )
+        root_key = b64url_decode(str(raw_root_key), expected_length=32)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("Gateway returned an invalid Worker owner certificate") from exc
+    if not isinstance(certificate, dict) or not verify_key_manifest(certificate, root_key):
+        raise ValueError("Worker owner certificate signature is invalid")
+    manifest = certificate.get("manifest")
+    expected = {
+        "kind": "vgen-worker-owner-certificate",
+        "owner_root_key_id": certificate.get("signer_key_id"),
+        "worker_key_id": device_key_id(
+            b64url_decode(str(worker.get("signing_public_key")), expected_length=32)
+        ),
+        "worker_signing_public_key": worker.get("signing_public_key"),
+        "worker_encryption_public_key": worker.get("encryption_public_key"),
+    }
+    if not isinstance(manifest, dict) or any(
+        manifest.get(key) != value for key, value in expected.items()
+    ):
+        raise ValueError("Worker owner certificate does not bind the selected Worker keys")
+
+
+def _verify_prepared_allocation(
+    prepared: Mapping[str, Any],
+    *,
+    workspace_id: str,
+    pool_id: str,
+    worker: Mapping[str, Any],
+    authority_store: WorkspaceAuthorityStore | None = None,
+) -> None:
+    """Verify Workspace authorization before disclosing a Task Data Key."""
+
+    allocation = prepared.get("allocation")
+    if not isinstance(allocation, Mapping):
+        raise ValueError("Gateway returned no Workspace allocation proof")
+    proof = allocation.get("proof")
+    if not isinstance(proof, Mapping):
+        raise ValueError("Gateway returned an invalid Workspace allocation proof")
+    try:
+        admin_user_id = str(allocation["admin_user_id"])
+        root_public_text = str(allocation["admin_root_signing_public_key"])
+        root_key = b64url_decode(root_public_text, expected_length=32)
+        proof_payload = proof["payload"]
+        (authority_store or WorkspaceAuthorityStore()).require(
+            workspace_id=workspace_id,
+            user_id=admin_user_id,
+            presented_root_signing_public_key=root_public_text,
+            presented_root_key_id=str(proof_payload["approver_root_key_id"]),
+        )
+        expected = build_allocation_proof_payload(
+            allocation_id=str(allocation["id"]),
+            workspace_id=workspace_id,
+            pool_id=pool_id,
+            worker_id=str(worker["id"]),
+            worker_signing_public_key=str(worker["signing_public_key"]),
+            worker_encryption_public_key=str(worker["encryption_public_key"]),
+            worker_certificate=worker["certificate"],
+            owner_consent_at=float(allocation["owner_consent_at"]),
+            approver_root_key_id=str(proof_payload["approver_root_key_id"]),
+            issued_at=int(proof_payload["issued_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Gateway returned a malformed Workspace allocation proof") from exc
+    if not verify_allocation_proof(proof, root_key, expected=expected):
+        raise ValueError(
+            "Workspace allocation proof does not authorize the selected Worker and Pool"
+        )
+
+
+def _resolve_pool_id(
+    client: GatewayClient,
+    *,
+    workspace_id: str,
+    requested: str | None,
+) -> str:
+    from .worker_bundle import WorkerBundleError, select_pool
+
+    pools = client.request("GET", f"/api/v1/workspaces/{workspace_id}/pools")
+    if not isinstance(pools, list):
+        raise WorkerBundleError("Gateway returned an invalid Pool list.")
+    selected = select_pool(
+        pools,
+        requested=requested,
+        default=getattr(client.profile, "default_pool", None),
+    )
+    return str(selected["id"])
+
+
+def _download_task_outputs(
+    client: GatewayClient,
+    task_id: str,
+    *,
+    output_dir: str | Path,
+    overwrite: bool,
+) -> dict[str, Any]:
+    task = client.get_task(task_id)
+    reader, task_data_key, content_attempt_id, key_version = _task_reader_context(client, task_id)
+    workspace_id = str(reader["workspace_id"])
+    outputs = [
+        artifact
+        for artifact in task.get("artifacts", [])
+        if artifact.get("direction") == "output"
+        and artifact.get("state") == "available"
+        and artifact.get("download_ticket")
+    ]
+    if not outputs:
+        raise ValueError("task has no downloadable output artifacts")
+    destination_root = Path(output_dir).expanduser().resolve()
+    destination_root.mkdir(parents=True, exist_ok=True)
+    downloaded: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for index, artifact in enumerate(outputs):
+        metadata = artifact.get("media_metadata")
+        raw_name = metadata.get("filename") if isinstance(metadata, dict) else None
+        filename = Path(str(raw_name or f"{artifact['id']}.bin")).name
+        if not filename or filename in {".", ".."}:
+            filename = f"output-{index:02d}.bin"
+        media_type = (
+            str(metadata.get("media_type"))
+            if isinstance(metadata, dict) and metadata.get("media_type")
+            else None
+        )
+        filename = with_safe_media_extension(filename, media_type)
+        if filename in used_names:
+            filename = f"{index:02d}-{filename}"
+        used_names.add(filename)
+        destination = destination_root / filename
+        if destination.exists() and not overwrite:
+            raise ValueError(f"refusing to overwrite output: {destination}")
+        receipt = download_and_decrypt_output(
+            artifact,
+            destination,
+            task_data_key=task_data_key,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            artifact_attempt_id=str(artifact.get("attempt_id") or content_attempt_id),
+            key_version=key_version,
+        )
+        downloaded.append(
+            {
+                "artifact_id": artifact["id"],
+                "path": str(destination),
+                "size": receipt.size_bytes,
+            }
+        )
+    return {"task_id": task_id, "outputs": downloaded}
+
+
+def _wait_for_task(
+    client: GatewayClient,
+    task_id: str,
+    *,
+    interval: float,
+    timeout: float,
+) -> dict[str, Any]:
+    if interval <= 0 or timeout <= 0:
+        raise ValueError("task wait interval and timeout must be positive")
+    deadline = time.monotonic() + timeout
+    last_state: str | None = None
+    while True:
+        task = client.get_task(task_id)
+        state = str(task.get("state") or "unknown")
+        if state != last_state:
+            print(f"任务状态：{state}", file=sys.stderr)
+            last_state = state
+        if state in {"succeeded", "failed", "cancelled", "expired"}:
+            return task
+        if time.monotonic() >= deadline:
+            raise TimeoutError("task wait timed out")
+        time.sleep(interval)
+
+
+def _task_command(args: argparse.Namespace) -> None:
+    client = _client(args.profile)
+    try:
+        if args.task_action == "preflight":
+            manifest, directory, digest = _resolve_workflow(args.workflow)
+            parameters = _effective_parameters(manifest, args)
+            variant = next(
+                (item for item in manifest.variants if item.executor_type == args.executor), None
+            )
+            if variant is None:
+                raise ValueError(f"workflow has no {args.executor} executor variant")
+            template = load_json(directory / variant.payload)
+            mapping = json.loads((directory / str(variant.mapping)).read_text(encoding="utf-8"))
+            _, _, operation = build_comfy_graph(template, mapping, parameters)
+            workspace_id = args.workspace or client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError("task preflight requires a default Workspace or --workspace")
+            pool_id = _resolve_pool_id(client, workspace_id=workspace_id, requested=args.pool)
+            checked = client.preflight_task(
+                {
+                    "workspace_id": workspace_id,
+                    "pool_id": pool_id,
+                    "workflow_ref": f"{manifest.id}@{manifest.version}",
+                    "workflow_digest": f"sha256:{digest}",
+                    "executor_type": variant.executor_type,
+                    "public_requirements": _workflow_public_requirements(
+                        variant,
+                        operation=operation,
+                    ),
+                }
+            )
+            message, next_step = _PREFLIGHT_MESSAGES.get(
+                str(checked.get("state")),
+                ("Gateway 返回了未知预检状态。", "请升级 CLI 后重试。"),
+            )
+            _json({**checked, "message": message, "next": next_step})
+        elif args.task_action == "submit":
+            manifest, directory, digest = _resolve_workflow(args.workflow)
+            parameters = _effective_parameters(manifest, args)
+            local_inputs = _local_task_inputs(args)
+            variant = next(
+                (item for item in manifest.variants if item.executor_type == args.executor), None
+            )
+            if variant is None:
+                raise ValueError(f"workflow has no {args.executor} executor variant")
+            template = load_json(directory / variant.payload)
+            mapping = json.loads((directory / str(variant.mapping)).read_text(encoding="utf-8"))
+            graph, effective, operation = build_comfy_graph(template, mapping, parameters)
+            workspace_id = args.workspace or client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError("task submit requires a default Workspace or --workspace")
+            pool_id = _resolve_pool_id(client, workspace_id=workspace_id, requested=args.pool)
+            prepared = client.prepare_task(
+                {
+                    "workspace_id": workspace_id,
+                    "pool_id": pool_id,
+                    "workflow_ref": f"{manifest.id}@{manifest.version}",
+                    "workflow_digest": f"sha256:{digest}",
+                    "executor_type": variant.executor_type,
+                    "public_requirements": _workflow_public_requirements(
+                        variant,
+                        operation=operation,
+                    ),
+                    "client_channel": "cli",
+                    "priority": args.priority,
+                    "input_artifacts": [item.prepare_descriptor() for item in local_inputs],
+                },
+                idempotency_key=args.idempotency_key or f"submit:{uuid.uuid4()}",
+            )
+            attempt_id = prepared.get("attempt_id")
+            if not attempt_id:
+                raise RuntimeError("Gateway prepare response has no attempt_id required by E2EE")
+            worker = prepared["worker"]
+            _verify_prepared_worker_certificate(worker)
+            _verify_prepared_allocation(
+                prepared,
+                workspace_id=workspace_id,
+                pool_id=pool_id,
+                worker=worker,
+            )
+            key_version = int(prepared.get("key_version", 1))
+            content_attempt_id = str(prepared.get("content_attempt_id") or attempt_id)
+            content_aad = task_aad(
+                workspace_id=workspace_id,
+                task_id=prepared["id"],
+                attempt_id=content_attempt_id,
+                key_version=key_version,
+            )
+            task_data_key = generate_task_data_key()
+            uploaded = encrypt_and_upload_inputs(
+                local_inputs,
+                list(prepared.get("artifact_tickets") or []),
+                task_data_key=task_data_key,
+                workspace_id=workspace_id,
+                task_id=prepared["id"],
+                content_attempt_id=content_attempt_id,
+                key_version=key_version,
+            )
+            opaque = json.dumps(
+                {
+                    "workflow": graph,
+                    "input_bindings": _comfy_input_bindings(mapping, uploaded),
+                    "effective_parameters": effective,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encrypted_payload = encrypt_payload(task_data_key, opaque, aad=content_aad)
+            worker_envelope = wrap_task_key(
+                b64url_decode(worker["encryption_public_key"], expected_length=32),
+                task_data_key,
+                aad=task_aad(
+                    workspace_id=workspace_id,
+                    task_id=prepared["id"],
+                    attempt_id=attempt_id,
+                    key_version=key_version,
+                ),
+            )
+            reader_envelope = wrap_task_key_for_workspace(
+                WorkspaceKeyStore().load(workspace_id, key_version),
+                task_data_key,
+                aad=content_aad,
+            )
+            committed = client.commit_task(
+                prepared["id"],
+                {
+                    "encrypted_payload": json.dumps(
+                        encrypted_payload.to_dict(), separators=(",", ":")
+                    ),
+                    "worker_tdk_envelope": json.dumps(
+                        worker_envelope.to_dict(), separators=(",", ":")
+                    ),
+                    "reader_envelope": json.dumps(reader_envelope.to_dict(), separators=(",", ":")),
+                    "key_algorithm": HPKE_ALGORITHM,
+                    "artifacts": [],
+                },
+            )
+            if not args.wait:
+                _json(committed)
+            else:
+                task_id = str(committed.get("id") or prepared["id"])
+                completed = _wait_for_task(
+                    client,
+                    task_id,
+                    interval=args.wait_interval,
+                    timeout=args.timeout,
+                )
+                if completed.get("state") != "succeeded":
+                    raise ValueError(f"task ended without a video (state={completed.get('state')})")
+                _json(
+                    _download_task_outputs(
+                        client,
+                        task_id,
+                        output_dir=args.output_dir,
+                        overwrite=args.overwrite,
+                    )
+                )
+        elif args.task_action == "show":
+            _json(client.get_task(args.task_id))
+        elif args.task_action == "get":
+            _json(
+                _download_task_outputs(
+                    client,
+                    args.task_id,
+                    output_dir=args.output_dir,
+                    overwrite=args.overwrite,
+                )
+            )
+        elif args.task_action == "list":
+            _json(
+                client.list_tasks(workspace_id=args.workspace or client.profile.default_workspace)
+            )
+        elif args.task_action == "cancel":
+            _json(client.close_task(args.task_id))
+        elif args.task_action == "retry":
+            retry = client.request(
+                "POST",
+                f"/api/v1/tasks/{args.task_id}/retry",
+                json_body={},
+                idempotency_key=f"retry:{args.task_id}:{uuid.uuid4()}",
+            )
+            reader, task_data_key, _, key_version = _task_reader_context(client, args.task_id)
+            worker = retry["worker"]
+            _verify_prepared_worker_certificate(worker)
+            _verify_prepared_allocation(
+                retry,
+                workspace_id=str(retry["workspace_id"]),
+                pool_id=str(retry["pool_id"]),
+                worker=worker,
+            )
+            attempt_id = str(retry["attempt_id"])
+            worker_envelope = wrap_task_key(
+                b64url_decode(worker["encryption_public_key"], expected_length=32),
+                task_data_key,
+                aad=task_aad(
+                    workspace_id=str(reader["workspace_id"]),
+                    task_id=args.task_id,
+                    attempt_id=attempt_id,
+                    key_version=key_version,
+                ),
+            )
+            _json(
+                client.request(
+                    "POST",
+                    f"/api/v1/tasks/{args.task_id}/rekey",
+                    json_body={
+                        "replacement_worker_id": worker["id"],
+                        "worker_tdk_envelope": json.dumps(
+                            worker_envelope.to_dict(), separators=(",", ":")
+                        ),
+                        "key_algorithm": HPKE_ALGORITHM,
+                    },
+                    idempotency_key=f"rekey:{args.task_id}:{attempt_id}",
+                )
+            )
+        elif args.task_action == "watch":
+            deadline = time.monotonic() + args.timeout
+            while True:
+                task = client.get_task(args.task_id)
+                state = task.get("state")
+                _json(task)
+                if state in {"succeeded", "failed", "cancelled", "expired"}:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("task watch timed out")
+                time.sleep(args.interval)
+        elif args.task_action == "usage":
+            workspace_id = args.workspace or client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _json(client.request("GET", f"/api/v1/workspaces/{workspace_id}/usage"))
+    finally:
+        client.close()
+
+
+def _usage_command(args: argparse.Namespace) -> None:
+    client = _client(args.profile)
+    try:
+        workspace_id = args.workspace or client.profile.default_workspace
+        if not workspace_id:
+            raise ValueError("workspace is required")
+        values = client.request(
+            "GET",
+            f"/api/v1/workspaces/{workspace_id}/usage",
+            params={"limit": args.limit},
+        )
+        if args.usage_action == "list":
+            _json(values)
+            return
+        selected = next(
+            (
+                item
+                for item in values
+                if item.get("id") == args.entry_id
+                or item.get("attempt_id") == args.entry_id
+                or item.get("task_id") == args.entry_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError("usage entry is not present in the requested Workspace window")
+        _json(selected)
+    finally:
+        client.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="vgen", description="Encrypted VGen v1 CLI")
+    parser.add_argument("--version", action="version", version=f"vgen {__version__}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    setup = sub.add_parser(
+        "setup",
+        help="initialize this Mac as a Home Broker without handling resource IDs",
+    )
+    setup.add_argument("--gateway", "--endpoint", dest="endpoint")
+    setup.add_argument("--display-name")
+    setup.add_argument("--workspace-name")
+    setup.add_argument("--pool-name")
+    setup.add_argument("--broker-name")
+    setup.add_argument("--device-name")
+    setup.add_argument("--profile", default="home")
+    setup.add_argument("--identity", default="default")
+    setup.add_argument("--recovery-file", type=Path)
+    setup.add_argument("--workflow-package", type=Path, help=argparse.SUPPRESS)
+    bootstrap_source = setup.add_mutually_exclusive_group()
+    bootstrap_source.add_argument("--bootstrap-code-file", type=Path)
+    bootstrap_source.add_argument("--bootstrap-code-stdin", action="store_true")
+    setup.add_argument("--non-interactive", action="store_true")
+    setup.add_argument("--no-home-broker", action="store_true")
+    setup.add_argument("--no-broker-service", action="store_true")
+    setup.add_argument("--json", action="store_true")
+
+    identity = sub.add_parser("identity")
+    identity_sub = identity.add_subparsers(dest="identity_action", required=True)
+    identity_init = identity_sub.add_parser("init")
+    identity_init.add_argument("--alias", default="default")
+    identity_init.add_argument("--overwrite", action="store_true")
+    identity_init.add_argument("--dangerously-export-recovery")
+    identity_recover = identity_sub.add_parser("recover")
+    identity_recover.add_argument("--alias", default="default")
+    identity_recover.add_argument("--private-key-file")
+    identity_recover.add_argument("--overwrite", action="store_true")
+    identity_recover.add_argument("--profile")
+    identity_recover.add_argument("--device-name", default="recovered-device")
+    identity_show = identity_sub.add_parser("show")
+    identity_show.add_argument("--alias", default="default")
+    identity_device = identity_sub.add_parser("device")
+    identity_device.add_argument("--alias", default="default")
+    identity_revoke = identity_sub.add_parser("revoke")
+    identity_revoke.add_argument("device_id", nargs="?")
+    identity_revoke.add_argument("--profile")
+    identity_revoke.add_argument("--forget-local", action="store_true")
+    for action in ("login", "logout"):
+        command = identity_sub.add_parser(action)
+        command.add_argument("--profile")
+    identity_enroll = identity_sub.add_parser("enroll", help="claim a User invite read from stdin")
+    identity_enroll.add_argument("--invite-stdin", action="store_true", required=True)
+    identity_enroll.add_argument("--display-name", required=True)
+    identity_enroll.add_argument("--device-name", default="primary-device")
+    identity_enroll.add_argument("--profile")
+    identity_device_enroll = identity_sub.add_parser(
+        "device-enroll", help="claim a Broker Device invite using the local Device key"
+    )
+    identity_device_enroll.add_argument("--invite-stdin", action="store_true", required=True)
+    identity_device_enroll.add_argument("--device-name", default="broker-device")
+    identity_device_enroll.add_argument("--profile")
+
+    profile = sub.add_parser("profile")
+    profile_sub = profile.add_subparsers(dest="profile_action", required=True)
+    profile_add = profile_sub.add_parser("add")
+    profile_add.add_argument("name")
+    profile_add.add_argument("endpoint")
+    profile_add.add_argument("--workspace")
+    profile_add.add_argument("--identity", default="default")
+    profile_add.add_argument("--no-use", action="store_true")
+    profile_use = profile_sub.add_parser("use")
+    profile_use.add_argument("name")
+    profile_show = profile_sub.add_parser("show")
+    profile_show.add_argument("name", nargs="?")
+    profile_sub.add_parser("list")
+
+    gateway = sub.add_parser("gateway")
+    gateway_sub = gateway.add_subparsers(dest="gateway_action", required=True)
+    bootstrap = gateway_sub.add_parser("bootstrap")
+    bootstrap.add_argument("--profile")
+    bootstrap.add_argument("--display-name", required=True)
+    bootstrap.add_argument("--device-name", default="primary-device")
+    health = gateway_sub.add_parser("health")
+    health.add_argument("--profile")
+
+    service = sub.add_parser("service", help="manage a scoped API Service identity")
+    service_sub = service.add_subparsers(dest="service_action", required=True)
+    service_enroll = service_sub.add_parser(
+        "enroll", help="claim a Service invite using a new independent key pair"
+    )
+    service_enroll.add_argument("--invite-stdin", action="store_true", required=True)
+    service_enroll.add_argument("--name", required=True)
+    service_enroll_storage = service_enroll.add_mutually_exclusive_group()
+    service_enroll_storage.add_argument("--credentials-account")
+    service_enroll_storage.add_argument("--credentials-file", type=Path)
+    service_enroll.add_argument("--overwrite", action="store_true")
+    service_enroll.add_argument(
+        "--use", action="store_true", help="bind this profile to the enrolled Service"
+    )
+    service_enroll.add_argument("--profile")
+    service_use = service_sub.add_parser(
+        "use", help="bind a profile to locally stored Service credentials"
+    )
+    service_use.add_argument("service_id")
+    service_use_source = service_use.add_mutually_exclusive_group()
+    service_use_source.add_argument("--credentials-account")
+    service_use_source.add_argument("--credentials-file", type=Path)
+    service_use.add_argument("--profile")
+    for action in ("login", "logout", "show", "revoke-local"):
+        command = service_sub.add_parser(action)
+        command.add_argument("--profile")
+    service_key_sync = service_sub.add_parser("key-sync")
+    service_key_sync.add_argument("--workspace")
+    service_key_sync.add_argument("--key-version", type=int)
+    service_key_sync.add_argument("--profile")
+
+    workspace = sub.add_parser("workspace")
+    workspace_sub = workspace.add_subparsers(dest="workspace_action", required=True)
+    create = workspace_sub.add_parser("create")
+    create.add_argument("name")
+    create.add_argument("--broker-id")
+    create.add_argument("--use", action="store_true")
+    create.add_argument("--profile")
+    listing = workspace_sub.add_parser("list")
+    listing.add_argument("--profile")
+    pool_create = workspace_sub.add_parser("pool-create")
+    pool_create.add_argument("name")
+    pool_create.add_argument("--workspace")
+    pool_create.add_argument("--policy")
+    pool_create.add_argument("--profile")
+    pool_list = workspace_sub.add_parser("pool-list")
+    pool_list.add_argument("--workspace")
+    pool_list.add_argument("--profile")
+    owner_migrate = workspace_sub.add_parser(
+        "owner-migrate",
+        help="explicitly pin a legacy pre-v0.3 Workspace Owner after a TOFU warning",
+    )
+    owner_migrate.add_argument("--workspace")
+    owner_migrate.add_argument(
+        "--accept-legacy-tofu",
+        action="store_true",
+        help="dangerously accept the displayed legacy Owner identity without a prompt",
+    )
+    owner_migrate.add_argument("--profile")
+    key_sync = workspace_sub.add_parser("key-sync")
+    key_sync.add_argument("--workspace")
+    key_sync.add_argument("--key-version", type=int)
+    key_sync.add_argument("--profile")
+    key_grant = workspace_sub.add_parser("key-grant")
+    key_grant.add_argument("recipient_id")
+    key_grant.add_argument(
+        "--recipient-type", choices=("user_recovery", "device", "service"), required=True
+    )
+    key_grant.add_argument("--workspace")
+    key_grant.add_argument("--key-version", type=int)
+    key_grant.add_argument("--profile")
+    key_grant_enrollment = workspace_sub.add_parser(
+        "key-grant-enrollment",
+        help="grant the current Workspace key to the User claimed by an Enrollment",
+    )
+    key_grant_enrollment.add_argument("enrollment_id")
+    key_grant_enrollment.add_argument("--workspace")
+    key_grant_enrollment.add_argument("--verification-code")
+    key_grant_enrollment.add_argument("--profile")
+    key_rotate = workspace_sub.add_parser("key-rotate")
+    key_rotate.add_argument("--workspace")
+    key_rotate.add_argument("--expected-key-version", type=int)
+    key_rotate.add_argument("--profile")
+    authority_pin = workspace_sub.add_parser("authority-pin")
+    authority_pin.add_argument("user_id")
+    authority_pin.add_argument("--root-signing-public-key", required=True)
+    authority_pin.add_argument("--root-key-id")
+    authority_pin.add_argument("--workspace")
+    authority_pin.add_argument("--profile")
+    invite = workspace_sub.add_parser("invite")
+    invite.add_argument("--workspace")
+    invite.add_argument(
+        "--kind",
+        choices=("user", "broker_device", "service", "workspace_member"),
+        required=True,
+    )
+    invite.add_argument(
+        "--method", choices=("direct_invite", "invite_approval"), default="invite_approval"
+    )
+    invite.add_argument("--relationship")
+    invite.add_argument("--scope", action="append", default=[])
+    invite.add_argument("--subject-key-fingerprint")
+    invite.add_argument("--ttl", type=int, default=1800)
+    invite.add_argument(
+        "--wait",
+        action="store_true",
+        help="wait for claim and automatically grant the Workspace key for a direct invite",
+    )
+    invite.add_argument("--timeout", type=float, default=600)
+    invite.add_argument("--wait-interval", type=float, default=1)
+    invite.add_argument("--verification-code")
+    invite.add_argument("--profile")
+    apply = workspace_sub.add_parser("apply")
+    apply.add_argument("--workspace", required=True)
+    apply.add_argument("--pool")
+    apply.add_argument("--kind", required=True)
+    apply.add_argument("--relationship")
+    apply.add_argument("--display-name")
+    apply.add_argument("--device-name")
+    apply.add_argument("--profile")
+    decide = workspace_sub.add_parser("decide")
+    decide.add_argument("enrollment_id")
+    decision = decide.add_mutually_exclusive_group(required=True)
+    decision.add_argument("--approve", action="store_true")
+    decision.add_argument("--reject", dest="approve", action="store_false")
+    decide.add_argument("--verification-code")
+    decide.add_argument("--workspace")
+    decide.add_argument("--profile")
+    enrollment_list = workspace_sub.add_parser("enrollment-list")
+    enrollment_list.add_argument("--workspace")
+    enrollment_list.add_argument("--state")
+    enrollment_list.add_argument("--profile")
+    allocation_list = workspace_sub.add_parser("allocation-list")
+    allocation_list.add_argument("--workspace")
+    allocation_list.add_argument("--profile")
+    workspace_audit = workspace_sub.add_parser("audit")
+    workspace_audit.add_argument("--workspace")
+    workspace_audit.add_argument("--limit", type=int, default=100)
+    workspace_audit.add_argument("--profile")
+
+    join = sub.add_parser(
+        "join",
+        help="join a Workspace as a new User or claim a membership invite",
+    )
+    join.add_argument(
+        "--invite-stdin",
+        action="store_true",
+        help="read the complete one-time Invite URI from stdin instead of a hidden prompt",
+    )
+    join.add_argument("--gateway", "--endpoint", dest="endpoint")
+    join.add_argument("--display-name")
+    join.add_argument("--device-name")
+    join.add_argument("--identity")
+    join.add_argument("--recovery-file", type=Path)
+    join.add_argument("--pool", help="default Pool name or ID when the Workspace has several")
+    join.add_argument("--resume", action="store_true", help="continue after approval or key grant")
+    join.add_argument("--non-interactive", action="store_true")
+    join.add_argument("--json", action="store_true")
+    join.add_argument("--workflow-package", type=Path, help=argparse.SUPPRESS)
+    join.add_argument("--profile")
+
+    broker = sub.add_parser("broker")
+    broker_sub = broker.add_subparsers(dest="broker_action", required=True)
+    broker_create = broker_sub.add_parser("create")
+    broker_create.add_argument("name")
+    broker_create.add_argument("--profile")
+    for action in ("list", "status"):
+        command = broker_sub.add_parser(action)
+        command.add_argument("--profile")
+    broker_device = broker_sub.add_parser("device")
+    broker_device.add_argument("broker_id")
+    broker_device.add_argument("device_id")
+    broker_device.add_argument("--profile")
+    broker_serve = broker_sub.add_parser("serve")
+    broker_serve.add_argument("--broker-id", required=True)
+    broker_serve.add_argument("--broker-device-id", required=True)
+    broker_serve.add_argument("--profile")
+    broker_serve.add_argument("--once", action="store_true")
+    broker_serve.add_argument("--poll-seconds", type=float, default=5)
+    broker_update = broker_sub.add_parser(
+        "worker-update",
+        help="upload a reviewed VGen Worker wheel and apply it when the Worker is idle",
+    )
+    broker_update.add_argument("wheel", type=Path)
+    broker_update.add_argument("--worker", help="owned Worker name or ID; automatic when unique")
+    broker_update.add_argument("--broker", help="Broker ID; defaults to this profile's Home Broker")
+    broker_update.add_argument("--wait", action="store_true")
+    broker_update.add_argument("--interval", type=float, default=2)
+    broker_update.add_argument("--timeout", type=float, default=3600)
+    broker_update.add_argument("--profile")
+    broker_models = broker_sub.add_parser(
+        "model-install",
+        help="ask an owned Worker to install missing models from a verified workflow",
+    )
+    broker_models.add_argument(
+        "workflow",
+        nargs="?",
+        default="vgen/minimax-h3-8step",
+        help="installed workflow reference (default: vgen/minimax-h3-8step)",
+    )
+    broker_models.add_argument("--worker", help="owned Worker name or ID; automatic when unique")
+    broker_models.add_argument("--broker", help="Broker ID; defaults to this profile's Home Broker")
+    broker_models.add_argument(
+        "--accept-license",
+        action="append",
+        default=[],
+        metavar="LICENSE",
+        help="accept a required model license; repeat for each distinct license",
+    )
+    broker_models.add_argument("--wait", action="store_true")
+    broker_models.add_argument("--interval", type=float, default=2)
+    broker_models.add_argument("--timeout", type=float, default=86_400)
+    broker_models.add_argument("--profile")
+    maintenance_list = broker_sub.add_parser(
+        "maintenance-list", help="list maintenance jobs for an owned Worker"
+    )
+    maintenance_list.add_argument("--worker", help="owned Worker name or ID")
+    maintenance_list.add_argument("--profile")
+    maintenance_show = broker_sub.add_parser("maintenance-show", help="show a maintenance job")
+    maintenance_show.add_argument("job_id")
+    maintenance_show.add_argument("--profile")
+    maintenance_cancel = broker_sub.add_parser(
+        "maintenance-cancel", help="cancel a queued or running maintenance job"
+    )
+    maintenance_cancel.add_argument("job_id")
+    maintenance_cancel.add_argument("--profile")
+
+    worker = sub.add_parser("worker")
+    worker_sub = worker.add_subparsers(dest="worker_action", required=True)
+    worker_bundle = worker_sub.add_parser(
+        "bundle",
+        help="provision a Worker and create a one-click private Windows ZIP",
+    )
+    worker_bundle.add_argument("--name", default="Windows GPU Worker")
+    worker_bundle.add_argument("--pool", help="Pool name (automatic when only one exists)")
+    worker_bundle.add_argument("--output", type=Path)
+    worker_bundle.add_argument(
+        "--comfyui-root",
+        help="optional Windows ComfyUI path; common installations are detected automatically",
+    )
+    worker_bundle.add_argument("--compute-rate", type=int, default=1_000_000)
+    worker_bundle.add_argument("--traffic-rate", type=int, default=0)
+    worker_bundle.add_argument("--worker-wheel", type=Path, help=argparse.SUPPRESS)
+    worker_bundle.add_argument("--overwrite", action="store_true")
+    worker_bundle.add_argument("--profile")
+    worker_installer = worker_sub.add_parser(
+        "installer-bundle",
+        help="build a reusable credential-free Windows Worker ZIP",
+    )
+    worker_installer.add_argument("--gateway-url")
+    worker_installer.add_argument("--output", type=Path)
+    worker_installer.add_argument("--worker-wheel", type=Path, help=argparse.SUPPRESS)
+    worker_installer.add_argument("--overwrite", action="store_true")
+    worker_installer.add_argument("--profile")
+    worker_invite = worker_sub.add_parser(
+        "invite",
+        help="create a one-use, approval-required Invite for a credential-free Worker",
+    )
+    worker_invite.add_argument("--name", default="Windows GPU Worker")
+    worker_invite.add_argument("--pool", help="Pool name (automatic when only one exists)")
+    worker_invite.add_argument("--manager-broker")
+    worker_invite.add_argument("--compute-rate", type=int, default=1_000_000)
+    worker_invite.add_argument("--traffic-rate", type=int, default=0)
+    worker_invite.add_argument("--ttl", type=int, default=1800)
+    worker_invite.add_argument("--profile")
+    worker_claim = worker_sub.add_parser(
+        "claim-invite",
+        help="generate a local Worker identity and claim an Invite through a hidden prompt",
+    )
+    worker_claim.add_argument("--gateway-url", required=True)
+    worker_claim.add_argument("--name", required=True)
+    worker_claim.add_argument("--executor", default="comfyui")
+    worker_claim.add_argument("--executor-version", default="1.1.0")
+    worker_claim.add_argument("--capacity", type=int, default=1)
+    worker_claim.add_argument("--identity-file", type=Path, required=True)
+    worker_claim.add_argument("--credentials-file", type=Path, required=True)
+    worker_claim.add_argument(
+        "--invite-stdin",
+        action="store_true",
+        help="read the Invite URI from stdin for automation; otherwise use a hidden prompt",
+    )
+    worker_claim.add_argument("--wait", action="store_true")
+    worker_claim.add_argument("--interval", type=float, default=2)
+    worker_claim.add_argument("--timeout", type=float, default=1800)
+    worker_approve = worker_sub.add_parser(
+        "approve-enrollment",
+        help="verify a pending Worker key and sign its certificate and Pool allocation",
+    )
+    worker_approve.add_argument("enrollment_id")
+    worker_approve.add_argument(
+        "--code",
+        required=True,
+        help="verification code shown locally by the enrolling Windows Worker",
+    )
+    worker_approve.add_argument("--profile")
+    worker_enroll = worker_sub.add_parser(
+        "enroll", help="register a User-owned Worker (a Broker is optional)"
+    )
+    worker_enroll.add_argument("name")
+    worker_enroll.add_argument("--executor", default="comfyui")
+    worker_enroll.add_argument("--executor-version", default="")
+    worker_enroll.add_argument("--capacity", type=int, default=1)
+    worker_enroll.add_argument("--manager-broker")
+    worker_enroll.add_argument("--identity-account", default="default")
+    worker_enroll.add_argument("--identity-file", type=Path)
+    worker_enroll.add_argument("--generate-identity", action="store_true")
+    worker_enroll.add_argument("--credentials-file", type=Path)
+    worker_enroll.add_argument("--overwrite", action="store_true")
+    worker_enroll.add_argument("--idempotency-key")
+    worker_enroll.add_argument("--profile")
+    worker_list = worker_sub.add_parser("list")
+    worker_list.add_argument("--workspace")
+    worker_list.add_argument("--profile")
+    manager_set = worker_sub.add_parser(
+        "manager-set", help="explicitly assign an owned Worker to a Broker"
+    )
+    manager_set.add_argument(
+        "worker", nargs="?", help="owned Worker name or ID; automatic when unique"
+    )
+    manager_set.add_argument("--broker", help="Broker ID; defaults to this profile's Home Broker")
+    manager_set.add_argument("--profile")
+    worker_offer = worker_sub.add_parser("offer")
+    worker_offer.add_argument("worker_id")
+    worker_offer.add_argument("--pool", required=True)
+    worker_offer.add_argument("--profile")
+    allocation_approve = worker_sub.add_parser("approve-allocation")
+    allocation_approve.add_argument("allocation_id")
+    allocation_approve.add_argument("--profile")
+    worker_leave = worker_sub.add_parser("leave")
+    worker_leave.add_argument("worker_id")
+    worker_leave.add_argument("--force", action="store_true")
+    worker_leave.add_argument("--profile")
+    worker_revoke = worker_sub.add_parser("revoke")
+    worker_revoke.add_argument("worker_id")
+    worker_revoke.add_argument("--profile")
+    rate_propose = worker_sub.add_parser("rate-propose")
+    rate_propose.add_argument("worker_id")
+    rate_propose.add_argument("--workspace")
+    rate_propose.add_argument("--compute-rate", type=int, required=True)
+    rate_propose.add_argument("--traffic-rate", type=int, default=0)
+    rate_propose.add_argument("--profile")
+    rate_approve = worker_sub.add_parser("rate-approve")
+    rate_approve.add_argument("rate_id")
+    rate_approve.add_argument("--profile")
+    worker_serve = worker_sub.add_parser("serve", help="run the encrypted Worker lease daemon")
+    worker_serve.add_argument("--gateway-url")
+    worker_serve.add_argument("--worker-id")
+    worker_serve.add_argument("--identity-file", type=Path)
+    worker_serve.add_argument("--identity-account")
+    worker_serve.add_argument("--credentials-file", type=Path)
+    worker_serve.add_argument("--credentials-keyring", action="store_true")
+    worker_serve.add_argument("--session-token-file", type=Path)
+    worker_serve.add_argument("--executor", default="comfyui")
+    worker_serve.add_argument("--comfy-url", default="http://127.0.0.1:8188")
+    worker_serve.add_argument("--comfy-output-dir", type=Path)
+    worker_serve.add_argument("--comfy-model-root", type=Path)
+    worker_serve.add_argument(
+        "--comfy-policy-file",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_COMFYUI_POLICY_FILE"])
+            if os.environ.get("VGEN_COMFYUI_POLICY_FILE")
+            else None
+        ),
+        help="local machine-admin ComfyUI graph allowlist",
+    )
+    worker_serve.add_argument("--announce", action="store_true")
+    worker_serve.add_argument("--allow-http", action="store_true")
+    worker_serve.add_argument("--local-artifact-root", type=Path, action="append", default=[])
+    worker_serve.add_argument("--work-root", type=Path)
+    worker_serve.add_argument("--lease-ttl", type=int, default=60)
+    worker_serve.add_argument("--interval", type=float, default=5)
+    worker_serve.add_argument("--once", action="store_true")
+    worker_serve.add_argument("--json", action="store_true")
+
+    workflow = sub.add_parser("workflow")
+    workflow_sub = workflow.add_subparsers(dest="workflow_action", required=True)
+    install = workflow_sub.add_parser("install")
+    install.add_argument("source")
+    install.add_argument("--allow-unsigned", action="store_true")
+    install.add_argument(
+        "--publisher-key",
+        help="base64 Ed25519 publisher key obtained independently of a remote market index",
+    )
+    custom = workflow_sub.add_parser("custom")
+    custom.add_argument("source")
+    custom.add_argument("--allow-unsigned", action="store_true")
+    workflow_sub.add_parser("list")
+    for action in ("show", "verify"):
+        command = workflow_sub.add_parser(action)
+        command.add_argument("source")
+    search = workflow_sub.add_parser("search")
+    search.add_argument("query")
+    search.add_argument("--index", required=True)
+    remove = workflow_sub.add_parser("remove")
+    remove.add_argument("workflow_id")
+    remove.add_argument("version")
+    remove.add_argument("--provenance", choices=("market", "custom"))
+    sign = workflow_sub.add_parser("sign")
+    sign.add_argument("source")
+    sign.add_argument("--key-file", required=True)
+    package = workflow_sub.add_parser("package")
+    package.add_argument("source")
+    package.add_argument("output")
+    publish = workflow_sub.add_parser("publish")
+    publish.add_argument("source")
+    publish.add_argument("output")
+    update = workflow_sub.add_parser("update")
+    update.add_argument("workflow_id")
+    update.add_argument("--index", required=True)
+
+    task = sub.add_parser("task")
+    task_sub = task.add_subparsers(dest="task_action", required=True)
+    preflight = task_sub.add_parser(
+        "preflight",
+        help="check Worker, workflow capability, and rate readiness without reserving capacity",
+    )
+    preflight.add_argument(
+        "prompt",
+        nargs="?",
+        default="VGen capability preflight",
+        help="optional local-only sample prompt used to validate workflow parameters",
+    )
+    preflight.add_argument("--workflow", default="vgen/minimax-h3-8step")
+    preflight.add_argument("--executor", default="comfyui")
+    preflight.add_argument("--workspace")
+    preflight.add_argument("--pool", help="Pool name (uses the Profile default when omitted)")
+    preflight.add_argument("--image")
+    preflight.add_argument("--last-image")
+    preflight.add_argument("--parameter", "-p", action="append", default=[])
+    preflight.add_argument("--profile")
+    submit = task_sub.add_parser("submit")
+    submit.add_argument("prompt")
+    submit.add_argument("--workflow", default="vgen/minimax-h3-8step")
+    submit.add_argument("--executor", default="comfyui")
+    submit.add_argument("--workspace")
+    submit.add_argument("--pool", help="Pool name (uses the Profile default when omitted)")
+    submit.add_argument("--image")
+    submit.add_argument("--last-image")
+    submit.add_argument("--parameter", "-p", action="append", default=[])
+    submit.add_argument("--priority", type=int, default=0)
+    submit.add_argument("--idempotency-key")
+    submit.add_argument(
+        "--wait",
+        action="store_true",
+        help="wait for completion and download the decrypted result",
+    )
+    submit.add_argument("--output-dir", default=".")
+    submit.add_argument("--overwrite", action="store_true")
+    submit.add_argument("--wait-interval", type=float, default=2)
+    submit.add_argument("--timeout", type=float, default=3600)
+    submit.add_argument("--profile")
+    for action in ("show", "cancel", "retry"):
+        command = task_sub.add_parser(action)
+        command.add_argument("task_id")
+        command.add_argument("--profile")
+    task_get = task_sub.add_parser("get")
+    task_get.add_argument("task_id")
+    task_get.add_argument("--output-dir", default=".")
+    task_get.add_argument("--overwrite", action="store_true")
+    task_get.add_argument("--profile")
+    task_list = task_sub.add_parser("list")
+    task_list.add_argument("--workspace")
+    task_list.add_argument("--profile")
+    watch = task_sub.add_parser("watch")
+    watch.add_argument("task_id")
+    watch.add_argument("--interval", type=float, default=2)
+    watch.add_argument("--timeout", type=float, default=3600)
+    watch.add_argument("--profile")
+    usage = task_sub.add_parser("usage")
+    usage.add_argument("--workspace")
+    usage.add_argument("--profile")
+
+    usage_root = sub.add_parser("usage")
+    usage_sub = usage_root.add_subparsers(dest="usage_action", required=True)
+    usage_list = usage_sub.add_parser("list")
+    usage_list.add_argument("--workspace")
+    usage_list.add_argument("--limit", type=int, default=100)
+    usage_list.add_argument("--profile")
+    usage_show = usage_sub.add_parser("show")
+    usage_show.add_argument("entry_id")
+    usage_show.add_argument("--workspace")
+    usage_show.add_argument("--limit", type=int, default=500)
+    usage_show.add_argument("--profile")
+    return parser
+
+
+def dispatch(args: argparse.Namespace) -> None:
+    handlers = {
+        "setup": setup_command,
+        "identity": _identity_command,
+        "profile": _profile_command,
+        "gateway": _gateway_command,
+        "service": _service_command,
+        "workspace": _workspace_command,
+        "join": join_command,
+        "broker": _broker_command,
+        "worker": _worker_command,
+        "workflow": _workflow_command,
+        "task": _task_command,
+        "usage": _usage_command,
+    }
+    handlers[args.command](args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        dispatch(build_parser().parse_args(argv))
+        return 0
+    except VgenClientError as exc:
+        print(f"{exc.code} {exc.name}: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except ArtifactTransferError as exc:
+        print(f"700002 STORAGE_UNAVAILABLE: {exc}", file=sys.stderr)
+        return 5
+    except VGenError as exc:
+        code = int(exc.code)
+        spec = get_error_spec(exc.code)
+        print(f"{code} {exc.code.name}: {spec.message}", file=sys.stderr)
+        return cli_exit_code(code, retry_action=spec.retry_action.value)
+    except WorkspaceAuthorityError as exc:
+        print(f"400003 KEY_MANIFEST_INVALID: {exc}", file=sys.stderr)
+        return 7
+    except (ProfileError, IdentityStoreError, WorkspaceKeyError, RegistryError, ValueError) as exc:
+        print(f"600001 VALIDATION_FAILED: {exc}", file=sys.stderr)
+        return 2
+    except TimeoutError as exc:
+        print(f"700001 GATEWAY_UNREACHABLE: {exc}", file=sys.stderr)
+        return 5
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print(f"900001 INTERNAL_ERROR: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

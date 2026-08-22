@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[gateway,broker,worker-comfyui,oss,dev]'
+      - run: ruff check src tests tools
+      - run: python -m pytest
+      - run: python tools/export_openapi_v1.py --check
+      - run: python -m build
+      - run: python tools/check_distribution.py dist
+
+  windows-powershell-51:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse the one-click Worker installer
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD\examples\windows-worker\setup-worker.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          ) > $null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - name: Verify repeated atomic model-path replacement
+        shell: powershell
+        run: .\tests\examples\windows-powershell51-model-paths.ps1
+      - name: Verify safe custom-node staging cleanup
+        shell: powershell
+        run: .\tests\examples\windows-powershell51-custom-node-staging.ps1
+      - name: Verify native installer output isolation
+        shell: powershell
+        run: .\tests\examples\windows-powershell51-native-output.ps1
+      - name: Verify console reuse with redirected ComfyUI logs
+        shell: powershell
+        run: .\tests\examples\windows-powershell51-no-new-window.ps1

@@ -1,0 +1,108 @@
+name: vgen-alpha
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile
+      args:
+        VGEN_UID: ${VGEN_CONTAINER_UID:-1000}
+    restart: unless-stopped
+    command:
+      - vgen-gateway
+      - --database
+      - /var/lib/vgen/vgen-gateway.db
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      VGEN_GATEWAY_DOCS: ${VGEN_GATEWAY_DOCS:-1}
+      VGEN_REQUIRE_REQUEST_SIGNATURES: "1"
+    volumes:
+      - gateway-data:/var/lib/vgen
+    ports:
+      - 127.0.0.1:${VGEN_GATEWAY_BIND_PORT:-8000}:8000
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  # Enable with: docker compose --profile tls up --build
+  # Set VGEN_DOMAIN to a public DNS name pointing at this host.
+  caddy:
+    image: caddy:2.10-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      VGEN_DOMAIN: ${VGEN_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+
+  # Complete Worker enrollment/allocation and provision its local credentials
+  # before enabling this profile. See `vgen-worker serve --help` for the current
+  # alpha credential/lease flags.
+  worker:
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile
+      args:
+        VGEN_UID: ${VGEN_CONTAINER_UID:-1000}
+    profiles: ["worker"]
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    command:
+      - vgen-worker
+      - serve
+      - --gateway-url
+      - http://gateway:8000
+      - --allow-http
+      - --comfy-url
+      - ${VGEN_COMFYUI_URL:-http://host.docker.internal:8188}
+      - --comfy-output-dir
+      - /comfy-output
+      - --comfy-model-root
+      - /comfy-models
+      - --comfy-policy-file
+      - /run/vgen-policy/comfyui-policy.yaml
+      - --json
+    environment:
+      VGEN_WORKER_ID: ${VGEN_WORKER_ID:-}
+      VGEN_WORKER_CREDENTIALS_FILE: /run/vgen-worker/credentials.json
+      VGEN_COMFYUI_POLICY_FILE: /run/vgen-policy/comfyui-policy.yaml
+    volumes:
+      - ${VGEN_COMFYUI_OUTPUT_DIR_HOST:-./comfy-output}:/comfy-output:ro
+      - ${VGEN_COMFYUI_MODEL_ROOT_HOST:-./comfy-models}:/comfy-models:ro
+      - ${VGEN_WORKER_CREDENTIALS_DIR:-./worker-credentials}:/run/vgen-worker:ro
+      - ${VGEN_COMFYUI_POLICY_FILE_HOST:-./comfyui-minimax-h3-policy.yaml}:/run/vgen-policy/comfyui-policy.yaml:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  gateway-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,745 @@
+"""``vgen-worker`` identity, diagnostics, and encrypted lease runtime."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import signal
+import stat
+import sys
+import time
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+from platformdirs import user_data_path
+
+from vgen.artifacts import (
+    ArtifactAdapterRegistry,
+    HttpArtifactAdapter,
+    LocalArtifactAdapter,
+)
+from vgen.executors import Executor, ExecutorRegistry
+from vgen.protocol import ErrorCode, VGenError
+
+from .core import (
+    GatewayUnavailableError,
+    LeaseLostError,
+    UploadPendingError,
+    WorkerCore,
+)
+from .credentials import (
+    WorkerCredentialError,
+    WorkerCredentials,
+    WorkerIdentityStore,
+    load_worker_credentials_file,
+    load_worker_credentials_keyring,
+)
+from .gateway import GatewayV1Client
+from .maintenance import MaintenanceOutcome, WorkerMaintenanceController
+from .updater import WorkerUpdateError
+
+logger = logging.getLogger("vgen.worker")
+
+EXIT_OK = 0
+EXIT_CONFIG = 2
+EXIT_UNAVAILABLE = 5
+EXIT_EXECUTION_FAILED = 6
+EXIT_CRYPTO = 7
+EXIT_UPDATE_RESTART = 75
+
+ExecutorFactory = Callable[[argparse.Namespace], Executor]
+GatewayFactory = Callable[
+    [argparse.Namespace, WorkerCredentials, requests.Session], GatewayV1Client
+]
+CoreFactory = Callable[[argparse.Namespace, Executor, requests.Session], WorkerCore]
+MaintenanceFactory = Callable[
+    [
+        argparse.Namespace,
+        WorkerCredentials,
+        GatewayV1Client,
+        Executor,
+        requests.Session,
+    ],
+    WorkerMaintenanceController,
+]
+
+
+class WorkerConfigurationError(ValueError):
+    pass
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="vgen-worker",
+        description="VGen provider-neutral encrypted GPU Worker runtime",
+    )
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    identity = subcommands.add_parser(
+        "identity-init",
+        help="generate a stable random Worker identity in keyring or a 0600 file",
+    )
+    identity.add_argument(
+        "--account",
+        default=os.environ.get("VGEN_WORKER_IDENTITY_ACCOUNT", "default"),
+        help="OS keyring account (ignored with --identity-file)",
+    )
+    identity.add_argument("--identity-file", type=Path)
+    identity.add_argument("--force", action="store_true")
+    identity.add_argument("--json", action="store_true")
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--executor",
+        default=os.environ.get("VGEN_WORKER_EXECUTOR", "comfyui"),
+        choices=("comfyui",),
+    )
+    common.add_argument(
+        "--comfy-url",
+        default=os.environ.get("VGEN_COMFYUI_URL", "http://127.0.0.1:8188"),
+    )
+    common.add_argument(
+        "--comfy-output-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "VGEN_COMFYUI_OUTPUT_DIR",
+                str(Path.home() / "ComfyUI" / "output"),
+            )
+        ),
+    )
+    common.add_argument(
+        "--comfy-model-root",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_COMFYUI_MODEL_ROOT"])
+            if os.environ.get("VGEN_COMFYUI_MODEL_ROOT")
+            else None
+        ),
+        help="ComfyUI models root used to verify policy-pinned model files",
+    )
+    common.add_argument(
+        "--comfy-policy-file",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_COMFYUI_POLICY_FILE"])
+            if os.environ.get("VGEN_COMFYUI_POLICY_FILE")
+            else None
+        ),
+        help=(
+            "local machine-admin graph allowlist (required before authenticated ComfyUI execution)"
+        ),
+    )
+    common.add_argument("--json", action="store_true", help="write one JSON status per line")
+
+    subcommands.add_parser(
+        "doctor",
+        parents=(common,),
+        help="check the configured executor and print its capabilities",
+    )
+
+    serve = subcommands.add_parser(
+        "serve",
+        parents=(common,),
+        help="announce, lease, decrypt, execute, and report Gateway work",
+    )
+    serve.add_argument(
+        "--gateway-url",
+        default=os.environ.get("VGEN_GATEWAY_URL"),
+        help="Gateway endpoint (or VGEN_GATEWAY_URL)",
+    )
+    serve.add_argument(
+        "--worker-id",
+        default=os.environ.get("VGEN_WORKER_ID"),
+        help="registered Worker ID",
+    )
+    serve.add_argument(
+        "--identity-file",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_WORKER_IDENTITY_FILE"])
+            if os.environ.get("VGEN_WORKER_IDENTITY_FILE")
+            else None
+        ),
+        help="explicit 0600 stable Worker identity file",
+    )
+    serve.add_argument(
+        "--identity-account",
+        default=os.environ.get("VGEN_WORKER_IDENTITY_ACCOUNT"),
+        help="OS keyring identity account (defaults to Worker ID)",
+    )
+    serve.add_argument(
+        "--credentials-file",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_WORKER_CREDENTIALS_FILE"])
+            if os.environ.get("VGEN_WORKER_CREDENTIALS_FILE")
+            else None
+        ),
+        help="0600 compatibility bundle containing identity and a short session",
+    )
+    serve.add_argument(
+        "--credentials-keyring",
+        action="store_true",
+        help="load the Worker credential bundle from the OS keyring by Worker ID",
+    )
+    serve.add_argument(
+        "--session-token-file",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_WORKER_SESSION_FILE"])
+            if os.environ.get("VGEN_WORKER_SESSION_FILE")
+            else None
+        ),
+        help="0600 file containing a short-lived Worker session token",
+    )
+    serve.add_argument(
+        "--announce",
+        action="store_true",
+        help="require authenticated execution mode (normally inferred from credentials)",
+    )
+    serve.add_argument(
+        "--allow-http",
+        action="store_true",
+        help="allow non-TLS Gateway access (localhost is always allowed)",
+    )
+    serve.add_argument(
+        "--local-artifact-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="enable file:// tickets only below this root (repeatable)",
+    )
+    serve.add_argument("--work-root", type=Path)
+    serve.add_argument(
+        "--lease-ttl",
+        type=int,
+        default=int(os.environ.get("VGEN_WORKER_LEASE_TTL", "60")),
+    )
+    serve.add_argument(
+        "--interval",
+        type=float,
+        default=float(os.environ.get("VGEN_WORKER_HEALTH_INTERVAL", "5")),
+    )
+    serve.add_argument("--once", action="store_true", help="poll at most one lease and exit")
+    return parser
+
+
+def _build_executor(arguments: argparse.Namespace) -> Executor:
+    if arguments.executor == "comfyui":
+        from vgen.executors.comfyui import (
+            ComfyUIExecutionPolicy,
+            ComfyUIExecutor,
+            ComfyUIPolicyError,
+        )
+
+        try:
+            policy = (
+                ComfyUIExecutionPolicy.load(arguments.comfy_policy_file)
+                if arguments.comfy_policy_file is not None
+                else None
+            )
+        except ComfyUIPolicyError as exc:
+            raise WorkerConfigurationError(str(exc)) from exc
+        return ComfyUIExecutor(
+            arguments.comfy_url,
+            arguments.comfy_output_dir,
+            policy=policy,
+            model_root=arguments.comfy_model_root,
+        )
+    raise WorkerConfigurationError(f"Unsupported executor: {arguments.executor}")
+
+
+def _build_gateway(
+    arguments: argparse.Namespace,
+    credentials: WorkerCredentials,
+    session: requests.Session,
+) -> GatewayV1Client:
+    return GatewayV1Client(
+        arguments.gateway_url,
+        credentials,
+        session=session,
+        lease_ttl_seconds=arguments.lease_ttl,
+        allow_http=arguments.allow_http,
+        session_token_provider=(
+            (lambda: _session_token(arguments) or "")
+            if arguments.session_token_file is not None
+            else None
+        ),
+    )
+
+
+def _build_core(
+    arguments: argparse.Namespace,
+    executor: Executor,
+    session: requests.Session,
+) -> WorkerCore:
+    adapters = [HttpArtifactAdapter(session)]
+    if arguments.local_artifact_root:
+        adapters.append(LocalArtifactAdapter(tuple(arguments.local_artifact_root)))
+    work_root = _worker_work_root(arguments)
+    return WorkerCore(
+        ExecutorRegistry(executor),
+        ArtifactAdapterRegistry(*adapters),
+        work_root=work_root,
+        heartbeat_interval_seconds=max(0.25, min(15.0, arguments.lease_ttl / 3)),
+    )
+
+
+def _worker_work_root(arguments: argparse.Namespace) -> Path:
+    return (arguments.work_root or (Path(user_data_path("vgen")) / "worker")).expanduser()
+
+
+def _build_maintenance(
+    arguments: argparse.Namespace,
+    credentials: WorkerCredentials,
+    gateway: GatewayV1Client,
+    executor: Executor,
+    _session: requests.Session,
+) -> WorkerMaintenanceController:
+    return WorkerMaintenanceController(
+        credentials,
+        gateway,
+        executor,  # type: ignore[arg-type]
+        work_root=_worker_work_root(arguments),
+        model_root=(
+            arguments.comfy_model_root or getattr(executor, "maintenance_model_root", None)
+        ),
+        # Downloads can run while the lease-keeper thread heartbeats through
+        # the Gateway client. requests.Session is not a concurrency contract,
+        # so maintenance artifacts use a separate connection pool.
+        session=requests.Session(),
+    )
+
+
+def _executor_status(executor: Executor) -> dict[str, Any]:
+    descriptor = executor.descriptor()
+    health = executor.health()
+    capabilities: Mapping[str, Any]
+    if health.healthy:
+        try:
+            capabilities = executor.capabilities()
+        except Exception as exc:
+            health = type(health)(
+                False,
+                "capability_probe_failed",
+                details={"error_type": type(exc).__name__},
+            )
+            capabilities = {}
+    else:
+        capabilities = {}
+    return {
+        "ok": health.healthy,
+        "executor": {
+            "type": descriptor.executor_type,
+            "version": descriptor.version,
+            "payload_formats": list(descriptor.payload_formats),
+            "operations": list(descriptor.operations),
+            "max_concurrency": descriptor.max_concurrency,
+            "health": health.status,
+            "health_details": dict(health.details),
+            "capabilities": dict(capabilities),
+        },
+    }
+
+
+def _gateway_url(value: str, *, allow_http: bool) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise WorkerConfigurationError("Gateway URL must be an absolute HTTP(S) URL.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise WorkerConfigurationError(
+            "Gateway URL must not contain credentials, query, or fragment."
+        )
+    localhost = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+    if parsed.scheme != "https" and not allow_http and not localhost:
+        raise WorkerConfigurationError(
+            "Remote Gateway URLs must use HTTPS (or explicitly pass --allow-http)."
+        )
+    return value.rstrip("/")
+
+
+def _session_token(arguments: argparse.Namespace) -> str | None:
+    environment_token = os.environ.get("VGEN_WORKER_SESSION_TOKEN")
+    if arguments.session_token_file is None:
+        return environment_token
+    expanded = arguments.session_token_file.expanduser()
+    if expanded.is_symlink():
+        raise WorkerConfigurationError("Worker session token file must not be a symbolic link.")
+    path = expanded.resolve()
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if os.name != "nt" and mode & 0o077:
+            raise WorkerConfigurationError("Worker session token file must have mode 0600.")
+        token = path.read_text(encoding="utf-8").strip()
+    except WorkerConfigurationError:
+        raise
+    except OSError as exc:
+        raise WorkerConfigurationError("Worker session token file cannot be read.") from exc
+    if not token:
+        raise WorkerConfigurationError("Worker session token file is empty.")
+    return token
+
+
+def _runtime_credentials(arguments: argparse.Namespace) -> WorkerCredentials | None:
+    if arguments.credentials_file is not None and arguments.credentials_keyring:
+        raise WorkerConfigurationError("Choose either --credentials-file or --credentials-keyring.")
+    if arguments.credentials_keyring:
+        if not arguments.worker_id:
+            raise WorkerConfigurationError("--credentials-keyring requires --worker-id.")
+        try:
+            return load_worker_credentials_keyring(arguments.worker_id)
+        except WorkerCredentialError as exc:
+            raise WorkerConfigurationError(str(exc)) from exc
+    if arguments.credentials_file is not None:
+        try:
+            credentials = load_worker_credentials_file(arguments.credentials_file)
+        except WorkerCredentialError as exc:
+            raise WorkerConfigurationError(str(exc)) from exc
+        if arguments.worker_id and arguments.worker_id != credentials.worker_id:
+            raise WorkerConfigurationError(
+                "Credential bundle Worker ID does not match --worker-id."
+            )
+        return credentials
+    token = _session_token(arguments)
+    if not token:
+        return None
+    if not arguments.worker_id:
+        raise WorkerConfigurationError("A session token requires --worker-id.")
+    account = arguments.identity_account or arguments.worker_id
+    try:
+        identity = WorkerIdentityStore().load(account, file_path=arguments.identity_file)
+    except WorkerCredentialError as exc:
+        raise WorkerConfigurationError(str(exc)) from exc
+    return WorkerCredentials(arguments.worker_id, identity.device_keys, token)
+
+
+def _gateway_probe(base_url: str, *, session: requests.Session) -> dict[str, Any]:
+    try:
+        response = session.get(f"{base_url}/api/v1/health", timeout=(10, 20))
+        if response.status_code >= 400:
+            return {
+                "ok": False,
+                "status": "gateway_rejected_health",
+                "http_status": response.status_code,
+            }
+        return {"ok": True, "status": "ready"}
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "status": "gateway_unreachable",
+            "code": 700001,
+            "error_type": type(exc).__name__,
+        }
+
+
+def _write_status(status: Mapping[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(status, ensure_ascii=False, sort_keys=True))
+        return
+    executor = status["executor"]
+    line = f"executor={executor['type']} version={executor['version']} health={executor['health']}"
+    gateway = status.get("gateway")
+    if isinstance(gateway, Mapping):
+        line += f" gateway={gateway.get('status')}"
+    line += f" mode={status.get('mode', 'unknown')}"
+    print(line, flush=True)
+
+
+def _announced_capabilities(status: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a descriptor even when ComfyUI cannot currently execute.
+
+    This keeps the Worker online for signed model/update maintenance without
+    advertising missing models or unavailable GPUs as executable capacity.
+    """
+
+    executor = status["executor"]
+    assert isinstance(executor, Mapping)
+    capabilities = executor.get("capabilities")
+    return {
+        "executors": [
+            {
+                "type": executor["type"],
+                "version": executor["version"],
+                "payload_formats": list(executor["payload_formats"]),
+                "operations": list(executor["operations"]),
+                "max_concurrency": executor["max_concurrency"],
+                "capabilities": dict(capabilities) if isinstance(capabilities, Mapping) else {},
+            }
+        ]
+    }
+
+
+def _apply_maintenance_outcome(status: dict[str, Any], outcome: MaintenanceOutcome) -> None:
+    status["mode"] = outcome.mode
+    status["maintenance_job_id"] = outcome.job_id
+    status["maintenance_succeeded"] = outcome.succeeded
+    if outcome.error_code is not None:
+        status["ok"] = False
+        status["failure"] = {
+            "code": outcome.error_code,
+            "name": "WORKER_MAINTENANCE_FAILED",
+        }
+
+
+def _identity_init(arguments: argparse.Namespace) -> int:
+    try:
+        identity = WorkerIdentityStore().generate(
+            arguments.account,
+            file_path=arguments.identity_file,
+            overwrite=arguments.force,
+        )
+    except WorkerCredentialError as exc:
+        raise WorkerConfigurationError(str(exc)) from exc
+    value = {
+        "ok": True,
+        "storage": "file" if arguments.identity_file else "keyring",
+        "account": arguments.account,
+        **identity.public_info(),
+    }
+    if arguments.json:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"worker_identity={value['key_id']} storage={value['storage']}")
+    return EXIT_OK
+
+
+def run(
+    argv: Sequence[str] | None = None,
+    *,
+    executor_factory: ExecutorFactory = _build_executor,
+    gateway_factory: GatewayFactory = _build_gateway,
+    core_factory: CoreFactory = _build_core,
+    maintenance_factory: MaintenanceFactory = _build_maintenance,
+    http_session: requests.Session | None = None,
+) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.command == "identity-init":
+            return _identity_init(arguments)
+        executor = executor_factory(arguments)
+        if arguments.command == "doctor":
+            status = _executor_status(executor)
+            status["mode"] = "diagnostic"
+            _write_status(status, json_output=arguments.json)
+            return EXIT_OK if status["ok"] else EXIT_UNAVAILABLE
+
+        if arguments.interval <= 0:
+            raise WorkerConfigurationError("Worker health interval must be positive.")
+        if not 15 <= arguments.lease_ttl <= 300:
+            raise WorkerConfigurationError("Worker lease TTL must be between 15 and 300 seconds.")
+        gateway_url = (
+            _gateway_url(arguments.gateway_url, allow_http=arguments.allow_http)
+            if arguments.gateway_url
+            else None
+        )
+        if arguments.announce and gateway_url is None:
+            raise WorkerConfigurationError("--announce requires --gateway-url.")
+        credentials = _runtime_credentials(arguments)
+        if arguments.announce and credentials is None:
+            raise WorkerConfigurationError(
+                "--announce requires a Worker identity and short-lived session."
+            )
+        if (
+            gateway_url is not None
+            and credentials is not None
+            and getattr(executor, "requires_execution_policy", False)
+            and not getattr(executor, "execution_policy_configured", False)
+        ):
+            raise WorkerConfigurationError(
+                "Authenticated ComfyUI execution requires --comfy-policy-file."
+            )
+        session = http_session or requests.Session()
+        gateway = (
+            gateway_factory(arguments, credentials, session)
+            if gateway_url is not None and credentials is not None
+            else None
+        )
+        core = core_factory(arguments, executor, session) if gateway is not None else None
+        maintenance = (
+            maintenance_factory(arguments, credentials, gateway, executor, session)
+            if gateway is not None and credentials is not None
+            else None
+        )
+        stopping = False
+
+        def stop(_signum: int, _frame: object) -> None:
+            nonlocal stopping
+            stopping = True
+
+        if not arguments.once:
+            signal.signal(signal.SIGINT, stop)
+            signal.signal(signal.SIGTERM, stop)
+
+        while not stopping:
+            recovered: MaintenanceOutcome | None = None
+            recovery_error: Exception | None = None
+            activation_status: dict[str, Any] | None = None
+
+            def announce_activated_runtime() -> None:
+                nonlocal activation_status
+                activation_status = _executor_status(executor)
+                assert gateway is not None
+                gateway.announce(_announced_capabilities(activation_status))
+
+            if gateway is not None and core is not None and maintenance is not None:
+                try:
+                    # Do this before probing ComfyUI or hashing large model
+                    # files. A newly selected runtime must confirm/rollback its
+                    # pending activation before any other Worker operation.
+                    recovered = maintenance.recover_pending_update(
+                        activation_probe=announce_activated_runtime
+                    )
+                except (
+                    GatewayUnavailableError,
+                    LeaseLostError,
+                    VGenError,
+                    WorkerUpdateError,
+                ) as exc:
+                    recovery_error = exc
+            status = activation_status or _executor_status(executor)
+            if gateway is not None and core is not None:
+                try:
+                    if recovery_error is not None:
+                        raise recovery_error
+                    if recovered is not None:
+                        _apply_maintenance_outcome(status, recovered)
+                        status["gateway"] = {"ok": True, "status": "connected"}
+                        if recovered.restart_required:
+                            _write_status(status, json_output=arguments.json)
+                            return EXIT_UPDATE_RESTART
+
+                    # Announce a generic descriptor even if ComfyUI is down or
+                    # models are missing, so the Gateway can deliver maintenance.
+                    gateway.announce(
+                        core.capabilities() if status["ok"] else _announced_capabilities(status)
+                    )
+                    resumed = core.resume_pending(gateway)
+                    if resumed is not None:
+                        status["mode"] = "upload_resumed"
+                        status["succeeded"] = resumed.succeeded
+                        status["gateway"] = {"ok": True, "status": "connected"}
+                        if resumed.failure is not None:
+                            status["ok"] = False
+                            status["failure"] = {
+                                "code": int(resumed.failure.code),
+                                "name": resumed.failure.name,
+                            }
+                    else:
+                        maintenance_outcome = (
+                            maintenance.run_one() if maintenance is not None else None
+                        )
+                        if maintenance_outcome is not None:
+                            _apply_maintenance_outcome(status, maintenance_outcome)
+                            status["gateway"] = {"ok": True, "status": "connected"}
+                            if maintenance_outcome.restart_required:
+                                _write_status(status, json_output=arguments.json)
+                                return EXIT_UPDATE_RESTART
+                        elif not status["ok"]:
+                            status["mode"] = "maintenance_only"
+                            status["gateway"] = {"ok": True, "status": "connected"}
+                        else:
+                            lease = gateway.poll_lease()
+                            if lease is None:
+                                status["mode"] = "idle"
+                                status["gateway"] = {"ok": True, "status": "connected"}
+                            else:
+                                outcome = core.process(lease, gateway)
+                                status["mode"] = "executed"
+                                status["attempt_id"] = lease.reference.attempt_id
+                                status["succeeded"] = outcome.succeeded
+                                status["gateway"] = {"ok": True, "status": "connected"}
+                                if outcome.failure is not None:
+                                    status["failure"] = {
+                                        "code": int(outcome.failure.code),
+                                        "name": outcome.failure.name,
+                                    }
+                                    status["ok"] = False
+                except UploadPendingError as exc:
+                    status["ok"] = False
+                    status["mode"] = "upload_pending"
+                    status["attempt_id"] = exc.attempt_id
+                    status["gateway"] = {"ok": True, "status": "connected"}
+                    status["failure"] = {
+                        "code": int(exc.code),
+                        "name": exc.name,
+                    }
+                except GatewayUnavailableError:
+                    status["ok"] = False
+                    status["mode"] = "unavailable"
+                    status["gateway"] = {
+                        "ok": False,
+                        "status": "gateway_unreachable",
+                        "code": 700001,
+                    }
+                except LeaseLostError:
+                    status["ok"] = False
+                    status["mode"] = "lease_lost"
+                    status["gateway"] = {
+                        "ok": False,
+                        "status": "lease_lost",
+                        "code": 310001,
+                    }
+                except VGenError as exc:
+                    status["ok"] = False
+                    status["mode"] = "gateway_error"
+                    status["gateway"] = {
+                        "ok": False,
+                        "status": "gateway_rejected_request",
+                        "code": int(exc.code),
+                    }
+                except WorkerUpdateError:
+                    status["ok"] = False
+                    status["mode"] = "maintenance_update_error"
+                    status["gateway"] = {"ok": True, "status": "connected"}
+                    status["failure"] = {
+                        "code": int(ErrorCode.EXECUTOR_UNAVAILABLE),
+                        "name": "WORKER_UPDATE_RUNTIME_INVALID",
+                    }
+            elif gateway_url:
+                status["gateway"] = _gateway_probe(gateway_url, session=session)
+                status["ok"] = status["ok"] and status["gateway"]["ok"]
+                status["mode"] = "readiness"
+            else:
+                status["mode"] = "readiness"
+            _write_status(status, json_output=arguments.json)
+            if arguments.once:
+                if status["ok"]:
+                    return EXIT_OK
+                failure = status.get("failure")
+                if isinstance(failure, Mapping) and 400000 <= int(failure["code"]) < 500000:
+                    return EXIT_CRYPTO
+                gateway_status = status.get("gateway")
+                if (
+                    isinstance(gateway_status, Mapping)
+                    and 400000 <= int(gateway_status.get("code", 0)) < 500000
+                ):
+                    return EXIT_CRYPTO
+                if status.get("mode") == "executed":
+                    return EXIT_EXECUTION_FAILED
+                return EXIT_UNAVAILABLE
+            deadline = time.monotonic() + arguments.interval
+            while not stopping and time.monotonic() < deadline:
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        return EXIT_OK
+    except WorkerConfigurationError as exc:
+        print(f"vgen-worker: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("VGEN_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    raise SystemExit(run())
+
+
+if __name__ == "__main__":
+    main()

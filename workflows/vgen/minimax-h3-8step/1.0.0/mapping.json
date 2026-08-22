@@ -1,0 +1,46 @@
+{
+  "prompt": {
+    "title": "LATENT",
+    "input": "prompt"
+  },
+  "seed": {
+    "title": "NOISE",
+    "input": "noise_seed"
+  },
+  "steps": {
+    "title": "SAMPLER",
+    "input": "steps"
+  },
+  "width": {
+    "title": "LATENT",
+    "input": "width"
+  },
+  "height": {
+    "title": "LATENT",
+    "input": "height"
+  },
+  "frames": {
+    "title": "LATENT",
+    "input": "length"
+  },
+  "fps": {
+    "title": "VIDEO_OUTPUT",
+    "input": "frame_rate"
+  },
+  "image": {
+    "title": "INPUT_IMAGE",
+    "input": "image",
+    "optional_connection": {
+      "target_title": "LATENT",
+      "input": "first_frame"
+    }
+  },
+  "last_image": {
+    "title": "LAST_IMAGE",
+    "input": "image",
+    "optional_connection": {
+      "target_title": "LATENT",
+      "input": "last_frame"
+    }
+  }
+}

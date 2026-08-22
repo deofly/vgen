@@ -1,0 +1,80 @@
+# Local machine-admin policy for the checked-in vgen/minimax-h3-8step 1.0.0
+# reference package. This file does not install or trust custom-node code; review
+# and install those nodes locally before copying this policy into production.
+version: 1
+allowed_workflow_digests:
+  # Re-read the installed package digest after every workflow package update.
+  - sha256:bd15cace959f6330626b47c07195b6f8a016e334683969c0d5b044b24debcb93
+# A model-install authorization must bind both the immutable package reference
+# and its digest to this local machine-admin policy.
+maintenance_workflows:
+  vgen/minimax-h3-8step@1.0.0: sha256:bd15cace959f6330626b47c07195b6f8a016e334683969c0d5b044b24debcb93
+allowed_node_classes:
+  - UNETLoader
+  - CLIPLoader
+  - VAELoader
+  - BasicGuider
+  - RandomNoise
+  - SamplerCustomAdvanced
+  - LoadImage
+allowed_custom_node_classes:
+  - LoraLoaderBypassModelOnly
+  - MiniMaxH3AudioConditioningT8
+  - MiniMaxH3DualClockSamplerT8
+  - MiniMaxH3AVDecodeT8
+  - VHS_VideoCombine
+# These paths are relative to the local ComfyUI models directory. The Worker
+# advertises a model digest only after it verifies both the exact size and
+# SHA-256 on disk; missing or changed files fail execution closed.
+models:
+  - path: diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+    sha256: sha256:e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a
+    size: 20970379616
+    source: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/3f57e8291d2ef846f9a074b1b76d2767db434abe/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+    revision: 3f57e8291d2ef846f9a074b1b76d2767db434abe
+    license: LicenseRef-MiniMax-H3-Community
+    license_url: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
+    gated: false
+    manual_download: false
+  - path: loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
+    sha256: sha256:2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e
+    size: 1956193000
+    source: https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/62487ee643501626a71502d679f735a23ee6af45/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
+    revision: 62487ee643501626a71502d679f735a23ee6af45
+    license: Apache-2.0
+    license_url: https://www.apache.org/licenses/LICENSE-2.0
+    gated: false
+    manual_download: false
+  - path: text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+    sha256: sha256:35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6
+    size: 15687142551
+    source: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/3f57e8291d2ef846f9a074b1b76d2767db434abe/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+    revision: 3f57e8291d2ef846f9a074b1b76d2767db434abe
+    license: LicenseRef-MiniMax-H3-Community
+    license_url: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
+    gated: false
+    manual_download: false
+  - path: vae/minimax_h3_video_vae_fp16.safetensors
+    sha256: sha256:7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522
+    size: 5207808496
+    source: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/64fa20dbeffe251ce32fad3b811c74a6467111bb/vae/minimax_h3_video_vae_fp16.safetensors
+    revision: 64fa20dbeffe251ce32fad3b811c74a6467111bb
+    license: LicenseRef-MiniMax-H3-Community
+    license_url: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
+    gated: false
+    manual_download: false
+  - path: vae/minimax_h3_audio_vae_fp32.safetensors
+    sha256: sha256:8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48
+    size: 605254808
+    source: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/3f57e8291d2ef846f9a074b1b76d2767db434abe/vae/minimax_h3_audio_vae_fp32.safetensors
+    revision: 3f57e8291d2ef846f9a074b1b76d2767db434abe
+    license: LicenseRef-MiniMax-H3-Community
+    license_url: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
+    gated: false
+    manual_download: false
+max_payload_bytes: 1048576
+max_nodes: 32
+max_edges: 128
+max_graph_depth: 24
+max_value_depth: 12
+max_input_fields_per_node: 64

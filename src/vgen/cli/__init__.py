@@ -1,0 +1,1 @@
+"""VGen command-line client."""
