@@ -71,7 +71,6 @@ from .auth import (
     authenticate_device_session,
     login_service_session,
     login_session,
-    login_worker_session,
 )
 from .client import GatewayClient, VgenClientError, cli_exit_code
 from .device_migration import register_recovered_device
@@ -235,20 +234,6 @@ def _client(profile_name: str | None = None, *, login: bool = True) -> GatewayCl
 
 def _read_invite() -> PinnedInvite:
     value = sys.stdin.read().strip()
-    return parse_pinned_invite_uri(value)
-
-
-def _read_worker_invite(*, from_stdin: bool) -> PinnedInvite:
-    if from_stdin:
-        value = sys.stdin.read().strip()
-    else:
-        if not sys.stdin.isatty():
-            raise ValueError(
-                "a hidden Invite prompt requires a terminal; use --invite-stdin for automation"
-            )
-        value = getpass.getpass("Paste the one-time Worker Invite (input hidden): ").strip()
-    if not value:
-        raise ValueError("Worker Invite is required")
     return parse_pinned_invite_uri(value)
 
 
@@ -1828,6 +1813,121 @@ def _broker_command(args: argparse.Namespace) -> None:
         client.close()
 
 
+def _create_worker_invite(
+    client: GatewayClient,
+    owner_identity: DeviceIdentity,
+    args: argparse.Namespace,
+) -> tuple[str, str, str]:
+    if not args.name.strip():
+        raise ValueError("Worker name is required")
+    if args.compute_rate < 0 or args.traffic_rate < 0:
+        raise ValueError("Worker rates cannot be negative")
+    if not 60 <= args.ttl <= 86_400:
+        raise ValueError("Worker Invite lifetime must be between 60 and 86400 seconds")
+    if args.interval <= 0 or args.timeout <= 0:
+        raise ValueError("Worker wait interval and timeout must be positive")
+    workspace_id = client.profile.default_workspace
+    if not workspace_id or not client.profile.user_id:
+        raise ValueError("the selected profile has no Workspace/User binding")
+    pool_id = _resolve_pool_id(client, workspace_id=workspace_id, requested=args.pool)
+    response = client.request(
+        "POST",
+        f"/api/v1/workspaces/{workspace_id}/worker-invites",
+        json_body={
+            "method": "invite_approval",
+            "pool_id": pool_id,
+            "name": args.name,
+            "executor_type": "comfyui",
+            "executor_version": "1.1.0",
+            "capacity": 1,
+            "manager_broker_id": (
+                args.manager_broker or getattr(client.profile, "home_broker_id", None)
+            ),
+            "rate_microtokens_per_gpu_second": args.compute_rate,
+            "traffic_microtokens_per_gib": args.traffic_rate,
+            "ttl_seconds": args.ttl,
+        },
+        idempotency_key=f"worker-add:{uuid.uuid4()}",
+    )
+    enrollment = response.get("enrollment") if isinstance(response, dict) else None
+    if (
+        not isinstance(enrollment, dict)
+        or str(enrollment.get("workspace_id")) != workspace_id
+        or str(enrollment.get("issuer_user_id")) != client.profile.user_id
+        or str(enrollment.get("pool_id")) != pool_id
+    ):
+        raise ValueError("Gateway returned an invalid Worker Invite")
+    invite_uri = decorate_invite_uri(
+        str(response["invite_uri"]),
+        workspace_id=workspace_id,
+        issuer_user_id=str(client.profile.user_id),
+        identity=owner_identity.root_keys,
+    )
+    return str(enrollment["id"]), workspace_id, invite_uri
+
+
+def _approve_worker_enrollment(
+    client: GatewayClient,
+    owner_identity: DeviceIdentity,
+    *,
+    enrollment_id: str,
+    workspace_id: str,
+    approval_code: str,
+) -> dict[str, Any]:
+    from .worker_enrollment import require_pending_worker_claim
+
+    issuer_user_id = client.profile.user_id
+    if not issuer_user_id:
+        raise ValueError("the selected profile has no User binding")
+    pending = client.request("GET", f"/api/v1/worker-enrollments/{enrollment_id}")
+    claim = require_pending_worker_claim(
+        pending,
+        enrollment_id=enrollment_id,
+        workspace_id=workspace_id,
+        issuer_user_id=issuer_user_id,
+        approval_code=approval_code,
+    )
+    allocation = pending.get("allocation")
+    if not isinstance(allocation, dict):
+        raise ValueError("Gateway returned no provisional Worker allocation")
+    owner_certificate = sign_key_manifest(
+        owner_identity.root_keys,
+        {
+            "version": 1,
+            "kind": "vgen-worker-owner-certificate",
+            "owner_root_key_id": owner_identity.root_key_id,
+            "worker_key_id": claim["worker_key_id"],
+            "worker_signing_public_key": claim["signing_public_key"],
+            "worker_encryption_public_key": claim["encryption_public_key"],
+            "issued_at": int(time.time()),
+        },
+    )
+    try:
+        proof_payload = build_allocation_proof_payload(
+            allocation_id=str(allocation["id"]),
+            workspace_id=str(allocation["workspace_id"]),
+            pool_id=str(allocation["pool_id"]),
+            worker_id=str(allocation["worker_id"]),
+            worker_signing_public_key=str(claim["signing_public_key"]),
+            worker_encryption_public_key=str(claim["encryption_public_key"]),
+            worker_certificate=owner_certificate,
+            owner_consent_at=float(allocation["owner_consent_at"]),
+            approver_root_key_id=owner_identity.root_key_id,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Gateway returned an invalid provisional Worker allocation") from exc
+    return client.request(
+        "POST",
+        f"/api/v1/worker-enrollments/{enrollment_id}/decision",
+        json_body={
+            "approve": True,
+            "owner_certificate": json.dumps(owner_certificate, separators=(",", ":")),
+            "allocation_proof": sign_allocation_proof(owner_identity.root_keys, proof_payload),
+        },
+        idempotency_key=f"worker-enrollment-approve:{enrollment_id}",
+    )
+
+
 def _worker_command(args: argparse.Namespace) -> None:
     if args.worker_action == "serve":
         from vgen.worker.main import run as run_worker
@@ -1867,271 +1967,43 @@ def _worker_command(args: argparse.Namespace) -> None:
             raise SystemExit(code)
         return
 
-    if args.worker_action == "bundle":
-        from .worker_bundle import create_windows_worker_bundle
-
-        client = _client(args.profile)
-        try:
-            workspace_id = client.profile.default_workspace
-            if not workspace_id:
-                raise ValueError(
-                    "the selected profile has no default Workspace; run `vgen workspace create --use`"
-                )
-            _, owner_identity = _profile_and_identity(client.profile.name)
-            result = create_windows_worker_bundle(
-                client,
-                owner_identity,
-                worker_name=args.name,
-                workspace_id=workspace_id,
-                pool=args.pool,
-                default_pool=getattr(client.profile, "default_pool", None),
-                output=args.output,
-                comfyui_root=args.comfyui_root,
-                compute_rate=args.compute_rate,
-                traffic_rate=args.traffic_rate,
-                manager_broker_id=getattr(client.profile, "home_broker_id", None),
-                wheel_path=args.worker_wheel,
-                overwrite=args.overwrite,
-            )
-            _json(result.public_dict())
-        finally:
-            client.close()
-        return
-
-    if args.worker_action == "installer-bundle":
-        from .worker_bundle import create_public_windows_worker_installer_bundle
-
-        gateway_url = args.gateway_url
-        if not gateway_url:
-            gateway_url = ProfileStore().get(args.profile).endpoint
-        result = create_public_windows_worker_installer_bundle(
-            gateway_url=gateway_url,
-            output=args.output,
-            wheel_path=args.worker_wheel,
-            overwrite=args.overwrite,
-        )
-        _json(result.public_dict())
-        return
-
-    if args.worker_action == "claim-invite":
-        from .worker_enrollment import enroll_worker_from_invite
-
-        invite = _read_worker_invite(from_stdin=args.invite_stdin)
-        result = enroll_worker_from_invite(
-            gateway_url=args.gateway_url,
-            invite=invite,
-            name=args.name,
-            identity_file=args.identity_file,
-            credentials_file=args.credentials_file,
-            executor_type=args.executor,
-            executor_version=args.executor_version,
-            capacity=args.capacity,
-            wait=args.wait,
-            interval=args.interval,
-            timeout=args.timeout,
-        )
-        _json(result.public_dict())
-        return
-
-    from vgen.worker.credentials import (
-        WorkerCredentialError,
-        WorkerCredentials,
-        WorkerIdentityStore,
-        save_worker_credentials_file,
-        save_worker_credentials_keyring,
-    )
-
     client = _client(args.profile)
     try:
-        if args.worker_action == "invite":
-            if args.compute_rate < 0 or args.traffic_rate < 0:
-                raise ValueError("Worker rates cannot be negative")
-            workspace_id = client.profile.default_workspace
-            if not workspace_id:
-                raise ValueError(
-                    "the selected profile has no default Workspace; run `vgen workspace create --use`"
+        if args.worker_action == "add":
+            _, owner_identity = _profile_and_identity(client.profile.name)
+            enrollment_id, workspace_id, invite_uri = _create_worker_invite(
+                client, owner_identity, args
+            )
+            print("\n在 Windows 运行统一 Worker 安装器，然后把下面的一次性 Invite 粘贴到隐藏输入框：\n")
+            print(invite_uri)
+            print("\nInvite 不要发送到群聊、截图或命令参数。正在等待 Windows 领取……")
+            deadline = time.monotonic() + args.timeout
+            while True:
+                pending = client.request(
+                    "GET", f"/api/v1/worker-enrollments/{enrollment_id}"
                 )
-            pool_id = _resolve_pool_id(
+                enrollment = pending.get("enrollment") if isinstance(pending, dict) else None
+                state = str(enrollment.get("state") or "") if isinstance(enrollment, dict) else ""
+                if state == "pending" and isinstance(enrollment.get("claim"), dict):
+                    break
+                if state in {"active", "expired", "rejected", "revoked"}:
+                    raise ValueError(f"Worker enrollment finished unexpectedly with state '{state}'")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("等待 Windows 领取 Worker Invite 超时；请重新运行 vgen worker add")
+                time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
+            print("\n✓ Windows 已生成本机 Worker 密钥并领取 Invite。")
+            code = input("请输入 Windows 显示的完整验证码以批准接入: ").strip()
+            if not code:
+                raise ValueError("验证码不能为空；Worker 尚未批准")
+            result = _approve_worker_enrollment(
                 client,
+                owner_identity,
+                enrollment_id=enrollment_id,
                 workspace_id=workspace_id,
-                requested=args.pool,
+                approval_code=code,
             )
-            _, owner_identity = _profile_and_identity(args.profile)
-            response = client.request(
-                "POST",
-                f"/api/v1/workspaces/{workspace_id}/worker-invites",
-                json_body={
-                    "method": "invite_approval",
-                    "pool_id": pool_id,
-                    "name": args.name,
-                    "executor_type": "comfyui",
-                    "executor_version": "1.1.0",
-                    "capacity": 1,
-                    "manager_broker_id": (
-                        args.manager_broker
-                        or getattr(client.profile, "home_broker_id", None)
-                    ),
-                    "rate_microtokens_per_gpu_second": args.compute_rate,
-                    "traffic_microtokens_per_gib": args.traffic_rate,
-                    "ttl_seconds": args.ttl,
-                },
-                idempotency_key=f"worker-invite:{uuid.uuid4()}",
-            )
-            enrollment = response.get("enrollment") if isinstance(response, dict) else None
-            if (
-                not isinstance(enrollment, dict)
-                or str(enrollment.get("workspace_id")) != workspace_id
-                or str(enrollment.get("issuer_user_id")) != client.profile.user_id
-                or str(enrollment.get("pool_id")) != pool_id
-            ):
-                raise ValueError("Gateway returned an invalid Worker Invite")
-            _json(
-                {
-                    "enrollment_id": str(enrollment["id"]),
-                    "enrollment": enrollment,
-                    "invite_uri": decorate_invite_uri(
-                        str(response["invite_uri"]),
-                        workspace_id=workspace_id,
-                        issuer_user_id=str(client.profile.user_id),
-                        identity=owner_identity.root_keys,
-                    ),
-                    "next": (
-                        "Paste this once into enroll-worker.ps1; compare the verification "
-                        "code shown on Windows, then run "
-                        f"`vgen worker approve-enrollment {enrollment['id']} --code <CODE>`."
-                    ),
-                }
-            )
-        elif args.worker_action == "approve-enrollment":
-            from .worker_enrollment import require_pending_worker_claim
-
-            workspace_id = client.profile.default_workspace
-            issuer_user_id = client.profile.user_id
-            if not workspace_id or not issuer_user_id:
-                raise ValueError("the selected profile has no Workspace/User binding")
-            pending = client.request(
-                "GET",
-                f"/api/v1/worker-enrollments/{args.enrollment_id}",
-            )
-            claim = require_pending_worker_claim(
-                pending,
-                enrollment_id=args.enrollment_id,
-                workspace_id=workspace_id,
-                issuer_user_id=issuer_user_id,
-                approval_code=args.code,
-            )
-            allocation = pending.get("allocation")
-            if not isinstance(allocation, dict):
-                raise ValueError("Gateway returned no provisional Worker allocation")
-            _, owner_identity = _profile_and_identity(args.profile)
-            owner_certificate = sign_key_manifest(
-                owner_identity.root_keys,
-                {
-                    "version": 1,
-                    "kind": "vgen-worker-owner-certificate",
-                    "owner_root_key_id": owner_identity.root_key_id,
-                    "worker_key_id": claim["worker_key_id"],
-                    "worker_signing_public_key": claim["signing_public_key"],
-                    "worker_encryption_public_key": claim["encryption_public_key"],
-                    "issued_at": int(time.time()),
-                },
-            )
-            try:
-                proof_payload = build_allocation_proof_payload(
-                    allocation_id=str(allocation["id"]),
-                    workspace_id=str(allocation["workspace_id"]),
-                    pool_id=str(allocation["pool_id"]),
-                    worker_id=str(allocation["worker_id"]),
-                    worker_signing_public_key=str(claim["signing_public_key"]),
-                    worker_encryption_public_key=str(claim["encryption_public_key"]),
-                    worker_certificate=owner_certificate,
-                    owner_consent_at=float(allocation["owner_consent_at"]),
-                    approver_root_key_id=owner_identity.root_key_id,
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError("Gateway returned an invalid provisional Worker allocation") from exc
-            response = client.request(
-                "POST",
-                f"/api/v1/worker-enrollments/{args.enrollment_id}/decision",
-                json_body={
-                    "approve": True,
-                    "owner_certificate": json.dumps(
-                        owner_certificate,
-                        separators=(",", ":"),
-                    ),
-                    "allocation_proof": sign_allocation_proof(
-                        owner_identity.root_keys,
-                        proof_payload,
-                    ),
-                },
-                idempotency_key=f"worker-enrollment-approve:{args.enrollment_id}",
-            )
-            _json(response)
-        elif args.worker_action == "enroll":
-            identity_store = WorkerIdentityStore()
-            account = args.identity_account
-            try:
-                identity = identity_store.load(account, file_path=args.identity_file)
-            except WorkerCredentialError:
-                if not args.generate_identity:
-                    raise
-                identity = identity_store.generate(account, file_path=args.identity_file)
-            owner_identity = DeviceIdentityStore().load(client.profile.key_ref or "default")
-            owner_certificate = sign_key_manifest(
-                owner_identity.root_keys,
-                {
-                    "version": 1,
-                    "kind": "vgen-worker-owner-certificate",
-                    "owner_root_key_id": owner_identity.root_key_id,
-                    "worker_key_id": identity.key_id,
-                    "worker_signing_public_key": identity.public_info()["signing_public_key"],
-                    "worker_encryption_public_key": identity.public_info()["encryption_public_key"],
-                    "issued_at": int(time.time()),
-                },
-            )
-            response = client.request(
-                "POST",
-                "/api/v1/workers",
-                json_body=identity.public_registration(
-                    name=args.name,
-                    executor_type=args.executor,
-                    executor_version=args.executor_version,
-                    manager_broker_id=(
-                        args.manager_broker or getattr(client.profile, "home_broker_id", None)
-                    ),
-                    capacity=args.capacity,
-                    certificate=json.dumps(owner_certificate, separators=(",", ":")),
-                ),
-                idempotency_key=args.idempotency_key or f"worker:{identity.key_id}",
-            )
-            session = login_worker_session(client.profile, response["id"], identity.device_keys)
-            token = str(session["token"])
-            credentials = WorkerCredentials(
-                response["id"],
-                identity.device_keys,
-                token,
-                owner_root_signing_public_key=owner_identity.root_signing_public_key,
-            )
-            if args.credentials_file:
-                save_worker_credentials_file(
-                    Path(args.credentials_file), credentials, overwrite=args.overwrite
-                )
-                storage = str(Path(args.credentials_file).expanduser().resolve())
-            else:
-                save_worker_credentials_keyring(credentials)
-                storage = "os-keyring"
-            _json(
-                {
-                    "worker_id": response["id"],
-                    "status": response["status"],
-                    "session_expires_at": session.get("expires_at"),
-                    "credentials": storage,
-                    "serve": (
-                        f"vgen-worker serve --gateway-url {client.profile.endpoint} "
-                        f"--worker-id {response['id']} --credentials-keyring"
-                    ),
-                }
-            )
+            print("\n✓ 验证码一致，Worker 已批准。Windows 将自动继续安装和启动。")
+            _json(result)
         elif args.worker_action == "manager-set":
             broker_id = _maintenance_broker_id(client, args.broker)
             worker = _select_owned_worker(client, args.worker)
@@ -3035,13 +2907,8 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("broker", "maintenance-list"): "列出 Worker 更新和模型安装任务。",
     ("broker", "maintenance-show"): "查看一条 Worker 维护任务的状态和结果。",
     ("broker", "maintenance-cancel"): "取消尚未结束的 Worker 维护任务。",
-    ("worker",): "接入、分配、运行和维护 GPU Worker。",
-    ("worker", "bundle"): "创建已绑定身份的一键 Windows Worker 安装包。",
-    ("worker", "installer-bundle"): "创建不含任何用户凭据的通用 Windows 安装包。",
-    ("worker", "invite"): "为通用 Windows 安装包生成一次性 Worker 邀请。",
-    ("worker", "claim-invite"): "在 Worker 设备生成密钥并领取一次性邀请。",
-    ("worker", "approve-enrollment"): "核对验证码并批准待接入的 Worker。",
-    ("worker", "enroll"): "直接登记当前用户拥有的 Worker。",
+    ("worker",): "用统一安装流程接入、查看、退出和运行 GPU Worker。",
+    ("worker", "add"): "创建一次性邀请，等待 Windows 验证并批准 Worker 接入。",
     ("worker", "list"): "列出 Worker、状态、心跳和能力信息。",
     ("worker", "manager-set"): "指定负责维护某台 Worker 的 Broker。",
     ("worker", "offer"): "由 Worker 所有者提议把 Worker 加入资源池。",
@@ -3607,87 +3474,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = sub.add_parser("worker")
     worker_sub = worker.add_subparsers(dest="worker_action", required=True)
-    worker_bundle = worker_sub.add_parser(
-        "bundle",
-        help="provision a Worker and create a one-click private Windows ZIP",
+    worker_add = worker_sub.add_parser(
+        "add",
+        help="guide a universal Windows installer through secure Worker enrollment",
     )
-    worker_bundle.add_argument("--name", default="Windows GPU Worker")
-    worker_bundle.add_argument("--pool", help="Pool name (automatic when only one exists)")
-    worker_bundle.add_argument("--output", type=Path)
-    worker_bundle.add_argument(
-        "--comfyui-root",
-        help="optional Windows ComfyUI path; common installations are detected automatically",
-    )
-    worker_bundle.add_argument("--compute-rate", type=int, default=1_000_000)
-    worker_bundle.add_argument("--traffic-rate", type=int, default=0)
-    worker_bundle.add_argument("--worker-wheel", type=Path, help=argparse.SUPPRESS)
-    worker_bundle.add_argument("--overwrite", action="store_true")
-    worker_bundle.add_argument("--profile")
-    worker_installer = worker_sub.add_parser(
-        "installer-bundle",
-        help="build a reusable credential-free Windows Worker ZIP",
-    )
-    worker_installer.add_argument("--gateway-url")
-    worker_installer.add_argument("--output", type=Path)
-    worker_installer.add_argument("--worker-wheel", type=Path, help=argparse.SUPPRESS)
-    worker_installer.add_argument("--overwrite", action="store_true")
-    worker_installer.add_argument("--profile")
-    worker_invite = worker_sub.add_parser(
-        "invite",
-        help="create a one-use, approval-required Invite for a credential-free Worker",
-    )
-    worker_invite.add_argument("--name", default="Windows GPU Worker")
-    worker_invite.add_argument("--pool", help="Pool name (automatic when only one exists)")
-    worker_invite.add_argument("--manager-broker")
-    worker_invite.add_argument("--compute-rate", type=int, default=1_000_000)
-    worker_invite.add_argument("--traffic-rate", type=int, default=0)
-    worker_invite.add_argument("--ttl", type=int, default=1800)
-    worker_invite.add_argument("--profile")
-    worker_claim = worker_sub.add_parser(
-        "claim-invite",
-        help="generate a local Worker identity and claim an Invite through a hidden prompt",
-    )
-    worker_claim.add_argument("--gateway-url", required=True)
-    worker_claim.add_argument("--name", required=True)
-    worker_claim.add_argument("--executor", default="comfyui")
-    worker_claim.add_argument("--executor-version", default="1.1.0")
-    worker_claim.add_argument("--capacity", type=int, default=1)
-    worker_claim.add_argument("--identity-file", type=Path, required=True)
-    worker_claim.add_argument("--credentials-file", type=Path, required=True)
-    worker_claim.add_argument(
-        "--invite-stdin",
-        action="store_true",
-        help="read the Invite URI from stdin for automation; otherwise use a hidden prompt",
-    )
-    worker_claim.add_argument("--wait", action="store_true")
-    worker_claim.add_argument("--interval", type=float, default=2)
-    worker_claim.add_argument("--timeout", type=float, default=1800)
-    worker_approve = worker_sub.add_parser(
-        "approve-enrollment",
-        help="verify a pending Worker key and sign its certificate and Pool allocation",
-    )
-    worker_approve.add_argument("enrollment_id")
-    worker_approve.add_argument(
-        "--code",
-        required=True,
-        help="verification code shown locally by the enrolling Windows Worker",
-    )
-    worker_approve.add_argument("--profile")
-    worker_enroll = worker_sub.add_parser(
-        "enroll", help="register a User-owned Worker (a Broker is optional)"
-    )
-    worker_enroll.add_argument("name")
-    worker_enroll.add_argument("--executor", default="comfyui")
-    worker_enroll.add_argument("--executor-version", default="")
-    worker_enroll.add_argument("--capacity", type=int, default=1)
-    worker_enroll.add_argument("--manager-broker")
-    worker_enroll.add_argument("--identity-account", default="default")
-    worker_enroll.add_argument("--identity-file", type=Path)
-    worker_enroll.add_argument("--generate-identity", action="store_true")
-    worker_enroll.add_argument("--credentials-file", type=Path)
-    worker_enroll.add_argument("--overwrite", action="store_true")
-    worker_enroll.add_argument("--idempotency-key")
-    worker_enroll.add_argument("--profile")
+    worker_add.add_argument("--name", default="Windows GPU Worker")
+    worker_add.add_argument("--pool", help="Pool name (automatic when only one exists)")
+    worker_add.add_argument("--manager-broker")
+    worker_add.add_argument("--compute-rate", type=int, default=1_000_000)
+    worker_add.add_argument("--traffic-rate", type=int, default=0)
+    worker_add.add_argument("--ttl", type=int, default=1800)
+    worker_add.add_argument("--interval", type=float, default=2)
+    worker_add.add_argument("--timeout", type=float, default=1800)
+    worker_add.add_argument("--profile")
     worker_list = worker_sub.add_parser("list")
     worker_list.add_argument("--workspace")
     worker_list.add_argument("--profile")

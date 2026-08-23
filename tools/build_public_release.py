@@ -1,7 +1,7 @@
 """Build the public release tree consumed by Gateway and Nginx.
 
 The tool publishes two immutable, credential-free ZIP files plus a mutable
-``stable`` pointer and a fail-closed macOS bootstrap.  It never signs an
+``stable`` pointer and fail-closed macOS/Windows bootstraps.  It never signs an
 artifact: HTTPS and the recorded SHA-256 values provide transport and
 integrity checks, not publisher authenticity.
 """
@@ -37,6 +37,7 @@ _CHECKSUM_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._+-]+)$")
 _MAX_ARCHIVE_ENTRIES = 4096
 _MAX_UNCOMPRESSED_BYTES = 2 * 1024**3
 _BOOTSTRAP_NAME = "install-macos.sh"
+_WINDOWS_BOOTSTRAP_NAME = "install-windows-worker.ps1"
 
 
 class PublicReleaseBuildError(ValueError):
@@ -50,6 +51,7 @@ class ReleaseBuildResult:
     manifest: Path
     stable_pointer: Path
     macos_bootstrap: Path
+    windows_worker_bootstrap: Path
     manifest_sha256: str
 
 
@@ -763,6 +765,160 @@ fi
     return script.encode("utf-8")
 
 
+def _windows_worker_bootstrap(
+    *,
+    release_origin: str,
+    version: str,
+    manifest_sha256: str,
+) -> bytes:
+    """Return a pinned, credential-free PowerShell installer bootstrap."""
+
+    # JSON encoding gives PowerShell-safe double-quoted constants for the
+    # validated HTTPS origins and strict version/digest alphabets used here.
+    release = json.dumps(release_origin)
+    expected_version = json.dumps(version)
+    expected_manifest = json.dumps(manifest_sha256)
+    script = rf'''$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+Set-StrictMode -Version Latest
+Add-Type -AssemblyName System.Net.Http
+
+$ReleaseOrigin = {release}
+$ExpectedVersion = {expected_version}
+$ExpectedManifestSha256 = {expected_manifest}
+$ExpectedArtifact = "vgen-windows-worker-installer-$ExpectedVersion.zip"
+
+function Get-VGenBytes([string]$Url, [int64]$Limit) {{
+    $uri = [Uri]$Url
+    $origin = [Uri]$ReleaseOrigin
+    if ($uri.Scheme -ne $origin.Scheme -or $uri.Host -ne $origin.Host -or $uri.Port -ne $origin.Port) {{
+        throw "Cross-origin release URL refused."
+    }}
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $response = $null
+    try {{
+        $response = $client.GetAsync($uri).GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {{
+            throw "Release download returned HTTP $([int]$response.StatusCode)."
+        }}
+        $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+        if ($bytes.LongLength -gt $Limit) {{ throw "Release file exceeded its size limit." }}
+        return $bytes
+    }}
+    finally {{
+        if ($null -ne $response) {{ $response.Dispose() }}
+        $client.Dispose()
+        $handler.Dispose()
+    }}
+}}
+
+function Get-Sha256([byte[]]$Bytes) {{
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {{
+        return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+    }}
+    finally {{ $sha.Dispose() }}
+}}
+
+Write-Host "[vgen] Checking the latest Windows Worker installer..."
+$stableBytes = Get-VGenBytes "$ReleaseOrigin/releases/channels/stable.json" 1048576
+$stable = [Text.Encoding]::UTF8.GetString($stableBytes) | ConvertFrom-Json
+if ($stable.schema_version -ne 1 -or $stable.channel -ne "stable" -or
+    $stable.version -ne $ExpectedVersion -or
+    $stable.manifest_sha256 -ne $ExpectedManifestSha256) {{
+    throw "Stable release metadata does not match this reviewed installer. Download the installer command again."
+}}
+
+$manifestBytes = Get-VGenBytes "$ReleaseOrigin/releases/$ExpectedVersion/manifest.json" 1048576
+if ((Get-Sha256 $manifestBytes) -ne $ExpectedManifestSha256) {{
+    throw "Release manifest SHA-256 mismatch."
+}}
+$manifest = [Text.Encoding]::UTF8.GetString($manifestBytes) | ConvertFrom-Json
+$matches = @($manifest.artifacts | Where-Object {{
+    $_.name -eq "windows-worker-installer" -and
+    $_.kind -eq "worker-installer" -and
+    $_.platform -eq "windows"
+}})
+if ($manifest.schema_version -ne 1 -or $manifest.audience -ne "public" -or
+    $manifest.version -ne $ExpectedVersion -or $matches.Count -ne 1) {{
+    throw "Release manifest does not contain one Windows Worker installer."
+}}
+$artifact = $matches[0]
+if ($artifact.filename -ne $ExpectedArtifact -or $artifact.content_type -ne "application/zip" -or
+    (($artifact.size -isnot [long]) -and ($artifact.size -isnot [int])) -or
+    [int64]$artifact.size -le 0 -or [int64]$artifact.size -gt 536870912 -or
+    [string]$artifact.sha256 -notmatch '^[0-9a-f]{{64}}$') {{
+    throw "Windows Worker artifact metadata is invalid."
+}}
+
+Write-Host "[vgen] Downloading and verifying VGen Windows Worker $ExpectedVersion..."
+$archiveBytes = Get-VGenBytes "$ReleaseOrigin/releases/$ExpectedVersion/$ExpectedArtifact" 536870912
+if ($archiveBytes.LongLength -ne [int64]$artifact.size -or
+    (Get-Sha256 $archiveBytes) -ne [string]$artifact.sha256) {{
+    throw "Windows Worker installer size or SHA-256 mismatch."
+}}
+
+$installRoot = Join-Path $env:LOCALAPPDATA "VGen\installer\$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"
+$parent = Split-Path -Parent $installRoot
+[IO.Directory]::CreateDirectory($parent) | Out-Null
+$staging = "$installRoot.staging-$([Guid]::NewGuid().ToString('N'))"
+[IO.Directory]::CreateDirectory($staging) | Out-Null
+$archivePath = Join-Path $staging $ExpectedArtifact
+[IO.File]::WriteAllBytes($archivePath, $archiveBytes)
+
+try {{
+    Add-Type -AssemblyName System.IO.Compression
+    $stream = [IO.File]::OpenRead($archivePath)
+    try {{
+        $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read)
+        try {{
+            $required = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            @(
+                "INSTALL.txt", "enroll-worker.ps1", "start-worker.cmd", "setup-worker.ps1",
+                "vgen-worker-bundle.json", "comfyui-minimax-h3-policy.yaml", "SHA256SUMS",
+                "vgen-$ExpectedVersion-py3-none-any.whl"
+            ) | ForEach-Object {{ [void]$required.Add($_) }}
+            if ($zip.Entries.Count -ne $required.Count) {{ throw "Installer ZIP has an unexpected file count." }}
+            foreach ($entry in $zip.Entries) {{
+                if (-not $required.Remove($entry.FullName) -or
+                    $entry.FullName.Contains("/") -or $entry.FullName.Contains("\") -or
+                    [string]::IsNullOrWhiteSpace($entry.Name)) {{
+                    throw "Installer ZIP contains an unexpected or unsafe path."
+                }}
+                $target = Join-Path $staging $entry.Name
+                $input = $entry.Open()
+                try {{
+                    $output = [IO.File]::Create($target)
+                    try {{ $input.CopyTo($output) }} finally {{ $output.Dispose() }}
+                }} finally {{ $input.Dispose() }}
+            }}
+            if ($required.Count -ne 0) {{ throw "Installer ZIP is incomplete." }}
+        }} finally {{ $zip.Dispose() }}
+    }} finally {{ $stream.Dispose() }}
+    Remove-Item -LiteralPath $archivePath -Force
+    if (Test-Path -LiteralPath $installRoot) {{
+        $existing = Get-Item -LiteralPath $installRoot -Force
+        if (-not $existing.PSIsContainer -or
+            ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+            throw "Existing VGen installer directory is unsafe."
+        }}
+        Remove-Item -LiteralPath $installRoot -Recurse -Force
+    }}
+    Move-Item -LiteralPath $staging -Destination $installRoot
+}} catch {{
+    if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force }}
+    throw
+}}
+
+Write-Host "[vgen] Verified. Starting the universal Worker installer..."
+& (Join-Path $installRoot "start-worker.cmd")
+if ($LASTEXITCODE -ne 0) {{ throw "Windows Worker setup stopped with exit code $LASTEXITCODE." }}
+'''
+    return script.encode("utf-8")
+
+
 def build_public_release(
     *,
     version: str,
@@ -871,6 +1027,13 @@ def build_public_release(
     )
     bootstrap_path = root / _BOOTSTRAP_NAME
     _atomic_public_file(bootstrap_path, bootstrap, mode=0o755)
+    windows_bootstrap = _windows_worker_bootstrap(
+        release_origin=release_origin,
+        version=version,
+        manifest_sha256=manifest_sha256,
+    )
+    windows_bootstrap_path = root / _WINDOWS_BOOTSTRAP_NAME
+    _atomic_public_file(windows_bootstrap_path, windows_bootstrap, mode=0o644)
 
     channels = root / "channels"
     _ensure_directory(channels)
@@ -890,6 +1053,7 @@ def build_public_release(
         manifest=version_root / "manifest.json",
         stable_pointer=stable_pointer,
         macos_bootstrap=bootstrap_path,
+        windows_worker_bootstrap=windows_bootstrap_path,
         manifest_sha256=manifest_sha256,
     )
 
@@ -936,6 +1100,7 @@ def main() -> int:
     print(f"manifest_sha256={result.manifest_sha256}")
     print(f"stable_pointer={result.stable_pointer}")
     print(f"macos_bootstrap={result.macos_bootstrap}")
+    print(f"windows_worker_bootstrap={result.windows_worker_bootstrap}")
     return 0
 
 

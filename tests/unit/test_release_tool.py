@@ -81,9 +81,7 @@ def _public_release(tmp_path: Path, *, version: str = "0.3.1") -> Path:
         "published_at": "2026-08-22T12:34:56Z",
         "artifacts": metadata,
     }
-    manifest_bytes = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode()
+    manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
     (version_root / "manifest.json").write_bytes(manifest_bytes)
     digest = hashlib.sha256(manifest_bytes).hexdigest()
     stable = {
@@ -97,13 +95,14 @@ def _public_release(tmp_path: Path, *, version: str = "0.3.1") -> Path:
         encoding="utf-8",
     )
     bootstrap = (
-        "#!/bin/sh\n"
-        f"EXPECTED_VERSION={version}\n"
-        f"EXPECTED_MANIFEST_SHA256={digest}\n"
-        "exit 0\n"
+        f"#!/bin/sh\nEXPECTED_VERSION={version}\nEXPECTED_MANIFEST_SHA256={digest}\nexit 0\n"
     )
     (root / "install-macos.sh").write_text(bootstrap, encoding="utf-8")
     (root / "install-macos.sh").chmod(0o755)
+    (root / "install-windows-worker.ps1").write_text(
+        f'$ExpectedVersion = "{version}"\n$ExpectedManifestSha256 = "{digest}"\n',
+        encoding="utf-8",
+    )
     return root
 
 
@@ -113,9 +112,7 @@ def test_release_preflight_requires_clean_tagged_source(tmp_path) -> None:
         TOOL._git_preflight("0.3.1", require_tag=True, repository=repository)
 
     _git(repository, "tag", "v0.3.1")
-    commit, published_at = TOOL._git_preflight(
-        "0.3.1", require_tag=True, repository=repository
-    )
+    commit, published_at = TOOL._git_preflight("0.3.1", require_tag=True, repository=repository)
     assert commit == _git(repository, "rev-parse", "HEAD")
     assert published_at.endswith("Z")
 
@@ -182,9 +179,7 @@ def test_publish_refuses_to_replace_public_or_remote_release_version(
     remote_repository = _repository(remote_root, version="0.7.1")
     _git(remote_repository, "tag", "v0.7.2")
     monkeypatch.setattr(TOOL, "_public_version_exists", lambda *args: False)
-    monkeypatch.setattr(
-        TOOL, "_remote_tag_locations", lambda *args, **kwargs: ["origin"]
-    )
+    monkeypatch.setattr(TOOL, "_remote_tag_locations", lambda *args, **kwargs: ["origin"])
     with pytest.raises(TOOL.ReleaseError, match=r"v0\.7\.2 already exists on remote"):
         TOOL._prepare_release_source(
             "0.7.2",
@@ -211,6 +206,7 @@ def test_release_deployment_archive_is_closed_and_reproducible(tmp_path) -> None
     with tarfile.open(first, "r:gz") as archive:
         assert set(archive.getnames()) == {
             "install-macos.sh",
+            "install-windows-worker.ps1",
             "channels/stable.json",
             "0.3.1/manifest.json",
             "0.3.1/VGen-macOS-0.3.1.zip",
@@ -219,9 +215,7 @@ def test_release_deployment_archive_is_closed_and_reproducible(tmp_path) -> None
         assert all(member.isfile() for member in archive.getmembers())
 
 
-def test_release_cleanup_replaces_only_current_local_staging(
-    tmp_path, monkeypatch
-) -> None:
+def test_release_cleanup_replaces_only_current_local_staging(tmp_path, monkeypatch) -> None:
     repository = tmp_path / "repository"
     current = repository / "dist" / "public-releases" / "0.3.1"
     previous = repository / "dist" / "public-releases" / "0.3.0"
@@ -343,7 +337,7 @@ def test_release_config_rejects_loose_permissions_and_missing_targets(
     config_path = tmp_path / "release.toml"
     monkeypatch.setenv("VGEN_RELEASE_CONFIG", str(config_path))
     config_path.write_text(
-        'schema_version = 1\n'
+        "schema_version = 1\n"
         'gateway = "https://vgen-gw.example.com"\n'
         'releases = "https://vgen.example.com"\n'
         'ssh = "root@ecs.example.com"\n'
@@ -446,6 +440,10 @@ def test_publish_can_reset_and_initialize_gateway_with_oss_role(
     assert "--oss-transfer-role VGenArtifactTransferRole" in gateway
     assert "--confirm-oss-configured" in gateway
     assert "setup-gateway.sh upgrade" not in gateway
+    release_site = next(command for command in ssh_commands if "setup-release-site.sh" in command)
+    assert "setup-release-site.sh install" in release_site
+    assert "--domain vgen.example.com" in release_site
+    assert "--confirm-domain vgen.example.com" in release_site
 
 
 def test_publish_rejects_incomplete_oss_install_before_ssh(
@@ -560,7 +558,9 @@ def test_publish_generates_cloud_kit_before_resetting_test_gateway(
         aliyun_account_id="1234567890123456",
         oss_transfer_role="VGenArtifactTransferRole",
     )
-    gateway = next(" ".join(command) for command in commands if "setup-gateway.sh" in " ".join(command))
+    gateway = next(
+        " ".join(command) for command in commands if "setup-gateway.sh" in " ".join(command)
+    )
     assert "setup-gateway.sh reset-test" not in gateway
     assert "setup-gateway.sh install" in gateway
     assert "--confirm-oss-configured" not in gateway
@@ -568,9 +568,7 @@ def test_publish_generates_cloud_kit_before_resetting_test_gateway(
 
 def test_ecs_publisher_inline_python_supports_python_36() -> None:
     source = PUBLISHER_PATH.read_text(encoding="utf-8")
-    inline_blocks = re.findall(
-        r"python3 -I -B <<'PY'\n(.*?)\nPY(?:\n|$)", source, flags=re.DOTALL
-    )
+    inline_blocks = re.findall(r"python3 -I -B <<'PY'\n(.*?)\nPY(?:\n|$)", source, flags=re.DOTALL)
     assert len(inline_blocks) == 3
     for inline_python in inline_blocks:
         ast.parse(inline_python, filename=str(PUBLISHER_PATH), feature_version=(3, 6))
@@ -639,6 +637,7 @@ def test_ecs_publisher_is_idempotent_and_rejects_immutable_changes(tmp_path) -> 
     assert json.loads((release_root / "channels" / "stable.json").read_text())["version"] == version
     assert stat.S_IMODE((release_root / version).stat().st_mode) == 0o755
     assert stat.S_IMODE((release_root / "install-macos.sh").stat().st_mode) == 0o755
+    assert stat.S_IMODE((release_root / "install-windows-worker.ps1").stat().st_mode) == 0o644
 
     second = publish()
     assert second.returncode == 0, second.stderr
@@ -662,8 +661,10 @@ def test_ecs_publisher_restores_channel_when_public_check_fails(tmp_path) -> Non
     channels = release_root / "channels"
     channels.mkdir(parents=True)
     old_bootstrap = b"#!/bin/sh\necho old\n"
+    old_windows_bootstrap = b"Write-Host old\n"
     old_stable = b'{"channel":"stable","version":"0.3.0"}\n'
     (release_root / "install-macos.sh").write_bytes(old_bootstrap)
+    (release_root / "install-windows-worker.ps1").write_bytes(old_windows_bootstrap)
     (channels / "stable.json").write_bytes(old_stable)
 
     fake_bin = tmp_path / "bin"
@@ -702,6 +703,7 @@ def test_ecs_publisher_restores_channel_when_public_check_fails(tmp_path) -> Non
     )
     assert result.returncode != 0
     assert (release_root / "install-macos.sh").read_bytes() == old_bootstrap
+    assert (release_root / "install-windows-worker.ps1").read_bytes() == old_windows_bootstrap
     assert (channels / "stable.json").read_bytes() == old_stable
     assert (release_root / version).is_dir()
     assert "restored the previous public release channel" in result.stdout

@@ -1,4 +1,4 @@
-"""Provision a Windows Worker and emit a private, one-click installation bundle."""
+"""Build the credential-free Windows Worker release artifact."""
 
 from __future__ import annotations
 
@@ -10,28 +10,14 @@ import json
 import os
 import re
 import tempfile
-import time
 import zipfile
 from dataclasses import dataclass
 from importlib import metadata, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 from vgen import __version__
-from vgen.crypto import (
-    build_allocation_proof_payload,
-    sign_allocation_proof,
-    sign_key_manifest,
-)
-from vgen.worker.credentials import WorkerCredentials, WorkerIdentity
-
-from .auth import login_worker_session
-
-if TYPE_CHECKING:
-    from .client import GatewayClient
-    from .identity_store import DeviceIdentity
-
 
 _BUNDLE_FORMAT = "vgen-windows-worker-bundle"
 _BUNDLE_VERSION = 1
@@ -48,21 +34,6 @@ class WorkerBundleError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerBundleResult:
-    path: Path
-    worker_name: str
-    pool_name: str
-
-    def public_dict(self) -> dict[str, str]:
-        return {
-            "bundle": str(self.path),
-            "worker_name": self.worker_name,
-            "pool_name": self.pool_name,
-            "next": "Extract the ZIP on Windows, then double-click start-worker.cmd.",
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class WorkerInstallerBundleResult:
     """A credential-free bundle safe for public release distribution."""
 
@@ -74,7 +45,7 @@ class WorkerInstallerBundleResult:
             "bundle": str(self.path),
             "gateway": self.gateway_url,
             "credentials": "generated-locally-after-one-time-invite",
-            "next": "Extract the ZIP on Windows, then run enroll-worker.ps1.",
+            "next": "Extract the ZIP on Windows, then double-click start-worker.cmd.",
         }
 
 
@@ -316,20 +287,6 @@ def select_pool(
     raise WorkerBundleError(f"Choose a Pool by name with --pool. Available Pools: {names}")
 
 
-def _safe_output_path(output: Path | None, worker_name: str) -> Path:
-    if output is None:
-        target_root = Path.home() / "Downloads"
-        if not target_root.is_dir():
-            target_root = Path.cwd()
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", worker_name.strip()).strip("-.") or "worker"
-        output = target_root / f"vgen-worker-{slug}.zip"
-    target = output.expanduser().resolve()
-    if target.suffix.lower() != ".zip":
-        raise WorkerBundleError("Worker bundle output must use the .zip extension.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return target
-
-
 def _safe_installer_output_path(output: Path | None) -> Path:
     if output is None:
         target_root = Path.home() / "Downloads"
@@ -445,12 +402,10 @@ def create_public_windows_worker_installer_bundle(
         b"VGen Windows Worker\r\n"
         b"===================\r\n\r\n"
         b"1. Extract every file in this ZIP to a normal local folder.\r\n"
-        b"2. Right-click enroll-worker.ps1 and choose Run with PowerShell.\r\n"
-        b"3. Paste the one-time Invite only into the hidden VGen prompt.\r\n"
-        b"4. Send the displayed verification code to the Workspace owner through "
-        b"a trusted channel.\r\n"
-        b"5. The owner approves with: vgen worker approve-enrollment <id> --code "
-        b"<displayed-code>\r\n\r\n"
+        b"2. Double-click start-worker.cmd.\r\n"
+        b"3. On the owner's Mac, run: vgen worker add\r\n"
+        b"4. Paste the displayed one-time Invite only into the hidden Windows prompt.\r\n"
+        b"5. Enter the Windows verification code into the still-running Mac command.\r\n\r\n"
         b"This public installer contains no Worker identity or credentials.\r\n"
     )
     _write_public_installer_bundle(
@@ -467,210 +422,3 @@ def create_public_windows_worker_installer_bundle(
         ],
     )
     return WorkerInstallerBundleResult(target, endpoint)
-
-
-def _write_private_bundle(
-    target: Path,
-    *,
-    overwrite: bool,
-    config: dict[str, Any],
-    script: bytes,
-    launcher: bytes,
-    policy: bytes,
-    wheel_name: str,
-    wheel: bytes,
-    credentials: bytes,
-) -> None:
-    if target.exists() and not overwrite:
-        raise WorkerBundleError(f"Refusing to overwrite existing bundle: {target}")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        os.chmod(temporary, 0o600)
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            entries = (
-                (_LAUNCHER_NAME, launcher, 0o755),
-                (_SCRIPT_NAME, script, 0o644),
-                (
-                    "vgen-worker-bundle.json",
-                    json.dumps(config, indent=2, sort_keys=True).encode() + b"\n",
-                    0o644,
-                ),
-                (_POLICY_NAME, policy, 0o644),
-                (wheel_name, wheel, 0o644),
-                ("worker-credentials.json", credentials, 0o600),
-            )
-            for name, value, mode in entries:
-                info = zipfile.ZipInfo(name, time.localtime()[:6])
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = mode << 16
-                archive.writestr(info, value)
-        if target.exists() and not overwrite:
-            raise WorkerBundleError(f"Refusing to overwrite existing bundle: {target}")
-        os.replace(temporary, target)
-        os.chmod(target, 0o600)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def create_windows_worker_bundle(
-    client: GatewayClient,
-    owner_identity: DeviceIdentity,
-    *,
-    worker_name: str,
-    workspace_id: str,
-    pool: str | None,
-    default_pool: str | None,
-    output: Path | None,
-    comfyui_root: str | None,
-    compute_rate: int,
-    traffic_rate: int,
-    manager_broker_id: str | None = None,
-    wheel_path: Path | None = None,
-    overwrite: bool = False,
-) -> WorkerBundleResult:
-    if not worker_name.strip():
-        raise WorkerBundleError("Worker name is required.")
-    if compute_rate < 0 or traffic_rate < 0:
-        raise WorkerBundleError("Worker rates cannot be negative.")
-
-    target = _safe_output_path(output, worker_name)
-    script = _asset_bytes(_SCRIPT_NAME)
-    launcher = _asset_bytes(_LAUNCHER_NAME)
-    policy = _asset_bytes(_POLICY_NAME)
-    wheel_name, wheel = load_worker_wheel(wheel_path)
-    if target.exists() and not overwrite:
-        raise WorkerBundleError(f"Refusing to overwrite existing bundle: {target}")
-
-    pools = client.request("GET", f"/api/v1/workspaces/{workspace_id}/pools")
-    if not isinstance(pools, list):
-        raise WorkerBundleError("Gateway returned an invalid Pool list.")
-    selected_pool = select_pool(pools, requested=pool, default=default_pool)
-    pool_id = str(selected_pool["id"])
-    pool_name = str(selected_pool["name"])
-
-    identity = WorkerIdentity.generate()
-    owner_certificate = sign_key_manifest(
-        owner_identity.root_keys,
-        {
-            "version": 1,
-            "kind": "vgen-worker-owner-certificate",
-            "owner_root_key_id": owner_identity.root_key_id,
-            "worker_key_id": identity.key_id,
-            "worker_signing_public_key": identity.public_info()["signing_public_key"],
-            "worker_encryption_public_key": identity.public_info()["encryption_public_key"],
-            "issued_at": int(time.time()),
-        },
-    )
-    worker_id: str | None = None
-    try:
-        worker = client.request(
-            "POST",
-            "/api/v1/workers",
-            json_body=identity.public_registration(
-                name=worker_name.strip(),
-                executor_type="comfyui",
-                executor_version=_EXECUTOR_VERSION,
-                capacity=1,
-                manager_broker_id=manager_broker_id,
-                certificate=json.dumps(owner_certificate, separators=(",", ":")),
-            ),
-            idempotency_key=f"worker-bundle:{identity.key_id}",
-        )
-        worker_id = str(worker["id"])
-        session = login_worker_session(client.profile, worker_id, identity.device_keys)
-        allocation = client.request(
-            "POST",
-            f"/api/v1/workers/{worker_id}/offer",
-            json_body={"pool_id": pool_id},
-            idempotency_key=f"worker-offer:{worker_id}:{pool_id}",
-        )
-        allocation = client.request("GET", f"/api/v1/worker-allocations/{allocation['id']}")
-        worker_manifest = allocation.get("worker")
-        if not isinstance(worker_manifest, dict):
-            raise WorkerBundleError("Gateway allocation response has no Worker key manifest.")
-        proof_payload = build_allocation_proof_payload(
-            allocation_id=str(allocation["id"]),
-            workspace_id=str(allocation["workspace_id"]),
-            pool_id=str(allocation["pool_id"]),
-            worker_id=str(allocation["worker_id"]),
-            worker_signing_public_key=str(worker_manifest["signing_public_key"]),
-            worker_encryption_public_key=str(worker_manifest["encryption_public_key"]),
-            worker_certificate=worker_manifest["certificate"],
-            owner_consent_at=float(allocation["owner_consent_at"]),
-            approver_root_key_id=owner_identity.root_key_id,
-        )
-        client.request(
-            "POST",
-            f"/api/v1/worker-allocations/{allocation['id']}/approve",
-            json_body={"proof": sign_allocation_proof(owner_identity.root_keys, proof_payload)},
-            idempotency_key=(
-                f"allocation-approve:{allocation['id']}:{proof_payload['owner_consent_at_ms']}"
-            ),
-        )
-        rate = client.request(
-            "POST",
-            f"/api/v1/workers/{worker_id}/rates",
-            json_body={
-                "workspace_id": workspace_id,
-                "rate_microtokens_per_gpu_second": compute_rate,
-                "traffic_microtokens_per_gib": traffic_rate,
-            },
-            idempotency_key=(
-                f"worker-rate:{worker_id}:{workspace_id}:{compute_rate}:{traffic_rate}"
-            ),
-        )
-        client.request(
-            "POST",
-            f"/api/v1/rates/{rate['id']}/approve",
-            json_body={},
-            idempotency_key=f"rate-approve:{rate['id']}",
-        )
-        credentials = WorkerCredentials(
-            worker_id=worker_id,
-            device_keys=identity.device_keys,
-            session_token=str(session["token"]),
-            owner_root_signing_public_key=owner_identity.root_signing_public_key,
-        )
-        config = {
-            "format": _BUNDLE_FORMAT,
-            "version": _BUNDLE_VERSION,
-            "gateway_url": client.profile.endpoint,
-            "worker_credentials": "worker-credentials.json",
-            "comfyui_root": comfyui_root,
-            "wheel": {
-                "name": wheel_name,
-                "version": __version__,
-                "sha256": _sha256(wheel),
-            },
-            "policy": {"name": _POLICY_NAME, "sha256": _sha256(policy)},
-        }
-        _write_private_bundle(
-            target,
-            overwrite=overwrite,
-            config=config,
-            script=script,
-            launcher=launcher,
-            policy=policy,
-            wheel_name=wheel_name,
-            wheel=wheel,
-            credentials=credentials.to_bytes(),
-        )
-    except Exception:
-        if worker_id is not None:
-            try:
-                client.request(
-                    "POST",
-                    f"/api/v1/workers/{worker_id}/revoke",
-                    json_body={},
-                    idempotency_key=f"worker-revoke:{worker_id}",
-                )
-            except Exception as cleanup_exc:
-                raise WorkerBundleError(
-                    "Bundle creation failed and automatic Worker cleanup could not be confirmed; "
-                    "inspect `vgen worker list` before retrying."
-                ) from cleanup_exc
-        raise
-
-    return WorkerBundleResult(target, worker_name.strip(), pool_name)

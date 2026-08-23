@@ -582,7 +582,7 @@ def setup_command(args: Any) -> None:
                     "profile": asdict(profile),
                     "workflow": f"{OFFICIAL_WORKFLOW_ID}@{OFFICIAL_WORKFLOW_VERSION}",
                     "home_broker_service": broker_service,
-                    "next_command": "vgen worker bundle",
+                    "next_command": "vgen worker add",
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -597,4 +597,4 @@ def setup_command(args: Any) -> None:
     print(f"  工作空间: {workspace_display}")
     print(f"  GPU 资源池: {pool_display}")
     print(f"  Home Broker: {broker_service}")
-    print("\n下一步在这台 Mac 上运行：vgen worker bundle")
+    print("\n下一步在这台 Mac 上运行：vgen worker add")

@@ -475,6 +475,7 @@ def _clean_transient_outputs(version: str) -> None:
 def build_deployment_archive(*, version: str, public_root: Path, output: Path) -> Path:
     expected = (
         Path("install-macos.sh"),
+        Path("install-windows-worker.ps1"),
         Path("channels") / "stable.json",
         Path(version) / "manifest.json",
         Path(version) / f"VGen-macOS-{version}.zip",
@@ -546,13 +547,10 @@ def build_release(
     _run(
         [
             python,
-            "-m",
-            "vgen",
-            "worker",
-            "installer-bundle",
-            "--gateway-url",
+            "tools/build_windows_worker_bundle.py",
+            "--gateway",
             gateway,
-            "--worker-wheel",
+            "--wheel",
             str(wheel),
             "--output",
             str(windows),
@@ -620,6 +618,7 @@ def _verify_public_release(release_origin: str, version: str) -> None:
     ):
         raise ReleaseError("public stable pointer did not switch to the requested version")
     read(f"{release_origin}/releases/install-macos.sh", 2 * 1024 * 1024)
+    read(f"{release_origin}/releases/install-windows-worker.ps1", 2 * 1024 * 1024)
     manifest = json.loads(
         read(f"{release_origin}/releases/{version}/manifest.json", 1024 * 1024)
     )
@@ -738,12 +737,18 @@ def publish_release(
     if REMOTE_DIRECTORY_PATTERN.fullmatch(remote_dir) is None:
         raise ReleaseError("SSH returned an unsafe remote staging directory")
     publisher = REPOSITORY / "examples" / "ecs" / "publish-release.sh"
-    upload_sources = [str(result.deployment_archive), str(publisher)]
+    release_site_installer = REPOSITORY / "examples" / "ecs" / "setup-release-site.sh"
+    upload_sources = [
+        str(result.deployment_archive),
+        str(publisher),
+        str(release_site_installer),
+    ]
     if gateway_action != "none":
         upload_sources.append(str(result.gateway_bundle))
     _run([*scp, *upload_sources, f"{ssh_target}:{remote_dir}/"])
     remote_archive = f"{remote_dir}/{result.deployment_archive.name}"
     remote_publisher = f"{remote_dir}/{publisher.name}"
+    remote_release_site_installer = f"{remote_dir}/{release_site_installer.name}"
     prefix = "" if ssh_target.startswith("root@") else "sudo "
     if gateway_action != "none":
         remote_gateway = f"{remote_dir}/{result.gateway_bundle.name}"
@@ -789,6 +794,12 @@ def publish_release(
             + " && ".join(setup_commands)
         )
         _run([*ssh, gateway_command])
+    release_site_command = (
+        f"{prefix}bash {shlex.quote(remote_release_site_installer)} install "
+        f"--domain {shlex.quote(release_domain)} "
+        f"--confirm-domain {shlex.quote(release_domain)}"
+    )
+    _run([*ssh, release_site_command])
     remote_command = (
         f"{prefix}bash {shlex.quote(remote_publisher)} "
         f"--archive {shlex.quote(remote_archive)} "

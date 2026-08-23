@@ -27,7 +27,7 @@ ECS Gateway（公网 HTTPS 控制面和密文任务状态）
 2. 在 Mac 安装 CLI/Home Broker，完成首次身份和 Workspace 初始化；
 3. 其他 Mac 从下载域名安装 CLI，再通过 Gateway 域名加入 Workspace；
 4. 在 Windows 安装 ComfyUI Desktop 或解压 ComfyUI Portable；
-5. Windows 下载无凭据通用 Worker ZIP，用一次性邀请登记并启动 Worker；
+5. Windows 运行统一 Worker 安装命令，按 Mac 显示的一次性邀请登记并启动 Worker；
 6. Worker 缺模型时，由管理员 Mac 上的 Broker 发起模型下载；
 7. 分别提交 0、1、2 张图片的视频任务进行验收。
 
@@ -50,8 +50,8 @@ Windows Worker 暂时必须保持 PowerShell 窗口打开；当前版本不安�
 | `vgen-windows-worker-installer-<版本>.zip` | 可公开下载、无凭据的 Windows Worker 首装包 |
 | `vgen-<版本>-py3-none-any.whl` | 经管理员复核后远程更新 VGen Worker |
 
-`vgen worker bundle` 生成的 `vgen-worker-<名称>.zip` 是某一台 Worker 的私密包，内含
-Worker 私钥，不能公开分发，也不要发送到群聊、公开网盘或代码仓库。
+Windows Worker 只提供一个公开通用安装包。包内没有 Worker ID、Invite、session 或私钥；
+每台 Windows 会在首次运行时生成自己的本机密钥，因此同一个公开安装入口可供所有人使用。
 
 开始前：
 
@@ -70,7 +70,8 @@ sha256sum -c SHA256SUMS
 
 VGen 使用两个独立 HTTPS origin：`https://<Gateway域名>` 只提供 `/api/v1`，
 `https://<下载域名>` 只提供公开安装包。下载站的 `/releases/channels/stable.json` 指向当前
-不可变版本，`/releases/install-macos.sh` 是固定的一键安装入口。用户只需复制一条命令；脚本会
+不可变版本，`/releases/install-macos.sh` 和 `/releases/install-windows-worker.ps1` 是固定的
+一键安装入口。用户只需复制一条命令；脚本会
 从已固定的下载 origin 读取 stable、manifest 和 ZIP，自动校验摘要、大小与 SHA-256，并拒绝
 跨域或非 HTTPS 下载。以后把下载站迁到 OSS/CDN 不需要修改 Gateway Profile。
 
@@ -375,81 +376,34 @@ vgen join --resume
 
 ## 5. Windows Worker 和 ComfyUI
 
-### 5.1 推荐：无凭据通用包和一次性 Worker 邀请
+### 5.1 一键安装和互动接入
 
-管理员创建只可使用一次、领取后还需管理员批准的 Worker 邀请：
-
-```bash
-vgen worker invite --name "Windows GPU Worker" --pool "默认 GPU 池"
-```
-
-保存输出中的 `enrollment_id`，只把完整邀请 URI 发给目标 Windows。Windows 可用浏览器下载，
-也可在 PowerShell 下载当前明确版本：
+先在 Windows 安装 ComfyUI Desktop，或解压官方 ComfyUI Portable；Desktop 多实例管理器需要
+先创建并启动一次本地 Standalone。然后打开普通 PowerShell，运行固定的一键安装命令：
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing `
-  "https://<下载域名>/releases/<版本>/vgen-windows-worker-installer-<版本>.zip" `
-  -OutFile ".\vgen-windows-worker-installer-<版本>.zip"
-Expand-Archive ".\vgen-windows-worker-installer-<版本>.zip" ".\VGen-Worker"
-Set-Location ".\VGen-Worker"
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\enroll-worker.ps1"
+irm https://<下载域名>/releases/install-windows-worker.ps1 | iex
 ```
 
-脚本在 Windows 本机生成 Worker 私钥，并在隐藏输入框读取一次性邀请；公开 ZIP、Gateway 和
-管理员 Mac 都不生成或保存这把私钥。领取成功后 Windows 会显示完整的 claim 绑定验证码；
-通过可信的一对一渠道把这个验证码发给管理员。管理员只在看到 Windows 本机显示的完整值后
-运行：
+脚本会读取 stable release、核对 manifest、大小和 SHA-256，下载并安全解压通用安装包，然后
+进入唯一的 Worker 安装入口。不需要手工下载 ZIP，也不要分别运行 `enroll-worker.ps1` 或
+`setup-worker.ps1`。
+
+同时在 Workspace Owner 的 Mac 上运行：
 
 ```bash
-vgen worker approve-enrollment <enrollment_id> --code <Windows显示的完整验证码>
+vgen worker add --name "Windows GPU Worker" --pool "默认 GPU 池"
 ```
 
-CLI 会用验证码重新绑定待审批 claim；不匹配时拒绝签发 Worker certificate 和 Pool allocation，
-防止 Gateway 或中间人替换 Worker 公钥。批准后 Windows 会自动继续现有的 ComfyUI 检测和
-Worker 安装。这个通用 ZIP 可以公开缓存，但 Invite 仍是一次性秘密，不能打进安装包或放在
-PowerShell 参数中。
+只有一个 Pool 时可以省略 `--pool`。Mac 命令会显示一次性 Invite 并保持等待；把它粘贴到
+Windows 的隐藏输入框。Windows 在本机生成私钥并显示完整验证码，再把验证码输入仍在等待的
+Mac 命令。验证码一致后，Mac 自动签发 Worker certificate、批准 Pool 和费率，Windows 自动
+继续检测 ComfyUI、安装并启动 Worker。
 
-### 5.2 兼容方式：在 Mac 生成指定 Worker 私密包
+Invite 只能使用一次，不能发到群聊、截图或放入命令参数。通用安装包可以公开缓存和重复下载，
+但每台 Windows 都会生成不同的私钥和 Worker 身份。
 
-默认 Workspace 只有一个 Pool 时运行：
-
-```bash
-vgen worker bundle
-```
-
-存在多个 Pool 时按名称选择：
-
-```bash
-vgen worker bundle --pool "我的 3090"
-```
-
-CLI 会登记 Worker、完成 Pool 和费率批准，并在 `~/Downloads` 生成私密 ZIP。只通过可信的
-点对点方式把它交给目标 Windows 机器。
-
-从 `0.1.x` 首次迁移到支持 Broker 维护任务的 `0.2.x` 时，旧 credential 缺少 Owner 根公钥
-信任锚，必须撤销旧 Worker 并重新生成一次 bundle：
-
-```bash
-vgen worker list
-vgen worker revoke <worker_id>
-vgen worker bundle
-```
-
-这是一项一次性迁移；完成后日常 VGen Worker wheel 更新由 Broker 发起。
-
-### 5.3 私密包首次启动
-
-1. 安装 ComfyUI Desktop，或解压官方 ComfyUI Portable；Desktop 多实例管理器需要先创建并
-   启动一次本地 Standalone；
-2. 完全退出所有正在运行的 ComfyUI；
-3. 把私密 Worker ZIP 解压到本地目录；
-4. 双击 `start-worker.cmd`。
-
-也可以在解压目录运行：
-
-```powershell
-.\setup-worker.ps1
-```
+### 5.2 Worker 首次启动和重试
 
 安装器会自动检查 Gateway，准备隔离的 VGen runtime 和 custom nodes，必要时只在
 `127.0.0.1:8188` 启动 ComfyUI，然后以前台方式运行 Worker。缺模型不会使安装失败：Worker
@@ -467,7 +421,7 @@ VGen Worker 已安装的固定版本 custom nodes。只有仓库来源、固定 
 `.节点目录.vgen-staging-<32 位十六进制字符>` 的暂存目录，普通启动会先做归属和重解析点
 检查，再仅清理这些 VGen 旧暂存目录；`-CheckOnly` 始终只读。
 
-安装器会自行收紧私密 credential 的 Windows ACL，不需要用户先运行 `icacls` 或手工修改
+安装器会自行收紧本机 credential 的 Windows ACL，不需要用户先运行 `icacls` 或手工修改
 JSON。
 
 Python、pip、winget 在安装时显示的进度只写入当前窗口，不会被当作 Python 或 Git 路径。
@@ -479,7 +433,7 @@ Python、pip、winget 在安装时显示的进度只写入当前窗口，不会�
 `Ctrl+C` 可让脚本停止本次由它启动的 Worker 和 ComfyUI；如果直接强制关闭窗口导致残留
 进程，先在任务管理器结束残留的 ComfyUI/Python，再重新启动。
 
-### 5.4 Desktop、Portable 和自定义数据目录
+### 5.3 Desktop、Portable 和自定义数据目录
 
 脚本会检查 AppData、Program Files、Program Files (x86)、ComfyUI Desktop 安装记录和常见
 Portable 目录，并自动判断安装类型：
@@ -507,21 +461,21 @@ Portable 目录，并自动判断安装类型：
 .\setup-worker.ps1 -CheckOnly
 ```
 
-### 5.5 重装同一台 Worker
+### 5.4 重装同一台 Worker
 
 日常修复不需要创建新的 Worker：
 
 1. 关闭前台 Worker；
-2. 只删除上次 ZIP 的**解压目录**；
-3. 从原来的私密 ZIP 重新解压并双击 `start-worker.cmd`。
+2. 重新运行同一条 `irm ...install-windows-worker.ps1 | iex` 安装命令；
+3. 安装器检测到本机 credential 后会继续使用同一个 Worker 身份。
 
-不要删除 ComfyUI、模型、`%LOCALAPPDATA%\VGen` 或私密 ZIP 中的 credential。复用同一个 ZIP
-会保留同一 Worker 身份，不会在 Gateway 产生重复记录。
+不要删除 ComfyUI、模型或 `%LOCALAPPDATA%\VGen` 中的 credential。重复运行公开安装入口会
+保留同一 Worker 身份，不会在 Gateway 产生重复记录。
 
 ## 6. Broker 发起模型下载和 Worker 更新
 
 这些命令都在 Mac 上运行，并要求 Windows Worker 的前台 PowerShell 仍在线。正常由
-`vgen worker invite` 或 `vgen worker bundle` 创建的 Worker 已绑定当前 Home Broker；如果
+`vgen worker add` 接入的 Worker 已绑定当前 Home Broker；如果
 CLI 明确报告没有 manager Broker，先运行：
 
 ```bash
@@ -641,8 +595,8 @@ vgen worker revoke <worker_id>
 ```
 
 `--force` 和 `revoke` 会使当前 lease/fencing token 失效，迟到结果不能覆盖新 Attempt。撤销后的
-Worker ID 不能“复活”；重新接入需要运行 `vgen worker bundle` 创建新的 Worker。日常重装同一
-Worker 时不要先撤销，按第 5.5 节复用原私密 ZIP 即可。
+Worker ID 不能“复活”；重新接入时在 Mac 重新运行 `vgen worker add`，Windows 重新运行统一
+安装器以创建新的 Worker。日常重装同一 Worker 时不要先撤销，按第 5.4 节直接重跑安装器即可。
 
 ### 8.2 Mac Device 移除和换机边界
 
@@ -672,7 +626,7 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
 
 ## 9. 安全边界
 
-- 恢复词、私钥、Worker 私密 ZIP 和 Bootstrap code 都不能进入聊天、截图、Issue、日志或
+- 恢复词、私钥、Worker credential 和 Bootstrap code 都不能进入聊天、截图、Issue、日志或
   公开存储；
 - 公网只暴露 Gateway HTTPS，不暴露 Gateway 内部端口或 ComfyUI；
 - Gateway 保存任务状态、密文和调度元数据，不保存解密私钥；真正执行任务的 Worker 必然能

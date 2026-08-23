@@ -334,6 +334,18 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):
         assert secret_word not in script
 
+    windows = result.windows_worker_bootstrap.read_text(encoding="utf-8")
+    assert stat.S_IMODE(result.windows_worker_bootstrap.stat().st_mode) == 0o644
+    assert '$ExpectedVersion = "' + VERSION + '"' in windows
+    assert result.manifest_sha256 in windows
+    assert "/releases/channels/stable.json" in windows
+    assert "windows-worker-installer" in windows
+    assert "Get-Sha256 $archiveBytes" in windows
+    assert "Installer ZIP contains an unexpected or unsafe path" in windows
+    assert '"start-worker.cmd"' in windows
+    for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):
+        assert secret_word not in windows
+
 
 def test_gateway_and_release_origins_are_independent(tmp_path: Path) -> None:
     result = _build(

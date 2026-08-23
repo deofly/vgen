@@ -30,7 +30,7 @@ Publish an already reviewed VGen public release without restarting Gateway:
     --domain vgen.example.com
 
 The script validates every archive entry and digest, publishes the immutable
-version directory, replaces install-macos.sh, switches stable.json last, then
+version directory, replaces both public installer bootstraps, switches stable.json last, then
 checks the public HTTPS endpoints. A failed public check restores the channel.
 
 Options:
@@ -156,6 +156,7 @@ output_root = Path(os.environ["VGEN_UNPACK_DIR"])
 version = os.environ["VGEN_RELEASE_VERSION"]
 expected = {
     "install-macos.sh",
+    "install-windows-worker.ps1",
     "channels/stable.json",
     f"{version}/manifest.json",
     f"{version}/VGen-macOS-{version}.zip",
@@ -241,6 +242,11 @@ if not re.search(rf"(?m)^EXPECTED_VERSION={re.escape(version)}$", bootstrap):
     raise SystemExit("macOS bootstrap is not pinned to this release version")
 if not re.search(rf"(?m)^EXPECTED_MANIFEST_SHA256={manifest_digest}$", bootstrap):
     raise SystemExit("macOS bootstrap is not pinned to this manifest digest")
+windows_bootstrap = (output_root / "install-windows-worker.ps1").read_text(encoding="utf-8")
+if f'$ExpectedVersion = "{version}"' not in windows_bootstrap:
+    raise SystemExit("Windows bootstrap is not pinned to this release version")
+if f'$ExpectedManifestSha256 = "{manifest_digest}"' not in windows_bootstrap:
+    raise SystemExit("Windows bootstrap is not pinned to this manifest digest")
 print(f"validated public release {version}")
 PY
 
@@ -294,6 +300,13 @@ if [[ -f "${RELEASE_ROOT}/install-macos.sh" && ! -L "${RELEASE_ROOT}/install-mac
 else
   : >"${BACKUP_DIR}/install-macos.sh.absent"
 fi
+if [[ -f "${RELEASE_ROOT}/install-windows-worker.ps1" && \
+      ! -L "${RELEASE_ROOT}/install-windows-worker.ps1" ]]; then
+  install -m 0644 "${RELEASE_ROOT}/install-windows-worker.ps1" \
+    "${BACKUP_DIR}/install-windows-worker.ps1"
+else
+  : >"${BACKUP_DIR}/install-windows-worker.ps1.absent"
+fi
 if [[ -f "${RELEASE_ROOT}/channels/stable.json" && \
       ! -L "${RELEASE_ROOT}/channels/stable.json" ]]; then
   install -m 0644 "${RELEASE_ROOT}/channels/stable.json" "${BACKUP_DIR}/stable.json"
@@ -310,6 +323,14 @@ restore_channel() {
       "${RELEASE_ROOT}/install-macos.sh"
   else
     rm -f -- "${RELEASE_ROOT}/install-macos.sh"
+  fi
+  if [[ -f "${BACKUP_DIR}/install-windows-worker.ps1" ]]; then
+    install_managed -m 0644 "${BACKUP_DIR}/install-windows-worker.ps1" \
+      "${RELEASE_ROOT}/.install-windows-worker.ps1.rollback"
+    mv -f "${RELEASE_ROOT}/.install-windows-worker.ps1.rollback" \
+      "${RELEASE_ROOT}/install-windows-worker.ps1"
+  else
+    rm -f -- "${RELEASE_ROOT}/install-windows-worker.ps1"
   fi
   if [[ -f "${BACKUP_DIR}/stable.json" ]]; then
     install_managed -m 0644 "${BACKUP_DIR}/stable.json" \
@@ -339,6 +360,11 @@ install_managed -m 0755 \
 mv -f "${BOOTSTRAP_STAGE}" "${RELEASE_ROOT}/install-macos.sh"
 CHANNEL_CHANGED=1
 
+WINDOWS_BOOTSTRAP_STAGE="$(mktemp "${RELEASE_ROOT}/.install-windows-worker.ps1.XXXXXXXX")"
+install_managed -m 0644 \
+  "${UNPACK_DIR}/install-windows-worker.ps1" "${WINDOWS_BOOTSTRAP_STAGE}"
+mv -f "${WINDOWS_BOOTSTRAP_STAGE}" "${RELEASE_ROOT}/install-windows-worker.ps1"
+
 STABLE_STAGE="$(mktemp "${RELEASE_ROOT}/channels/.stable.json.XXXXXXXX")"
 install_managed -m 0644 \
   "${UNPACK_DIR}/channels/stable.json" "${STABLE_STAGE}"
@@ -366,6 +392,8 @@ PY
   rm -f -- "${STABLE_RESPONSE}"
   curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
     "https://${DOMAIN}/releases/install-macos.sh"
+  curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
+    "https://${DOMAIN}/releases/install-windows-worker.ps1"
   curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
     "https://${DOMAIN}/releases/${VERSION}/manifest.json"
   curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \

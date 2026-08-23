@@ -261,6 +261,9 @@ def test_ecs_nginx_serves_only_constrained_release_paths_with_correct_caches() -
     assert "location = /releases/install-macos.sh" in source
     assert "alias /var/www/vgen-releases/install-macos.sh;" in source
     assert "location = /releases/install-macos.sh" in installer
+    assert "location = /releases/install-windows-worker.ps1" in source
+    assert "alias /var/www/vgen-releases/install-windows-worker.ps1;" in source
+    assert "location = /releases/install-windows-worker.ps1" in installer
     for config in (source, installer):
         release_location = next(
             line.strip()

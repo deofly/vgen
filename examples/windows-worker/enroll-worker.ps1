@@ -48,9 +48,7 @@ function Assert-ClosedBundleDirectory {
         "setup-worker.ps1",
         "vgen-worker-bundle.json",
         "comfyui-minimax-h3-policy.yaml",
-        "SHA256SUMS",
-        "worker-credentials.json",
-        ".worker-enrollment-identity.json"
+        "SHA256SUMS"
     )
     $wheelCount = 0
     foreach ($item in @(Get-ChildItem -LiteralPath $Root -Force)) {
@@ -205,8 +203,9 @@ try {
     $wheelPath = Assert-RegularLocalFile (Join-Path $PSScriptRoot $wheelName) "VGen wheel"
     $setupPath = Assert-RegularLocalFile `
         (Join-Path $PSScriptRoot "setup-worker.ps1") "Worker setup script"
-    $credentialPath = Join-Path $PSScriptRoot "worker-credentials.json"
-    $identityPath = Join-Path $PSScriptRoot ".worker-enrollment-identity.json"
+    $credentialRoot = Join-Path $env:LOCALAPPDATA "VGen\credentials"
+    $credentialPath = Join-Path $credentialRoot "worker-credentials.json"
+    $identityPath = Join-Path $credentialRoot ".worker-enrollment-identity.json"
 
     if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf)) {
         $python = Ensure-Python311
@@ -240,13 +239,15 @@ try {
             }
         }
         $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
+        Write-Host ""
+        Write-Host "[vgen] On the Workspace owner's Mac, run: vgen worker add"
+        Write-Host "[vgen] Paste the Invite shown by that still-running command below."
         Write-Step "Creating a local Worker identity and claiming the one-time Invite"
-        & $bootstrapPython -I -B -m vgen worker claim-invite `
+        & $bootstrapPython -I -B -m vgen.cli.worker_enrollment `
             --gateway-url $gatewayOrigin `
             --name $WorkerName `
             --identity-file $identityPath `
-            --credentials-file $credentialPath `
-            --wait
+            --credentials-file $credentialPath
         if ($LASTEXITCODE -ne 0) {
             throw "Worker enrollment did not complete. No Invite secret was saved."
         }

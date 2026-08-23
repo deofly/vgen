@@ -31,12 +31,12 @@ REQUIRED_SDIST = {
     "src/vgen/gateway/openapi.py",
     "src/vgen/cli/upgrade.py",
     "tools/build_public_release.py",
+    "tools/build_windows_worker_bundle.py",
     "tools/check_distribution.py",
     "tools/export_openapi_v1.py",
     "tools/project_version.py",
     "tools/release.py",
     "tools/release.sh",
-    "tools/repack_worker_bundle.py",
     "workflows/vgen/minimax-h3-8step/1.0.0/manifest.yaml",
 }
 REQUIRED_WHEEL = {

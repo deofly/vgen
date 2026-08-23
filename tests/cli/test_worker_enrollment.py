@@ -248,27 +248,7 @@ def test_claim_refuses_existing_credentials_before_contacting_gateway(tmp_path: 
     assert credentials.read_text(encoding="utf-8") == "do-not-replace"
 
 
-def test_worker_claim_cli_has_no_invite_secret_argv_option() -> None:
-    command = build_parser().parse_args(
-        [
-            "worker",
-            "claim-invite",
-            "--gateway-url",
-            "https://gateway.example",
-            "--name",
-            "GPU",
-            "--identity-file",
-            "identity.json",
-            "--credentials-file",
-            "credentials.json",
-        ]
-    )
-    assert command.worker_action == "claim-invite"
-    assert not hasattr(command, "invite")
-    assert command.invite_stdin is False
-
-
-def test_admin_approval_reverifies_claim_and_signs_certificate_and_allocation_atomically(
+def test_worker_add_creates_invite_waits_and_approves_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, owner = DeviceIdentityStore(MemorySecrets()).initialize()
@@ -304,8 +284,11 @@ def test_admin_approval_reverifies_claim_and_signs_certificate_and_allocation_at
     class ApprovalClient:
         profile = SimpleNamespace(
             name="home",
+            endpoint="https://gateway.example",
             default_workspace="wsp_shared",
+            default_pool=None,
             user_id="usr_owner",
+            home_broker_id="brk_home",
         )
 
         def __init__(self) -> None:
@@ -320,6 +303,22 @@ def test_admin_approval_reverifies_claim_and_signs_certificate_and_allocation_at
             idempotency_key: str | None = None,
         ) -> dict[str, Any]:
             del idempotency_key
+            if method == "GET" and path == "/api/v1/workspaces/wsp_shared/pools":
+                return [{"id": "pol_shared", "name": "Shared GPUs"}]
+            if method == "POST" and path == "/api/v1/workspaces/wsp_shared/worker-invites":
+                assert json_body is not None
+                assert json_body["method"] == "invite_approval"
+                assert json_body["pool_id"] == "pol_shared"
+                assert json_body["manager_broker_id"] == "brk_home"
+                return {
+                    "invite_uri": "vgen://join/inv_test#one-time-secret-with-enough-entropy",
+                    "enrollment": {
+                        "id": "inv_test",
+                        "workspace_id": "wsp_shared",
+                        "issuer_user_id": "usr_owner",
+                        "pool_id": "pol_shared",
+                    },
+                }
             if method == "GET":
                 assert path == "/api/v1/worker-enrollments/inv_test"
                 return pending
@@ -336,14 +335,16 @@ def test_admin_approval_reverifies_claim_and_signs_certificate_and_allocation_at
         "vgen.cli.main._profile_and_identity",
         lambda profile: (client.profile, owner),
     )
+    monkeypatch.setattr("builtins.input", lambda prompt: worker_approval_code(claim))
     dispatch(
         build_parser().parse_args(
             [
                 "worker",
-                "approve-enrollment",
-                "inv_test",
-                "--code",
-                worker_approval_code(claim),
+                "add",
+                "--name",
+                "Windows GPU",
+                "--pool",
+                "Shared GPUs",
             ]
         )
     )

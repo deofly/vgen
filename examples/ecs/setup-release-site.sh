@@ -109,6 +109,12 @@ server {
     add_header Cache-Control "public, max-age=0, must-revalidate" always;
     add_header Content-Disposition 'attachment; filename="install-macos.sh"' always;
   }
+  location = /releases/install-windows-worker.ps1 {
+    alias ${RELEASE_ROOT}/install-windows-worker.ps1;
+    default_type text/plain;
+    add_header Cache-Control "public, max-age=0, must-revalidate" always;
+    add_header Content-Disposition 'attachment; filename="install-windows-worker.ps1"' always;
+  }
   location ~ "^/releases/(?<vgen_release_version>[0-9]+(?:\.[0-9]+){2})/(?<vgen_release_file>[A-Za-z0-9][A-Za-z0-9._+-]{0,191})\$" {
     alias ${RELEASE_ROOT}/\$vgen_release_version/\$vgen_release_file;
     add_header Cache-Control "public, max-age=31536000, immutable" always;

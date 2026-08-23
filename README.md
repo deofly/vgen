@@ -51,5 +51,5 @@ Service 不能读取端到端加密的任务内容。
 - [行为准则](CODE_OF_CONDUCT.md)
 - [Apache-2.0 License](LICENSE)
 
-不要公开恢复词、私钥、Invite secret、Bootstrap code、Worker 私密 ZIP、session 或签名
+不要公开恢复词、私钥、Invite secret、Bootstrap code、Worker credential、session 或签名
 artifact URL，也不要把 Gateway 内部端口或 ComfyUI 直接暴露到公网。

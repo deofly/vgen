@@ -1010,7 +1010,7 @@ function Resolve-WorkerBundleSettings {
         }
     }
     else {
-        throw "vgen-worker-bundle.json is required. Generate a private ZIP with 'vgen worker bundle' on the Mac."
+        throw "vgen-worker-bundle.json is required. Download and extract the official universal Windows Worker installer again."
     }
 
     $resolvedGateway = $GatewayUrl

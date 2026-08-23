@@ -587,15 +587,16 @@ test "$PWD" = "$(git rev-parse --show-toplevel)" && \
 不得删除整个 `dist/public-releases/`，也不得把这条命令改成 ECS 上的
 `/var/www/vgen-releases/X.Y.Z/`。
 
-`publish` 先完成全部本地构建，再创建远端临时目录并上传，最后才调用 ECS 发布器切换 stable。
+`publish` 先完成全部本地构建，再创建远端临时目录并上传；它会用当前版本的
+`setup-release-site.sh` 原子刷新下载站 Nginx 路由，之后才调用 ECS 发布器切换 stable。
 如果日志尚未出现 `scp`，ECS 完全未被修改；如果 ECS 发布器失败，先读取当前
 `/releases/channels/stable.json`，确认原版本仍生效后再修复和重试。ECS 发布器的内嵌校验代码兼容
 服务器自带 Python 3.6，不要求为发布流程替换系统 Python。任何失败都不得手工覆盖
 `/var/www/vgen-releases/X.Y.Z/`；远端同版本不同字节意味着必须检查是否已发布，并在已发布时升级版本号。
 
 ECS 端由包内同一份 [`examples/ecs/publish-release.sh`](../examples/ecs/publish-release.sh) 完成：
-它校验 tar 条目 allowlist、manifest、两个 ZIP 的大小和 SHA-256、Mac bootstrap pin，使用发布锁，
-先原子放置 `X.Y.Z/`，再替换 bootstrap，最后切换 `stable.json`。公网检查失败时恢复原频道文件；
+它校验 tar 条目 allowlist、manifest、两个 ZIP 的大小和 SHA-256、Mac/Windows bootstrap pin，
+使用发布锁，先原子放置 `X.Y.Z/`，再替换两个 bootstrap，最后切换 `stable.json`。公网检查失败时恢复原频道文件；
 新版本目录保留为未被 stable 引用的不可变审计记录。这个流程只发布下载频道，不重启 Gateway。
 
 下面保留底层命令作为构建器开发、故障定位和独立审核依据。
@@ -614,16 +615,15 @@ python tools/build_gateway_bundle.py
 ./examples/macos/build-bundle.sh \
   --gateway https://gateway.example.com \
   --release-origin https://downloads.example.com
-PYTHONPATH=src python -m vgen worker installer-bundle \
-  --gateway-url https://gateway.example.com \
-  --output dist/vgen-windows-worker-installer-$(python tools/project_version.py).zip
+python tools/build_windows_worker_bundle.py \
+  --gateway https://gateway.example.com
 ```
 
 Mac 构建器会把本手册对应版本的用户手册复制为包内离线 `README.md`；Gateway 构建器从用户
 手册的 Gateway 标记区生成 `INSTALL.txt`。这些是生成的离线安装卡，不是第三套维护源。
 Windows 通用 ZIP 不包含 Worker ID、私钥、session 或 Invite，可以由公共构建机生成。Windows
-领取 Invite 时才在本机生成私钥。`vgen worker bundle` 产生的私密 ZIP 则仍必须由已登录且
-获授权的 CLI 为目标 Worker 单独生成，不能由公共构建机批量预制。
+领取 Invite 时才在本机生成私钥。产品不再生成逐设备私密 ZIP；用户接入统一由 Mac 的
+`vgen worker add` 和 Windows 固定安装入口完成。
 
 用明确的 UTC 发布时间把两个公开 ZIP 组装成与 Gateway release catalog 完全一致的 staging
 目录：
@@ -641,6 +641,7 @@ python tools/build_public_release.py \
 ```text
 public-releases/
   install-macos.sh
+  install-windows-worker.ps1
   channels/stable.json
   X.Y.Z/
     manifest.json
@@ -654,11 +655,12 @@ public-releases/
 `py3-none-any` tag，且 wheel 字节 SHA-256 必须完全相同。相同版本和相同内容可安全重跑。
 `manifest.json` 固化 size/SHA-256；`stable.json` 固化原始 manifest 摘要。
 
-`install-macos.sh` 是无凭据的 mutable bootstrap，由同一次构建生成。它不依赖 `jq`，使用安装
-本就需要的 Python 3.11 从固定 release origin 读取静态 stable pointer，再校验不可变 manifest 摘要、Mac ZIP size 和
-SHA-256；跨域 redirect、非 HTTPS（测试 loopback 除外）或 API/manifest 不一致都 fail closed。
-工具先原子切换 bootstrap，最后原子切换 stable pointer；中间状态只会拒绝安装，不会把新
-bootstrap 配到旧 release。
+`install-macos.sh` 和 `install-windows-worker.ps1` 是无凭据的 mutable bootstrap，由同一次构建
+生成。两者都从固定 release origin 读取 stable pointer，再校验不可变 manifest、目标 ZIP size
+和 SHA-256；跨域、非 HTTPS（测试 loopback 除外）或 metadata 不一致都 fail closed。工具先
+原子切换两个 bootstrap，最后原子切换 stable pointer；中间状态只会拒绝安装，不会把新
+bootstrap 配到旧 release。Mac 脚本使用安装本就需要的 Python 3.11；Windows 脚本兼容系统
+Windows PowerShell 5.1 和 .NET Framework。
 
 ### 8.2 Mac CLI 自升级契约
 

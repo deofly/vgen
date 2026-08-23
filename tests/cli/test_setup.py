@@ -459,7 +459,7 @@ def test_setup_resumes_partial_bootstrap_with_chinese_defaults_and_ascii_keys(
 
     output = capsys.readouterr().out
     assert "初始化完成" in output
-    assert "vgen worker bundle" in output
+    assert "vgen worker add" in output
     for secret in (
         "bootstrap-must-stay-secret",
         "session-must-stay-secret",
@@ -858,7 +858,7 @@ def test_setup_json_does_not_contain_bootstrap_or_session_fields() -> None:
                 "profile": {},
                 "workflow": "vgen/minimax-h3-8step@1.0.0",
                 "home_broker_service": "已启动",
-                "next_command": "vgen worker bundle",
+                "next_command": "vgen worker add",
             }
         )
     )

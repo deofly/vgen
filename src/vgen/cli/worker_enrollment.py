@@ -6,13 +6,15 @@ authorizes a pending enrollment.  The Invite secret is intentionally accepted
 only as an in-memory value; callers must obtain it from a hidden prompt or
 stdin, never from an argv option.
 
-The Gateway endpoints consumed here are the v0.3 Worker enrollment contract.
-They are kept separate from Workspace membership claim because credentials for
+The Gateway endpoints consumed here are the Worker enrollment contract. They
+are kept separate from Workspace membership claim because credentials for
 different principal kinds must never be interchangeable.
 """
 
 from __future__ import annotations
 
+import argparse
+import getpass
 import hashlib
 import json
 import secrets
@@ -43,7 +45,7 @@ from vgen.worker.credentials import (
 from .auth import login_worker_session
 from .client import GatewayClient
 from .profile import GatewayProfile
-from .workspace_authorities import PinnedInvite
+from .workspace_authorities import PinnedInvite, parse_pinned_invite_uri
 
 WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
 WORKER_APPROVAL_CODE_CONTEXT = b"vgen-worker-enrollment-approval-code-v1\x00"
@@ -425,3 +427,44 @@ def public_claim_digest(claim: Mapping[str, Any]) -> str:
     """Return a log-safe digest for admin review and audit records."""
 
     return "sha256:" + hashlib.sha256(canonical_json(dict(claim))).hexdigest()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Private Windows-installer entrypoint; intentionally absent from `vgen --help`."""
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--gateway-url", required=True)
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--identity-file", type=Path, required=True)
+    parser.add_argument("--credentials-file", type=Path, required=True)
+    parser.add_argument("--executor", default="comfyui")
+    parser.add_argument("--executor-version", default="1.1.0")
+    parser.add_argument("--capacity", type=int, default=1)
+    parser.add_argument("--interval", type=float, default=2)
+    parser.add_argument("--timeout", type=float, default=1800)
+    arguments = parser.parse_args(argv)
+    if not sys.stdin.isatty():
+        raise WorkerEnrollmentError("Worker enrollment requires an interactive terminal.")
+    value = getpass.getpass("Paste the one-time Worker Invite (input hidden): ").strip()
+    if not value:
+        raise WorkerEnrollmentError("Worker Invite is required.")
+    invite = parse_pinned_invite_uri(value)
+    result = enroll_worker_from_invite(
+        gateway_url=arguments.gateway_url,
+        invite=invite,
+        name=arguments.name,
+        identity_file=arguments.identity_file,
+        credentials_file=arguments.credentials_file,
+        executor_type=arguments.executor,
+        executor_version=arguments.executor_version,
+        capacity=arguments.capacity,
+        wait=True,
+        interval=arguments.interval,
+        timeout=arguments.timeout,
+    )
+    print(json.dumps(result.public_dict(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
