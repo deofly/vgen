@@ -91,6 +91,96 @@ def test_gateway_installer_has_valid_bash_syntax_and_concise_help() -> None:
     assert "OSS mode uses only an ECS RAM Role" in result.stdout
 
 
+def test_gateway_nginx_separates_control_auth_and_artifact_abuse_boundaries() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+    example = (ROOT / "examples" / "ecs" / "nginx-vgen.conf.example").read_text(
+        encoding="utf-8"
+    )
+    hardened = source.split("render_nginx_config_profile() {", 1)[1].split(
+        "render_legacy_nginx_config_profile() {", 1
+    )[0]
+    assert "client_max_body_size 16m;" in hardened
+    assert hardened.count("client_max_body_size 64k;") == 2
+    assert (
+        "limit_req_zone \\$binary_remote_addr zone=vgen_bootstrap_per_ip:10m rate=5r/m;"
+        in hardened
+    )
+    assert (
+        "limit_req_zone \\$binary_remote_addr zone=vgen_public_auth_per_ip:10m rate=2r/s;"
+        in hardened
+    )
+    assert "limit_req_status 429;" in hardened
+    assert hardened.count("error_page 413 = @vgen_body_too_large;") == 3
+    assert "error_page 429 = @vgen_bootstrap_rate_limited;" in hardened
+    assert "error_page 429 = @vgen_public_auth_rate_limited;" in hardened
+    assert 'add_header Retry-After "12" always;' in hardened
+    assert 'add_header Retry-After "1" always;' in hardened
+    assert '\"code\":600004,\"name\":\"REQUEST_BODY_TOO_LARGE\"' in hardened
+    assert '\"code\":600005,\"name\":\"RATE_LIMITED\"' in hardened
+    assert "proxy_intercept_errors on" not in hardened
+    assert "location ^~ /api/v1/artifacts/transfer/" in hardened
+    artifact = hardened.split("location ^~ /api/v1/artifacts/transfer/", 1)[1].split(
+        "location / {", 1
+    )[0]
+    assert "client_max_body_size 100g;" in artifact
+    assert "proxy_request_buffering off;" in artifact
+    assert "proxy_buffering off;" in artifact
+    assert "proxy_set_header X-Forwarded-For \\$remote_addr;" in hardened
+    assert "proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;" not in hardened
+    for directive in (
+        "client_max_body_size 16m;",
+        "client_max_body_size 64k;",
+        "limit_req_status 429;",
+        "error_page 413 = @vgen_body_too_large;",
+        "error_page 429 = @vgen_bootstrap_rate_limited;",
+        'add_header Retry-After "12" always;',
+        '"code":600004,"name":"REQUEST_BODY_TOO_LARGE"',
+        '"code":600005,"name":"RATE_LIMITED"',
+        "location ^~ /api/v1/artifacts/transfer/",
+        "proxy_set_header X-Forwarded-For $remote_addr;",
+    ):
+        assert directive in example
+
+    upgrade = source.split("verify_upgrade_preconditions() {", 1)[1].split("\n}", 1)[0]
+    assert "render_previous_gateway_nginx_config" in upgrade
+    assert "render_split_domain_legacy_gateway_nginx_config" in upgrade
+
+
+def test_gateway_upgrade_renders_exact_legacy_and_hardened_nginx_profiles(tmp_path: Path) -> None:
+    previous = tmp_path / "previous.conf"
+    split_domain = tmp_path / "split-domain.conf"
+    hardened = tmp_path / "hardened.conf"
+    completed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'export VGEN_SETUP_LIBRARY_ONLY=1; source "$1"; DOMAIN=vgen.example.com; '
+            'render_previous_gateway_nginx_config "$2"; '
+            'render_split_domain_legacy_gateway_nginx_config "$3"; '
+            'render_nginx_config "$4"',
+            "bash",
+            str(INSTALLER),
+            str(previous),
+            str(split_domain),
+            str(hardened),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    previous_text = previous.read_text(encoding="utf-8")
+    split_text = split_domain.read_text(encoding="utf-8")
+    hardened_text = hardened.read_text(encoding="utf-8")
+    assert "client_max_body_size 5g;" in previous_text
+    assert "limit_req_zone" not in previous_text
+    assert "/releases/" not in previous_text
+    assert "location = /releases/channels/stable.json" in split_text
+    assert "client_max_body_size 5g;" in split_text
+    assert "client_max_body_size 16m;" in hardened_text
+    assert "limit_req_zone" in hardened_text
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [

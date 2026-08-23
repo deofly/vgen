@@ -1,5 +1,8 @@
 # VGen Gateway API-only TLS endpoint. Installer downloads deliberately use a
 # separate hostname; see nginx-vgen-releases.conf.example.
+limit_req_zone $binary_remote_addr zone=vgen_bootstrap_per_ip:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=vgen_public_auth_per_ip:10m rate=2r/s;
+
 server {
   listen 80;
   server_name vgen-gw.zcbiz.com;
@@ -24,25 +27,91 @@ server {
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "no-referrer" always;
 
-  # Encrypted uploads use direct OSS tickets in production. Keep this limit for
-  # control-plane requests and compatibility probes; application limits still apply.
-  client_max_body_size 5g;
-  client_body_timeout 30m;
-  send_timeout 30m;
-  proxy_request_buffering off;
-  proxy_buffering off;
+  # Control-plane metadata can include a 4096-recipient KeyEnvelope rotation,
+  # but task media transfers directly to OSS.
+  client_max_body_size 16m;
+  client_body_timeout 15s;
+  send_timeout 60s;
+  proxy_request_buffering on;
+  proxy_buffering on;
 
   proxy_connect_timeout 10s;
-  proxy_read_timeout 30m;
-  proxy_send_timeout 30m;
+  proxy_read_timeout 60s;
+  proxy_send_timeout 60s;
   proxy_http_version 1.1;
   proxy_set_header Connection "";
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Forwarded-Proto https;
+  proxy_set_header X-Request-Id $request_id;
+  limit_req_status 429;
+  error_page 413 = @vgen_body_too_large;
+
+  location = /api/v1/auth/bootstrap {
+    client_max_body_size 64k;
+    limit_req zone=vgen_bootstrap_per_ip burst=2 nodelay;
+    error_page 413 = @vgen_body_too_large;
+    error_page 429 = @vgen_bootstrap_rate_limited;
+    proxy_pass http://127.0.0.1:8010;
+  }
+
+  location ~ ^/api/v1/(?:auth/(?:challenges|sessions|enroll|services/enroll|device-recovery/(?:challenges|complete))|devices/enroll|worker-enrollments/claim|enrollments/claim)$ {
+    client_max_body_size 64k;
+    limit_req zone=vgen_public_auth_per_ip burst=20 nodelay;
+    error_page 413 = @vgen_body_too_large;
+    error_page 429 = @vgen_public_auth_rate_limited;
+    proxy_pass http://127.0.0.1:8010;
+  }
+
+  location ^~ /api/v1/artifacts/transfer/ {
+    # Local/test capability uploads are ticket-authenticated and streamed. Do
+    # not buffer them in Nginx; the signed ticket's max_bytes remains final.
+    client_max_body_size 100g;
+    client_body_timeout 30m;
+    send_timeout 30m;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_read_timeout 30m;
+    proxy_send_timeout 30m;
+    proxy_pass http://127.0.0.1:8010;
+  }
+
+  location @vgen_body_too_large {
+    internal;
+    default_type application/json;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Request-ID $request_id always;
+    return 413 '{"error":{"code":600004,"name":"REQUEST_BODY_TOO_LARGE","message":"The request body is too large.","origin":"gateway","retry":{"allowed":false,"action":"none","after_ms":null},"responsibility":"consumer","request_id":"$request_id","task_id":null,"attempt_id":null,"details":{}}}';
+  }
+
+  location @vgen_bootstrap_rate_limited {
+    internal;
+    default_type application/json;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Retry-After "12" always;
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Request-ID $request_id always;
+    return 429 '{"error":{"code":600005,"name":"RATE_LIMITED","message":"Too many requests were sent in a short period.","origin":"gateway","retry":{"allowed":true,"action":"later","after_ms":12000},"responsibility":"consumer","request_id":"$request_id","task_id":null,"attempt_id":null,"details":{"layer":"nginx"}}}';
+  }
+
+  location @vgen_public_auth_rate_limited {
+    internal;
+    default_type application/json;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Retry-After "1" always;
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Request-ID $request_id always;
+    return 429 '{"error":{"code":600005,"name":"RATE_LIMITED","message":"Too many requests were sent in a short period.","origin":"gateway","retry":{"allowed":true,"action":"later","after_ms":1000},"responsibility":"consumer","request_id":"$request_id","task_id":null,"attempt_id":null,"details":{"layer":"nginx"}}}';
+  }
 
   location / {
     proxy_pass http://127.0.0.1:8010;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto https;
-    proxy_set_header X-Request-Id $request_id;
   }
 }

@@ -30,7 +30,7 @@ def cli_exit_code(code: int, *, retry_action: str = "none") -> int:
     if category == 50:
         return 8
     if category == 60:
-        return 2
+        return 5 if retry_action != "none" else 2
     if category == 70:
         return 5
     return 1

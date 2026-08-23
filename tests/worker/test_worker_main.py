@@ -166,6 +166,40 @@ def test_serve_once_claims_and_executes_one_authenticated_lease(
     assert gateway.announced == {"executors": [{"type": "fake"}]}
 
 
+def test_worker_refuses_credentials_pinned_to_another_gateway(
+    tmp_path: Path, capsys: Any
+) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials(
+            "wrk_test",
+            DeviceKeys.generate(),
+            "short-session",
+            gateway_url="https://old-gateway.example",
+        ),
+    )
+
+    exit_code = run(
+        [
+            "serve",
+            "--once",
+            "--gateway-url",
+            "https://new-gateway.example",
+            "--credentials-file",
+            str(credential_file),
+            "--announce",
+        ],
+        executor_factory=lambda _arguments: FakeExecutor(),
+        gateway_factory=lambda *_arguments: (_ for _ in ()).throw(
+            AssertionError("mismatched Gateway must not be contacted")
+        ),
+    )
+
+    assert exit_code == EXIT_CONFIG
+    assert "bound to a different Gateway" in capsys.readouterr().err
+
+
 def test_authenticated_serve_rejects_policy_required_executor_without_local_policy(
     tmp_path: Path,
     capsys: Any,

@@ -144,6 +144,20 @@ Gateway 使用 ECS 身份调用 STS，并把临时凭据进一步限制为单个
 会在创建数据库前验证 `AssumeRole`，不会上传随机探测对象。Bucket 应保持私有，并为任务前缀配置
 符合业务保留期的生命周期和未完成分片清理规则。
 
+参考部署把普通控制请求限制为 16 MiB，以容纳一次最多 4096 个加密 KeyEnvelope 的合法轮换；
+Bootstrap、登录 challenge/session、恢复和 Invite claim 进一步限制为 64 KiB，并按来源地址限流。
+正文超限返回 413；触发频率限制返回 429 并包含 `Retry-After`。Gateway 还会按实际接收字节
+计数，因此 chunked
+请求不能绕过限制。图片和视频继续由 CLI/Worker 直传 OSS；仅测试用的本地 artifact capability
+路由允许大文件流式传输，Nginx 不缓冲正文，Gateway 仍按已签发 ticket 的 `max_bytes` 拒绝越界。
+不要为了接收媒体而调大控制面上限。
+
+这份 Nginx 配置要求 Gateway 域名直接面对客户端，并故意用连接来源 `$remote_addr` 覆盖来访者
+自带的 `X-Forwarded-For`。若以后在前面增加 CDN/LB，必须先把该服务的**精确出口 CIDR**配置为
+可信 `set_real_ip_from`，再按供应商文档选择 `real_ip_header` 并复测限流；完成前不能切流。不要直接
+信任公网 `X-Forwarded-For`，否则攻击者可以伪造来源绕过限流；不配置 real-ip 又直接接 CDN，
+则所有用户会被错误地按代理的同一个 IP 限流。
+
 如果安装已创建 runtime 和 `gateway.env`，但尚未创建数据库就中断，使用新发布包执行
 `setup-gateway.sh resume --domain <Gateway域名>`。通过统一发布工具恢复时使用
 `--resume-gateway`，不要再次 reset 或重复填写 OSS 参数。
@@ -467,10 +481,31 @@ Portable 目录，并自动判断安装类型：
 
 1. 关闭前台 Worker；
 2. 重新运行同一条 `irm ...install-windows-worker.ps1 | iex` 安装命令；
-3. 安装器检测到本机 credential 后会继续使用同一个 Worker 身份。
+3. 安装器会让本机 Worker 用私钥向当前 Gateway 重新验证身份；验证成功后继续使用同一个
+   Worker，并安全刷新短期登录信息。
 
 不要删除 ComfyUI、模型或 `%LOCALAPPDATA%\VGen` 中的 credential。重复运行公开安装入口会
 保留同一 Worker 身份，不会在 Gateway 产生重复记录。
+
+若网络中断、Gateway 暂时异常、签名不匹配，或 credential 记录的是另一个 Gateway，安装器会
+停止并原样保留 credential，不会把临时故障误当成“设备已移除”。先修复网络/Gateway 再重试。
+只有 credential 已明确绑定当前 Gateway，并且当前 Gateway 明确拒绝这个 Worker 身份时，安装器
+才会自动进入重新接入；此时旧 credential 仍保持在原位置，直到新 Invite 获批并取得新登录信息。
+新接入完整成功后，安装器才原子切换到新 credential，并在同目录保留名称含
+`archived-<时间>` 的旧 credential 备份。审批、网络或写入任一步失败，原 credential 都不变。
+等待审批或临时断网时，安装器会保留专用的待接入 identity；重跑同一流程会继续使用这把待审批
+密钥，不会因反复生成身份而让已经领取的 Invite 无法续跑。它只在新 credential 切换成功后清理。
+
+如果提示 credential 属于另一个 Gateway、旧版 credential 无法确认归属，或本地文件损坏，请先
+让 Workspace Owner 核对目标 Gateway 和旧 Worker 状态。确认确实要创建新 Worker 后，按错误
+消息显示的完整路径运行：
+
+```powershell
+& "<错误消息中的完整路径>\start-worker.cmd" -Reenroll
+```
+
+`-Reenroll` 只授权走新的 Invite 流程，不会立刻删除或覆盖旧 credential；它同样要等新 Worker
+完成审批和登录后才切换。不要在未确认 Gateway 或仅遇到临时断网时使用它。
 
 ## 6. Broker 发起模型下载和 Worker 更新
 
@@ -596,7 +631,10 @@ vgen worker revoke <worker_id>
 
 `--force` 和 `revoke` 会使当前 lease/fencing token 失效，迟到结果不能覆盖新 Attempt。撤销后的
 Worker ID 不能“复活”；重新接入时在 Mac 重新运行 `vgen worker add`，Windows 重新运行统一
-安装器以创建新的 Worker。日常重装同一 Worker 时不要先撤销，按第 5.4 节直接重跑安装器即可。
+安装器。安装器确认当前 Gateway 已拒绝旧身份后会自动要求新的 Invite，并且只在新 Worker 完整
+接入成功后替换本地 credential。若安装器无法确认旧 credential 的 Gateway 归属，按第 5.4 节
+核对后运行错误消息给出的 `start-worker.cmd -Reenroll`。日常重装同一 Worker 时不要先撤销，按
+第 5.4 节直接重跑安装器即可。
 
 ### 8.2 Mac Device 移除和换机边界
 

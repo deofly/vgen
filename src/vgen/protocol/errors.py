@@ -150,6 +150,8 @@ class ErrorCode(IntEnum):
     VALIDATION_FAILED = 600001
     IDEMPOTENCY_CONFLICT = 600002
     PROTOCOL_VERSION_UNSUPPORTED = 600003
+    REQUEST_BODY_TOO_LARGE = 600004
+    RATE_LIMITED = 600005
 
     # 70xxxx: network / external dependency
     GATEWAY_UNREACHABLE = 700001
@@ -736,6 +738,22 @@ _ERROR_SPECS = (
         400,
         ErrorOrigin.GATEWAY,
         responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.REQUEST_BODY_TOO_LARGE,
+        "The request body is too large.",
+        413,
+        ErrorOrigin.GATEWAY,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.RATE_LIMITED,
+        "Too many requests were sent in a short period.",
+        429,
+        ErrorOrigin.GATEWAY,
+        retry=RetryAction.LATER,
+        responsibility=Responsibility.CONSUMER,
+        retry_after_ms=1_000,
     ),
     _spec(
         ErrorCode.GATEWAY_UNREACHABLE,

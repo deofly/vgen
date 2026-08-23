@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import stat
 import subprocess
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from vgen.crypto import (
     DeviceKeys,
@@ -33,6 +36,38 @@ class WorkerCredentialError(ValueError):
     """A safe local credential configuration error."""
 
 
+def normalize_worker_gateway_origin(value: str) -> str:
+    """Return the canonical HTTPS (or loopback HTTP) origin pinned to a Worker."""
+
+    candidate = value.strip().rstrip("/")
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError as exc:
+        raise WorkerCredentialError("Worker credential Gateway URL is invalid.") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise WorkerCredentialError("Worker credential Gateway must be an origin URL.")
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower()
+    localhost = hostname in {"127.0.0.1", "::1", "localhost"}
+    if scheme != "https" and not localhost:
+        raise WorkerCredentialError(
+            "Worker credential Gateway must use HTTPS except for localhost."
+        )
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = 443 if scheme == "https" else 80
+    netloc = rendered_host if port in {None, default_port} else f"{rendered_host}:{port}"
+    return urlunsplit((scheme, netloc, "", "", ""))
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerCredentials:
     worker_id: str
@@ -42,6 +77,10 @@ class WorkerCredentials:
     # is public, but it travels with the private Worker credential bundle so a
     # compromised Gateway cannot substitute another Worker owner's root key.
     owner_root_signing_public_key: str | None = None
+    # Bind the private Worker key to the Gateway origin where it was enrolled.
+    # Older alpha credentials omitted this value and are upgraded only after a
+    # fresh key-possession login succeeds against the selected Gateway.
+    gateway_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.worker_id:
@@ -55,6 +94,12 @@ class WorkerCredentials:
                 raise WorkerCredentialError(
                     "Worker owner root signing public key is invalid."
                 ) from exc
+        if self.gateway_url is not None:
+            object.__setattr__(
+                self,
+                "gateway_url",
+                normalize_worker_gateway_origin(self.gateway_url),
+            )
 
     def to_bytes(self) -> bytes:
         return (
@@ -68,6 +113,11 @@ class WorkerCredentials:
                     **(
                         {"owner_root_signing_public_key": (self.owner_root_signing_public_key)}
                         if self.owner_root_signing_public_key is not None
+                        else {}
+                    ),
+                    **(
+                        {"gateway_url": self.gateway_url}
+                        if self.gateway_url is not None
                         else {}
                     ),
                 },
@@ -100,6 +150,9 @@ class WorkerCredentials:
                     None
                     if decoded.get("owner_root_signing_public_key") is None
                     else str(decoded["owner_root_signing_public_key"])
+                ),
+                gateway_url=(
+                    None if decoded.get("gateway_url") is None else str(decoded["gateway_url"])
                 ),
             )
         except WorkerCredentialError:
@@ -287,6 +340,12 @@ def load_worker_credentials_file(path: Path) -> WorkerCredentials:
         raise WorkerCredentialError("Worker credential file cannot be read.") from exc
 
 
+def validate_worker_private_file(path: Path) -> Path:
+    """Validate a private Worker file path without parsing or changing its bytes."""
+
+    return _require_private_file(path)
+
+
 def save_worker_credentials_file(
     path: Path,
     credentials: WorkerCredentials,
@@ -295,7 +354,79 @@ def save_worker_credentials_file(
 ) -> None:
     """Write a recoverable 0600 credential file without following symlinks."""
 
+    if overwrite and (path.expanduser().exists() or path.expanduser().is_symlink()):
+        _replace_private_bytes(path, credentials.to_bytes())
+        return
     _save_private_bytes(path, credentials.to_bytes(), overwrite=overwrite)
+
+
+def replace_worker_credentials_file_with_backup(
+    path: Path,
+    credentials: WorkerCredentials,
+) -> Path:
+    """Atomically promote new credentials while retaining the previous bytes.
+
+    The replacement is fully materialized and ACL-hardened beside the canonical
+    file first. A same-directory hard link (or private copy fallback) preserves
+    the old credential before ``os.replace`` atomically switches the canonical
+    name, so an interrupted enrollment never leaves it missing or half-written.
+    """
+
+    resolved = _require_private_file(path)
+    temporary = resolved.with_name(f".{resolved.name}.staged-{secrets.token_hex(8)}")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup: Path | None = None
+    try:
+        if os.name == "nt":
+            _protect_windows_private_file(resolved)
+        _save_private_bytes(temporary, credentials.to_bytes(), overwrite=False)
+        for _attempt in range(10):
+            candidate = resolved.with_name(
+                f"{resolved.stem}.archived-{stamp}-{secrets.token_hex(4)}{resolved.suffix}"
+            )
+            if candidate.exists() or candidate.is_symlink():
+                continue
+            backup = candidate
+            break
+        if backup is None:
+            raise WorkerCredentialError("A unique Worker credential archive could not be created.")
+        try:
+            os.link(resolved, backup, follow_symlinks=False)
+        except OSError:
+            try:
+                old_value = resolved.read_bytes()
+            except OSError as exc:
+                raise WorkerCredentialError("Worker credential file cannot be backed up.") from exc
+            _save_private_bytes(backup, old_value, overwrite=False)
+        try:
+            os.replace(temporary, resolved)
+        except OSError as exc:
+            raise WorkerCredentialError("New Worker credentials could not be activated.") from exc
+        return backup
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _replace_private_bytes(path: Path, value: bytes) -> None:
+    """Replace a private file atomically, retaining the old file on any failure."""
+
+    resolved = _require_private_file(path)
+    temporary = resolved.with_name(f".{resolved.name}.tmp-{secrets.token_hex(8)}")
+    try:
+        _save_private_bytes(temporary, value, overwrite=False)
+        os.replace(temporary, resolved)
+    except WorkerCredentialError:
+        raise
+    except OSError as exc:
+        raise WorkerCredentialError("Private Worker file could not be replaced.") from exc
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _save_private_bytes(path: Path, value: bytes, *, overwrite: bool) -> None:
@@ -333,7 +464,7 @@ def _save_private_bytes(path: Path, value: bytes, *, overwrite: bool) -> None:
 
 
 def _protect_windows_private_file(path: Path) -> None:
-    """Replace inherited ACLs with the current user and LocalSystem only.
+    """Replace inherited ACLs with the current user, LocalSystem, and Administrators.
 
     Python's POSIX mode argument does not protect a file on Windows.  ``icacls``
     is present on supported Windows editions and accepts SID notation, avoiding
@@ -359,6 +490,15 @@ def _protect_windows_private_file(path: Path) -> None:
         sid = records[0][1].strip() if len(records) == 1 and len(records[0]) >= 2 else ""
         if not sid.startswith("S-1-"):
             raise ValueError
+        owned = subprocess.run(
+            ["icacls.exe", str(path), "/setowner", f"*{sid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if owned.returncode != 0:
+            raise ValueError
         hardened = subprocess.run(
             [
                 "icacls.exe",
@@ -367,6 +507,7 @@ def _protect_windows_private_file(path: Path) -> None:
                 "/grant:r",
                 f"*{sid}:(F)",
                 "*S-1-5-18:(F)",
+                "*S-1-5-32-544:(F)",
             ],
             check=False,
             capture_output=True,

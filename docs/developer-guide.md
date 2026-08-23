@@ -85,6 +85,26 @@ TLS 仍是强制要求，签名不提供传输保密。
 Service 使用独立 Ed25519/X25519 principal、独立 keyring namespace 和独立 session；不得借用
 同机 User Device 的 session 或根密钥。
 
+Gateway 的应用层控制请求默认最多 16 MiB；这个上限覆盖 4096 个加密 KeyEnvelope 的批量轮换，
+但不承载媒体。公开的 Bootstrap、challenge/session、设备恢复和 enrollment/Invite claim 最多
+64 KiB。中间件先检查 `Content-Length`，再按 ASGI 实际 chunk 累加，不能相信声明长度；artifact
+capability 路由不聚合正文，而是在验证 ticket 后按其 `max_bytes` 流式处理。参考 Nginx 配置采用
+同样的 16 MiB/64 KiB 边界，只在 artifact 路由关闭 request buffering。进程内 token bucket
+作为 Nginx 之外的兜底，按来源与端点类别返回带 `Retry-After` 的 429；bucket 使用有上限的 LRU/
+空闲淘汰，不把攻击者来源写入 SQLite。`VGEN_GATEWAY_MAX_CONTROL_BODY_BYTES` 只用于受控的嵌入式
+部署；修改它时必须同步审核 Nginx 和最大合法 schema，不能借此接收媒体。
+
+参考 Nginx 默认直接面对客户端，以 `$binary_remote_addr` 建桶，并把传给 loopback Uvicorn 的
+`X-Forwarded-For` 强制覆盖为 `$remote_addr`，绝不能接纳公网请求自带的 forwarding chain。引入
+CDN/LB 前，必须按供应商公布的精确出口 CIDR 配置 `set_real_ip_from` 和对应 `real_ip_header`，验证
+伪造头无法改变来源后再切流；否则要么所有用户共享代理 IP 被误限，要么攻击者可伪造 IP 绕限。
+
+周期 sweep 除调度状态外，还删除过期 challenge、request nonce、idempotency record、无活动维护
+lease 引用的过期 session，以及超过 ticket 最大有效期保护窗口的 transfer-ticket use。已撤销但尚未
+到期的 session 行保留到原 expiry，便于短期诊断且令旧测试/审计语义稳定；它们仍无法通过认证。
+清 session 前必须先清理 terminal maintenance job 的外键；active lease 的 session 行必须保留到
+fencing/关闭完成。新增临时安全表时必须同时提供 expiry 索引和 sweep 规则。
+
 ### 2.2 Enrollment
 
 Enrollment 是统一状态机，不是可互换的凭据：

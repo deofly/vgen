@@ -11,7 +11,10 @@ import os
 import secrets
 import sqlite3
 import sys
+import threading
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
@@ -111,6 +114,148 @@ class Principal:
     session_id: str
 
 
+@dataclass(slots=True)
+class _RateBucket:
+    tokens: float
+    updated_at: float
+
+
+class _TokenBucketRateLimiter:
+    """Small process-local abuse backstop with strictly bounded memory.
+
+    Nginx is the first public rate-limit layer. This limiter still protects a
+    directly reached development Gateway and survives proxy misconfiguration
+    without writing attacker-controlled buckets to SQLite.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_buckets: int = 10_000,
+        idle_seconds: float = 900.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_buckets <= 0 or idle_seconds <= 0:
+            raise ValueError("rate limiter bounds must be positive")
+        self._max_buckets = max_buckets
+        self._idle_seconds = idle_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._buckets: OrderedDict[tuple[str, str], _RateBucket] = OrderedDict()
+
+    @property
+    def bucket_count(self) -> int:
+        with self._lock:
+            return len(self._buckets)
+
+    def check(
+        self,
+        category: str,
+        client_id: str,
+        *,
+        capacity: int,
+        refill_per_second: float,
+    ) -> tuple[bool, float]:
+        if capacity <= 0 or refill_per_second <= 0:
+            raise ValueError("rate limit policy must be positive")
+        stamp = self._clock()
+        key = (category, client_id[:255])
+        with self._lock:
+            cutoff = stamp - self._idle_seconds
+            while self._buckets:
+                oldest_key = next(iter(self._buckets))
+                if self._buckets[oldest_key].updated_at > cutoff:
+                    break
+                self._buckets.popitem(last=False)
+
+            bucket = self._buckets.pop(key, None)
+            if bucket is None:
+                bucket = _RateBucket(float(capacity), stamp)
+            else:
+                elapsed = max(0.0, stamp - bucket.updated_at)
+                bucket.tokens = min(
+                    float(capacity), bucket.tokens + elapsed * refill_per_second
+                )
+                bucket.updated_at = stamp
+
+            allowed = bucket.tokens >= 1.0
+            if allowed:
+                bucket.tokens -= 1.0
+                retry_after = 0.0
+            else:
+                retry_after = (1.0 - bucket.tokens) / refill_per_second
+            self._buckets[key] = bucket
+            while len(self._buckets) > self._max_buckets:
+                self._buckets.popitem(last=False)
+            return allowed, retry_after
+
+
+_PUBLIC_RATE_LIMITS: dict[str, tuple[int, float]] = {
+    # Category: (short burst capacity, sustained tokens per second).
+    "bootstrap": (5, 5 / 60),
+    "device_recovery": (10, 10 / 60),
+    "session_challenge": (30, 120 / 60),
+    "public_enrollment": (15, 30 / 60),
+}
+_PUBLIC_AUTH_MAX_BODY_BYTES = 64 * 1024
+
+
+def _public_rate_limit_category(path: str) -> str | None:
+    if path == "/api/v1/auth/bootstrap":
+        return "bootstrap"
+    if path in {
+        "/api/v1/auth/device-recovery/challenges",
+        "/api/v1/auth/device-recovery/complete",
+    }:
+        return "device_recovery"
+    if path in {"/api/v1/auth/challenges", "/api/v1/auth/sessions"}:
+        return "session_challenge"
+    if path in {
+        "/api/v1/auth/enroll",
+        "/api/v1/devices/enroll",
+        "/api/v1/auth/services/enroll",
+        "/api/v1/worker-enrollments/claim",
+        "/api/v1/enrollments/claim",
+    }:
+        return "public_enrollment"
+    return None
+
+
+def _declared_content_length(request: Request) -> int | None:
+    raw = request.headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("invalid_content_length") from exc
+    if value < 0:
+        raise ValueError("invalid_content_length")
+    return value
+
+
+async def _cache_bounded_body(request: Request, *, max_bytes: int) -> bool:
+    """Read a small control request once, including chunked request bodies.
+
+    Content-Length is only a fast rejection hint. Counting the ASGI chunks is
+    the authoritative application boundary and prevents a chunked request or
+    a misleading length header from reaching request.body() unbounded later.
+    """
+
+    body = bytearray()
+    total = 0
+    async for chunk in request.stream():
+        chunk_size = len(chunk)
+        if chunk_size > max_bytes - total:
+            return False
+        body.extend(chunk)
+        total += chunk_size
+    # Starlette deliberately uses this cache in Request.body() and in the
+    # wrapped receive channel passed through BaseHTTPMiddleware.
+    request._body = bytes(body)  # type: ignore[attr-defined]
+    return True
+
+
 def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", None) or protocol_new_id("request")
 
@@ -123,7 +268,10 @@ def _error_response(
     task_id: str | None = None,
     attempt_id: str | None = None,
     status_code: int | None = None,
+    retry_after_ms: int | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
+    response_headers = {"X-Request-ID": _request_id(request), **(headers or {})}
     return JSONResponse(
         error_envelope(
             code,
@@ -131,9 +279,10 @@ def _error_response(
             details=details,
             task_id=task_id,
             attempt_id=attempt_id,
+            retry_after_ms=retry_after_ms,
         ),
         status_code=status_code or get_error_spec(code).http_status,
-        headers={"X-Request-ID": _request_id(request)},
+        headers=response_headers,
     )
 
 
@@ -281,6 +430,7 @@ def create_app(
     release_public_base_url: str | None = None,
     serve_release_files: bool | None = None,
     sweep_interval_seconds: float | None = None,
+    max_control_body_bytes: int | None = None,
 ) -> FastAPI:
     """Create an isolated Gateway app.
 
@@ -308,6 +458,14 @@ def create_app(
     )
     if sweep_interval <= 0:
         raise RuntimeError("VGEN_GATEWAY_SWEEP_SECONDS must be positive")
+    control_body_limit = (
+        max_control_body_bytes
+        if max_control_body_bytes is not None
+        else int(os.getenv("VGEN_GATEWAY_MAX_CONTROL_BODY_BYTES", str(16 * 1024**2)))
+    )
+    if control_body_limit <= 0:
+        raise RuntimeError("VGEN_GATEWAY_MAX_CONTROL_BODY_BYTES must be positive")
+    rate_limiter = _TokenBucketRateLimiter()
 
     configured_release_root = release_root or os.getenv("VGEN_RELEASE_ROOT")
     configured_release_public_base_url = release_public_base_url or os.getenv(
@@ -387,6 +545,8 @@ def create_app(
     app.state.artifact_store = artifact_store
     app.state.release_catalog = release_catalog
     app.state.bootstrap_code = configured_bootstrap
+    app.state.control_body_limit = control_body_limit
+    app.state.public_rate_limiter = rate_limiter
 
     def external_ticket(ticket: dict[str, Any], request: Request) -> dict[str, Any]:
         value = dict(ticket)
@@ -823,6 +983,34 @@ def create_app(
     @app.middleware("http")
     async def request_controls(request: Request, call_next):
         request.state.request_id = protocol_new_id("request")
+        method = request.method.upper()
+        rate_category = _public_rate_limit_category(request.url.path)
+        request_body_limit = (
+            min(control_body_limit, _PUBLIC_AUTH_MAX_BODY_BYTES)
+            if rate_category is not None
+            else control_body_limit
+        )
+        is_control_mutation = (
+            method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/v1/")
+            and not request.url.path.startswith("/api/v1/artifacts/transfer/")
+        )
+        if is_control_mutation:
+            try:
+                declared_length = _declared_content_length(request)
+            except ValueError:
+                return _error_response(
+                    ErrorCode.VALIDATION_FAILED,
+                    request,
+                    details={"reason": "invalid_content_length"},
+                    status_code=400,
+                )
+            if declared_length is not None and declared_length > request_body_limit:
+                return _error_response(
+                    ErrorCode.REQUEST_BODY_TOO_LARGE,
+                    request,
+                    details={"max_bytes": request_body_limit},
+                )
         protocol_exempt = (
             request.url.path in {"/healthz", "/api/v1/health", "/docs", "/openapi.json"}
             or request.url.path.startswith("/docs/")
@@ -842,8 +1030,56 @@ def create_app(
                 # or observability systems.
                 details={"supported": ["1"]},
             )
+        if method == "POST" and rate_category is not None:
+            client_id = request.client.host if request.client is not None else "unknown"
+            capacity, refill_per_second = _PUBLIC_RATE_LIMITS[rate_category]
+            allowed, retry_after = rate_limiter.check(
+                rate_category,
+                client_id,
+                capacity=capacity,
+                refill_per_second=refill_per_second,
+            )
+            if not allowed:
+                retry_seconds = max(1, math.ceil(retry_after))
+                return _error_response(
+                    ErrorCode.RATE_LIMITED,
+                    request,
+                    details={"category": rate_category},
+                    retry_after_ms=retry_seconds * 1000,
+                    headers={
+                        "Retry-After": str(retry_seconds),
+                        "Cache-Control": "no-store",
+                    },
+                )
+        if is_control_mutation and rate_category is None:
+            # Protected routes reject a missing/expired bearer before reading
+            # as much as the 16 MiB legal key-rotation body. Public enrollment
+            # routes are separately capped at 64 KiB and rate limited above.
+            authorization = request.headers.get("Authorization", "")
+            if not authorization.lower().startswith("bearer "):
+                return _error_response(ErrorCode.AUTHENTICATION_REQUIRED, request)
+            pre_authenticated_session = db.resolve_session(authorization[7:].strip())
+            if pre_authenticated_session is None:
+                return _error_response(ErrorCode.SESSION_EXPIRED, request)
+            try:
+                validate_session_subject(pre_authenticated_session)
+            except VGenError as exc:
+                return _error_response(
+                    exc.code,
+                    request,
+                    details=exc.details,
+                    retry_after_ms=exc.retry_after_ms,
+                )
+            request.state.pre_authenticated_session = pre_authenticated_session
+        if is_control_mutation and not await _cache_bounded_body(
+            request, max_bytes=request_body_limit
+        ):
+            return _error_response(
+                ErrorCode.REQUEST_BODY_TOO_LARGE,
+                request,
+                details={"max_bytes": request_body_limit},
+            )
         idempotency_key = request.headers.get("Idempotency-Key")
-        method = request.method.upper()
         cache_mode = idempotency_cache_mode(request.url.path)
         safe_to_cache = cache_mode != "disabled"
         record = None
@@ -865,7 +1101,9 @@ def create_app(
                 authorization = request.headers.get("Authorization", "")
                 if not authorization.lower().startswith("bearer "):
                     return _error_response(ErrorCode.AUTHENTICATION_REQUIRED, request)
-                session = db.resolve_session(authorization[7:].strip())
+                session = getattr(request.state, "pre_authenticated_session", None)
+                if session is None:
+                    session = db.resolve_session(authorization[7:].strip())
                 if session is None:
                     return _error_response(ErrorCode.SESSION_EXPIRED, request)
                 try:
@@ -1009,7 +1247,9 @@ def create_app(
     ) -> Principal:
         if credentials is None:
             raise VGenError(ErrorCode.AUTHENTICATION_REQUIRED, request_id=_request_id(request))
-        row = db.resolve_session(credentials.credentials)
+        row = getattr(request.state, "pre_authenticated_session", None)
+        if row is None:
+            row = db.resolve_session(credentials.credentials)
         if row is None:
             raise VGenError(ErrorCode.SESSION_EXPIRED, request_id=_request_id(request))
         validate_session_subject(row)
@@ -1326,6 +1566,20 @@ def create_app(
         if not secrets.compare_digest(verified.artifact_id, artifact_id):
             raise VGenError(ErrorCode.PERMISSION_DENIED)
         if request.method == "PUT":
+            try:
+                declared_length = _declared_content_length(request)
+            except ValueError as exc:
+                raise VGenError(
+                    ErrorCode.VALIDATION_FAILED,
+                    request_id=_request_id(request),
+                    details={"reason": "invalid_content_length"},
+                ) from exc
+            if declared_length is not None and declared_length > verified.max_bytes:
+                raise VGenError(
+                    ErrorCode.REQUEST_BODY_TOO_LARGE,
+                    request_id=_request_id(request),
+                    details={"max_bytes": verified.max_bytes},
+                )
             if not db.claim_transfer_ticket(ticket, verified.artifact_id):
                 raise VGenError(ErrorCode.REPLAY_DETECTED)
             size, digest = await artifact_store.put_chunks(

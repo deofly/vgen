@@ -8,6 +8,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "examples" / "windows-worker" / "setup-worker.ps1"
+ENROLLMENT_SCRIPT = ROOT / "examples" / "windows-worker" / "enroll-worker.ps1"
+WORKER_LAUNCHER = ROOT / "examples" / "windows-worker" / "start-worker.cmd"
 USER_GUIDE = ROOT / "docs" / "user-guide.md"
 DEVELOPER_GUIDE = ROOT / "docs" / "developer-guide.md"
 MANIFEST = ROOT / "workflows" / "vgen" / "minimax-h3-8step" / "1.0.0" / "manifest.yaml"
@@ -736,6 +738,52 @@ def test_windows_worker_rejects_broad_credential_acl() -> None:
         "[System.IO.File]::ReadAllText($credentialsPath)"
     )
     assert "不需要用户先运行 `icacls`" in guide
+
+
+def test_windows_worker_reinstall_verifies_identity_and_stages_safe_reenrollment() -> None:
+    enrollment = ENROLLMENT_SCRIPT.read_text(encoding="utf-8")
+    launcher = WORKER_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "[switch]$Reenroll" in enrollment
+    assert "--check-existing" in enrollment
+    assert "--reenroll-existing" in enrollment
+    assert "$credentialCheckExit -eq 10" in enrollment
+    assert "--replace-existing" in enrollment
+    assert '".worker-reenrollment-identity.json"' in enrollment
+    assert ".worker-reenrollment-$([Guid]" not in enrollment
+    assert "current credential remains active until replacement succeeds" in enrollment
+    assert "pending replacement identity were kept unchanged" in enrollment
+    assert 'Join-Path $PSScriptRoot "start-worker.cmd"' in enrollment
+    assert '" -Reenroll' in enrollment
+    assert "Remove-Item -LiteralPath $credentialPath" not in enrollment
+    assert "Move-Item -LiteralPath $credentialPath" not in enrollment
+    assert enrollment.index("--check-existing") < enrollment.index("$setupArguments")
+    assert 'if /I not "%~1"=="-Reenroll"' in launcher
+    assert 'if not "%~2"==""' in launcher
+    assert "%*" not in launcher
+    assert '"%~dp0enroll-worker.ps1" %VGEN_WORKER_REENROLL_ARG%' in launcher
+
+
+def test_windows_worker_enrollment_secures_acl_before_any_gateway_identity_request() -> None:
+    enrollment = ENROLLMENT_SCRIPT.read_text(encoding="utf-8")
+    acl = enrollment.split("function Assert-CredentialAcl", 1)[1].split(
+        "function Assert-ClosedBundleDirectory", 1
+    )[0]
+
+    assert "$acl.AreAccessRulesProtected" in acl
+    assert "$acl.GetAccessRules(" in acl
+    assert '"S-1-5-18"' in acl
+    assert '"S-1-5-32-544"' in acl
+    assert "FileSystemRights]::FullControl" in acl
+    assert "grants access to an unapproved principal" in acl
+    assert '& icacls.exe $Path /setowner "*$currentSid"' in acl
+    assert '& icacls.exe $Path /inheritance:r /grant:r "*$($currentSid):F"' in acl
+    assert enrollment.index(
+        '$credentialPath = Assert-RegularLocalFile $credentialPath "Existing Worker credential"'
+    ) < enrollment.index("Protect-CredentialAcl $credentialPath")
+    assert enrollment.index("Protect-CredentialAcl $credentialPath") < enrollment.index(
+        "--check-existing"
+    )
 
 
 def test_windows_worker_check_only_never_changes_acl_or_installs_prerequisites() -> None:

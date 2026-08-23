@@ -591,6 +591,10 @@ class GatewayRepository:
             expired_leases = self._expire_leases(conn, stamp)
             expired_maintenance_jobs = self._expire_maintenance_jobs(conn, stamp)
             queued_commands = self._ensure_rekey_commands(conn, stamp)
+        # Keep attacker-influenced authentication/replay tables bounded outside
+        # the scheduling transaction. Expired maintenance leases above clear
+        # their session foreign keys before this cleanup attempts deletion.
+        self.db.prune_expired_security_state(stamp=stamp)
         return {
             "expired_leases": expired_leases,
             "expired_maintenance_jobs": expired_maintenance_jobs,

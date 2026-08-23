@@ -36,14 +36,19 @@ from vgen.crypto import (
     verify_message,
 )
 from vgen.worker.credentials import (
+    WorkerCredentialError,
     WorkerCredentials,
     WorkerIdentity,
     WorkerIdentityStore,
+    load_worker_credentials_file,
+    normalize_worker_gateway_origin,
+    replace_worker_credentials_file_with_backup,
     save_worker_credentials_file,
+    validate_worker_private_file,
 )
 
 from .auth import login_worker_session
-from .client import GatewayClient
+from .client import GatewayClient, VgenClientError
 from .profile import GatewayProfile
 from .workspace_authorities import PinnedInvite, parse_pinned_invite_uri
 
@@ -62,15 +67,158 @@ class WorkerEnrollmentResult:
     enrollment_id: str
     credentials_path: Path
     state: str
+    previous_credentials_archive: Path | None = None
 
-    def public_dict(self) -> dict[str, str]:
+    def public_dict(self) -> dict[str, str | None]:
         return {
             "worker_id": self.worker_id,
             "enrollment_id": self.enrollment_id,
             "state": self.state,
             "credentials": str(self.credentials_path),
+            "previous_credentials_archive": (
+                str(self.previous_credentials_archive)
+                if self.previous_credentials_archive is not None
+                else None
+            ),
             "next": "Continue with the reviewed Windows Worker setup.",
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ExistingWorkerCredentialResult:
+    status: str
+    worker_id: str
+    credentials_path: Path
+    gateway_url: str
+
+    def public_dict(self) -> dict[str, str | None]:
+        return {
+            "status": self.status,
+            "worker_id": self.worker_id,
+            "credentials": str(self.credentials_path),
+            "gateway_url": self.gateway_url,
+        }
+
+
+def prepare_existing_worker_credentials(
+    *,
+    gateway_url: str,
+    credentials_file: Path,
+    force_reenroll: bool = False,
+    session_login: Callable[[GatewayProfile, str, Any], Mapping[str, object]] | None = None,
+) -> ExistingWorkerCredentialResult:
+    """Verify/refresh an existing credential or authorize staged re-enrollment.
+
+    Automatic re-enrollment is deliberately narrow: the credential must already be
+    pinned to this exact Gateway origin and that Gateway must explicitly reject
+    a new key-possession login. Transport failures, 5xx responses, malformed
+    responses, key mismatches, legacy unpinned credentials, and origin changes
+    all retain the credential and stop setup. Even when re-enrollment is
+    authorized, the canonical credential remains untouched until a new Invite,
+    approval, and Worker session have all completed.
+    """
+
+    target = credentials_file.expanduser()
+    target_origin = normalize_worker_gateway_origin(gateway_url)
+    if force_reenroll:
+        try:
+            validate_worker_private_file(target)
+        except WorkerCredentialError as exc:
+            raise WorkerEnrollmentError(
+                "Existing Worker credential storage is unsafe and was kept unchanged. "
+                "Repair its path or access rules before re-enrollment."
+            ) from exc
+        try:
+            credentials = load_worker_credentials_file(target)
+            worker_id = credentials.worker_id
+        except WorkerCredentialError:
+            worker_id = "unknown"
+        return ExistingWorkerCredentialResult(
+            status="reenrollment_required",
+            worker_id=worker_id,
+            credentials_path=target.resolve(),
+            gateway_url=target_origin,
+        )
+
+    try:
+        credentials = load_worker_credentials_file(target)
+    except WorkerCredentialError as exc:
+        raise WorkerEnrollmentError(
+            "Existing Worker credentials are invalid and were kept unchanged. Confirm the "
+            "intended Gateway before using -Reenroll."
+        ) from exc
+
+    if credentials.gateway_url is not None and credentials.gateway_url != target_origin:
+        raise WorkerEnrollmentError(
+            "Existing Worker credentials are bound to a different Gateway and were kept "
+            "unchanged. Confirm the intended Gateway before using -Reenroll."
+        )
+
+    profile = GatewayProfile(name="worker-credential-check", endpoint=target_origin)
+    login = session_login or login_worker_session
+    try:
+        session = login(profile, credentials.worker_id, credentials.device_keys)
+    except VgenClientError as exc:
+        if (
+            exc.code == 700001
+            or exc.retry_action == "later"
+            or exc.status_code is None
+            or exc.status_code == 429
+            or exc.status_code >= 500
+        ):
+            raise WorkerEnrollmentError(
+                "The Gateway could not verify the existing Worker right now. Credentials "
+                "were kept unchanged; wait for Retry-After if shown, then retry after the "
+                "Gateway or network recovers."
+            ) from None
+        if exc.code == 100001 and exc.status_code == 401:
+            if credentials.gateway_url == target_origin:
+                return ExistingWorkerCredentialResult(
+                    status="reenrollment_required",
+                    worker_id=credentials.worker_id,
+                    credentials_path=target.resolve(),
+                    gateway_url=target_origin,
+                )
+            raise WorkerEnrollmentError(
+                "This older Worker credential is not accepted by the selected Gateway. "
+                "Because it is not pinned to that Gateway, it was kept unchanged. Confirm "
+                "the intended Gateway before using -Reenroll."
+            ) from None
+        raise WorkerEnrollmentError(
+            "The Gateway did not confirm that this Worker was removed. Credentials were "
+            "kept unchanged; confirm the intended Gateway before using -Reenroll."
+        ) from None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkerEnrollmentError(
+            "The Gateway returned an invalid Worker login response. Credentials were kept "
+            "unchanged; retry after the Gateway is repaired."
+        ) from exc
+
+    token = session.get("token")
+    returned_worker_id = session.get("worker_id", credentials.worker_id)
+    if (
+        not isinstance(token, str)
+        or not token
+        or returned_worker_id != credentials.worker_id
+    ):
+        raise WorkerEnrollmentError(
+            "The Gateway returned an invalid Worker login response. Credentials were kept "
+            "unchanged; retry after the Gateway is repaired."
+        )
+    refreshed = WorkerCredentials(
+        worker_id=credentials.worker_id,
+        device_keys=credentials.device_keys,
+        session_token=token,
+        owner_root_signing_public_key=credentials.owner_root_signing_public_key,
+        gateway_url=target_origin,
+    )
+    save_worker_credentials_file(target, refreshed, overwrite=True)
+    return ExistingWorkerCredentialResult(
+        status="reused",
+        worker_id=credentials.worker_id,
+        credentials_path=target.resolve(),
+        gateway_url=target_origin,
+    )
 
 
 def worker_claim_payload(
@@ -312,6 +460,7 @@ def enroll_worker_from_invite(
     interval: float = 2.0,
     timeout: float = 1800.0,
     overwrite_identity: bool = False,
+    replace_existing_credentials: bool = False,
     transport: Any | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> WorkerEnrollmentResult:
@@ -320,8 +469,20 @@ def enroll_worker_from_invite(
     if interval <= 0 or timeout <= 0:
         raise WorkerEnrollmentError("Enrollment interval and timeout must be positive.")
     credentials_target = credentials_file.expanduser()
-    if credentials_target.exists() or credentials_target.is_symlink():
+    credentials_exist = credentials_target.exists() or credentials_target.is_symlink()
+    if credentials_exist and not replace_existing_credentials:
         raise WorkerEnrollmentError("Worker credentials already exist; refusing to replace them.")
+    if replace_existing_credentials and not credentials_exist:
+        raise WorkerEnrollmentError(
+            "Existing Worker credentials disappeared; refusing staged re-enrollment."
+        )
+    if replace_existing_credentials:
+        try:
+            validate_worker_private_file(credentials_target)
+        except WorkerCredentialError as exc:
+            raise WorkerEnrollmentError(
+                "Existing Worker credential storage is unsafe; refusing staged re-enrollment."
+            ) from exc
     identity_store = WorkerIdentityStore()
     identity_target = identity_file.expanduser()
     if identity_target.exists() or identity_target.is_symlink():
@@ -413,13 +574,22 @@ def enroll_worker_from_invite(
         device_keys=identity.device_keys,
         session_token=str(session["token"]),
         owner_root_signing_public_key=invite.authority.root_signing_public_key,
+        gateway_url=gateway_url,
     )
-    save_worker_credentials_file(credentials_target, credentials)
+    previous_credentials_archive = None
+    if replace_existing_credentials:
+        previous_credentials_archive = replace_worker_credentials_file_with_backup(
+            credentials_target,
+            credentials,
+        )
+    else:
+        save_worker_credentials_file(credentials_target, credentials)
     return WorkerEnrollmentResult(
         worker_id=worker_id,
         enrollment_id=enrollment_id,
         credentials_path=credentials_target.resolve(),
         state=state,
+        previous_credentials_archive=previous_credentials_archive,
     )
 
 
@@ -429,20 +599,34 @@ def public_claim_digest(claim: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(dict(claim))).hexdigest()
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     """Private Windows-installer entrypoint; intentionally absent from `vgen --help`."""
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--gateway-url", required=True)
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--identity-file", type=Path, required=True)
+    parser.add_argument("--name")
+    parser.add_argument("--identity-file", type=Path)
     parser.add_argument("--credentials-file", type=Path, required=True)
+    existing = parser.add_mutually_exclusive_group()
+    existing.add_argument("--check-existing", action="store_true")
+    existing.add_argument("--reenroll-existing", action="store_true")
+    parser.add_argument("--replace-existing", action="store_true")
     parser.add_argument("--executor", default="comfyui")
     parser.add_argument("--executor-version", default="1.1.0")
     parser.add_argument("--capacity", type=int, default=1)
     parser.add_argument("--interval", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=1800)
     arguments = parser.parse_args(argv)
+    if arguments.check_existing or arguments.reenroll_existing:
+        result = prepare_existing_worker_credentials(
+            gateway_url=arguments.gateway_url,
+            credentials_file=arguments.credentials_file,
+            force_reenroll=arguments.reenroll_existing,
+        )
+        print(json.dumps(result.public_dict(), ensure_ascii=False, sort_keys=True))
+        return 10 if result.status == "reenrollment_required" else 0
+    if not arguments.name or arguments.identity_file is None:
+        raise WorkerEnrollmentError("Worker name and identity file are required for enrollment.")
     if not sys.stdin.isatty():
         raise WorkerEnrollmentError("Worker enrollment requires an interactive terminal.")
     value = getpass.getpass("Paste the one-time Worker Invite (input hidden): ").strip()
@@ -461,9 +645,18 @@ def main(argv: list[str] | None = None) -> int:
         wait=True,
         interval=arguments.interval,
         timeout=arguments.timeout,
+        replace_existing_credentials=arguments.replace_existing,
     )
     print(json.dumps(result.public_dict(), ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (WorkerCredentialError, WorkerEnrollmentError) as exc:
+        print(f"[vgen] {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

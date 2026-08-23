@@ -23,6 +23,7 @@ from vgen.protocol.ids import new_id as protocol_new_id
 
 SCHEMA_VERSION = 1
 WORKER_ONLINE_WINDOW_SECONDS = 120.0
+TRANSFER_TICKET_REPLAY_RETENTION_SECONDS = 7_200.0
 
 
 def new_id(prefix: str) -> str:
@@ -111,6 +112,8 @@ CREATE TABLE IF NOT EXISTS device_recovery_challenges (
 );
 CREATE INDEX IF NOT EXISTS idx_device_recovery_challenges_subject
     ON device_recovery_challenges(user_id, device_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_recovery_challenges_expiry
+    ON device_recovery_challenges(expires_at);
 
 CREATE TABLE IF NOT EXISTS auth_challenges (
     id TEXT PRIMARY KEY,
@@ -122,6 +125,7 @@ CREATE TABLE IF NOT EXISTS auth_challenges (
     consumed_at REAL,
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_expiry ON auth_challenges(expires_at);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -136,6 +140,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash, expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS services (
     id TEXT PRIMARY KEY,
@@ -163,6 +168,8 @@ CREATE TABLE IF NOT EXISTS service_auth_challenges (
     consumed_at REAL,
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_service_auth_challenges_expiry
+    ON service_auth_challenges(expires_at);
 
 CREATE TABLE IF NOT EXISTS request_nonces (
     principal_type TEXT NOT NULL,
@@ -534,12 +541,14 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     created_at REAL NOT NULL,
     PRIMARY KEY(principal_key, method, path, idempotency_key)
 );
+CREATE INDEX IF NOT EXISTS idx_idempotency_records_expiry ON idempotency_records(expires_at);
 
 CREATE TABLE IF NOT EXISTS transfer_ticket_uses (
     ticket_hash TEXT PRIMARY KEY,
     artifact_id TEXT NOT NULL,
     used_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_transfer_ticket_uses_age ON transfer_ticket_uses(used_at);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY,
@@ -850,6 +859,66 @@ class GatewayDatabase:
             except sqlite3.IntegrityError:
                 return False
             return True
+
+    def prune_expired_security_state(self, *, stamp: float | None = None) -> dict[str, int]:
+        """Bound short-lived authentication and replay-protection tables.
+
+        Transfer-ticket uses remain longer than the maximum one-hour ticket
+        lifetime before deletion. Expired sessions referenced by an active
+        maintenance lease are retained until that lease is fenced or closed,
+        preserving the existing foreign-key and fencing semantics.
+        """
+
+        cutoff = now() if stamp is None else stamp
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                """UPDATE worker_maintenance_jobs SET lease_session_id=NULL
+                   WHERE state IN ('succeeded','failed','cancelled','expired')
+                     AND lease_session_id IN (
+                       SELECT id FROM sessions
+                       WHERE expires_at<=?
+                     )""",
+                (cutoff,),
+            )
+            statements = {
+                "device_recovery_challenges": (
+                    "DELETE FROM device_recovery_challenges WHERE expires_at<=?",
+                    (cutoff,),
+                ),
+                "auth_challenges": (
+                    "DELETE FROM auth_challenges WHERE expires_at<=?",
+                    (cutoff,),
+                ),
+                "service_auth_challenges": (
+                    "DELETE FROM service_auth_challenges WHERE expires_at<=?",
+                    (cutoff,),
+                ),
+                "request_nonces": (
+                    "DELETE FROM request_nonces WHERE expires_at<=?",
+                    (cutoff,),
+                ),
+                "idempotency_records": (
+                    "DELETE FROM idempotency_records WHERE expires_at<=?",
+                    (cutoff,),
+                ),
+                "sessions": (
+                    """DELETE FROM sessions
+                       WHERE expires_at<=?
+                         AND NOT EXISTS (
+                           SELECT 1 FROM worker_maintenance_jobs
+                           WHERE lease_session_id=sessions.id
+                         )""",
+                    (cutoff,),
+                ),
+                "transfer_ticket_uses": (
+                    "DELETE FROM transfer_ticket_uses WHERE used_at<=?",
+                    (cutoff - TRANSFER_TICKET_REPLAY_RETENTION_SECONDS,),
+                ),
+            }
+            deleted: dict[str, int] = {}
+            for name, (sql, values) in statements.items():
+                deleted[name] = max(0, conn.execute(sql, values).rowcount)
+        return deleted
 
     def create_challenge(
         self, principal_type: str, principal_id: str, ttl_seconds: int = 120

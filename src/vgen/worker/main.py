@@ -39,6 +39,7 @@ from .credentials import (
     WorkerIdentityStore,
     load_worker_credentials_file,
     load_worker_credentials_keyring,
+    normalize_worker_gateway_origin,
 )
 from .gateway import GatewayV1Client
 from .maintenance import MaintenanceOutcome, WorkerMaintenanceController
@@ -543,6 +544,16 @@ def run(
         if arguments.announce and gateway_url is None:
             raise WorkerConfigurationError("--announce requires --gateway-url.")
         credentials = _runtime_credentials(arguments)
+        if gateway_url is not None and credentials is not None and credentials.gateway_url:
+            try:
+                selected_gateway = normalize_worker_gateway_origin(gateway_url)
+            except WorkerCredentialError as exc:
+                raise WorkerConfigurationError(str(exc)) from exc
+            if selected_gateway != credentials.gateway_url:
+                raise WorkerConfigurationError(
+                    "Worker credentials are bound to a different Gateway; refusing to start. "
+                    "Use the reviewed Worker re-enrollment flow instead."
+                )
         if arguments.announce and credentials is None:
             raise WorkerConfigurationError(
                 "--announce requires a Worker identity and short-lived session."

@@ -13,6 +13,11 @@ from vgen.worker import (
     WorkerIdentityStore,
 )
 from vgen.worker import credentials as credential_module
+from vgen.worker.credentials import (
+    load_worker_credentials_file,
+    replace_worker_credentials_file_with_backup,
+    save_worker_credentials_file,
+)
 
 
 def test_worker_identity_file_is_0600_and_registration_is_public(tmp_path: Path) -> None:
@@ -57,6 +62,71 @@ def test_worker_credentials_round_trip_optional_owner_maintenance_trust_anchor()
     assert WorkerCredentials.from_bytes(legacy.to_bytes()).owner_root_signing_public_key is None
 
 
+def test_worker_credentials_round_trip_canonical_gateway_origin() -> None:
+    value = WorkerCredentials(
+        "wrk_test",
+        DeviceKeys.generate(),
+        "session",
+        gateway_url="https://GATEWAY.example:443/",
+    )
+    restored = WorkerCredentials.from_bytes(value.to_bytes())
+    assert restored.gateway_url == "https://gateway.example"
+
+    with pytest.raises(WorkerCredentialError, match="must use HTTPS"):
+        WorkerCredentials(
+            "wrk_test",
+            DeviceKeys.generate(),
+            "session",
+            gateway_url="http://gateway.example",
+        )
+
+
+def test_new_worker_credentials_replace_canonical_atomically_and_keep_backup(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker-credentials.json"
+    old = WorkerCredentials(
+        "wrk_old",
+        DeviceKeys.generate(),
+        "old-session",
+        gateway_url="https://gateway.example",
+    )
+    new = WorkerCredentials(
+        "wrk_new",
+        DeviceKeys.generate(),
+        "new-session",
+        gateway_url="https://gateway.example",
+    )
+    save_worker_credentials_file(path, old)
+    old_bytes = path.read_bytes()
+
+    backup = replace_worker_credentials_file_with_backup(path, new)
+
+    assert load_worker_credentials_file(path).worker_id == "wrk_new"
+    assert backup.read_bytes() == old_bytes
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert backup.stat().st_mode & 0o777 == 0o600
+
+
+def test_failed_atomic_worker_credential_promotion_keeps_canonical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "worker-credentials.json"
+    old = WorkerCredentials("wrk_old", DeviceKeys.generate(), "old-session")
+    new = WorkerCredentials("wrk_new", DeviceKeys.generate(), "new-session")
+    save_worker_credentials_file(path, old)
+    old_bytes = path.read_bytes()
+
+    monkeypatch.setattr(
+        credential_module.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    with pytest.raises(WorkerCredentialError, match="could not be activated"):
+        replace_worker_credentials_file_with_backup(path, new)
+    assert path.read_bytes() == old_bytes
+
+
 def test_windows_private_acl_uses_sid_and_fails_closed_on_icacls_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -72,8 +142,11 @@ def test_windows_private_acl_uses_sid_and_fails_closed_on_icacls_error(
     monkeypatch.setattr(credential_module.subprocess, "run", succeeded)
     credential_module._protect_windows_private_file(tmp_path / "credential.json")
     assert calls[1][0] == "icacls.exe"
-    assert "*S-1-5-21-123:(F)" in calls[1]
-    assert "*S-1-5-18:(F)" in calls[1]
+    assert "/setowner" in calls[1]
+    assert "*S-1-5-21-123" in calls[1]
+    assert "*S-1-5-21-123:(F)" in calls[2]
+    assert "*S-1-5-18:(F)" in calls[2]
+    assert "*S-1-5-32-544:(F)" in calls[2]
 
     def failed(command: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
@@ -84,3 +157,28 @@ def test_windows_private_acl_uses_sid_and_fails_closed_on_icacls_error(
     monkeypatch.setattr(credential_module.subprocess, "run", failed)
     with pytest.raises(WorkerCredentialError, match="access rules"):
         credential_module._protect_windows_private_file(tmp_path / "credential.json")
+
+
+def test_windows_credential_promotion_hardens_canonical_and_staged_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "worker-credentials.json"
+    old = WorkerCredentials("wrk_old", DeviceKeys.generate(), "old-session")
+    new = WorkerCredentials("wrk_new", DeviceKeys.generate(), "new-session")
+    save_worker_credentials_file(path, old)
+    old_bytes = path.read_bytes()
+    protected: list[str] = []
+
+    monkeypatch.setattr(credential_module.os, "name", "nt")
+    monkeypatch.setattr(
+        credential_module,
+        "_protect_windows_private_file",
+        lambda candidate: protected.append(str(candidate)),
+    )
+
+    backup = replace_worker_credentials_file_with_backup(path, new)
+
+    assert protected[0] == str(path.resolve())
+    assert ".worker-credentials.json.staged-" in protected[1]
+    assert backup.read_bytes() == old_bytes
+    assert load_worker_credentials_file(path).worker_id == "wrk_new"

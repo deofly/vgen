@@ -112,7 +112,21 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
             in capability_reissuing_operation["x-vgen-idempotency-replay"]
         )
 
-    for status in ("400", "401", "403", "404", "409", "422", "500", "502", "503", "504"):
+    for status in (
+        "400",
+        "401",
+        "403",
+        "404",
+        "409",
+        "413",
+        "422",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "507",
+    ):
         response = protected_write["responses"][status]
         assert response == {"$ref": f"#/components/responses/VGenError{status}"}
         shared_response = schema["components"]["responses"][f"VGenError{status}"]
@@ -120,6 +134,11 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
             "$ref": "#/components/schemas/ErrorEnvelope"
         }
         assert "X-Request-ID" in shared_response["headers"]
+        if status == "429":
+            assert shared_response["headers"]["Retry-After"]["schema"] == {
+                "type": "integer",
+                "minimum": 1,
+            }
 
     error_schema = schema["components"]["schemas"]["VGenError"]
     assert set(error_schema["properties"]["code"]["enum"]) == {int(code) for code in ErrorCode}

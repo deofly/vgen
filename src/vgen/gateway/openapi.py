@@ -41,7 +41,7 @@ _MAINTENANCE_CREATE_PATH = re.compile(
 _MAINTENANCE_CLAIM_PATH = re.compile(
     r"^/api/v1/workers/[^/]+/maintenance-jobs/claim$"
 )
-ERROR_HTTP_STATUSES = (400, 401, 403, 404, 409, 422, 500, 502, 503, 504, 507)
+ERROR_HTTP_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504, 507)
 
 
 def idempotency_cache_mode(path: str) -> str:
@@ -359,14 +359,20 @@ def _normalize_security(operation: dict[str, Any]) -> None:
 
 
 def _error_response(status: int) -> dict[str, Any]:
+    headers: dict[str, Any] = {
+        "X-Request-ID": {
+            "description": "Opaque request correlation identifier.",
+            "schema": {"type": "string"},
+        }
+    }
+    if status == 429:
+        headers["Retry-After"] = {
+            "description": "Seconds until the client should retry the rate-limited request.",
+            "schema": {"type": "integer", "minimum": 1},
+        }
     return {
         "description": f"VGen {status} business error.",
-        "headers": {
-            "X-Request-ID": {
-                "description": "Opaque request correlation identifier.",
-                "schema": {"type": "string"},
-            }
-        },
+        "headers": headers,
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}},
     }
 

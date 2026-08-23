@@ -15,7 +15,8 @@ accepted as a PowerShell parameter or command-line argument.
 param(
     [string]$WorkerName,
     [string]$ComfyUIRoot,
-    [string]$ComfyUIDataRoot
+    [string]$ComfyUIDataRoot,
+    [switch]$Reenroll
 )
 
 Set-StrictMode -Version Latest
@@ -37,6 +38,76 @@ function Assert-RegularLocalFile {
         throw "$Description must not be a symbolic link or reparse point."
     }
     return $item.FullName
+}
+
+function Assert-CredentialAcl {
+    param([string]$Path)
+
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentSid = $identity.User.Value
+        $allowedSids = @(
+            $currentSid,
+            "S-1-5-18",       # NT AUTHORITY\SYSTEM
+            "S-1-5-32-544"   # BUILTIN\Administrators
+        )
+        $acl = Get-Acl -LiteralPath $Path
+        $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        $rules = $acl.GetAccessRules(
+            $true,
+            $true,
+            [System.Security.Principal.SecurityIdentifier]
+        )
+    }
+    catch {
+        throw "Worker credential access rules could not be verified."
+    }
+    if (-not $acl.AreAccessRulesProtected) {
+        throw "Worker credential must disable inherited access rules."
+    }
+    if ($ownerSid -notin $allowedSids) {
+        throw "Worker credential has an unapproved owner."
+    }
+    $currentUserAllowed = $false
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        $ruleSid = $rule.IdentityReference.Value
+        if ($ruleSid -notin $allowedSids) {
+            throw "Worker credential grants access to an unapproved principal."
+        }
+        if ($ruleSid -eq $currentSid -and
+            (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+                [System.Security.AccessControl.FileSystemRights]::FullControl)) {
+            $currentUserAllowed = $true
+        }
+    }
+    if (-not $currentUserAllowed) {
+        throw "Worker credential does not grant full control to the current Windows user."
+    }
+}
+
+function Protect-CredentialAcl {
+    param([string]$Path)
+
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentSid = $identity.User.Value
+    }
+    catch {
+        throw "The current Windows user could not be identified for credential protection."
+    }
+    & icacls.exe $Path /setowner "*$currentSid" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Worker credential owner could not be secured."
+    }
+    & icacls.exe $Path /inheritance:r /grant:r "*$($currentSid):F" `
+        "*S-1-5-18:F" "*S-1-5-32-544:F" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Worker credential access rules could not be secured."
+    }
+    Assert-CredentialAcl $Path
 }
 
 function Assert-ClosedBundleDirectory {
@@ -207,22 +278,53 @@ try {
     $credentialPath = Join-Path $credentialRoot "worker-credentials.json"
     $identityPath = Join-Path $credentialRoot ".worker-enrollment-identity.json"
 
-    if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf)) {
-        $python = Ensure-Python311
-        $bootstrapRoot = Join-Path $env:LOCALAPPDATA "VGen\enrollment\$([string]$config.wheel.version)"
-        $bootstrapPython = Join-Path $bootstrapRoot "Scripts\python.exe"
-        if (-not (Test-Path -LiteralPath $bootstrapPython -PathType Leaf)) {
-            Write-Step "Creating the local Worker enrollment runtime"
-            & $python -I -B -m venv $bootstrapRoot | Out-Host
-            if ($LASTEXITCODE -ne 0) {
-                throw "Python could not create the Worker enrollment runtime."
-            }
-        }
-        Write-Step "Installing the reviewed local VGen wheel"
-        & $bootstrapPython -I -B -m pip install --disable-pip-version-check --upgrade $wheelPath | Out-Host
+    if (Test-Path -LiteralPath $credentialPath -PathType Leaf) {
+        $credentialPath = Assert-RegularLocalFile $credentialPath "Existing Worker credential"
+        Protect-CredentialAcl $credentialPath
+    }
+
+    $python = Ensure-Python311
+    $bootstrapRoot = Join-Path $env:LOCALAPPDATA "VGen\enrollment\$([string]$config.wheel.version)"
+    $bootstrapPython = Join-Path $bootstrapRoot "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $bootstrapPython -PathType Leaf)) {
+        Write-Step "Creating the local Worker enrollment runtime"
+        & $python -I -B -m venv $bootstrapRoot | Out-Host
         if ($LASTEXITCODE -ne 0) {
-            throw "The reviewed VGen wheel could not be installed."
+            throw "Python could not create the Worker enrollment runtime."
         }
+    }
+    Write-Step "Installing the reviewed local VGen wheel"
+    & $bootstrapPython -I -B -m pip install --disable-pip-version-check --upgrade $wheelPath | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "The reviewed VGen wheel could not be installed."
+    }
+
+    $replaceExistingCredential = $false
+    if (Test-Path -LiteralPath $credentialPath -PathType Leaf) {
+        $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
+        $credentialCheckMode = if ($Reenroll) { "--reenroll-existing" } else { "--check-existing" }
+        Write-Step "Verifying the existing Worker identity with this Gateway"
+        & $bootstrapPython -I -B -m vgen.cli.worker_enrollment `
+            --gateway-url $gatewayOrigin `
+            --credentials-file $credentialPath `
+            $credentialCheckMode | Out-Host
+        $credentialCheckExit = $LASTEXITCODE
+        if ($credentialCheckExit -eq 10) {
+            $replaceExistingCredential = $true
+            Write-Step "A new Worker identity is required; the current credential remains active until replacement succeeds"
+        }
+        elseif ($credentialCheckExit -eq 0) {
+            Write-Step "Using the verified, locally protected Worker credentials"
+        }
+        else {
+            $reenrollLauncher = Join-Path $PSScriptRoot "start-worker.cmd"
+            throw "Existing Worker credentials could not be verified and were kept unchanged. Retry after any Gateway or network issue is fixed. If the Workspace owner has confirmed that this Worker was revoked or belongs to another Gateway, run: `"$reenrollLauncher`" -Reenroll"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf) -or
+        $replaceExistingCredential) {
+        $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
         if ([string]::IsNullOrWhiteSpace($WorkerName)) {
             $defaultName = if ([string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
                 "Windows GPU Worker"
@@ -238,25 +340,40 @@ try {
                 $enteredName.Trim()
             }
         }
-        $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
+        $enrollmentIdentityPath = $identityPath
+        if ($replaceExistingCredential) {
+            $enrollmentIdentityPath = Join-Path $credentialRoot `
+                ".worker-reenrollment-identity.json"
+        }
         Write-Host ""
         Write-Host "[vgen] On the Workspace owner's Mac, run: vgen worker add"
         Write-Host "[vgen] Paste the Invite shown by that still-running command below."
         Write-Step "Creating a local Worker identity and claiming the one-time Invite"
-        & $bootstrapPython -I -B -m vgen.cli.worker_enrollment `
-            --gateway-url $gatewayOrigin `
-            --name $WorkerName `
-            --identity-file $identityPath `
-            --credentials-file $credentialPath
+        $enrollmentArguments = @(
+            "-I", "-B", "-m", "vgen.cli.worker_enrollment",
+            "--gateway-url", $gatewayOrigin,
+            "--name", $WorkerName,
+            "--identity-file", $enrollmentIdentityPath,
+            "--credentials-file", $credentialPath
+        )
+        if ($replaceExistingCredential) {
+            $enrollmentArguments += "--replace-existing"
+        }
+        & $bootstrapPython @enrollmentArguments
         if ($LASTEXITCODE -ne 0) {
-            throw "Worker enrollment did not complete. No Invite secret was saved."
+            if ($replaceExistingCredential) {
+                throw "Worker re-enrollment did not complete. Existing Worker credentials and the pending replacement identity were kept unchanged so the same Invite can resume."
+            }
+            throw "Worker enrollment did not complete. No Worker credential was created; the pending enrollment identity was kept so the same Invite can resume."
         }
-        if (Test-Path -LiteralPath $identityPath -PathType Leaf) {
-            Remove-Item -LiteralPath $identityPath -Force
+        if ($replaceExistingCredential -and
+            (Test-Path -LiteralPath $enrollmentIdentityPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $enrollmentIdentityPath -Force
         }
-    }
-    else {
-        Write-Step "Using the existing locally protected Worker credentials"
+        if (-not $replaceExistingCredential -and
+            (Test-Path -LiteralPath $enrollmentIdentityPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $enrollmentIdentityPath -Force
+        }
     }
 
     Write-Step "Enrollment completed; continuing with reviewed Worker setup"

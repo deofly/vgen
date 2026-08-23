@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,11 +10,13 @@ from typing import Any
 import httpx
 import pytest
 
+from vgen.cli.client import VgenClientError
 from vgen.cli.identity_store import DeviceIdentityStore
 from vgen.cli.main import build_parser, dispatch
 from vgen.cli.worker_enrollment import (
     WorkerEnrollmentError,
     enroll_worker_from_invite,
+    prepare_existing_worker_credentials,
     require_pending_worker_claim,
     sign_worker_claim,
     verify_worker_claim,
@@ -246,6 +249,399 @@ def test_claim_refuses_existing_credentials_before_contacting_gateway(tmp_path: 
             credentials_file=credentials,
         )
     assert credentials.read_text(encoding="utf-8") == "do-not-replace"
+
+
+def test_existing_worker_credential_is_refreshed_and_pinned_after_fresh_login(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "worker-credentials.json"
+    original = WorkerCredentials("wrk_existing", WorkerIdentity.generate().device_keys, "old")
+    credentials_path.write_bytes(original.to_bytes())
+    credentials_path.chmod(0o600)
+
+    result = prepare_existing_worker_credentials(
+        gateway_url="https://GATEWAY.example:443/",
+        credentials_file=credentials_path,
+        session_login=lambda _profile, worker_id, _keys: {
+            "token": "fresh",
+            "worker_id": worker_id,
+        },
+    )
+
+    assert result.status == "reused"
+    refreshed = load_worker_credentials_file(credentials_path)
+    assert refreshed.session_token == "fresh"
+    assert refreshed.gateway_url == "https://gateway.example"
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (
+            VgenClientError(
+                700001,
+                "GATEWAY_UNREACHABLE",
+                "offline",
+                retry_action="later",
+            ),
+            "network recovers",
+        ),
+        (
+            VgenClientError(900001, "INTERNAL_ERROR", "broken", status_code=503),
+            "network recovers",
+        ),
+        (
+            VgenClientError(
+                100001,
+                "AUTHENTICATION_REQUIRED",
+                "misclassified upstream failure",
+                status_code=503,
+            ),
+            "network recovers",
+        ),
+        (
+            VgenClientError(
+                600005,
+                "RATE_LIMITED",
+                "slow down",
+                retry_action="later",
+                status_code=429,
+            ),
+            "Retry-After",
+        ),
+        (
+            VgenClientError(
+                100001,
+                "AUTHENTICATION_REQUIRED",
+                "misclassified rate limit",
+                retry_action="later",
+                status_code=429,
+            ),
+            "Retry-After",
+        ),
+        (
+            VgenClientError(100003, "SIGNATURE_INVALID", "invalid", status_code=401),
+            "did not confirm",
+        ),
+    ],
+)
+def test_existing_worker_transient_or_ambiguous_failure_never_changes_credentials(
+    tmp_path: Path,
+    error: VgenClientError,
+    message: str,
+) -> None:
+    credentials_path = tmp_path / "worker-credentials.json"
+    credentials = WorkerCredentials(
+        "wrk_existing",
+        WorkerIdentity.generate().device_keys,
+        "old",
+        gateway_url="https://gateway.example",
+    )
+    credentials_path.write_bytes(credentials.to_bytes())
+    credentials_path.chmod(0o600)
+    before = credentials_path.read_bytes()
+
+    def fail(_profile: object, _worker_id: str, _keys: object) -> Mapping[str, object]:
+        raise error
+
+    with pytest.raises(WorkerEnrollmentError, match=message):
+        prepare_existing_worker_credentials(
+            gateway_url="https://gateway.example",
+            credentials_file=credentials_path,
+            session_login=fail,
+        )
+    assert credentials_path.read_bytes() == before
+
+
+def test_only_same_pinned_gateway_auth_rejection_authorizes_reenrollment(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "worker-credentials.json"
+    credentials = WorkerCredentials(
+        "wrk_existing",
+        WorkerIdentity.generate().device_keys,
+        "old",
+        gateway_url="https://gateway.example",
+    )
+    credentials_path.write_bytes(credentials.to_bytes())
+    credentials_path.chmod(0o600)
+    before = credentials_path.read_bytes()
+
+    def rejected(_profile: object, _worker_id: str, _keys: object) -> Mapping[str, object]:
+        raise VgenClientError(
+            100001,
+            "AUTHENTICATION_REQUIRED",
+            "rejected",
+            status_code=401,
+        )
+
+    result = prepare_existing_worker_credentials(
+        gateway_url="https://gateway.example",
+        credentials_file=credentials_path,
+        session_login=rejected,
+    )
+    assert result.status == "reenrollment_required"
+    assert credentials_path.read_bytes() == before
+
+    with pytest.raises(WorkerEnrollmentError, match="different Gateway"):
+        prepare_existing_worker_credentials(
+            gateway_url="https://other.example",
+            credentials_file=credentials_path,
+            session_login=lambda *_args: pytest.fail("mismatched Gateway must not be contacted"),
+        )
+    assert credentials_path.read_bytes() == before
+
+
+def test_unpinned_auth_rejection_is_ambiguous_but_explicit_reenroll_keeps_canonical(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "worker-credentials.json"
+    credentials = WorkerCredentials("wrk_legacy", WorkerIdentity.generate().device_keys, "old")
+    credentials_path.write_bytes(credentials.to_bytes())
+    credentials_path.chmod(0o600)
+    before = credentials_path.read_bytes()
+
+    def rejected(_profile: object, _worker_id: str, _keys: object) -> Mapping[str, object]:
+        raise VgenClientError(100001, "AUTHENTICATION_REQUIRED", "rejected", status_code=401)
+
+    with pytest.raises(WorkerEnrollmentError, match="older Worker credential"):
+        prepare_existing_worker_credentials(
+            gateway_url="https://gateway.example",
+            credentials_file=credentials_path,
+            session_login=rejected,
+        )
+    result = prepare_existing_worker_credentials(
+        gateway_url="https://gateway.example",
+        credentials_file=credentials_path,
+        force_reenroll=True,
+    )
+    assert result.status == "reenrollment_required"
+    assert credentials_path.read_bytes() == before
+
+
+def test_explicit_reenroll_allows_private_corrupt_content_without_changing_it(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "worker-credentials.json"
+    credentials_path.write_bytes(b"corrupt-but-private\n")
+    credentials_path.chmod(0o600)
+
+    result = prepare_existing_worker_credentials(
+        gateway_url="https://gateway.example",
+        credentials_file=credentials_path,
+        force_reenroll=True,
+    )
+
+    assert result.status == "reenrollment_required"
+    assert result.worker_id == "unknown"
+    assert credentials_path.read_bytes() == b"corrupt-but-private\n"
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "broad_permissions"])
+def test_reenrollment_rejects_unsafe_canonical_before_contacting_gateway(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    actual = tmp_path / "actual-worker-credentials.json"
+    actual.write_bytes(b"private\n")
+    actual.chmod(0o600)
+    credentials_path = tmp_path / "worker-credentials.json"
+    if unsafe_kind == "symlink":
+        credentials_path.symlink_to(actual)
+    else:
+        credentials_path.write_bytes(b"broad\n")
+        credentials_path.chmod(0o644)
+
+    with pytest.raises(WorkerEnrollmentError, match="storage is unsafe"):
+        prepare_existing_worker_credentials(
+            gateway_url="https://gateway.example",
+            credentials_file=credentials_path,
+            force_reenroll=True,
+        )
+
+    _, invite = _invite()
+    identity_path = tmp_path / "must-not-be-created.json"
+    with pytest.raises(WorkerEnrollmentError, match="storage is unsafe"):
+        enroll_worker_from_invite(
+            gateway_url="https://gateway.example",
+            invite=invite,
+            name="Replacement",
+            identity_file=identity_path,
+            credentials_file=credentials_path,
+            replace_existing_credentials=True,
+            transport=httpx.MockTransport(
+                lambda _request: pytest.fail("unsafe credential must fail before transport")
+            ),
+        )
+    assert not identity_path.exists()
+
+
+def test_failed_reenrollment_keeps_canonical_credential_byte_for_byte(tmp_path: Path) -> None:
+    _, invite = _invite()
+    credentials_path = tmp_path / "worker-credentials.json"
+    original = WorkerCredentials(
+        "wrk_revoked",
+        WorkerIdentity.generate().device_keys,
+        "old",
+        gateway_url="https://gateway.example",
+    )
+    credentials_path.write_bytes(original.to_bytes())
+    credentials_path.chmod(0o600)
+    before = credentials_path.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "enrollment": {
+                    "id": invite.invite_id,
+                    "workspace_id": "wsp_shared",
+                    "issuer_user_id": "usr_owner",
+                    "worker_key_id": body["claim"]["worker_key_id"],
+                    "state": "rejected",
+                }
+            },
+        )
+
+    with pytest.raises(WorkerEnrollmentError, match="state 'rejected'"):
+        enroll_worker_from_invite(
+            gateway_url="https://gateway.example",
+            invite=invite,
+            name="Replacement",
+            identity_file=tmp_path / "replacement-identity.json",
+            credentials_file=credentials_path,
+            replace_existing_credentials=True,
+            transport=httpx.MockTransport(handler),
+        )
+    assert credentials_path.read_bytes() == before
+
+
+def test_interrupted_reenrollment_keeps_canonical_and_reuses_pending_identity(
+    tmp_path: Path,
+) -> None:
+    _, invite = _invite()
+    credentials_path = tmp_path / "worker-credentials.json"
+    original = WorkerCredentials(
+        "wrk_revoked",
+        WorkerIdentity.generate().device_keys,
+        "old",
+        gateway_url="https://gateway.example",
+    )
+    credentials_path.write_bytes(original.to_bytes())
+    credentials_path.chmod(0o600)
+    before = credentials_path.read_bytes()
+    identity_path = tmp_path / ".worker-reenrollment-identity.json"
+    claimed_key_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        claimed_key_ids.append(body["claim"]["worker_key_id"])
+        return httpx.Response(
+            200,
+            json={
+                "enrollment": {
+                    "id": invite.invite_id,
+                    "workspace_id": "wsp_shared",
+                    "issuer_user_id": "usr_owner",
+                    "worker_key_id": body["claim"]["worker_key_id"],
+                    "state": "pending",
+                }
+            },
+        )
+
+    for _attempt in range(2):
+        with pytest.raises(WorkerEnrollmentError, match="requires administrator approval"):
+            enroll_worker_from_invite(
+                gateway_url="https://gateway.example",
+                invite=invite,
+                name="Replacement",
+                identity_file=identity_path,
+                credentials_file=credentials_path,
+                replace_existing_credentials=True,
+                wait=False,
+                transport=httpx.MockTransport(handler),
+            )
+        assert credentials_path.read_bytes() == before
+        assert identity_path.is_file()
+
+    assert len(claimed_key_ids) == 2
+    assert claimed_key_ids[0] == claimed_key_ids[1]
+
+
+def test_successful_reenrollment_replaces_canonical_only_after_session_and_keeps_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner, invite = _invite()
+    credentials_path = tmp_path / "worker-credentials.json"
+    original = WorkerCredentials(
+        "wrk_revoked",
+        WorkerIdentity.generate().device_keys,
+        "old",
+        gateway_url="https://gateway.example",
+    )
+    credentials_path.write_bytes(original.to_bytes())
+    credentials_path.chmod(0o600)
+    before = credentials_path.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        claim = body["claim"]
+        certificate = sign_key_manifest(
+            owner.root_keys,
+            {
+                "version": 1,
+                "kind": "vgen-worker-owner-certificate",
+                "owner_root_key_id": owner.root_key_id,
+                "worker_key_id": claim["worker_key_id"],
+                "worker_signing_public_key": claim["signing_public_key"],
+                "worker_encryption_public_key": claim["encryption_public_key"],
+                "issued_at": 1_800_000_000,
+            },
+        )
+        return httpx.Response(
+            200,
+            json={
+                "enrollment": {
+                    "id": invite.invite_id,
+                    "workspace_id": "wsp_shared",
+                    "issuer_user_id": "usr_owner",
+                    "worker_key_id": claim["worker_key_id"],
+                    "state": "active",
+                },
+                "worker": {
+                    "id": "wrk_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "signing_public_key": claim["signing_public_key"],
+                    "encryption_public_key": claim["encryption_public_key"],
+                    "certificate": json.dumps(certificate),
+                },
+            },
+        )
+
+    canonical_during_login: list[bytes] = []
+
+    def login(_profile: object, worker_id: str, _keys: object) -> Mapping[str, object]:
+        canonical_during_login.append(credentials_path.read_bytes())
+        return {"token": "new-session", "worker_id": worker_id}
+
+    monkeypatch.setattr("vgen.cli.worker_enrollment.login_worker_session", login)
+    result = enroll_worker_from_invite(
+        gateway_url="https://gateway.example",
+        invite=invite,
+        name="Replacement",
+        identity_file=tmp_path / "replacement-identity.json",
+        credentials_file=credentials_path,
+        replace_existing_credentials=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert canonical_during_login == [before]
+    assert result.previous_credentials_archive is not None
+    assert result.previous_credentials_archive.read_bytes() == before
+    replacement = load_worker_credentials_file(credentials_path)
+    assert replacement.worker_id == "wrk_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert replacement.session_token == "new-session"
+    assert replacement.gateway_url == "https://gateway.example"
 
 
 def test_worker_add_creates_invite_waits_and_approves_atomically(

@@ -2150,12 +2150,14 @@ function Assert-CredentialAcl {
         if ($ruleSid -notin $allowedSids) {
             throw "WorkerCredentials grants access to an unapproved principal."
         }
-        if ($ruleSid -eq $currentSid) {
+        if ($ruleSid -eq $currentSid -and
+            (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+                [System.Security.AccessControl.FileSystemRights]::FullControl)) {
             $currentUserAllowed = $true
         }
     }
     if (-not $currentUserAllowed) {
-        throw "WorkerCredentials does not grant access to the current Windows user."
+        throw "WorkerCredentials does not grant full control to the current Windows user."
     }
 }
 

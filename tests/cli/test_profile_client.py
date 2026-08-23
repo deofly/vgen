@@ -370,6 +370,7 @@ def test_gateway_profile_accepts_secure_origin(endpoint: str) -> None:
         (400001, "none", 7),
         (500002, "none", 8),
         (600001, "none", 2),
+        (600005, "later", 5),
         (700001, "later", 5),
         (900001, "none", 1),
     ],

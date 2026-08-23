@@ -176,6 +176,24 @@
           }
         }
       },
+      "VGenError413": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        },
+        "description": "VGen 413 business error.",
+        "headers": {
+          "X-Request-ID": {
+            "description": "Opaque request correlation identifier.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "VGenError422": {
         "content": {
           "application/json": {
@@ -186,6 +204,31 @@
         },
         "description": "VGen 422 business error.",
         "headers": {
+          "X-Request-ID": {
+            "description": "Opaque request correlation identifier.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "VGenError429": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        },
+        "description": "VGen 429 business error.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds until the client should retry the rate-limited request.",
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
           "X-Request-ID": {
             "description": "Opaque request correlation identifier.",
             "schema": {
@@ -2427,6 +2470,8 @@
               600001,
               600002,
               600003,
+              600004,
+              600005,
               700001,
               700002,
               700003,
@@ -2517,6 +2562,8 @@
               "VALIDATION_FAILED",
               "IDEMPOTENCY_CONFLICT",
               "PROTOCOL_VERSION_UNSUPPORTED",
+              "REQUEST_BODY_TOO_LARGE",
+              "RATE_LIMITED",
               "GATEWAY_UNREACHABLE",
               "STORAGE_UNAVAILABLE",
               "EXTERNAL_DEPENDENCY_UNAVAILABLE",
@@ -3534,8 +3581,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -3634,8 +3687,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -3748,8 +3807,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -3861,8 +3926,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -3953,8 +4024,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4034,8 +4111,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4115,8 +4198,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4196,8 +4285,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4277,8 +4372,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4358,8 +4459,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4439,8 +4546,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4529,8 +4642,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4643,8 +4762,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4756,8 +4881,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4841,8 +4972,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -4935,8 +5072,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5048,8 +5191,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5170,8 +5319,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5263,8 +5418,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5355,8 +5516,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5456,8 +5623,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5570,8 +5743,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5673,8 +5852,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5748,8 +5933,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5826,8 +6017,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -5931,8 +6128,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6044,8 +6247,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6147,8 +6356,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6233,8 +6448,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6306,8 +6527,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6415,8 +6642,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6506,8 +6739,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6611,8 +6850,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6703,8 +6948,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6798,8 +7049,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -6911,8 +7168,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7002,8 +7265,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7107,8 +7376,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7210,8 +7485,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7301,8 +7582,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7406,8 +7693,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7498,8 +7791,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7587,8 +7886,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7710,8 +8015,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7811,8 +8122,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -7905,8 +8222,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8018,8 +8341,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8127,8 +8456,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8241,8 +8576,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8347,8 +8688,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8448,8 +8795,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8571,8 +8924,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8693,8 +9052,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8806,8 +9171,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -8919,8 +9290,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9032,8 +9409,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9135,8 +9518,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9220,8 +9609,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9314,8 +9709,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9420,8 +9821,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9522,8 +9929,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9624,8 +10037,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9738,8 +10157,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9864,8 +10289,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -9965,8 +10396,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10048,8 +10485,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10153,8 +10596,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10247,8 +10696,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10350,8 +10805,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10463,8 +10924,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10563,8 +11030,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10661,8 +11134,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10775,8 +11254,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10869,8 +11354,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -10971,8 +11462,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
@@ -11047,8 +11544,14 @@
           "409": {
             "$ref": "#/components/responses/VGenError409"
           },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
           "422": {
             "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
           },
           "500": {
             "$ref": "#/components/responses/VGenError500"
