@@ -2,22 +2,17 @@
 
 # VGen
 
-VGen 是一个开源 GPU 工作流控制面，由公网 Gateway、Mac CLI/Home Broker 和远程 Worker
-组成。任务内容和媒体端到端加密；Gateway 负责身份、准入、调度、租约、审计和用量，不保存
-业务明文或解密私钥。
+VGen 是一个 GPU 工作流平台，由 Gateway、Broker 和远程 Worker 共同运行工作流。它帮助团队
+共享 GPU 资源、执行视频生成任务，并让任务内容和媒体始终保持端到端加密。
 
 ## 功能
 
-- 在多个 User、Workspace 和 Pool 之间共享 GPU Worker。
-- Worker 与 Broker 可运行在不同机器和网络中。
-- 按 allocation、容量、lease 和 fencing 安全调度任务。
-- 通过内置 ComfyUI Executor 执行文生视频、首帧图生视频和首尾帧视频任务。
-- CLI、Worker 与私有 OSS 使用短期凭据直接传输加密任务媒体。
-- 由 Mac Broker 安装固定版本的工作流模型，并远程更新或回滚 Windows Worker；首次安装完成后
-  无需到 Windows 电脑旁操作。
-- Mac CLI/Home Broker 支持校验、原子升级和失败回滚。
-- Gateway API 与公开安装包使用独立域名。
-- 为每个 Attempt 记录输出视频时长和生成耗时，为后续按时长计算 `billing_token` 预留扩展点。
+- 在多个用户、Workspace 和 Pool 之间共享 GPU 资源。
+- 通过 Broker 控制远程 GPU Worker 执行工作流。
+- 使用 ComfyUI 执行文生视频、首帧图生视频和首尾帧视频任务。
+- 在客户端和 Worker 之间安全传输任务媒体。
+- 安装工作流模型，并远程管理 Worker 更新。
+- 按资源容量可靠地调度和执行任务。
 
 ## 环境依赖
 
@@ -26,14 +21,8 @@ VGen 是一个开源 GPU 工作流控制面，由公网 Gateway、Mac CLI/Home B
 - Git
 - Docker 与 Docker Compose
 
-完整 GPU 环境需要：
-
-- ECS：Python 3.11+、Nginx、systemd、HTTPS、私有 OSS 和 STS；
-- Mac：Python 3.11+，用于 CLI/Home Broker；
-- Windows GPU 电脑：PowerShell 5.1+、ComfyUI 0.30.0+ 和工作流所需模型。
-
-Windows Worker 当前在前台 PowerShell 窗口中运行。Gateway 内部端口和 ComfyUI 必须保持
-私有，只对外开放 Gateway HTTPS 地址。
+完整 GPU 环境需要 Python 3.11+、支持的 GPU 运行时（例如 ComfyUI）以及工作流所需模型。
+部署和 Worker 配置请参考[用户手册](docs/zh-CN/user-guide.md)。
 
 ## 快速上手
 
@@ -56,8 +45,8 @@ docker compose -f examples/docker-compose.yml \
 
 该 Compose 配置只适合本地预览，不能作为生产部署模板。
 
-生成真实视频前，请先按[用户手册](docs/zh-CN/user-guide.md)完成 Gateway、Mac、Windows
-Worker、ComfyUI 和模型配置，然后运行：
+生成真实视频前，请先按[用户手册](docs/zh-CN/user-guide.md)完成 Gateway、Broker、Worker、
+ComfyUI 和模型配置，然后运行：
 
 ```bash
 vgen gateway health
@@ -86,17 +75,21 @@ python tools/check_public_repository.py
 提交 credential、恢复材料、本地数据库、生成的发行物或机器专用配置。社区协作约定见
 [行为准则](CODE_OF_CONDUCT.md)。
 
-## 协议
+## API
 
-机器可读的 API 契约位于 [`schemas/openapi-v1.json`](schemas/openapi-v1.json)。公共接口使用
-`/api/v1`，不支持旧 shared-token 路由。已经发布的六位业务错误码是永久兼容标识。
+机器可读的 API 契约位于 [`schemas/openapi-v1.json`](schemas/openapi-v1.json)。公共 API 使用
+`/api/v1`。
+
+独立的 [Python 和 Java SDK](sdks/README.zh-CN.md)提供 API Service 凭据、请求签名和端到端加密
+能力，不需要导入 CLI 内部模块。
 
 ## 其他重要文档
 
-- [用户手册](docs/zh-CN/user-guide.md)：Gateway 部署、Mac 接入、Windows Worker、模型安装、
+- [用户手册](docs/zh-CN/user-guide.md)：Gateway 部署、Broker 接入、Worker、模型安装、
   更新、真实任务和故障处理。
 - [开发与发布手册](docs/zh-CN/developer-guide.md)：架构、安全、协议、开发、测试、构建、
   发布、迁移和扩展规范。
+- [SDK 兼容性协议](docs/zh-CN/sdk-compatibility.md)：凭据、签名、加密和跨语言兼容规则。
 - [安全策略](SECURITY.md)：支持范围和私密漏洞报告方式。
 - [Apache-2.0 License](LICENSE)
 

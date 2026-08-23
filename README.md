@@ -2,27 +2,18 @@
 
 English | [简体中文](README.zh-CN.md)
 
-VGen is an open-source control plane for running GPU workflows across a public
-Gateway, Mac CLI/Home Broker, and remote Workers. Task content and media are
-end-to-end encrypted; the Gateway handles identity, admission, scheduling,
-leases, auditing, and usage without storing business plaintext or decryption
-keys.
+VGen is a platform for running GPU workflows through a Gateway, Brokers, and
+remote Workers. It helps teams share GPU capacity, run video-generation tasks,
+and keep task content and media encrypted end to end.
 
 ## Features
 
-- Share GPU Workers across Users, Workspaces, and Pools.
-- Run Workers and Brokers on different machines and networks.
-- Schedule by allocation, capacity, leases, and fencing.
-- Submit text-to-video, first-frame image-to-video, and first/last-frame jobs
-  through the built-in ComfyUI Executor.
-- Transfer encrypted task media directly between clients, Workers, and private
-  OSS using short-lived credentials.
-- Install pinned workflow models and remotely update or roll back Windows
-  Workers from the Mac Broker, without physical access after initial setup.
-- Upgrade the Mac CLI/Home Broker atomically with verification and rollback.
-- Keep Gateway API traffic independent from public release downloads.
-- Record output video duration and generation elapsed time for every Attempt,
-  ready for a future duration-based `billing_token` formula.
+- Share GPU capacity across users, workspaces, and pools.
+- Run workflows on remote GPU Workers while controlling them from a Broker.
+- Generate text-to-video, first-frame, and first/last-frame videos with ComfyUI.
+- Move task media securely between clients and Workers.
+- Install workflow models and manage Worker updates remotely.
+- Schedule work reliably with capacity-aware task execution.
 
 ## Requirements
 
@@ -31,16 +22,9 @@ For a local Gateway preview:
 - Git
 - Docker with Docker Compose
 
-For a complete GPU setup:
-
-- an ECS host with Python 3.11+, Nginx, systemd, HTTPS, private OSS, and STS;
-- a Mac with Python 3.11+ for the CLI/Home Broker;
-- a Windows GPU machine with PowerShell 5.1+, ComfyUI 0.30.0+, and the required
-  workflow models.
-
-The Windows Worker currently runs in a foreground PowerShell window. Keep the
-Gateway's internal port and ComfyUI private; expose only the Gateway HTTPS
-endpoint.
+For a complete GPU setup, you need Python 3.11+, a supported GPU runtime such
+as ComfyUI, and the models required by the workflow. See the [User Guide](docs/user-guide.md)
+for deployment and Worker setup.
 
 ## Quick start
 
@@ -63,8 +47,8 @@ docker compose -f examples/docker-compose.yml \
 
 This Compose setup is local-only and is not a production deployment template.
 
-To generate a real video, first complete Gateway, Mac, Windows Worker, ComfyUI,
-and model setup from the [User Guide](docs/user-guide.md). Then run:
+To generate a real video, first complete Gateway, Broker, Worker, ComfyUI, and
+model setup from the [User Guide](docs/user-guide.md). Then run:
 
 ```bash
 vgen gateway health
@@ -96,21 +80,24 @@ material, local databases, generated release artifacts, or machine-specific
 configuration. Community expectations are in the
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## Protocol
+## API
 
-The machine-readable API contract is
-[`schemas/openapi-v1.json`](schemas/openapi-v1.json). Public endpoints use
-`/api/v1`; legacy shared-token routes are unsupported. Published six-digit
-business error codes are permanent compatibility identifiers.
+The machine-readable API contract is [`schemas/openapi-v1.json`](schemas/openapi-v1.json).
+Public API endpoints use `/api/v1`.
+
+Independent [Python and Java SDKs](sdks/README.md) provide API Service credentials,
+request signing, and end-to-end encryption without importing CLI internals.
 
 ## Documentation
 
-- [User Guide](docs/user-guide.md): Gateway deployment, Mac onboarding,
-  Windows Worker setup, model installation, upgrades, real jobs, and
+- [User Guide](docs/user-guide.md): Gateway deployment, Broker onboarding,
+  Worker setup, model installation, upgrades, real jobs, and
   troubleshooting.
 - [Developer and Release Guide](docs/developer-guide.md): architecture,
   security, protocol behavior, development, testing, builds, releases,
   migration, and extension rules.
+- [SDK Compatibility Contract](docs/sdk-compatibility.md): credential, signature,
+  encryption, and cross-language compatibility rules.
 - [Security Policy](SECURITY.md): supported releases and private vulnerability
   reporting.
 - [Apache-2.0 License](LICENSE)

@@ -302,6 +302,19 @@ python tools/export_openapi_v1.py --check
 python tools/check_public_repository.py
 ```
 
+SDK changes additionally require the production compatibility vectors and both
+standalone language packages to pass:
+
+```bash
+python -m pip install -e 'sdks/python[dev]'
+python -m pytest tests/sdk_compat sdks/python/tests
+mvn --file sdks/java/pom.xml test
+```
+
+Both SDKs consume [`tests/sdk_compat/vectors.json`](../tests/sdk_compat/vectors.json).
+They must remain additive and must not import CLI internals or require a change
+to the deployed CLI, Gateway, Broker, or Worker wire formats.
+
 Protocol and authorization changes require negative tests as well as happy
 paths. Migration tests must cover old schema snapshots, interrupted migration,
 foreign keys, and rollback boundaries. Installer tests must cover unsafe ZIP

@@ -473,6 +473,18 @@ python -m build
 python tools/check_distribution.py dist
 ```
 
+修改 SDK 时还必须通过线上协议兼容向量和两个独立语言包的测试：
+
+```bash
+python -m pip install -e 'sdks/python[dev]'
+python -m pytest tests/sdk_compat sdks/python/tests
+mvn --file sdks/java/pom.xml test
+```
+
+两个 SDK 共用 [`tests/sdk_compat/vectors.json`](../../tests/sdk_compat/vectors.json)。SDK 只能
+增量增加客户端能力，不得导入 CLI 内部模块，也不得要求改变已部署 CLI、Gateway、Broker 或
+Worker 的线上格式。
+
 `check_public_repository.py` 同时检查已跟踪和未忽略的新文件，拒绝本机状态、凭据文件、私钥头、
 常见云 AccessKey 形式和超过 10 MiB 的源码文件。它不能替代托管平台的私密漏洞报告或发布前对
 完整 Git 历史的 secret 扫描，但会阻止最常见的误提交进入 Pull Request。
