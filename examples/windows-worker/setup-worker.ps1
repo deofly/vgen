@@ -2965,7 +2965,7 @@ try {
     }
 
     Write-Step "Running fail-closed Worker doctor"
-    $doctorOutput = & $workerExecutable doctor --comfy-url $ComfyUrl --comfy-output-dir $outputRoot --comfy-model-root $modelsRoot --comfy-policy-file $policyPath --json
+    $doctorOutput = & $workerExecutable doctor --comfy-url $ComfyUrl --comfy-output-dir $outputRoot --comfy-model-root $modelsRoot --comfy-policy-file $policyPath --progress --json
     $doctorExit = $LASTEXITCODE
     try {
         $doctor = (($doctorOutput | ForEach-Object { [string]$_ }) -join "`n") | ConvertFrom-Json

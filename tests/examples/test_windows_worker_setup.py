@@ -41,6 +41,7 @@ def test_windows_worker_script_auto_loads_bundle_and_keeps_advanced_inputs() -> 
     for parameter in ("GatewayUrl", "WorkerCredentials", "ComfyUIRoot"):
         assert re.search(rf"\${parameter}\b", text)
     assert "[switch]$CheckOnly" in text
+    assert "--progress --json" in text
     assert "if ($CheckOnly)" in text
     assert "CheckOnly completed successfully" in text
     assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in text

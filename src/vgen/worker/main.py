@@ -139,10 +139,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--json", action="store_true", help="write one JSON status per line")
 
-    subcommands.add_parser(
+    doctor = subcommands.add_parser(
         "doctor",
         parents=(common,),
         help="check the configured executor and print its capabilities",
+    )
+    doctor.add_argument(
+        "--progress",
+        action="store_true",
+        help="write model verification progress to stderr",
     )
 
     serve = subcommands.add_parser(
@@ -238,7 +243,28 @@ def _build_executor(arguments: argparse.Namespace) -> Executor:
             ComfyUIExecutionPolicy,
             ComfyUIExecutor,
             ComfyUIPolicyError,
+            ModelVerificationProgress,
         )
+
+        def show_model_progress(progress: ModelVerificationProgress) -> None:
+            file_percent = int(progress.file_bytes_read * 100 / progress.file_size)
+            total_percent = (
+                100
+                if progress.total_size == 0
+                else int(progress.total_bytes_read * 100 / progress.total_size)
+            )
+            file_gib = progress.file_bytes_read / (1024**3)
+            file_size_gib = progress.file_size / (1024**3)
+            total_gib = progress.total_bytes_read / (1024**3)
+            total_size_gib = progress.total_size / (1024**3)
+            print(
+                f"[vgen] Verifying model {progress.model_index}/{progress.model_count}: "
+                f"{progress.path} | file {file_percent}% "
+                f"({file_gib:.1f}/{file_size_gib:.1f} GiB) | total {total_percent}% "
+                f"({total_gib:.1f}/{total_size_gib:.1f} GiB)",
+                file=sys.stderr,
+                flush=True,
+            )
 
         try:
             policy = (
@@ -253,6 +279,9 @@ def _build_executor(arguments: argparse.Namespace) -> Executor:
             arguments.comfy_output_dir,
             policy=policy,
             model_root=arguments.comfy_model_root,
+            model_verification_progress=(
+                show_model_progress if getattr(arguments, "progress", False) else None
+            ),
         )
     raise WorkerConfigurationError(f"Unsupported executor: {arguments.executor}")
 

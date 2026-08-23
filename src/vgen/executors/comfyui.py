@@ -130,6 +130,17 @@ class ComfyUIModelPin:
 
 
 @dataclass(frozen=True)
+class ModelVerificationProgress:
+    model_index: int
+    model_count: int
+    path: str
+    file_bytes_read: int
+    file_size: int
+    total_bytes_read: int
+    total_size: int
+
+
+@dataclass(frozen=True)
 class ComfyUIExecutionPolicy:
     """Local machine-admin authorization for decrypted ComfyUI graphs.
 
@@ -974,6 +985,7 @@ class ComfyUIExecutor:
         client: ComfyUIClient | None = None,
         policy: ComfyUIExecutionPolicy | None = None,
         model_root: Path | None = None,
+        model_verification_progress: Callable[[ModelVerificationProgress], None] | None = None,
     ) -> None:
         self._client = client or ComfyUIClient(base_url)
         self._output_dir = output_dir.expanduser().resolve()
@@ -984,6 +996,7 @@ class ComfyUIExecutor:
             else (self._output_dir.parent / "models").resolve()
         )
         self._model_digest_cache: dict[Path, tuple[int, int, int, int, int, str]] = {}
+        self._model_verification_progress = model_verification_progress
 
     @property
     def execution_policy_configured(self) -> bool:
@@ -1068,7 +1081,39 @@ class ComfyUIExecutor:
         pins = self._policy.model_files if self._policy is not None else ()
         verified: list[str] = []
         failures = 0
-        for pin in pins:
+        total_size = sum(pin.size for pin in pins)
+        total_bytes_read = 0
+        last_reported_total_percent = -1
+
+        def report(
+            *,
+            model_index: int,
+            pin: ComfyUIModelPin,
+            file_bytes_read: int,
+            force: bool = False,
+        ) -> None:
+            nonlocal last_reported_total_percent
+            if self._model_verification_progress is None:
+                return
+            total_percent = (
+                100 if total_size == 0 else int(total_bytes_read * 100 / total_size)
+            )
+            if not force and total_percent <= last_reported_total_percent:
+                return
+            last_reported_total_percent = total_percent
+            self._model_verification_progress(
+                ModelVerificationProgress(
+                    model_index=model_index,
+                    model_count=len(pins),
+                    path=pin.path,
+                    file_bytes_read=file_bytes_read,
+                    file_size=pin.size,
+                    total_bytes_read=total_bytes_read,
+                    total_size=total_size,
+                )
+            )
+
+        for model_index, pin in enumerate(pins, start=1):
             candidate = (self._model_root / pin.path).resolve()
             if self._model_root != candidate and self._model_root not in candidate.parents:
                 failures += 1
@@ -1093,14 +1138,29 @@ class ComfyUIExecutor:
                 digest = cached[5]
             else:
                 hasher = hashlib.sha256()
+                file_bytes_read = 0
+                report(model_index=model_index, pin=pin, file_bytes_read=0, force=True)
                 try:
                     with candidate.open("rb") as stream:
                         while block := stream.read(8 * 1024 * 1024):
                             hasher.update(block)
+                            file_bytes_read += len(block)
+                            total_bytes_read += len(block)
+                            report(
+                                model_index=model_index,
+                                pin=pin,
+                                file_bytes_read=file_bytes_read,
+                            )
                 except OSError:
                     failures += 1
                     continue
                 digest = hasher.hexdigest()
+                report(
+                    model_index=model_index,
+                    pin=pin,
+                    file_bytes_read=file_bytes_read,
+                    force=True,
+                )
                 after = candidate.stat()
                 if (
                     after.st_dev,

@@ -498,6 +498,49 @@ def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     assert raised.value.details == {"reason": "model_integrity_unavailable"}
 
 
+def test_comfyui_model_verification_reports_bytes_and_completion(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    model_root = tmp_path / "models"
+    output_dir.mkdir()
+    (model_root / "diffusion_models").mkdir(parents=True)
+    model = model_root / "diffusion_models/model.safetensors"
+    contents = b"trusted-model"
+    model.write_bytes(contents)
+    digest = sha256(contents).hexdigest()
+    policy = ComfyUIExecutionPolicy.from_mapping(
+        {
+            "version": 1,
+            "allowed_node_classes": ["SafeNode"],
+            "models": [
+                {
+                    "path": "diffusion_models/model.safetensors",
+                    "sha256": f"sha256:{digest}",
+                    "size": len(contents),
+                }
+            ],
+        }
+    )
+    progress = []
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        output_dir,
+        client=FakeComfyClient(output_dir / "result.mp4"),
+        policy=policy,
+        model_root=model_root,
+        model_verification_progress=progress.append,
+    )
+
+    executor.capabilities()
+
+    assert progress[0].model_index == 1
+    assert progress[0].model_count == 1
+    assert progress[0].file_bytes_read == 0
+    assert progress[-1].path == "diffusion_models/model.safetensors"
+    assert progress[-1].file_bytes_read == len(contents)
+    assert progress[-1].total_bytes_read == len(contents)
+    assert progress[-1].total_size == len(contents)
+
+
 @pytest.mark.parametrize(
     "path",
     ["../escape.safetensors", "/absolute.safetensors", "C:\\escape.safetensors"],
