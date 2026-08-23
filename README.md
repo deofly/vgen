@@ -1,77 +1,117 @@
 # VGen
 
-VGen 是一个开源的 GPU 工作流控制面，把公网 Gateway、用户的 Mac CLI/Home Broker 和任意
-位置的 Worker 分开部署。任务内容和媒体端到端加密；Gateway 负责身份、准入、调度、租约、
-审计与用量，不保存业务明文或解密私钥。
+English | [简体中文](README.zh-CN.md)
 
-当前项目处于 pre-1.0 Alpha。唯一产品版本来自 `pyproject.toml`，使用完整的
-`0.MINOR.PATCH`：bugfix 增加 PATCH，功能或 breaking change 增加 MINOR。
+VGen is an open-source control plane for running GPU workflows across a public
+Gateway, Mac CLI/Home Broker, and remote Workers. Task content and media are
+end-to-end encrypted; the Gateway handles identity, admission, scheduling,
+leases, auditing, and usage without storing business plaintext or decryption
+keys.
 
-## 当前能力
+## Features
 
-- 一个 Gateway endpoint 承载多个 Workspace 和 Pool；
-- User 与 Broker Device 分离，同一 User 可拥有多台设备；
-- 新 Mac 可用一次性邀请执行 `vgen join`，只装 CLI 即可使用 Workspace 共享 Worker；
-- Broker 与 Worker 可位于不同网络，User 也可以只拥有 Worker；
-- A/B 的 Worker 可加入同一 Pool，任务按 allocation、容量、lease 和 fencing 调度；
-- CLI 与 API Service 使用短期、密钥绑定的 session；
-- `prepare/commit`、Worker 定向密钥封装、密文 artifact 和 `rekey_required`；
-- 内置 ComfyUI Executor，参考工作流 `vgen/minimax-h3-8step` 支持 0 图 t2v、1 图首帧 i2v、
-  2 图首尾帧 flf；
-- Broker 发起模型下载；`vgen worker upgrade` 从固定 stable 下载源校验并远程更新 Worker；
-- Mac CLI/Home Broker 通过 `vgen upgrade` 校验 stable release、原子升级并在失败时回滚；
-- Gateway API 与 public release 下载域名独立，以及本机生成密钥的无凭据 Windows Worker 通用包；
-- 工作流 market/custom 隔离、不可变 digest、签名和本地执行策略；
-- 每 Attempt 可追溯 Worker、consumer channel、GPU/流量指标和 `billing_token`；
-- 六位统一错误码、重试动作和 CLI exit code。
+- Share GPU Workers across Users, Workspaces, and Pools.
+- Run Workers and Brokers on different machines and networks.
+- Schedule by allocation, capacity, leases, and fencing.
+- Submit text-to-video, first-frame image-to-video, and first/last-frame jobs
+  through the built-in ComfyUI Executor.
+- Transfer encrypted task media directly between clients, Workers, and private
+  OSS using short-lived credentials.
+- Install pinned workflow models and update Windows Workers from the Mac Broker.
+- Upgrade the Mac CLI/Home Broker atomically with verification and rollback.
+- Keep Gateway API traffic independent from public release downloads.
+- Track Worker, GPU, network, and `billing_token` usage for every Attempt.
 
-v1 仍采用单 Gateway/SQLite，不提供 active-active。Windows Worker 当前以前台 PowerShell
-监督器运行，尚未提供 Service、后台常驻或开机自启。SGLang Diffusion 和 Diffusers 只预留
-Executor 扩展契约，尚未交付 adapter。API Service 可以完成身份认证和最小 scope 授权，但
-当前 v1 暂不为 Service 新发 Workspace Data Key；在补齐与 User 等价的 Owner 签名准入证明前，
-Service 不能读取端到端加密的任务内容。
+## Requirements
 
-## 本地开发快速验证
+For a local Gateway preview:
 
-源码开发要求 Python 3.11+：
+- Git
+- Docker with Docker Compose
+
+For a complete GPU setup:
+
+- an ECS host with Python 3.11+, Nginx, systemd, HTTPS, private OSS, and STS;
+- a Mac with Python 3.11+ for the CLI/Home Broker;
+- a Windows GPU machine with PowerShell 5.1+, ComfyUI 0.30.0+, and the required
+  workflow models.
+
+The Windows Worker currently runs in a foreground PowerShell window. Keep the
+Gateway's internal port and ComfyUI private; expose only the Gateway HTTPS
+endpoint.
+
+## Quick start
+
+Preview the Gateway locally without an ECS account or GPU:
+
+```bash
+git clone https://github.com/deofly/vgen.git
+cd vgen
+docker compose -f examples/docker-compose.yml \
+  --env-file examples/.env.example up --build -d
+curl --fail http://127.0.0.1:8000/api/v1/health
+```
+
+The response should contain `"ok":true`. Stop the preview with:
+
+```bash
+docker compose -f examples/docker-compose.yml \
+  --env-file examples/.env.example down
+```
+
+This Compose setup is local-only and is not a production deployment template.
+
+To generate a real video, first complete Gateway, Mac, Windows Worker, ComfyUI,
+and model setup from the [User Guide](docs/user-guide.md). Then run:
+
+```bash
+vgen gateway health
+vgen task preflight
+vgen task submit "A cinematic sunrise above a calm sea" \
+  --wait --output-dir ~/Downloads/VGen-output
+```
+
+Open the absolute output path printed by the CLI and verify playback and visual
+quality.
+
+## Local development
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[gateway,broker,worker-comfyui,oss,dev]'
+python -m ruff check .
 python -m pytest
+python tools/export_openapi_v1.py --check
 python tools/check_public_repository.py
 ```
 
-只体验本机 Gateway 时，也可以运行：
+## Contributing
 
-```bash
-docker compose -f examples/docker-compose.yml \
-  --env-file examples/.env.example up --build
-```
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. Keep commits
+focused, add tests for behavior changes, and never commit credentials, recovery
+material, local databases, generated release artifacts, or machine-specific
+configuration. Community expectations are in the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
-该 Compose 配置只监听宿主机 `127.0.0.1`，并显式启用开发专用的本地密文 ArtifactStore；不能
-作为公网或生产部署模板。生产部署必须按用户手册配置私有 OSS、STS 和 Nginx。
+## Protocol
 
-## 两份权威手册
+The machine-readable API contract is
+[`schemas/openapi-v1.json`](schemas/openapi-v1.json). Public endpoints use
+`/api/v1`; legacy shared-token routes are unsupported. Published six-digit
+business error codes are permanent compatibility identifiers.
 
-- [用户手册](docs/user-guide.md)：ECS Gateway、管理员/使用者 Mac 加入、Windows Worker、
-  ComfyUI、模型下载、Worker 更新、真实 0/1/2 图测试和故障处理。
-- [开发与发布手册](docs/developer-guide.md)：架构、安全、API、Executor、工作流市场、开发、
-  测试、版本、构建、发行、迁移和扩展规范。
+## Documentation
 
-组件目录不再维护另一套 README。Gateway 包内 `INSTALL.txt` 和 Mac ZIP 内 `README.md` 由用户
-手册生成；工作流目录中的 README 是被 checksum 固定的包元数据，不是第三份产品手册。
-
-## 协议与贡献
-
-固定的机器可读契约位于 [`schemas/openapi-v1.json`](schemas/openapi-v1.json)。公共 API 只使用
-`/api/v1`；旧 shared-token 路由不受支持。开发环境、质量门和发行来源要求见开发手册。
-
-- [贡献指南](CONTRIBUTING.md)
-- [安全报告](SECURITY.md)
-- [行为准则](CODE_OF_CONDUCT.md)
+- [User Guide](docs/user-guide.md): Gateway deployment, Mac onboarding,
+  Windows Worker setup, model installation, upgrades, real jobs, and
+  troubleshooting.
+- [Developer and Release Guide](docs/developer-guide.md): architecture,
+  security, protocol behavior, development, testing, builds, releases,
+  migration, and extension rules.
+- [Security Policy](SECURITY.md): supported releases and private vulnerability
+  reporting.
 - [Apache-2.0 License](LICENSE)
 
-不要公开恢复词、私钥、Invite secret、Bootstrap code、Worker credential、session 或签名
-artifact URL，也不要把 Gateway 内部端口或 ComfyUI 直接暴露到公网。
+Never disclose recovery words, private keys, invite secrets, bootstrap codes,
+Worker credentials, sessions, or signed artifact URLs.

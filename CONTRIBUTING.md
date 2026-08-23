@@ -10,7 +10,7 @@
 4. Do not reuse or renumber a published six-digit error code.
 5. New executors must pass the executor conformance suite and must not add
    engine-specific fields to the Gateway task protocol.
-6. Follow [the versioning policy](docs/developer-guide.md#8-版本与候选发行). Change the product
+6. Follow [the versioning policy](docs/developer-guide.md#8-versioning-and-release-candidates). Change the product
    version only in `pyproject.toml`; do not hand-copy it into runtime code,
    installer sources or tests. Release-specific user documentation may show the
    matching artifact filename, but must not drive a build.

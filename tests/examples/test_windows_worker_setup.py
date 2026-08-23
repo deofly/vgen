@@ -112,8 +112,8 @@ def test_windows_worker_supports_official_portable_and_generic_python_layouts_fa
     assert "$candidates.Count -ne 1" in text
     assert '"portable" {' in text
     assert "ComfyUI Portable" in guide
-    assert "找到多套时在当前窗口列出编号供选择" in guide
-    assert "不会扫描整个磁盘" in guide
+    assert "listing numbered choices in the current" in guide
+    assert "never scans the entire disk" in guide
 
 
 def test_windows_worker_preserves_desktop_record_layout_metadata() -> None:
@@ -740,7 +740,7 @@ def test_windows_worker_rejects_broad_credential_acl() -> None:
     assert text.index("Protect-CredentialAcl $credentialsPath") < text.index(
         "[System.IO.File]::ReadAllText($credentialsPath)"
     )
-    assert "不需要用户先运行 `icacls`" in guide
+    assert "does not need to run `icacls` first" in guide
 
 
 def test_windows_worker_reinstall_verifies_identity_and_stages_safe_reenrollment() -> None:
@@ -826,15 +826,15 @@ def test_two_handbooks_are_the_only_documentation_sources_for_operations_and_rel
     user = USER_GUIDE.read_text(encoding="utf-8")
     developer = DEVELOPER_GUIDE.read_text(encoding="utf-8")
 
-    assert "面向部署者和使用者的唯一操作手册" in user
-    assert "面向开发者、贡献者和发布者的唯一权威手册" in developer
+    assert "single operations handbook for VGen deployers and users" in user
+    assert "single authoritative handbook for VGen developers" in developer
     assert "python tools/build_gateway_bundle.py" in developer
     assert "./examples/macos/build-bundle.sh" in developer
     assert "sha256sum -c SHA256SUMS" in user
     assert "sudo ./setup-gateway.sh install \\" in user
     assert "--artifact-store oss" in user
-    assert "./setup-gateway.sh upgrade --domain <Gateway域名>" in user
-    assert "健康检查失败时自动恢复旧版本" in user
+    assert "./setup-gateway.sh upgrade --domain <gateway-domain>" in user
+    assert "automatically restores the previous version if health checks fail" in user
     assert "sudo cat /var/lib/vgen/bootstrap-code" in user
     assert "sudo rm -f /var/lib/vgen/bootstrap-code" in user
     assert "start-worker.cmd" in user

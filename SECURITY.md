@@ -28,4 +28,4 @@ Gateway metadata is not end-to-end private. Task payloads and artifacts are.
 The Worker selected to execute a task necessarily observes its plaintext. Never
 install workflow executors or ComfyUI custom nodes from an untrusted publisher.
 The complete identity, encryption, maintenance and deployment boundary is in the
-[developer and release handbook](docs/developer-guide.md#2-身份准入与端到端加密).
+[developer and release handbook](docs/developer-guide.md#2-identity-admission-and-end-to-end-encryption).
