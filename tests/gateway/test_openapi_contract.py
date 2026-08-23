@@ -29,6 +29,10 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
         app.state.db.close()
 
     assert schema["openapi"].startswith("3.1.")
+    assert schema["info"]["license"] == {
+        "name": "Apache License 2.0",
+        "identifier": "Apache-2.0",
+    }
     assert schema["x-vgen-protocol-major"] == 1
     assert "VGenSession" in schema["components"]["securitySchemes"]
     assert "HTTPBearer" not in schema["components"]["securitySchemes"]

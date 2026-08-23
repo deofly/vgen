@@ -351,8 +351,8 @@ Owner 完成下面的密钥核验。
 新 Mac 只安装 CLI，不安装 Home Broker、Worker、ComfyUI 或 Docker：
 
 ```bash
-curl -fsSL https://vgen.zcbiz.com/releases/install-macos.sh | bash
-vgen join --gateway https://vgen-gw.zcbiz.com
+curl -fsSL https://downloads.example.com/releases/install-macos.sh | bash
+vgen join --gateway https://gateway.example.com
 ```
 
 全新 User 的 `join` 会在本机生成用户和设备密钥，显示需要离线保存的 24 个恢复词；已有 User

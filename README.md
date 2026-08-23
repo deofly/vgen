@@ -31,6 +31,28 @@ Executor 扩展契约，尚未交付 adapter。API Service 可以完成身份认
 当前 v1 暂不为 Service 新发 Workspace Data Key；在补齐与 User 等价的 Owner 签名准入证明前，
 Service 不能读取端到端加密的任务内容。
 
+## 本地开发快速验证
+
+源码开发要求 Python 3.11+：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[gateway,broker,worker-comfyui,oss,dev]'
+python -m pytest
+python tools/check_public_repository.py
+```
+
+只体验本机 Gateway 时，也可以运行：
+
+```bash
+docker compose -f examples/docker-compose.yml \
+  --env-file examples/.env.example up --build
+```
+
+该 Compose 配置只监听宿主机 `127.0.0.1`，并显式启用开发专用的本地密文 ArtifactStore；不能
+作为公网或生产部署模板。生产部署必须按用户手册配置私有 OSS、STS 和 Nginx。
+
 ## 两份权威手册
 
 - [用户手册](docs/user-guide.md)：ECS Gateway、管理员/使用者 Mac 加入、Windows Worker、

@@ -371,20 +371,24 @@ class GatewayRepository:
         if not expired_tasks:
             return
         task_ids = [row["id"] for row in expired_tasks]
-        placeholders = ",".join("?" for _ in task_ids)
+        encoded_task_ids = json_text(task_ids)
         conn.execute(
-            f"""UPDATE task_attempts SET state='expired',finished_at=?
-                WHERE task_id IN ({placeholders}) AND state IN ('reserved','leased')""",
-            (stamp, *task_ids),
+            """UPDATE task_attempts SET state='expired',finished_at=?
+               WHERE task_id IN (SELECT value FROM json_each(?))
+                 AND state IN ('reserved','leased')""",
+            (stamp, encoded_task_ids),
         )
         conn.execute(
-            f"""UPDATE leases SET released_at=? WHERE attempt_id IN
-                 (SELECT id FROM task_attempts WHERE task_id IN ({placeholders})) AND released_at IS NULL""",
-            (stamp, *task_ids),
+            """UPDATE leases SET released_at=? WHERE attempt_id IN
+                 (SELECT id FROM task_attempts
+                  WHERE task_id IN (SELECT value FROM json_each(?)))
+                 AND released_at IS NULL""",
+            (stamp, encoded_task_ids),
         )
         conn.execute(
-            f"UPDATE tasks SET state='expired',finished_at=?,updated_at=? WHERE id IN ({placeholders})",
-            (stamp, stamp, *task_ids),
+            """UPDATE tasks SET state='expired',finished_at=?,updated_at=?
+               WHERE id IN (SELECT value FROM json_each(?))""",
+            (stamp, stamp, encoded_task_ids),
         )
 
     @staticmethod
@@ -2353,7 +2357,8 @@ class GatewayRepository:
                 ),
             )
         row = self.db.fetchone("SELECT * FROM enrollments WHERE id=?", (invite_id,))
-        assert row is not None
+        if row is None:
+            raise RuntimeError("created Worker enrollment could not be reloaded")
         return self._worker_enrollment_value(row, include_claim=False), secret
 
     def claim_worker_invite(
@@ -2488,7 +2493,8 @@ class GatewayRepository:
                 ),
             )
         claimed = self.db.fetchone("SELECT * FROM enrollments WHERE id=?", (invite_id,))
-        assert claimed is not None
+        if claimed is None:
+            raise RuntimeError("claimed Worker enrollment could not be reloaded")
         return self._worker_enrollment_value(claimed, include_claim=False)
 
     def worker_enrollment_signing_material(self, enrollment_id: str) -> dict[str, str]:
@@ -2666,7 +2672,13 @@ class GatewayRepository:
                     (new_id("aud"), admin_user_id, row["workspace_id"], enrollment_id, stamp),
                 )
             else:
-                assert owner_certificate is not None and allocation_proof is not None
+                if owner_certificate is None or allocation_proof is None:
+                    raise RepositoryError(
+                        VALIDATION_FAILED,
+                        "WORKER_ENROLLMENT_APPROVAL_MATERIAL_REQUIRED",
+                        "Approving a Worker requires its owner certificate and allocation proof.",
+                        422,
+                    )
                 self._verify_worker_enrollment_claim(claim, proof_signature)
                 pool = conn.execute(
                     """SELECT id FROM pools
@@ -2868,7 +2880,8 @@ class GatewayRepository:
                     ),
                 )
         decided = self.db.fetchone("SELECT * FROM enrollments WHERE id=?", (enrollment_id,))
-        assert decided is not None
+        if decided is None:
+            raise RuntimeError("decided Worker enrollment could not be reloaded")
         return self._worker_enrollment_value(decided, include_claim=True)
 
     def enroll_user(
@@ -6379,23 +6392,14 @@ class GatewayRepository:
     ) -> list[dict[str, Any]]:
         if principal_type == "service":
             self.require_service(workspace_id, principal_id)
-            principal_filter = (
-                " AND t.consumer_principal_type='service' AND t.consumer_principal_id=?"
-            )
-            args: tuple[Any, ...] = (
-                workspace_id,
-                principal_id,
-                min(max(limit, 1), 500),
-            )
+            access_mode = "service"
         else:
             self.require_user(user_id)
             membership = self.membership(workspace_id, user_id)
             if membership is not None and membership["role"] in ("owner", "admin"):
-                principal_filter = ""
-                args = (workspace_id, min(max(limit, 1), 500))
+                access_mode = "all"
             elif membership is not None:
-                principal_filter = " AND (t.consumer_user_id=? OR a.provider_user_id=?)"
-                args = (workspace_id, user_id, user_id, min(max(limit, 1), 500))
+                access_mode = "member"
             else:
                 approved_provider = self.db.fetchone(
                     """SELECT 1 AS allowed FROM worker_allocations wa
@@ -6418,17 +6422,34 @@ class GatewayRepository:
                         "Workspace usage access denied.",
                         403,
                     )
-                principal_filter = " AND a.provider_user_id=?"
-                args = (workspace_id, user_id, min(max(limit, 1), 500))
+                access_mode = "provider"
+        access_user_id = user_id or ""
         rows = self.db.fetchall(
             """SELECT l.*,a.worker_id,a.task_id,t.consumer_user_id,
                       t.consumer_principal_type,t.consumer_principal_id,t.client_channel,
                       t.workflow_ref,t.workflow_digest
                FROM usage_ledger l JOIN task_attempts a ON a.id=l.attempt_id JOIN tasks t ON t.id=a.task_id
-               WHERE t.workspace_id=?"""
-            + principal_filter
-            + " ORDER BY l.created_at DESC LIMIT ?",
-            args,
+               WHERE t.workspace_id=?
+                 AND (
+                   ?='all'
+                   OR (?='member' AND (t.consumer_user_id=? OR a.provider_user_id=?))
+                   OR (?='provider' AND a.provider_user_id=?)
+                   OR (?='service' AND t.consumer_principal_type='service'
+                                      AND t.consumer_principal_id=?)
+                 )
+               ORDER BY l.created_at DESC LIMIT ?""",
+            (
+                workspace_id,
+                access_mode,
+                access_mode,
+                access_user_id,
+                access_user_id,
+                access_mode,
+                access_user_id,
+                access_mode,
+                principal_id,
+                min(max(limit, 1), 500),
+            ),
         )
         return [row_dict(row, json_columns={"metrics", "rate_snapshot"}) for row in rows]
 

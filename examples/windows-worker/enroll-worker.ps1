@@ -28,6 +28,18 @@ function Write-Step {
     Write-Host "[vgen] $Message"
 }
 
+function Resolve-WindowsSystemTool {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        throw "The Windows system directory could not be located."
+    }
+    $path = [System.IO.Path]::Combine($env:SystemRoot, "System32", $Name)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Required Windows system tool is missing: $Name"
+    }
+    return $path
+}
+
 function Assert-RegularLocalFile {
     param([string]$Path, [string]$Description)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -98,11 +110,12 @@ function Protect-CredentialAcl {
     catch {
         throw "The current Windows user could not be identified for credential protection."
     }
-    & icacls.exe $Path /setowner "*$currentSid" 2>$null | Out-Null
+    $icaclsPath = Resolve-WindowsSystemTool "icacls.exe"
+    & $icaclsPath $Path /setowner "*$currentSid" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Worker credential owner could not be secured."
     }
-    & icacls.exe $Path /inheritance:r /grant:r "*$($currentSid):F" `
+    & $icaclsPath $Path /inheritance:r /grant:r "*$($currentSid):F" `
         "*S-1-5-18:F" "*S-1-5-32-544:F" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Worker credential access rules could not be secured."

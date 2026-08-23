@@ -14,7 +14,7 @@ import stat
 import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -473,8 +473,15 @@ def _protect_windows_private_file(path: Path) -> None:
     """
 
     try:
+        system_root = os.environ.get("SystemRoot", "").strip()
+        if not system_root:
+            raise ValueError
+        whoami = PureWindowsPath(system_root, "System32", "whoami.exe")
+        icacls = PureWindowsPath(system_root, "System32", "icacls.exe")
+        if not whoami.is_absolute() or not icacls.is_absolute():
+            raise ValueError
         identity = subprocess.run(
-            ["whoami.exe", "/user", "/fo", "csv", "/nh"],
+            [str(whoami), "/user", "/fo", "csv", "/nh"],
             check=True,
             capture_output=True,
             text=True,
@@ -491,7 +498,7 @@ def _protect_windows_private_file(path: Path) -> None:
         if not sid.startswith("S-1-"):
             raise ValueError
         owned = subprocess.run(
-            ["icacls.exe", str(path), "/setowner", f"*{sid}"],
+            [str(icacls), str(path), "/setowner", f"*{sid}"],
             check=False,
             capture_output=True,
             text=True,
@@ -501,7 +508,7 @@ def _protect_windows_private_file(path: Path) -> None:
             raise ValueError
         hardened = subprocess.run(
             [
-                "icacls.exe",
+                str(icacls),
                 str(path),
                 "/inheritance:r",
                 "/grant:r",
@@ -517,7 +524,7 @@ def _protect_windows_private_file(path: Path) -> None:
         if hardened.returncode != 0:
             raise ValueError
         verified = subprocess.run(
-            ["icacls.exe", str(path), "/verify"],
+            [str(icacls), str(path), "/verify"],
             check=False,
             capture_output=True,
             text=True,

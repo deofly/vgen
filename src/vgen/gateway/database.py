@@ -708,8 +708,9 @@ class GatewayDatabase:
         version = self.fetchone("SELECT version FROM schema_meta LIMIT 1")
         current_time = now() if stamp is None else stamp
         counts = {
-            table: int(self.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"])
-            for table in ("users", "workspaces", "tasks")
+            "users": int(self.fetchone("SELECT COUNT(*) AS n FROM users")["n"]),
+            "workspaces": int(self.fetchone("SELECT COUNT(*) AS n FROM workspaces")["n"]),
+            "tasks": int(self.fetchone("SELECT COUNT(*) AS n FROM tasks")["n"]),
         }
         worker_counts = self.fetchone(
             """SELECT COUNT(*) AS workers_total,

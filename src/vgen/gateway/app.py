@@ -10,7 +10,6 @@ import math
 import os
 import secrets
 import sqlite3
-import sys
 import threading
 import time
 from collections import OrderedDict
@@ -489,8 +488,8 @@ def create_app(
     elif configured_artifact_store == "oss":
         artifact_store = OssArtifactStore.from_environment()
     elif configured_artifact_store == "local" and os.getenv(
-        "VGEN_ALLOW_LOCAL_ARTIFACT_STORE_FOR_TESTS", ""
-    ) == "1" and "pytest" in sys.modules:
+        "VGEN_ALLOW_LOCAL_ARTIFACT_STORE", ""
+    ) == "1":
         resolved_artifact_root = artifact_root or os.getenv(
             "VGEN_ARTIFACT_ROOT", "./data/artifacts"
         )
@@ -505,7 +504,8 @@ def create_app(
         artifact_store = LocalArtifactStore(resolved_artifact_root, ticket_key)
     else:
         raise RuntimeError(
-            "VGEN_ARTIFACT_STORE=oss is required; local artifact storage is prohibited for task media"
+            "VGEN_ARTIFACT_STORE=oss is required for production; local artifact storage "
+            "requires the explicit development-only VGEN_ALLOW_LOCAL_ARTIFACT_STORE=1 opt-in"
         )
     db = GatewayDatabase(db_path)
     repository = GatewayRepository(db)
@@ -534,7 +534,12 @@ def create_app(
 
     app = FastAPI(
         title="VGen Gateway",
+        description="Open, encrypted GPU workflow control-plane API.",
         version="1.0.0",
+        license_info={
+            "name": "Apache License 2.0",
+            "identifier": "Apache-2.0",
+        },
         docs_url="/docs" if expose_docs else None,
         redoc_url=None,
         openapi_url="/openapi.json" if expose_docs else None,

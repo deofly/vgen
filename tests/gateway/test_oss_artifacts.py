@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from types import SimpleNamespace
 
@@ -149,17 +148,19 @@ def test_gateway_accepts_an_injected_provider_store_without_local_credentials(tm
         app.state.db.close()
 
 
-def test_gateway_prohibits_local_artifact_storage_without_test_override(
+def test_gateway_prohibits_local_artifact_storage_without_explicit_development_opt_in(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("VGEN_ARTIFACT_STORE", raising=False)
-    monkeypatch.delenv("VGEN_ALLOW_LOCAL_ARTIFACT_STORE_FOR_TESTS", raising=False)
-    with pytest.raises(RuntimeError, match="local artifact storage is prohibited"):
+    monkeypatch.delenv("VGEN_ALLOW_LOCAL_ARTIFACT_STORE", raising=False)
+    with pytest.raises(RuntimeError, match="explicit development-only"):
         create_app(database_path=str(tmp_path / "missing-store.db"), bootstrap_code="test")
     monkeypatch.setenv("VGEN_ARTIFACT_STORE", "local")
-    with pytest.raises(RuntimeError, match="local artifact storage is prohibited"):
+    with pytest.raises(RuntimeError, match="explicit development-only"):
         create_app(database_path=str(tmp_path / "local-store.db"), bootstrap_code="test")
-    monkeypatch.setenv("VGEN_ALLOW_LOCAL_ARTIFACT_STORE_FOR_TESTS", "1")
-    monkeypatch.delitem(sys.modules, "pytest")
-    with pytest.raises(RuntimeError, match="local artifact storage is prohibited"):
-        create_app(database_path=str(tmp_path / "forged.db"), bootstrap_code="test")
+    monkeypatch.setenv("VGEN_ALLOW_LOCAL_ARTIFACT_STORE", "1")
+    app = create_app(database_path=str(tmp_path / "dev-local.db"), bootstrap_code="test")
+    try:
+        assert app.state.artifact_store.store_type == "local"
+    finally:
+        app.state.db.close()

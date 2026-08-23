@@ -513,6 +513,11 @@ def install_openapi_contract(app: FastAPI) -> None:
                 routes=app.routes,
                 tags=app.openapi_tags,
                 servers=app.servers,
+                terms_of_service=app.terms_of_service,
+                contact=app.contact,
+                license_info=app.license_info,
+                separate_input_output_schemas=app.separate_input_output_schemas,
+                external_docs=getattr(app, "external_docs", None),
             )
             app.openapi_schema = harden_openapi(generated)
         return app.openapi_schema

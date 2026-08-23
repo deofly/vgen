@@ -33,6 +33,7 @@ REQUIRED_SDIST = {
     "tools/build_public_release.py",
     "tools/build_windows_worker_bundle.py",
     "tools/check_distribution.py",
+    "tools/check_public_repository.py",
     "tools/export_openapi_v1.py",
     "tools/project_version.py",
     "tools/release.py",

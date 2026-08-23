@@ -3510,6 +3510,11 @@
     }
   },
   "info": {
+    "description": "Open, encrypted GPU workflow control-plane API.",
+    "license": {
+      "identifier": "Apache-2.0",
+      "name": "Apache License 2.0"
+    },
     "title": "VGen Gateway",
     "version": "1.0.0"
   },

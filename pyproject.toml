@@ -54,7 +54,10 @@ oss = [
   "alibabacloud-tea-openapi>=0.4.0",
 ]
 dev = [
+  "bandit[toml]>=1.8",
   "build>=1.2",
+  "httpx2>=2.12",
+  "pip-audit>=2.8",
   "pytest>=8.3",
   "pytest-cov>=6.0",
   "ruff>=0.9",
@@ -97,3 +100,11 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/vgen/gateway/app.py" = ["B008"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+# VGen invokes fixed argv arrays without a shell. B404/B603 flag every such
+# subprocess use regardless of whether input can become shell syntax. B105 also
+# treats protocol field names and user-facing help containing "secret" as
+# embedded passwords. Keep the more specific process-path and data-flow checks.
+skips = ["B105", "B404", "B603"]

@@ -1,4 +1,4 @@
-name: vgen-alpha
+name: vgen-development
 
 services:
   gateway:
@@ -20,6 +20,10 @@ services:
     environment:
       VGEN_GATEWAY_DOCS: ${VGEN_GATEWAY_DOCS:-1}
       VGEN_REQUIRE_REQUEST_SIGNATURES: "1"
+      # Explicit local-development exception. Production deployments must use
+      # the OSS configuration from examples/ecs/setup-gateway.sh.
+      VGEN_ARTIFACT_STORE: local
+      VGEN_ALLOW_LOCAL_ARTIFACT_STORE: "1"
     volumes:
       - gateway-data:/var/lib/vgen
     ports:
@@ -34,28 +38,6 @@ services:
       timeout: 5s
       retries: 12
       start_period: 5s
-    security_opt:
-      - no-new-privileges:true
-
-  # Enable with: docker compose --profile tls up --build
-  # Set VGEN_DOMAIN to a public DNS name pointing at this host.
-  caddy:
-    image: caddy:2.10-alpine
-    profiles: ["tls"]
-    restart: unless-stopped
-    depends_on:
-      gateway:
-        condition: service_healthy
-    environment:
-      VGEN_DOMAIN: ${VGEN_DOMAIN:-localhost}
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
     security_opt:
       - no-new-privileges:true
 
@@ -104,5 +86,3 @@ services:
 
 volumes:
   gateway-data:
-  caddy-data:
-  caddy-config:

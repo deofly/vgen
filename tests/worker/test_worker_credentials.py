@@ -131,17 +131,18 @@ def test_windows_private_acl_uses_sid_and_fails_closed_on_icacls_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[list[str]] = []
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
 
     def succeeded(command: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
         calls.append(command)
-        if command[0] == "whoami.exe":
+        if command[0].lower().endswith(r"\system32\whoami.exe"):
             return SimpleNamespace(returncode=0, stdout='"DESKTOP\\user","S-1-5-21-123"\r\n')
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr(credential_module.subprocess, "run", succeeded)
     credential_module._protect_windows_private_file(tmp_path / "credential.json")
-    assert calls[1][0] == "icacls.exe"
+    assert calls[1][0].lower() == r"c:\windows\system32\icacls.exe"
     assert "/setowner" in calls[1]
     assert "*S-1-5-21-123" in calls[1]
     assert "*S-1-5-21-123:(F)" in calls[2]
@@ -150,7 +151,7 @@ def test_windows_private_acl_uses_sid_and_fails_closed_on_icacls_error(
 
     def failed(command: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
-        if command[0] == "whoami.exe":
+        if command[0].lower().endswith(r"\system32\whoami.exe"):
             return SimpleNamespace(returncode=0, stdout='"DESKTOP\\user","S-1-5-21-123"\r\n')
         return SimpleNamespace(returncode=5, stdout="access denied")
 

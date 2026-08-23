@@ -2,9 +2,18 @@
 
 ## Reporting
 
-Please report vulnerabilities privately to the project maintainer before opening
-a public issue. Do not include recovery words, private keys, invite secrets,
-session tokens, signed artifact URLs, prompts or user media in a report.
+Please use the repository host's **Security** tab and private vulnerability
+reporting form when it is available. If private reporting has not yet been
+enabled, contact the repository owner through the owner profile and request a
+private channel before sending technical details. Do not open a public issue
+containing an unpatched vulnerability.
+
+Do not include live recovery words, private keys, invite secrets, session
+tokens, signed artifact URLs, prompts or user media in a report. Reproduce with
+synthetic data and include the affected version, impact, prerequisites and the
+smallest safe proof of concept. The maintainer will acknowledge receipt,
+coordinate a fix and publish remediation information after affected users have
+a reasonable upgrade path.
 
 ## Supported versions
 

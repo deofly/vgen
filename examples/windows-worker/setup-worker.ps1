@@ -62,6 +62,18 @@ $MinimumVramBytes = [Int64]16000000000
 $MinimumRamBytes = [Int64]32000000000
 $ComfyUrl = "http://127.0.0.1:8188"
 
+function Resolve-WindowsSystemTool {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        throw "The Windows system directory could not be located."
+    }
+    $path = [System.IO.Path]::Combine($env:SystemRoot, "System32", $Name)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Required Windows system tool is missing: $Name"
+    }
+    return $path
+}
+
 $ModelPins = @(
     [PSCustomObject]@{
         Folder = "diffusion_models"
@@ -2171,11 +2183,12 @@ function Protect-CredentialAcl {
     catch {
         throw "The current Windows user could not be identified for credential protection."
     }
-    & icacls.exe $Path /setowner "*$currentSid" 2>$null | Out-Null
+    $icaclsPath = Resolve-WindowsSystemTool "icacls.exe"
+    & $icaclsPath $Path /setowner "*$currentSid" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "WorkerCredentials owner could not be secured."
     }
-    & icacls.exe $Path /inheritance:r /grant:r "*$($currentSid):F" "*S-1-5-18:F" "*S-1-5-32-544:F" 2>$null | Out-Null
+    & $icaclsPath $Path /inheritance:r /grant:r "*$($currentSid):F" "*S-1-5-18:F" "*S-1-5-32-544:F" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "WorkerCredentials access rules could not be secured."
     }

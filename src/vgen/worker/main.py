@@ -461,7 +461,8 @@ def _announced_capabilities(status: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     executor = status["executor"]
-    assert isinstance(executor, Mapping)
+    if not isinstance(executor, Mapping):
+        raise WorkerConfigurationError("Executor status must be an object.")
     capabilities = executor.get("capabilities")
     return {
         "executors": [
@@ -597,7 +598,10 @@ def run(
             def announce_activated_runtime() -> None:
                 nonlocal activation_status
                 activation_status = _executor_status(executor)
-                assert gateway is not None
+                if gateway is None:
+                    raise WorkerConfigurationError(
+                        "Worker update activation requires a Gateway connection."
+                    )
                 gateway.announce(_announced_capabilities(activation_status))
 
             if gateway is not None and core is not None and maintenance is not None:

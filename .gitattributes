@@ -1,0 +1,14 @@
+# Keep source and generated checksums reproducible across macOS, Linux, and
+# Windows checkouts. Runtime media and archives must never be normalized.
+* text=auto eol=lf
+*.7z binary
+*.gif binary
+*.gz binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
+*.png binary
+*.safetensors binary
+*.whl binary
+*.zip binary

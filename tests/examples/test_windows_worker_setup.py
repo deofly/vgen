@@ -731,7 +731,7 @@ def test_windows_worker_rejects_broad_credential_acl() -> None:
     )
     assert "function Protect-CredentialAcl" in text
     assert (
-        '& icacls.exe $Path /inheritance:r /grant:r "*$($currentSid):F" '
+        '& $icaclsPath $Path /inheritance:r /grant:r "*$($currentSid):F" '
         '"*S-1-5-18:F" "*S-1-5-32-544:F"'
     ) in text
     assert text.index("Protect-CredentialAcl $credentialsPath") < text.index(
@@ -776,8 +776,8 @@ def test_windows_worker_enrollment_secures_acl_before_any_gateway_identity_reque
     assert '"S-1-5-32-544"' in acl
     assert "FileSystemRights]::FullControl" in acl
     assert "grants access to an unapproved principal" in acl
-    assert '& icacls.exe $Path /setowner "*$currentSid"' in acl
-    assert '& icacls.exe $Path /inheritance:r /grant:r "*$($currentSid):F"' in acl
+    assert '& $icaclsPath $Path /setowner "*$currentSid"' in acl
+    assert '& $icaclsPath $Path /inheritance:r /grant:r "*$($currentSid):F"' in acl
     assert enrollment.index(
         '$credentialPath = Assert-RegularLocalFile $credentialPath "Existing Worker credential"'
     ) < enrollment.index("Protect-CredentialAcl $credentialPath")

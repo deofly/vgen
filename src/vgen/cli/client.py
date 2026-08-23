@@ -139,7 +139,8 @@ class GatewayClient:
                 self.session_token = self.token_refresher()
                 continue
             break
-        assert response is not None
+        if response is None:  # defensive invariant; the loop always sends at least once
+            raise RuntimeError("Gateway request completed without a response.")
         if response.is_success:
             return response.json() if response.content else None
         self._raise_error(response)

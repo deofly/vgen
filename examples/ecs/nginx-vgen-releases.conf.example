@@ -2,7 +2,7 @@
 # traffic and can later move unchanged to OSS/CDN.
 server {
   listen 80;
-  server_name vgen.zcbiz.com;
+  server_name releases.example.com;
 
   location /.well-known/acme-challenge/ {
     root /var/www/certbot;
@@ -15,10 +15,10 @@ server {
 
 server {
   listen 443 ssl http2;
-  server_name vgen.zcbiz.com;
+  server_name releases.example.com;
 
-  ssl_certificate /etc/letsencrypt/live/vgen.zcbiz.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/vgen.zcbiz.com/privkey.pem;
+  ssl_certificate /etc/letsencrypt/live/releases.example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/releases.example.com/privkey.pem;
 
   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
   add_header X-Content-Type-Options "nosniff" always;

@@ -172,7 +172,9 @@ class ComfyUIExecutionPolicy:
         except (OSError, UnicodeError) as exc:
             raise ComfyUIPolicyError("ComfyUI policy file cannot be read.") from exc
         try:
-            value = yaml.load(raw, Loader=_UniqueKeySafeLoader)
+            # _UniqueKeySafeLoader subclasses yaml.SafeLoader and only adds
+            # duplicate-key rejection; it cannot construct arbitrary objects.
+            value = yaml.load(raw, Loader=_UniqueKeySafeLoader)  # nosec B506
         except ComfyUIPolicyError:
             raise
         except yaml.YAMLError as exc:
@@ -828,7 +830,7 @@ class ComfyUIClient:
             try:
                 ws.close()
             except Exception:  # pragma: no cover - websocket cleanup is best effort
-                pass
+                logger.debug("ComfyUI websocket cleanup failed", exc_info=True)
         return ComfyRunResult(prompt_id, tuple(self._collect_outputs(prompt_id)))
 
     def _ws_url(self, client_id: str) -> str:

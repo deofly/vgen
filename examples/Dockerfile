@@ -11,7 +11,7 @@ WORKDIR /opt/vgen
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY src ./src
 
-RUN python -m pip install --no-cache-dir '.[gateway,broker,worker-comfyui]'
+RUN python -m pip install --no-cache-dir '.[gateway,broker,worker-comfyui,oss]'
 
 RUN addgroup --system vgen \
     && adduser --system --uid "${VGEN_UID}" --ingroup vgen --home /var/lib/vgen vgen \

@@ -373,9 +373,15 @@ vgen-worker --help
 ```bash
 mkdir -p .local/vgen-dev
 vgen-gateway --database "$PWD/.local/vgen-dev/gateway.db" init
-vgen-gateway --database "$PWD/.local/vgen-dev/gateway.db" serve \
+VGEN_ARTIFACT_STORE=local VGEN_ALLOW_LOCAL_ARTIFACT_STORE=1 \
+  vgen-gateway --database "$PWD/.local/vgen-dev/gateway.db" serve \
   --host 127.0.0.1 --port 8000
 ```
+
+这里的两个环境变量只允许本机开发和自动化测试显式启用本地密文 ArtifactStore。也可以在
+`examples/` 目录复制 `.env.example` 后执行 `docker compose up --build`；该 Compose 配置只把
+Gateway 发布到宿主机 loopback，不包含公网 TLS 代理。任何公网、共享或生产部署都必须使用
+第 8 节的 OSS 配置，不能设置 `VGEN_ALLOW_LOCAL_ARTIFACT_STORE=1`。
 
 另一个终端：
 
@@ -450,10 +456,17 @@ test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v0.3.1)"
 ```bash
 python -m pytest
 ruff check src tests tools
+bandit -c pyproject.toml -r src tools
+python -m pip_audit . --progress-spinner off
 python tools/export_openapi_v1.py --check
+python tools/check_public_repository.py
 python -m build
 python tools/check_distribution.py dist
 ```
+
+`check_public_repository.py` 同时检查已跟踪和未忽略的新文件，拒绝本机状态、凭据文件、私钥头、
+常见云 AccessKey 形式和超过 10 MiB 的源码文件。它不能替代托管平台的私密漏洞报告或发布前对
+完整 Git 历史的 secret 扫描，但会阻止最常见的误提交进入 Pull Request。
 
 测试分层：
 
@@ -576,8 +589,10 @@ session policy 把权限缩小到单对象 GET，或 PutObject/AbortMultipartUpl
 完成时 Gateway 用 HEAD 核对大小。安装/发布命令生成精确策略，但不会代替管理员修改云权限。
 
 生产 Gateway 的任务媒体没有本地 ArtifactStore 降级路径：`VGEN_ARTIFACT_STORE` 缺失、为 `local` 或 OSS
-配置不完整时，进程在创建数据库前退出。安装器只安装 `[gateway,oss]`，已有本地存储配置也不能
-通过原地升级绕过，开发测试环境必须先 `reset-test`，再以完整 OSS 配置重新初始化。
+配置不完整时，进程在创建数据库前退出。`local` 只有同时设置开发专用的
+`VGEN_ALLOW_LOCAL_ARTIFACT_STORE=1` 才能启动；ECS 安装器不会写入该变量，并且强制 OSS。
+安装器只安装 `[gateway,oss]`，已有本地存储配置也不能通过原地升级绕过，开发测试环境必须先
+`reset-test`，再以完整 OSS 配置重新初始化。
 公开 CLI/Worker 安装包仍由独立下载站本地目录 `/var/www/vgen-releases` 提供，不属于任务
 ArtifactStore，也不会被上述限制删除或迁移。
 

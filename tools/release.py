@@ -245,7 +245,8 @@ def _public_version_exists(release_origin: str, version: str) -> bool:
     url = f"{release}/releases/{version}/manifest.json"
     request = urllib.request.Request(url, headers={"User-Agent": "vgen-release/1"})
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        # _validated_origin above requires credential-free HTTPS.
+        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
             response.read(1)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -600,16 +601,19 @@ def _ssh_commands(target: str, port: int) -> tuple[list[str], list[str]]:
 
 
 def _verify_public_release(release_origin: str, version: str) -> None:
+    release, _ = _validated_origin(release_origin)
+
     def read(url: str, limit: int) -> bytes:
         request = urllib.request.Request(url, headers={"User-Agent": "vgen-release/1"})
-        with urllib.request.urlopen(request, timeout=20) as response:
+        # Every URL is derived from the validated HTTPS origin.
+        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
             value = response.read(limit + 1)
         if len(value) > limit:
             raise ReleaseError(f"public verification response exceeded its limit: {url}")
         return value
 
     stable = json.loads(
-        read(f"{release_origin}/releases/channels/stable.json", 1024 * 1024)
+        read(f"{release}/releases/channels/stable.json", 1024 * 1024)
     )
     if (
         not isinstance(stable, dict)
@@ -617,10 +621,10 @@ def _verify_public_release(release_origin: str, version: str) -> None:
         or stable.get("version") != version
     ):
         raise ReleaseError("public stable pointer did not switch to the requested version")
-    read(f"{release_origin}/releases/install-macos.sh", 2 * 1024 * 1024)
-    read(f"{release_origin}/releases/install-windows-worker.ps1", 2 * 1024 * 1024)
+    read(f"{release}/releases/install-macos.sh", 2 * 1024 * 1024)
+    read(f"{release}/releases/install-windows-worker.ps1", 2 * 1024 * 1024)
     manifest = json.loads(
-        read(f"{release_origin}/releases/{version}/manifest.json", 1024 * 1024)
+        read(f"{release}/releases/{version}/manifest.json", 1024 * 1024)
     )
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) != 2:
@@ -628,12 +632,13 @@ def _verify_public_release(release_origin: str, version: str) -> None:
     for artifact in artifacts:
         if not isinstance(artifact, dict) or not isinstance(artifact.get("filename"), str):
             raise ReleaseError("public manifest contains invalid artifact metadata")
-        url = f"{release_origin}/releases/{version}/{artifact['filename']}"
+        url = f"{release}/releases/{version}/{artifact['filename']}"
         request = urllib.request.Request(
             url,
             headers={"Range": "bytes=0-0", "User-Agent": "vgen-release/1"},
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        # URL is derived from the validated HTTPS origin.
+        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
             response.read(1)
 
 
