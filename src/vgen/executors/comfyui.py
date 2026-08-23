@@ -1430,43 +1430,68 @@ class ComfyUIExecutor:
 
 def _probe_media(path: Path) -> dict[str, int]:
     ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        return {}
+    if ffprobe:
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height,nb_frames",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+            payload = json.loads(completed.stdout)
+            stream = (payload.get("streams") or [{}])[0]
+            duration = (payload.get("format") or {}).get("duration")
+            result: dict[str, int] = {}
+            if stream.get("width"):
+                result["width"] = int(stream["width"])
+                result["height"] = int(stream["height"])
+            if stream.get("nb_frames") and str(stream["nb_frames"]).isdigit():
+                result["frames"] = int(stream["nb_frames"])
+            if duration:
+                result["duration_ms"] = round(float(duration) * 1000)
+            return result
+        except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, KeyError):
+            pass
+
+    # ComfyUI Desktop installations do not always expose ffprobe on PATH, but
+    # the supported Windows runtime already provides OpenCV. Use it as a local
+    # fallback so output video duration does not silently become zero.
     try:
-        completed = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=width,height,nb_frames",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "json",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-        payload = json.loads(completed.stdout)
-        stream = (payload.get("streams") or [{}])[0]
-        duration = (payload.get("format") or {}).get("duration")
-        result: dict[str, int] = {}
-        if stream.get("width"):
-            result["width"] = int(stream["width"])
-            result["height"] = int(stream["height"])
-        if stream.get("nb_frames") and str(stream["nb_frames"]).isdigit():
-            result["frames"] = int(stream["nb_frames"])
-        if duration:
-            result["duration_ms"] = round(float(duration) * 1000)
-        return result
-    except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, KeyError):
+        import cv2
+    except ImportError:
         return {}
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            return {}
+        frames = max(0, round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        width = max(0, round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        height = max(0, round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        result = {}
+        if width and height:
+            result.update({"width": width, "height": height})
+        if frames:
+            result["frames"] = frames
+        if frames and fps > 0 and math.isfinite(fps):
+            result["duration_ms"] = round(frames / fps * 1000)
+        return result
+    finally:
+        capture.release()
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

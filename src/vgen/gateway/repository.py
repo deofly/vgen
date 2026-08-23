@@ -2263,8 +2263,7 @@ class GatewayRepository:
         executor_version: str,
         capacity: int,
         manager_broker_id: str | None,
-        rate_microtokens_per_gpu_second: int,
-        traffic_microtokens_per_gib: int,
+        rate_microtokens_per_second: int,
         ttl_seconds: int,
     ) -> tuple[dict[str, Any], str]:
         """Issue a one-use, approval-required Invite without a bundled Worker key."""
@@ -2297,14 +2296,6 @@ class GatewayRepository:
                     "Manager broker is not owned by the Worker owner.",
                     403,
                 )
-        if traffic_microtokens_per_gib != 0:
-            raise RepositoryError(
-                RATE_NOT_APPROVED,
-                "TRAFFIC_BILLING_NOT_ENABLED",
-                "Traffic billing is not enabled by the v1 rate policy.",
-                409,
-            )
-
         invite_id = new_id("inv")
         worker_id = new_id("wrk")
         allocation_id = new_id("alc")
@@ -2320,8 +2311,7 @@ class GatewayRepository:
                 "executor_version": executor_version,
                 "capacity": capacity,
                 "manager_broker_id": manager_broker_id,
-                "rate_microtokens_per_gpu_second": rate_microtokens_per_gpu_second,
-                "traffic_microtokens_per_gib": traffic_microtokens_per_gib,
+                "rate_microtokens_per_second": rate_microtokens_per_second,
             }
         }
         with self.db.transaction(immediate=True) as conn:
@@ -2840,17 +2830,19 @@ class GatewayRepository:
                 conn.execute(
                     """INSERT INTO rate_cards
                        (id,worker_id,workspace_id,proposed_by_user_id,approved_by_user_id,
-                        rate_microtokens_per_gpu_second,traffic_microtokens_per_gib,
-                        formula_version,status,proposed_at,decided_at)
-                       VALUES (?,?,?,?,?,?,?,1,'approved',?,?)""",
+                        rate_microtokens_per_second,rate_microtokens_per_gpu_second,
+                        traffic_microtokens_per_gib,formula_version,status,proposed_at,decided_at)
+                       VALUES (?,?,?,?,?,?,0,0,0,'approved',?,?)""",
                     (
                         new_id("rat"),
                         config["worker_id"],
                         row["workspace_id"],
                         admin_user_id,
                         admin_user_id,
-                        config["rate_microtokens_per_gpu_second"],
-                        config["traffic_microtokens_per_gib"],
+                        config.get(
+                            "rate_microtokens_per_second",
+                            config.get("rate_microtokens_per_gpu_second", 0),
+                        ),
                         stamp,
                         stamp,
                     ),
@@ -4700,8 +4692,7 @@ class GatewayRepository:
         worker_id: str,
         workspace_id: str,
         user_id: str,
-        rate_microtokens_per_gpu_second: int,
-        traffic_microtokens_per_gib: int,
+        rate_microtokens_per_second: int,
     ) -> dict[str, Any]:
         worker = self.db.fetchone("SELECT * FROM workers WHERE id=?", (worker_id,))
         if worker is None:
@@ -4716,16 +4707,16 @@ class GatewayRepository:
         rate_id = new_id("rat")
         self.db.execute(
             """INSERT INTO rate_cards
-               (id,worker_id,workspace_id,proposed_by_user_id,rate_microtokens_per_gpu_second,
-                traffic_microtokens_per_gib,status,proposed_at)
-               VALUES (?,?,?,?,?,?,'proposed',?)""",
+               (id,worker_id,workspace_id,proposed_by_user_id,rate_microtokens_per_second,
+                rate_microtokens_per_gpu_second,traffic_microtokens_per_gib,formula_version,
+                status,proposed_at)
+               VALUES (?,?,?,?,?,0,0,0,'proposed',?)""",
             (
                 rate_id,
                 worker_id,
                 workspace_id,
                 user_id,
-                rate_microtokens_per_gpu_second,
-                traffic_microtokens_per_gib,
+                rate_microtokens_per_second,
                 now(),
             ),
         )
@@ -4736,13 +4727,6 @@ class GatewayRepository:
         if rate is None:
             raise RepositoryError(RATE_NOT_FOUND, "RATE_NOT_FOUND", "Rate card not found.", 404)
         self.require_admin(rate["workspace_id"], admin_user_id)
-        if int(rate["traffic_microtokens_per_gib"]) != 0:
-            raise RepositoryError(
-                RATE_NOT_APPROVED,
-                "TRAFFIC_BILLING_NOT_ENABLED",
-                "Traffic billing is not enabled by the v1 rate policy.",
-                409,
-            )
         stamp = now()
         with self.db.transaction(immediate=True) as conn:
             conn.execute(
@@ -5168,10 +5152,10 @@ class GatewayRepository:
             fencing = int(candidates["fencing_counter"]) + 1
             rate_snapshot = {
                 "rate_card_id": rate["id"],
-                "rate_microtokens_per_gpu_second": rate["rate_microtokens_per_gpu_second"],
-                "traffic_microtokens_per_gib": rate["traffic_microtokens_per_gib"],
-                "workflow_multiplier_ppm": 1_000_000,
-                "formula_version": rate["formula_version"],
+                "rate_microtokens_per_second": rate["rate_microtokens_per_second"],
+                "pricing_model": "video_duration_and_generation_time",
+                "formula_version": 0,
+                "formula_status": "not_implemented",
             }
             conn.execute(
                 """INSERT INTO tasks
@@ -5934,25 +5918,30 @@ class GatewayRepository:
         stamp: float,
     ) -> None:
         rate = json.loads(rate_snapshot_text)
-        gpu_active_ms = max(0, int(metrics.get("gpu_active_ms", 0)))
-        multiplier = max(0, int(rate.get("workflow_multiplier_ppm", 1_000_000)))
-        per_second = max(0, int(rate.get("rate_microtokens_per_gpu_second", 0)))
-        # gpu_active_ms is aggregate active accelerator time across the reported
-        # gpu_count; the rate therefore applies once and gpu_count is not multiplied again.
-        numerator = gpu_active_ms * per_second * multiplier
-        denominator = 1_000 * 1_000_000
-        compute = (numerator + denominator - 1) // denominator
-        egress = max(0, int(metrics.get("egress_bytes", 0)))
-        traffic_rate = max(0, int(rate.get("traffic_microtokens_per_gib", 0)))
-        traffic_numerator = egress * traffic_rate
-        traffic_denominator = 1024**3
-        traffic = (traffic_numerator + traffic_denominator - 1) // traffic_denominator
-        billable = succeeded or responsibility == "consumer"
-        if responsibility in ("provider", "platform"):
-            billable = False
-        if not billable:
-            compute = 0
-            traffic = 0
+        # Pricing is intentionally not implemented yet. The ledger stores only
+        # the stable dimensions required by the future formula: output video
+        # duration and generation elapsed time. Input-video duration is a
+        # reserved extension point and remains null until video inputs exist.
+        billing_dimensions = {
+            "output_video_duration_ms": max(0, int(metrics.get("duration_ms", 0))),
+            # This is measured by the Gateway from the accepted start to the
+            # final report, so future pricing does not trust a Worker-supplied
+            # elapsed-time value.
+            "generation_elapsed_ms": max(0, int(metrics.get("gateway_wall_ms", 0))),
+            "input_video_duration_ms": None,
+        }
+        ledger_rate_snapshot = {
+            "rate_card_id": rate.get("rate_card_id"),
+            "rate_microtokens_per_second": max(
+                0, int(rate.get("rate_microtokens_per_second", 0))
+            ),
+            "pricing_model": "video_duration_and_generation_time",
+            "formula_version": 0,
+            "formula_status": "not_implemented",
+        }
+        compute = 0
+        traffic = 0
+        billable = False
         prior = conn.execute(
             "SELECT integrity_hash FROM usage_ledger ORDER BY created_at DESC,id DESC LIMIT 1"
         ).fetchone()
@@ -5960,8 +5949,8 @@ class GatewayRepository:
         payload = {
             "attempt_id": attempt_id,
             "entry_type": "charge",
-            "metrics": metrics,
-            "rate_snapshot": rate,
+            "metrics": billing_dimensions,
+            "rate_snapshot": ledger_rate_snapshot,
             "compute_microtokens": compute,
             "traffic_microtokens": traffic,
             "billable": billable,
@@ -5978,14 +5967,14 @@ class GatewayRepository:
             (
                 new_id("led"),
                 attempt_id,
-                json_text(metrics),
-                rate_snapshot_text,
+                json_text(billing_dimensions),
+                json_text(ledger_rate_snapshot),
                 compute,
                 traffic,
                 compute + traffic,
                 int(billable),
                 responsibility,
-                int(rate.get("formula_version", 1)),
+                0,
                 previous_hash,
                 integrity_hash,
                 stamp,
@@ -6206,10 +6195,10 @@ class GatewayRepository:
             attempt_id = new_id("atm")
             rate_snapshot = {
                 "rate_card_id": rate["id"],
-                "rate_microtokens_per_gpu_second": rate["rate_microtokens_per_gpu_second"],
-                "traffic_microtokens_per_gib": rate["traffic_microtokens_per_gib"],
-                "workflow_multiplier_ppm": 1_000_000,
-                "formula_version": rate["formula_version"],
+                "rate_microtokens_per_second": rate["rate_microtokens_per_second"],
+                "pricing_model": "video_duration_and_generation_time",
+                "formula_version": 0,
+                "formula_status": "not_implemented",
             }
             conn.execute(
                 "UPDATE workers SET fencing_counter=?,updated_at=? WHERE id=?",

@@ -45,6 +45,19 @@ def test_existing_v1_ledger_adds_reversal_reference_reason_and_unique_index(tmp_
             integrity_hash TEXT NOT NULL UNIQUE,
             created_at REAL NOT NULL
         );
+        CREATE TABLE rate_cards (
+            id TEXT PRIMARY KEY,
+            worker_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            proposed_by_user_id TEXT NOT NULL,
+            approved_by_user_id TEXT,
+            rate_microtokens_per_gpu_second INTEGER NOT NULL,
+            traffic_microtokens_per_gib INTEGER NOT NULL DEFAULT 0,
+            formula_version INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL,
+            proposed_at REAL NOT NULL,
+            decided_at REAL
+        );
         """
     )
     legacy.commit()
@@ -53,8 +66,10 @@ def test_existing_v1_ledger_adds_reversal_reference_reason_and_unique_index(tmp_
     db = GatewayDatabase(str(path))
     try:
         columns = {row["name"] for row in db.fetchall("PRAGMA table_info(usage_ledger)")}
+        rate_columns = {row["name"] for row in db.fetchall("PRAGMA table_info(rate_cards)")}
         indexes = {row["name"]: row for row in db.fetchall("PRAGMA index_list(usage_ledger)")}
         assert {"reverses_ledger_id", "reversal_reason_code"} <= columns
+        assert "rate_microtokens_per_second" in rate_columns
         assert indexes["idx_ledger_one_reversal_per_charge"]["unique"] == 1
         assert indexes["idx_ledger_one_reversal_per_charge"]["partial"] == 1
     finally:
@@ -198,10 +213,11 @@ def _insert_running_attempt(
     fencing_token = int(stamp * 1_000_000)
     rate_snapshot = json_text(
         {
-            "rate_microtokens_per_gpu_second": 1_000_000,
-            "traffic_microtokens_per_gib": 0,
-            "workflow_multiplier_ppm": 1_000_000,
-            "formula_version": 1,
+            "rate_card_id": "rat_test",
+            "rate_microtokens_per_second": 1_000_000,
+            "pricing_model": "video_duration_and_generation_time",
+            "formula_version": 0,
+            "formula_status": "not_implemented",
         }
     )
     db.execute(
@@ -401,13 +417,11 @@ def test_resource_errors_use_permanent_category_codes(tmp_path) -> None:
             worker_id=worker["id"],
             workspace_id=workspace["id"],
             user_id=owner_id,
-            rate_microtokens_per_gpu_second=1_000_000,
-            traffic_microtokens_per_gib=1,
+            rate_microtokens_per_second=1_000_000,
         )
-        with pytest.raises(RepositoryError) as traffic:
-            repository.approve_rate(rate_id=rate["id"], admin_user_id=owner_id)
-        assert traffic.value.code == int(ErrorCode.RATE_NOT_APPROVED)
-        assert traffic.value.name == "TRAFFIC_BILLING_NOT_ENABLED"
+        approved = repository.approve_rate(rate_id=rate["id"], admin_user_id=owner_id)
+        assert approved["status"] == "approved"
+        assert approved["rate_microtokens_per_second"] == 1_000_000
     finally:
         db.close()
 
@@ -858,11 +872,9 @@ def test_worker_cannot_self_assign_consumer_billing_responsibility(tmp_path) -> 
         ledger = db.fetchone("SELECT * FROM usage_ledger WHERE attempt_id=?", (attempt_id,))
         ledger_metrics = json.loads(ledger["metrics"])
         assert event_metrics == reported_metrics
-        assert ledger_metrics["gateway_wall_ms"] < 10_000
-        assert set(ledger_metrics["anomaly_flags"]) == {
-            "gateway_wall_report_mismatch",
-            "gpu_active_exceeds_observed_capacity",
-        }
+        assert ledger_metrics["output_video_duration_ms"] == 0
+        assert 1_900 <= ledger_metrics["generation_elapsed_ms"] <= 2_500
+        assert ledger_metrics["input_video_duration_ms"] is None
         assert ledger["responsibility"] == "provider"
         assert ledger["billable"] == 0
         assert ledger["total_microtokens"] == 0
@@ -1055,12 +1067,13 @@ def test_running_cancellation_waits_for_signed_usage_and_charges_once(tmp_path) 
         assert repeated == finished
 
         ledger = db.fetchone("SELECT * FROM usage_ledger WHERE attempt_id=?", (attempt_id,))
-        assert ledger["billable"] == 1
+        assert ledger["billable"] == 0
         assert ledger["responsibility"] == "consumer"
-        assert ledger["compute_microtokens"] == 1_500_000
+        assert ledger["compute_microtokens"] == 0
         metrics = json.loads(ledger["metrics"])
-        assert metrics["gpu_active_ms"] == 1_500
-        assert "cancelled_gpu_active_derived_from_executor_wall" in metrics["anomaly_flags"]
+        assert metrics["output_video_duration_ms"] == 0
+        assert 1_900 <= metrics["generation_elapsed_ms"] <= 2_500
+        assert metrics["input_video_duration_ms"] is None
         assert (
             db.fetchone(
                 "SELECT COUNT(*) AS count FROM usage_events WHERE attempt_id=?", (attempt_id,)

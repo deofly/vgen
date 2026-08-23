@@ -454,7 +454,7 @@ def _runtime_credentials(arguments: argparse.Namespace) -> WorkerCredentials | N
 
 def _gateway_probe(base_url: str, *, session: requests.Session) -> dict[str, Any]:
     try:
-        response = session.get(f"{base_url}/api/v1/health", timeout=(10, 20))
+        response = session.get(f"{base_url}/healthz", timeout=(10, 20))
         if response.status_code >= 400:
             return {
                 "ok": False,

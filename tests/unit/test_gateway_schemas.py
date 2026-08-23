@@ -53,15 +53,14 @@ def test_rate_proposal_is_bounded_to_sqlite_integer_range() -> None:
     maximum = 1_000_000_000_000
     value = RateProposal(
         workspace_id="wsp_test",
-        rate_microtokens_per_gpu_second=maximum,
-        traffic_microtokens_per_gib=maximum,
+        rate_microtokens_per_second=maximum,
     )
-    assert value.rate_microtokens_per_gpu_second == maximum
+    assert value.rate_microtokens_per_second == maximum
 
     with pytest.raises(ValidationError):
         RateProposal(
             workspace_id="wsp_test",
-            rate_microtokens_per_gpu_second=maximum + 1,
+            rate_microtokens_per_second=maximum + 1,
         )
 
 

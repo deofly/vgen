@@ -73,6 +73,7 @@ from .schemas import (
     RateProposal,
     ServiceEnrollmentRequest,
     SessionRequest,
+    StatusResponse,
     TaskCommit,
     TaskPreflight,
     TaskPreflightResult,
@@ -1017,7 +1018,7 @@ def create_app(
                     details={"max_bytes": request_body_limit},
                 )
         protocol_exempt = (
-            request.url.path in {"/healthz", "/api/v1/health", "/docs", "/openapi.json"}
+            request.url.path in {"/healthz", "/docs", "/openapi.json"}
             or request.url.path.startswith("/docs/")
             or request.url.path.startswith("/api/v1/artifacts/transfer/")
             or request.url.path.startswith("/api/v1/releases/")
@@ -1269,6 +1270,15 @@ def create_app(
             raise VGenError(ErrorCode.PERMISSION_DENIED)
         return principal
 
+    def operator_principal(principal: Principal = Depends(user_principal)) -> Principal:
+        row = db.fetchone(
+            "SELECT is_operator FROM users WHERE id=? AND status='active'",
+            (principal.user_id,),
+        )
+        if row is None or int(row["is_operator"]) != 1:
+            raise VGenError(ErrorCode.PERMISSION_DENIED)
+        return principal
+
     def task_principal(principal: Principal = Depends(current_principal)) -> Principal:
         if principal.principal_type not in {"device", "service"}:
             raise VGenError(ErrorCode.PERMISSION_DENIED)
@@ -1457,8 +1467,11 @@ def create_app(
         return spec, authorization, expires_at, str(intent_payload["spec_digest"])
 
     @app.get("/healthz", tags=["system"], response_model=HealthResponse)
-    @app.get("/api/v1/health", tags=["system"], response_model=HealthResponse)
-    def health() -> dict[str, Any]:
+    def health() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.get("/api/v1/status", tags=["system"], response_model=StatusResponse)
+    def status(principal: Principal = Depends(operator_principal)) -> dict[str, Any]:
         return db.health()
 
     def public_release_manifest(

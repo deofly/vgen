@@ -20,7 +20,8 @@ keys.
 - Install pinned workflow models and update Windows Workers from the Mac Broker.
 - Upgrade the Mac CLI/Home Broker atomically with verification and rollback.
 - Keep Gateway API traffic independent from public release downloads.
-- Track Worker, GPU, network, and `billing_token` usage for every Attempt.
+- Record output video duration and generation elapsed time for every Attempt,
+  ready for a future duration-based `billing_token` formula.
 
 ## Requirements
 
@@ -49,7 +50,7 @@ git clone https://github.com/deofly/vgen.git
 cd vgen
 docker compose -f examples/docker-compose.yml \
   --env-file examples/.env.example up --build -d
-curl --fail http://127.0.0.1:8000/api/v1/health
+curl --fail http://127.0.0.1:8000/healthz
 ```
 
 The response should contain `"ok":true`. Stop the preview with:

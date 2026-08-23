@@ -12,7 +12,7 @@ from fastapi.openapi.utils import get_openapi
 from vgen.protocol.errors import ErrorCode, ErrorOrigin, Responsibility, RetryAction
 
 MUTATION_METHODS = frozenset({"post", "put", "patch", "delete"})
-PROTOCOL_EXEMPT_PATHS = frozenset({"/healthz", "/api/v1/health"})
+PROTOCOL_EXEMPT_PATHS = frozenset({"/healthz"})
 PROTOCOL_EXEMPT_PREFIXES = ("/api/v1/releases/",)
 IDEMPOTENCY_DISABLED_EXACT_PATHS = frozenset(
     {

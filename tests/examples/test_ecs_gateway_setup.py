@@ -594,8 +594,9 @@ def test_activate_reuses_only_the_exact_healthy_rolled_back_state() -> None:
     assert "backup_legacy_database" not in activate_body
     assert "deadline=$((SECONDS + 30))" in source
     assert "consecutive >= 2" in source
-    assert 'payload.get("schema_version") == 1' in source
-    assert 'payload.get("journal_mode") == "wal"' in source
+    assert 'set(payload) == {"ok"}' in source
+    assert 'payload.get("schema_version")' not in source
+    assert 'payload.get("journal_mode")' not in source
     assert '--output "${response_file}"' in source
     assert "2>/dev/null" in source
     assert "--http1.1" in source

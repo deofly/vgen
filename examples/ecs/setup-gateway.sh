@@ -767,7 +767,7 @@ gateway_local_health_is_ok() {
     --http1.1 \
     --header 'Connection: close' \
     --output "${health_file}" \
-    "http://127.0.0.1:${GATEWAY_PORT}/api/v1/health" 2>/dev/null && \
+    "http://127.0.0.1:${GATEWAY_PORT}/healthz" 2>/dev/null && \
     health_payload_is_ok <"${health_file}"; then
     rm -f -- "${health_file}"
     return 0
@@ -1206,7 +1206,7 @@ install_and_start_service() {
   local attempt
   for ((attempt = 1; attempt <= 30; attempt++)); do
     if curl --fail --silent --show-error --max-time 2 \
-      "http://127.0.0.1:${GATEWAY_PORT}/api/v1/health" | health_payload_is_ok; then
+      "http://127.0.0.1:${GATEWAY_PORT}/healthz" | health_payload_is_ok; then
       log "Gateway is healthy on 127.0.0.1:${GATEWAY_PORT}"
       return
     fi
@@ -1228,8 +1228,7 @@ except (json.JSONDecodeError, UnicodeDecodeError):
 valid = (
     isinstance(payload, dict)
     and payload.get("ok") is True
-    and payload.get("schema_version") == 1
-    and payload.get("journal_mode") == "wal"
+    and set(payload) == {"ok"}
 )
 raise SystemExit(0 if valid else 1)
 '
@@ -1252,7 +1251,7 @@ gateway_https_health_with_retry() {
       --header 'Connection: close' \
       --output "${response_file}" \
       --resolve "${DOMAIN}:443:127.0.0.1" \
-      "https://${DOMAIN}/api/v1/health" 2>/dev/null && \
+      "https://${DOMAIN}/healthz" 2>/dev/null && \
       health_payload_is_ok <"${response_file}"; then
       consecutive=$((consecutive + 1))
       if ((consecutive >= 2)); then
@@ -2388,15 +2387,15 @@ show_status() {
   fi
   printf 'gateway_service='
   systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true
-  printf 'local_api_v1_health='
+  printf 'local_healthz='
   if curl --fail --silent --max-time 3 \
-    "http://127.0.0.1:${GATEWAY_PORT}/api/v1/health" >/dev/null; then
+    "http://127.0.0.1:${GATEWAY_PORT}/healthz" >/dev/null; then
     printf 'ok\n'
   else
     printf 'unavailable\n'
   fi
-  printf 'public_api_v1_health='
-  if curl --fail --silent --max-time 10 "https://${DOMAIN}/api/v1/health" >/dev/null; then
+  printf 'public_healthz='
+  if curl --fail --silent --max-time 10 "https://${DOMAIN}/healthz" >/dev/null; then
     printf 'ok\n'
   else
     printf 'unavailable\n'

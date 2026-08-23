@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,6 +19,7 @@ from vgen.executors.comfyui import (
     ComfyUIExecutionPolicy,
     ComfyUIExecutor,
     ComfyUIPolicyError,
+    _probe_media,
 )
 from vgen.market.builder import build_comfy_graph
 from vgen.market.registry import package_digest
@@ -95,6 +98,37 @@ def _request(payload: bytes, *, digest: str = "a" * 64) -> ExecutionRequest:
         payload,
         timeout_seconds=30,
     )
+
+
+def test_media_probe_uses_opencv_when_ffprobe_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeCapture:
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, field: int) -> float:
+            return {1: 81, 2: 24, 3: 1280, 4: 720}[field]
+
+        def release(self) -> None:
+            return None
+
+    fake_cv2 = SimpleNamespace(
+        VideoCapture=lambda _path: FakeCapture(),
+        CAP_PROP_FRAME_COUNT=1,
+        CAP_PROP_FPS=2,
+        CAP_PROP_FRAME_WIDTH=3,
+        CAP_PROP_FRAME_HEIGHT=4,
+    )
+    monkeypatch.setattr("vgen.executors.comfyui.shutil.which", lambda _name: None)
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+
+    assert _probe_media(tmp_path / "result.mp4") == {
+        "width": 1280,
+        "height": 720,
+        "frames": 81,
+        "duration_ms": 3375,
+    }
 
 
 def test_comfyui_executor_keeps_graph_inside_adapter(tmp_path: Path) -> None:

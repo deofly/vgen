@@ -320,7 +320,7 @@ def _register_worker(
         f"/api/v1/workers/{worker['id']}/rates",
         json={
             "workspace_id": workspace_id,
-            "rate_microtokens_per_gpu_second": 1_000_000,
+            "rate_microtokens_per_second": 1_000_000,
         },
         headers=owner.headers,
     )
@@ -447,7 +447,7 @@ def _finish_body(
         "fencing_token": fencing_token,
         "succeeded": True,
         "output_artifacts": output_artifacts or [],
-        "metrics": {"gpu_active_ms": 10},
+        "metrics": {"executor_wall_ms": 10, "duration_ms": 1_000},
         "worker_signature": None,
         "failure_code": None,
         "responsibility": "none",
@@ -771,8 +771,12 @@ def test_retry_attempts_on_two_workers_have_independent_usage_entries(tmp_path: 
         by_attempt = {entry["attempt_id"]: entry for entry in usage}
         assert by_attempt[first_lease["attempt_id"]]["billable"] == 0
         assert by_attempt[first_lease["attempt_id"]]["total_microtokens"] == 0
-        assert by_attempt[second_lease["attempt_id"]]["billable"] == 1
-        assert by_attempt[second_lease["attempt_id"]]["total_microtokens"] == 10_000
+        assert by_attempt[second_lease["attempt_id"]]["billable"] == 0
+        assert by_attempt[second_lease["attempt_id"]]["total_microtokens"] == 0
+        dimensions = by_attempt[second_lease["attempt_id"]]["metrics"]
+        assert dimensions["output_video_duration_ms"] == 1_000
+        assert 0 < dimensions["generation_elapsed_ms"] <= 10
+        assert dimensions["input_video_duration_ms"] is None
 
 
 def test_enrollment_policies_expiry_reuse_approval_and_rejection(

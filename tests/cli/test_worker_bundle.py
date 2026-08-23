@@ -46,8 +46,7 @@ def test_parser_exposes_single_interactive_worker_add_command() -> None:
     assert args.worker_action == "add"
     assert args.name == "Windows GPU Worker"
     assert args.pool is None
-    assert args.compute_rate == 1_000_000
-    assert args.traffic_rate == 0
+    assert args.rate == 0
     for removed in (
         "bundle",
         "installer-bundle",

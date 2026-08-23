@@ -481,6 +481,10 @@ CREATE TABLE IF NOT EXISTS rate_cards (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     proposed_by_user_id TEXT NOT NULL REFERENCES users(id),
     approved_by_user_id TEXT REFERENCES users(id),
+    rate_microtokens_per_second INTEGER NOT NULL DEFAULT 0
+        CHECK(rate_microtokens_per_second >= 0),
+    -- Retained only so existing databases remain readable during the pricing
+    -- transition. New API requests and ledger entries do not use GPU/traffic rates.
     rate_microtokens_per_gpu_second INTEGER NOT NULL CHECK(rate_microtokens_per_gpu_second >= 0),
     traffic_microtokens_per_gib INTEGER NOT NULL DEFAULT 0,
     formula_version INTEGER NOT NULL DEFAULT 1,
@@ -617,6 +621,15 @@ class GatewayDatabase:
                     self._conn.execute(
                         f"ALTER TABLE broker_devices ADD COLUMN {column} {definition}"
                     )
+            rate_card_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(rate_cards)")
+            }
+            if "rate_microtokens_per_second" not in rate_card_columns:
+                self._conn.execute(
+                    "ALTER TABLE rate_cards ADD COLUMN "
+                    "rate_microtokens_per_second INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK(rate_microtokens_per_second >= 0)"
+                )
             usage_ledger_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(usage_ledger)")
             }

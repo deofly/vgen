@@ -189,11 +189,16 @@ new Attempt. Retrying an upload never reruns inference.
 
 ### 3.2 Usage ledger
 
-Each Attempt records consumer/provider principals, Broker, Worker, Workspace,
-Pool, workflow digest, Executor version, GPU time, Gateway time, bytes,
-resolution, frames, duration, steps, and rate snapshot. Worker usage reports
-are signed. The ledger is append-only; corrections use reversal entries.
-Public units are `billing_token`, backed by integer microtokens.
+Each Attempt keeps signed operational usage separately from its billing ledger.
+The billing ledger currently stores only `output_video_duration_ms`,
+`generation_elapsed_ms`, and a reserved `input_video_duration_ms` field. Input
+video duration is not collected yet. The Gateway measures generation elapsed
+time from the accepted start to the final report instead of trusting a Worker
+metric. The future formula will use video duration, generation elapsed time, and
+an approved per-second rate; until that formula is implemented, new entries have
+`formula_version: 0`, zero tokens, and `billable: false`. The ledger is
+append-only and corrections use reversal entries. Public units remain
+`billing_token`, backed by integer microtokens.
 
 ### 3.3 Error registry
 

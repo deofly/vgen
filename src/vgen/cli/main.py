@@ -531,9 +531,9 @@ def _profile_command(args: argparse.Namespace) -> None:
 
 def _gateway_command(args: argparse.Namespace) -> None:
     if args.gateway_action == "health":
-        client = _client(args.profile, login=False)
+        client = _client(args.profile)
         try:
-            _json(client.health())
+            _json(client.status())
         finally:
             client.close()
         return
@@ -1852,8 +1852,8 @@ def _create_worker_invite(
 ) -> tuple[str, str, str]:
     if not args.name.strip():
         raise ValueError("Worker name is required")
-    if args.compute_rate < 0 or args.traffic_rate < 0:
-        raise ValueError("Worker rates cannot be negative")
+    if args.rate < 0:
+        raise ValueError("Worker rate cannot be negative")
     if not 60 <= args.ttl <= 86_400:
         raise ValueError("Worker Invite lifetime must be between 60 and 86400 seconds")
     if args.interval <= 0 or args.timeout <= 0:
@@ -1875,8 +1875,7 @@ def _create_worker_invite(
             "manager_broker_id": (
                 args.manager_broker or getattr(client.profile, "home_broker_id", None)
             ),
-            "rate_microtokens_per_gpu_second": args.compute_rate,
-            "traffic_microtokens_per_gib": args.traffic_rate,
+            "rate_microtokens_per_second": args.rate,
             "ttl_seconds": args.ttl,
         },
         idempotency_key=f"worker-add:{uuid.uuid4()}",
@@ -2110,12 +2109,11 @@ def _worker_command(args: argparse.Namespace) -> None:
                     f"/api/v1/workers/{args.worker_id}/rates",
                     json_body={
                         "workspace_id": workspace_id,
-                        "rate_microtokens_per_gpu_second": args.compute_rate,
-                        "traffic_microtokens_per_gib": args.traffic_rate,
+                        "rate_microtokens_per_second": args.rate,
                     },
                     idempotency_key=(
                         f"worker-rate:{args.worker_id}:{workspace_id}:"
-                        f"{args.compute_rate}:{args.traffic_rate}"
+                        f"{args.rate}"
                     ),
                 )
             )
@@ -3116,7 +3114,6 @@ _ARGUMENT_HELP: dict[str, str] = {
     "comfy_policy_file": "本机管理员审核过的 ComfyUI 图白名单文件。",
     "comfy_url": "本机 ComfyUI API 地址，默认 http://127.0.0.1:8188。",
     "comfyui_root": "Windows 上包含 ComfyUI main.py 的目录；常见位置会自动识别。",
-    "compute_rate": "每 GPU 秒的计算费率，单位为 microtoken。",
     "credentials_account": "在系统 Keychain 中保存或读取凭据所用的账户名。",
     "credentials_file": "凭据文件路径；应限制为仅当前用户可读。",
     "credentials_keyring": "从系统凭据存储读取 Worker 凭据。",
@@ -3175,6 +3172,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "publisher_key": "通过独立可信渠道取得的作者 Ed25519 公钥。",
     "query": "工作流搜索关键词。",
     "rate_id": "待批准的 Rate Card ID。",
+    "rate": "为后续按视频时长和生成耗时计费预留的每秒费率，单位为 microtoken。",
     "recipient_id": "密钥接收方的 User、Device 或 Service ID。",
     "recipient_type": "密钥接收方类型。",
     "recovery_file": "已有恢复文件路径；用于恢复而不是创建新用户。",
@@ -3190,7 +3188,6 @@ _ARGUMENT_HELP: dict[str, str] = {
     "subject_key_fingerprint": "将邀请绑定到指定主体公钥的 SHA-256 指纹。",
     "task_id": "任务 ID。",
     "timeout": "最长等待秒数，超时只停止本地等待。",
-    "traffic_rate": "每字节流量费率，单位为 microtoken；当前通常为 0。",
     "ttl": "邀请有效秒数。",
     "use": "完成后把新建资源设为当前 Profile 的默认值。",
     "user_id": "用户 ID。",
@@ -3629,8 +3626,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker_add.add_argument("--name", default="Windows GPU Worker")
     worker_add.add_argument("--pool", help="Pool name (automatic when only one exists)")
     worker_add.add_argument("--manager-broker")
-    worker_add.add_argument("--compute-rate", type=int, default=1_000_000)
-    worker_add.add_argument("--traffic-rate", type=int, default=0)
+    worker_add.add_argument(
+        "--rate",
+        type=int,
+        default=0,
+        help="reserved microtokens-per-second rate for the future duration pricing formula",
+    )
     worker_add.add_argument("--ttl", type=int, default=1800)
     worker_add.add_argument("--interval", type=float, default=2)
     worker_add.add_argument("--timeout", type=float, default=1800)
@@ -3677,8 +3678,12 @@ def build_parser() -> argparse.ArgumentParser:
     rate_propose = worker_sub.add_parser("rate-propose")
     rate_propose.add_argument("worker_id")
     rate_propose.add_argument("--workspace")
-    rate_propose.add_argument("--compute-rate", type=int, required=True)
-    rate_propose.add_argument("--traffic-rate", type=int, default=0)
+    rate_propose.add_argument(
+        "--rate",
+        type=int,
+        required=True,
+        help="reserved microtokens-per-second rate for the future duration pricing formula",
+    )
     rate_propose.add_argument("--profile")
     rate_approve = worker_sub.add_parser("rate-approve")
     rate_approve.add_argument("rate_id")

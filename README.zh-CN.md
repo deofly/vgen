@@ -16,7 +16,7 @@ VGen 是一个开源 GPU 工作流控制面，由公网 Gateway、Mac CLI/Home B
 - 由 Mac Broker 安装固定版本的工作流模型并更新 Windows Worker。
 - Mac CLI/Home Broker 支持校验、原子升级和失败回滚。
 - Gateway API 与公开安装包使用独立域名。
-- 为每个 Attempt 记录 Worker、GPU、网络和 `billing_token` 用量。
+- 为每个 Attempt 记录输出视频时长和生成耗时，为后续按时长计算 `billing_token` 预留扩展点。
 
 ## 环境依赖
 
@@ -43,7 +43,7 @@ git clone https://github.com/deofly/vgen.git
 cd vgen
 docker compose -f examples/docker-compose.yml \
   --env-file examples/.env.example up --build -d
-curl --fail http://127.0.0.1:8000/api/v1/health
+curl --fail http://127.0.0.1:8000/healthz
 ```
 
 响应应包含 `"ok":true`。体验结束后运行：

@@ -127,8 +127,7 @@ def _invite(client: TestClient, headers: dict[str, str], workspace: dict, pool: 
             "executor_type": "comfyui",
             "executor_version": "1.1.0",
             "capacity": 1,
-            "rate_microtokens_per_gpu_second": 1_250_000,
-            "traffic_microtokens_per_gib": 0,
+            "rate_microtokens_per_second": 1_250_000,
             "ttl_seconds": 1800,
         },
         headers={**headers, "Idempotency-Key": "worker-invite-test"},
@@ -272,8 +271,7 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
             (active["worker"]["id"], workspace["id"]),
         )
         assert rate is not None
-        assert rate["rate_microtokens_per_gpu_second"] == 1_250_000
-        assert rate["traffic_microtokens_per_gib"] == 0
+        assert rate["rate_microtokens_per_second"] == 1_250_000
         assert secret not in json.dumps(active, sort_keys=True)
         assert "invite_secret_hash" not in json.dumps(active, sort_keys=True)
 

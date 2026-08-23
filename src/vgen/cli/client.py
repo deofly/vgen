@@ -169,7 +169,10 @@ class GatewayClient:
         )
 
     def health(self) -> Any:
-        return self.request("GET", "/api/v1/health", auth=False)
+        return self.request("GET", "/healthz", auth=False)
+
+    def status(self) -> Any:
+        return self.request("GET", "/api/v1/status")
 
     def create_workspace(self, payload: Mapping[str, Any]) -> Any:
         return self.request(

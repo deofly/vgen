@@ -1150,29 +1150,14 @@
       "HealthResponse": {
         "additionalProperties": false,
         "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/HealthCounts"
-          },
-          "journal_mode": {
-            "title": "Journal Mode",
-            "type": "string"
-          },
           "ok": {
             "const": true,
             "title": "Ok",
             "type": "boolean"
-          },
-          "schema_version": {
-            "minimum": 1.0,
-            "title": "Schema Version",
-            "type": "integer"
           }
         },
         "required": [
-          "ok",
-          "schema_version",
-          "journal_mode",
-          "counts"
+          "ok"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -1765,17 +1750,10 @@
       "RateProposal": {
         "additionalProperties": false,
         "properties": {
-          "rate_microtokens_per_gpu_second": {
+          "rate_microtokens_per_second": {
             "maximum": 1000000000000.0,
             "minimum": 0.0,
-            "title": "Rate Microtokens Per Gpu Second",
-            "type": "integer"
-          },
-          "traffic_microtokens_per_gib": {
-            "default": 0,
-            "maximum": 1000000000000.0,
-            "minimum": 0.0,
-            "title": "Traffic Microtokens Per Gib",
+            "title": "Rate Microtokens Per Second",
             "type": "integer"
           },
           "workspace_id": {
@@ -1785,7 +1763,7 @@
         },
         "required": [
           "workspace_id",
-          "rate_microtokens_per_gpu_second"
+          "rate_microtokens_per_second"
         ],
         "title": "RateProposal",
         "type": "object"
@@ -1940,6 +1918,36 @@
           "signature"
         ],
         "title": "SessionRequest",
+        "type": "object"
+      },
+      "StatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/HealthCounts"
+          },
+          "journal_mode": {
+            "title": "Journal Mode",
+            "type": "string"
+          },
+          "ok": {
+            "const": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "minimum": 1.0,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "schema_version",
+          "journal_mode",
+          "counts"
+        ],
+        "title": "StatusResponse",
         "type": "object"
       },
       "TaskCommit": {
@@ -2992,18 +3000,11 @@
             "title": "Pool Id",
             "type": "string"
           },
-          "rate_microtokens_per_gpu_second": {
-            "default": 1000000,
-            "maximum": 1000000000000.0,
-            "minimum": 0.0,
-            "title": "Rate Microtokens Per Gpu Second",
-            "type": "integer"
-          },
-          "traffic_microtokens_per_gib": {
+          "rate_microtokens_per_second": {
             "default": 0,
             "maximum": 1000000000000.0,
             "minimum": 0.0,
-            "title": "Traffic Microtokens Per Gib",
+            "title": "Rate Microtokens Per Second",
             "type": "integer"
           },
           "ttl_seconds": {
@@ -5901,74 +5902,6 @@
         ]
       }
     },
-    "/api/v1/health": {
-      "get": {
-        "operationId": "health_api_v1_health_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
-                }
-              }
-            },
-            "description": "Successful Response",
-            "headers": {
-              "X-Request-ID": {
-                "description": "Opaque request correlation identifier.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/VGenError400"
-          },
-          "401": {
-            "$ref": "#/components/responses/VGenError401"
-          },
-          "403": {
-            "$ref": "#/components/responses/VGenError403"
-          },
-          "404": {
-            "$ref": "#/components/responses/VGenError404"
-          },
-          "409": {
-            "$ref": "#/components/responses/VGenError409"
-          },
-          "413": {
-            "$ref": "#/components/responses/VGenError413"
-          },
-          "422": {
-            "$ref": "#/components/responses/VGenError422"
-          },
-          "429": {
-            "$ref": "#/components/responses/VGenError429"
-          },
-          "500": {
-            "$ref": "#/components/responses/VGenError500"
-          },
-          "502": {
-            "$ref": "#/components/responses/VGenError502"
-          },
-          "503": {
-            "$ref": "#/components/responses/VGenError503"
-          },
-          "504": {
-            "$ref": "#/components/responses/VGenError504"
-          },
-          "507": {
-            "$ref": "#/components/responses/VGenError507"
-          }
-        },
-        "summary": "Health",
-        "tags": [
-          "system"
-        ]
-      }
-    },
     "/api/v1/maintenance-jobs/{job_id}": {
       "get": {
         "operationId": "get_worker_maintenance_api_v1_maintenance_jobs__job_id__get",
@@ -6560,6 +6493,84 @@
         "summary": "Release Version Manifest",
         "tags": [
           "release"
+        ]
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "operationId": "status_api_v1_status_get",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/VgenProtocolVersion"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Opaque request correlation identifier.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/VGenError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/VGenError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/VGenError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/VGenError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/VGenError409"
+          },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
+          "422": {
+            "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/VGenError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/VGenError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/VGenError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/VGenError504"
+          },
+          "507": {
+            "$ref": "#/components/responses/VGenError507"
+          }
+        },
+        "security": [
+          {
+            "VGenSession": []
+          }
+        ],
+        "summary": "Status",
+        "tags": [
+          "system"
         ]
       }
     },

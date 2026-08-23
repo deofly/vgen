@@ -233,13 +233,13 @@ finish 或上传完成不得改变新 Attempt。上传失败只恢复同一密�
 
 ### 3.2 用量账本
 
-每个 Attempt 记录 consumer principal/channel、provider User、manager Broker、Worker、Workspace、
-Pool、workflow digest、Executor version、GPU active ms、Gateway observed time、bytes、分辨率、
-帧数、时长和 steps。Worker 签名 usage report，Gateway 记录观测值和异常标记。
-
-Rate、workflow multiplier 和公式版本在 Attempt 开始时固化。账本只追加；纠错写 reversal entry，
-不修改历史行。公开单位名是 `billing_token`，内部使用整数 microtoken，避免与 tokenizer token
-混淆。流量费率可以为零，但上传、下载和公网流出 bytes 必须完整记录。
+每个 Attempt 的签名运行数据与计费账本分开保存。计费账本当前只记录
+`output_video_duration_ms`、`generation_elapsed_ms`，并为尚未支持的输入视频预留
+`input_video_duration_ms`。生成耗时由 Gateway 根据已确认的开始时间和最终报告时间测量，
+不采用 Worker 自报值。后续公式将使用视频时长、生成耗时和已审批的每秒费率；公式落地前，
+新账本固定为 `formula_version: 0`、金额为 0、`billable: false`，不按 GPU 或流量计算费用。
+账本只追加；纠错写 reversal entry，不修改历史行。公开单位名仍为 `billing_token`，内部使用
+整数 microtoken，避免与 tokenizer token 混淆。
 
 ### 3.3 错误注册表
 
@@ -388,7 +388,7 @@ Gateway 发布到宿主机 loopback，不包含公网 TLS 代理。任何公网�
 另一个终端：
 
 ```bash
-curl --fail http://127.0.0.1:8000/api/v1/health
+curl --fail http://127.0.0.1:8000/healthz
 vgen identity init
 vgen profile add local http://127.0.0.1:8000
 IFS= read -r VGEN_LOCAL_BOOTSTRAP < .local/vgen-dev/bootstrap-code
@@ -398,7 +398,8 @@ unset VGEN_LOCAL_BOOTSTRAP
 rm .local/vgen-dev/bootstrap-code
 ```
 
-健康响应中的 Worker 数量使用 `workers_total`、`workers_active`、`workers_online` 和
+公开 `/healthz` 只返回 `{"ok":true}`。需登录的 `/api/v1/status` 中，Worker 数量使用
+`workers_total`、`workers_active`、`workers_online` 和
 `workers_revoked` 四个明确字段。`workers_online` 与调度器共享同一规则：状态为 active，且
 最近 120 秒内存在心跳；不要把 `workers_active` 当作实时在线数。
 

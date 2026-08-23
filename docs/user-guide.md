@@ -196,10 +196,13 @@ complete.
 
 ```bash
 sudo ./setup-gateway.sh status --domain <gateway-domain>
-curl --fail --silent https://<gateway-domain>/api/v1/health
+curl --fail --silent https://<gateway-domain>/healthz
+vgen gateway health
 ```
 
-The response must contain `"ok":true`. Worker counts have distinct meanings:
+The public `/healthz` response contains only `"ok":true`. An authenticated
+Gateway operator can run `vgen gateway health` to read `/api/v1/status`, where
+Worker counts have distinct meanings:
 
 - `workers_total`: all Worker records, including revoked records;
 - `workers_active`: admitted Workers, whether online or not;

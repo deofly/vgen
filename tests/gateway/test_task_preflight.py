@@ -151,8 +151,7 @@ def test_preflight_reports_safe_states_and_never_reserves_or_bills(tmp_path) -> 
             worker_id=worker["id"],
             workspace_id=workspace["id"],
             user_id=boot["user"]["id"],
-            rate_microtokens_per_gpu_second=1_000_000,
-            traffic_microtokens_per_gib=0,
+            rate_microtokens_per_second=1_000_000,
         )
         app.state.repository.approve_rate(
             rate_id=rate["id"], admin_user_id=boot["user"]["id"]

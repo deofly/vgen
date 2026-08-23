@@ -110,7 +110,7 @@ def user_enrollment_proof(keys: DeviceKeys, claim: dict) -> str:
     return sign_user_registration_claim(keys.signing_private_key, claim)
 
 
-def test_health_separates_worker_lifecycle_and_online_counts(tmp_path) -> None:
+def test_public_health_is_minimal_and_authenticated_status_has_counts(tmp_path) -> None:
     app = create_app(
         database_path=str(tmp_path / "gateway.db"),
         bootstrap_code="test-bootstrap",
@@ -119,7 +119,7 @@ def test_health_separates_worker_lifecycle_and_online_counts(tmp_path) -> None:
     )
     with TestClient(app) as client:
         client.headers.update({"Vgen-Protocol-Version": "1"})
-        boot, _ = bootstrap(client)
+        boot, headers = bootstrap(client)
         stamp = time.time()
         rows = (
             ("wrk_health_recent", "active", stamp - 10),
@@ -149,7 +149,25 @@ def test_health_separates_worker_lifecycle_and_online_counts(tmp_path) -> None:
                     ),
                 )
 
-        response = client.get("/api/v1/health")
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.json() == {"ok": True}
+
+        unauthorized = client.get("/api/v1/status")
+        assert unauthorized.status_code == 401
+
+        app.state.db.execute(
+            "UPDATE users SET is_operator=0 WHERE id=?",
+            (boot["user"]["id"],),
+        )
+        forbidden = client.get("/api/v1/status", headers=headers)
+        assert forbidden.status_code == 403
+
+        app.state.db.execute(
+            "UPDATE users SET is_operator=1 WHERE id=?",
+            (boot["user"]["id"],),
+        )
+        response = client.get("/api/v1/status", headers=headers)
 
         assert response.status_code == 200
         counts = response.json()["counts"]
@@ -170,10 +188,13 @@ def test_bootstrap_workspace_pool_and_idempotency(tmp_path) -> None:
     with TestClient(app) as client:
         client.headers.update({"Vgen-Protocol-Version": "1"})
         boot, headers = bootstrap(client)
-        health = client.get("/api/v1/health")
+        health = client.get("/healthz")
         assert health.status_code == 200
-        assert health.json()["journal_mode"] == "wal"
-        assert health.json()["counts"] == {
+        assert health.json() == {"ok": True}
+        status = client.get("/api/v1/status", headers=headers)
+        assert status.status_code == 200
+        assert status.json()["journal_mode"] == "wal"
+        assert status.json()["counts"] == {
             "users": 1,
             "workspaces": 0,
             "tasks": 0,
@@ -388,7 +409,7 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             f"/api/v1/workers/{worker['id']}/rates",
             json={
                 "workspace_id": workspace["id"],
-                "rate_microtokens_per_gpu_second": 1_000_000,
+                "rate_microtokens_per_second": 1_000_000,
             },
             headers=user_headers,
         )
@@ -620,9 +641,9 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             "fencing_token": lease["fencing_token"],
             "succeeded": True,
             "metrics": {
-                "gpu_active_ms": 2500,
+                "executor_wall_ms": 2500,
                 "gateway_wall_ms": 2700,
-                "egress_bytes": 4096,
+                "duration_ms": 1625,
                 "output_frames": 81,
             },
             "responsibility": "none",
@@ -670,8 +691,14 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
         assert len(entries) == 1
         assert entries[0]["worker_id"] == worker["id"]
         assert entries[0]["client_channel"] == "cli"
-        assert entries[0]["compute_microtokens"] == 2_500_000
-        assert entries[0]["billable"] == 1
+        assert entries[0]["compute_microtokens"] == 0
+        assert entries[0]["total_microtokens"] == 0
+        assert entries[0]["billable"] == 0
+        dimensions = entries[0]["metrics"]
+        assert dimensions["output_video_duration_ms"] == 1625
+        assert 0 < dimensions["generation_elapsed_ms"] <= 2700
+        assert dimensions["input_video_duration_ms"] is None
+        assert entries[0]["rate_snapshot"]["formula_status"] == "not_implemented"
         task_view = client.get(f"/api/v1/tasks/{task['id']}", headers=user_headers).json()
         output = next(item for item in task_view["artifacts"] if item["state"] == "available")
         downloaded_output = client.get(
@@ -739,10 +766,11 @@ def test_running_cancel_is_acknowledged_and_billed_once_end_to_end(tmp_path) -> 
         fencing_token = int(stamp * 1_000_000)
         rate_snapshot = json.dumps(
             {
-                "rate_microtokens_per_gpu_second": 1_000_000,
-                "traffic_microtokens_per_gib": 0,
-                "workflow_multiplier_ppm": 1_000_000,
-                "formula_version": 1,
+                "rate_card_id": "rat_cancel",
+                "rate_microtokens_per_second": 1_000_000,
+                "pricing_model": "video_duration_and_generation_time",
+                "formula_version": 0,
+                "formula_status": "not_implemented",
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -856,8 +884,12 @@ def test_running_cancel_is_acknowledged_and_billed_once_end_to_end(tmp_path) -> 
         assert usage.status_code == 200, usage.text
         assert len(usage.json()) == 1
         assert usage.json()[0]["attempt_id"] == attempt_id
-        assert usage.json()[0]["billable"] == 1
-        assert usage.json()[0]["compute_microtokens"] == 1_200_000
+        assert usage.json()[0]["billable"] == 0
+        assert usage.json()[0]["compute_microtokens"] == 0
+        dimensions = usage.json()[0]["metrics"]
+        assert dimensions["output_video_duration_ms"] == 0
+        assert 1_400 <= dimensions["generation_elapsed_ms"] <= 2_000
+        assert dimensions["input_video_duration_ms"] is None
         assert (
             app.state.db.fetchone(
                 "SELECT COUNT(*) AS count FROM usage_ledger WHERE attempt_id=?", (attempt_id,)

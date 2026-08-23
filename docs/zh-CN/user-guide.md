@@ -221,10 +221,12 @@ sudo ./setup-gateway.sh activate --domain <Gateway域名>
 
 ```bash
 sudo ./setup-gateway.sh status --domain <Gateway域名>
-curl --fail --silent https://<Gateway域名>/api/v1/health
+curl --fail --silent https://<Gateway域名>/healthz
+vgen gateway health
 ```
 
-响应应包含 `"ok":true`。其中 Worker 统计不会再把已撤销设备混为“可用 Worker”：
+公开 `/healthz` 只返回 `"ok":true`。登录后的 Gateway 管理员可运行
+`vgen gateway health` 读取 `/api/v1/status`，其中 Worker 统计不会把已撤销设备混为“可用 Worker”：
 
 - `workers_total`：数据库中的全部 Worker 记录，包括已撤销记录；
 - `workers_active`：准入状态为 active 的 Worker，不代表它此刻在线；
@@ -717,7 +719,7 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
 | 现象 | 处理 |
 |---|---|
 | `--domain is required` | 在每个 Gateway 脚本动作后明确加 `--domain <Gateway域名>`，域名不带 `https://` |
-| 公网 `/api/v1/health` 失败 | 在 ECS 运行 `sudo ./setup-gateway.sh status --domain <Gateway域名>`；未恢复健康前不要初始化客户端 |
+| 公网 `/healthz` 失败 | 在 ECS 运行 `sudo ./setup-gateway.sh status --domain <Gateway域名>`；未恢复健康前不要初始化客户端 |
 | Nginx 切换后持续 502 | 本机 Gateway 已健康且脚本明确回滚路由时使用 `activate --domain <Gateway域名>`；否则先检查 systemd/Nginx，必要时 `rollback --domain <Gateway域名>` |
 | Mac 已有身份却再次要求 Bootstrap | 立即停止，不要创建第二个身份；先运行 `vgen profile show` |
 | Windows 找到多套 ComfyUI | 在窗口中选择正确实例；没有目标时进入手动模式并粘贴应用或数据目录 |

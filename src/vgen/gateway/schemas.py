@@ -32,6 +32,10 @@ class HealthCounts(WireModel):
 
 class HealthResponse(WireModel):
     ok: Literal[True]
+
+
+class StatusResponse(WireModel):
+    ok: Literal[True]
     schema_version: int = Field(ge=1)
     journal_mode: str
     counts: HealthCounts
@@ -268,10 +272,7 @@ class WorkerInviteCreate(WireModel):
     executor_version: str = Field(default="1.1.0", max_length=120)
     capacity: int = Field(default=1, ge=1, le=64)
     manager_broker_id: str | None = None
-    rate_microtokens_per_gpu_second: int = Field(
-        default=1_000_000, ge=0, le=1_000_000_000_000
-    )
-    traffic_microtokens_per_gib: int = Field(default=0, ge=0, le=1_000_000_000_000)
+    rate_microtokens_per_second: int = Field(default=0, ge=0, le=1_000_000_000_000)
     ttl_seconds: int = Field(default=1800, ge=60, le=604800)
 
 
@@ -526,11 +527,9 @@ class AllocationApproval(WireModel):
 
 class RateProposal(WireModel):
     workspace_id: str
-    # Keep every worst-case v1 charge inside SQLite's signed 64-bit INTEGER
-    # range.  Python accepts arbitrary-size integers, but letting an unbounded
-    # provider proposal reach SQLite would turn a validation error into a 500.
-    rate_microtokens_per_gpu_second: int = Field(ge=0, le=1_000_000_000_000)
-    traffic_microtokens_per_gib: int = Field(default=0, ge=0, le=1_000_000_000_000)
+    # Reserved for the future duration-based pricing formula. It is snapshotted
+    # today but no charge is calculated until that formula is introduced.
+    rate_microtokens_per_second: int = Field(ge=0, le=1_000_000_000_000)
 
 
 class UsageReversalReason(StrEnum):

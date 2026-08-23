@@ -39,11 +39,17 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
     assert "HTTPValidationError" not in schema["components"]["schemas"]
     assert "ValidationError" not in schema["components"]["schemas"]
 
-    health = schema["paths"]["/api/v1/health"]["get"]
+    health = schema["paths"]["/healthz"]["get"]
     assert "VgenProtocolVersion" not in _headers(health)
     assert "security" not in health
-    health_schema = schema["components"]["schemas"]["HealthCounts"]
-    assert set(health_schema["required"]) == {
+    health_schema = schema["components"]["schemas"]["HealthResponse"]
+    assert set(health_schema["required"]) == {"ok"}
+
+    status = schema["paths"]["/api/v1/status"]["get"]
+    assert set(_headers(status)) == {"VgenProtocolVersion"}
+    assert status["security"] == [{"VGenSession": []}]
+    status_counts = schema["components"]["schemas"]["HealthCounts"]
+    assert set(status_counts["required"]) == {
         "users",
         "workspaces",
         "tasks",

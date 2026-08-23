@@ -2754,7 +2754,7 @@ try {
     Write-Step "Checking Gateway health"
     $gatewayBase = $GatewayUrl.AbsoluteUri.TrimEnd("/")
     try {
-        $health = Invoke-RestMethod -Uri "$gatewayBase/api/v1/health" -Method Get -TimeoutSec 20 -Headers @{ "Vgen-Protocol-Version" = "1" }
+        $health = Invoke-RestMethod -Uri "$gatewayBase/healthz" -Method Get -TimeoutSec 20
         if (-not $health.ok) {
             throw "not ready"
         }
