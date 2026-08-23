@@ -173,3 +173,34 @@ def test_rollback_pointer_switches_back_to_previous_python(tmp_path: Path) -> No
     updater.mark_activation_rolled_back(pointer)
     assert updater.active_python() == python.resolve()
     assert updater.pending_activation() is None
+
+
+def test_supervisor_uses_new_installer_runtime_after_terminal_old_rollback(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime-0.9.1"
+    fallback = source / "bin/python"
+    fallback.parent.mkdir(parents=True)
+    fallback.write_bytes(b"python")
+    updater = RuntimeUpdater(
+        tmp_path / "work",
+        current_python=fallback,
+        current_version="0.9.1",
+        source_runtime=source,
+    )
+    updater._write_pointer(
+        {
+            "format": "vgen-worker-runtime-pointer",
+            "version": 1,
+            "active_python": str(tmp_path / "worker-runtime-0.8.4/bin/python"),
+            "active_version": "0.8.4",
+            "rolled_back_job_id": "mtn_old",
+            "rolled_back_at": 1,
+        }
+    )
+
+    state = updater.supervisor_state(fallback=fallback)
+
+    assert state.active_python == fallback.resolve()
+    assert state.previous_python is None
+    assert not state.pending

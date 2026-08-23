@@ -895,6 +895,22 @@ def test_windows_worker_foreground_supervisor_switches_and_rolls_back_updates() 
     assert "-m vgen.worker.main @workerArguments" in text
 
 
+def test_windows_worker_ignores_terminal_rollback_from_older_base_runtime() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    state = text.split("function Get-WorkerRuntimeState", 1)[1].split(
+        "# Dot-sourcing is reserved", 1
+    )[0]
+
+    assert '$pointer.PSObject.Properties["rolled_back_job_id"]' in state
+    assert "if ($rolledBack -and -not $pending)" in state
+    fallback = state.split("if ($rolledBack -and -not $pending)", 1)[1].split(
+        "if (-not (Test-AllowedWorkerPythonPath", 1
+    )[0]
+    assert "ActivePython = $InitialPython" in fallback
+    assert "PreviousPython = $null" in fallback
+    assert "Pending = $false" in fallback
+
+
 def test_windows_worker_model_pins_match_reference_manifest() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     manifest = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))

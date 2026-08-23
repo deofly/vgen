@@ -356,10 +356,19 @@ class RuntimeUpdater:
         value = self._read_pointer()
         if value is None:
             return WorkerRuntimeState(trusted_fallback, None, False)
-        active = self._supervisor_python(value.get("active_python"), trusted_fallback)
         pending = isinstance(value.get("pending_job_id"), str) and bool(
             value["pending_job_id"].strip()
         )
+        rolled_back = isinstance(value.get("rolled_back_job_id"), str) and bool(
+            value["rolled_back_job_id"].strip()
+        )
+        # A newer reviewed installer may use a different immutable base runtime
+        # than the one recorded by an already completed rollback. Never launch
+        # that stale path; a terminal rollback has no activation left to recover,
+        # so resume from the installer's trusted fallback instead.
+        if rolled_back and not pending:
+            return WorkerRuntimeState(trusted_fallback, None, False)
+        active = self._supervisor_python(value.get("active_python"), trusted_fallback)
         previous = None
         if pending:
             previous = self._supervisor_python(value.get("previous_python"), trusted_fallback)

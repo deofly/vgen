@@ -2627,12 +2627,23 @@ function Get-WorkerRuntimeState {
     catch {
         throw "The VGen Worker runtime pointer is invalid."
     }
-    if ($pointer.format -ne "vgen-worker-runtime-pointer" -or $pointer.version -ne 1 -or
-        -not (Test-AllowedWorkerPythonPath ([string]$pointer.active_python) $InitialPython $WorkRoot)) {
+    if ($pointer.format -ne "vgen-worker-runtime-pointer" -or $pointer.version -ne 1) {
         throw "The VGen Worker runtime pointer is invalid."
     }
     $pending = $null -ne $pointer.PSObject.Properties["pending_job_id"] -and
         -not [string]::IsNullOrWhiteSpace([string]$pointer.pending_job_id)
+    $rolledBack = $null -ne $pointer.PSObject.Properties["rolled_back_job_id"] -and
+        -not [string]::IsNullOrWhiteSpace([string]$pointer.rolled_back_job_id)
+    if ($rolledBack -and -not $pending) {
+        return [PSCustomObject]@{
+            ActivePython = $InitialPython
+            PreviousPython = $null
+            Pending = $false
+        }
+    }
+    if (-not (Test-AllowedWorkerPythonPath ([string]$pointer.active_python) $InitialPython $WorkRoot)) {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
     $previousPython = $null
     if ($pending) {
         if ($null -eq $pointer.PSObject.Properties["previous_python"] -or
