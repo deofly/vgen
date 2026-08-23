@@ -86,7 +86,7 @@ from .service_credentials import (
 )
 from .session_store import SessionStore, StoredSession
 from .setup import prompt_bootstrap_code, setup_command
-from .upgrade import upgrade_command
+from .upgrade import stable_worker_wheel, upgrade_command
 from .user_enrollment import identity_registration_claim, sign_enrollment_admission
 from .workspace_authorities import (
     PinnedInvite,
@@ -1584,6 +1584,95 @@ def _create_maintenance_job(
     return created
 
 
+def _apply_worker_update(
+    client: GatewayClient,
+    args: argparse.Namespace,
+    wheel: Path,
+) -> dict[str, Any]:
+    from .worker_bundle import inspect_worker_update_wheel
+
+    broker_id = _maintenance_broker_id(client, args.broker)
+    worker = _select_owned_worker(client, args.worker)
+    worker = _ensure_broker_manages_worker(client, worker, broker_id)
+    artifact = inspect_worker_update_wheel(wheel)
+    capabilities = worker.get("capabilities")
+    current_version = (
+        capabilities.get("worker_runtime_version")
+        if isinstance(capabilities, Mapping)
+        else None
+    )
+    if isinstance(current_version, str):
+        try:
+            current = Version(current_version)
+            target = Version(artifact.version)
+        except InvalidVersion as exc:
+            raise ValueError("Worker reported an invalid runtime version") from exc
+        if current == target:
+            return {
+                "worker_id": worker["id"],
+                "state": "already_up_to_date",
+                "current_version": current_version,
+                "target_version": artifact.version,
+            }
+        if current > target:
+            raise ValueError(
+                f"Worker {current_version} is newer than stable {artifact.version}; "
+                "refusing to downgrade"
+            )
+    spec = {
+        "kind": "worker_update",
+        "target_version": artifact.version,
+        "artifact_sha256": artifact.sha256,
+        "artifact_size": artifact.size_bytes,
+        "apply": "on_idle",
+    }
+    _, identity = _profile_and_identity(client.profile.name)
+    created = _create_maintenance_job(
+        client,
+        identity,
+        broker_id=broker_id,
+        worker=worker,
+        spec=spec,
+    )
+    upload_ticket = created.get("upload_ticket")
+    if isinstance(upload_ticket, Mapping):
+        print(f"正在上传 Worker {artifact.version} 更新包…", file=sys.stderr)
+        ticket = _maintenance_upload_ticket(
+            upload_ticket,
+            expected_size=artifact.size_bytes,
+            expected_sha256=artifact.sha256,
+        )
+        adapter = (
+            OssStsArtifactAdapter()
+            if ticket.url.startswith("oss://")
+            else HttpArtifactAdapter()
+        )
+        adapter.upload(ticket, artifact.path)
+        committed = client.commit_worker_maintenance(str(created["id"]))
+        if not isinstance(committed, dict):
+            raise ValueError("Gateway returned an invalid committed maintenance job")
+    elif created.get("state") in {"queued", "leased", "running", "restarting"}:
+        # A prior invocation may already have uploaded and committed the same
+        # digest. The Gateway deduplicates that active job and must not mint a
+        # second upload capability.
+        committed = created
+    else:
+        raise ValueError("Gateway update job has no upload ticket")
+    result = (
+        _wait_for_maintenance(
+            client,
+            str(committed.get("id") or created["id"]),
+            interval=args.interval,
+            timeout=args.timeout,
+        )
+        if args.wait
+        else committed
+    )
+    if args.wait:
+        _raise_for_unsuccessful_maintenance(result)
+    return result
+
+
 def _broker_command(args: argparse.Namespace) -> None:
     if args.broker_action == "local-status":
         from .macos_broker_service import inspect_macos_broker_service
@@ -1664,64 +1753,7 @@ def _broker_command(args: argparse.Namespace) -> None:
                 )
             )
         elif args.broker_action == "worker-update":
-            from .worker_bundle import inspect_worker_update_wheel
-
-            broker_id = _maintenance_broker_id(client, args.broker)
-            worker = _select_owned_worker(client, args.worker)
-            worker = _ensure_broker_manages_worker(client, worker, broker_id)
-            artifact = inspect_worker_update_wheel(args.wheel)
-            spec = {
-                "kind": "worker_update",
-                "target_version": artifact.version,
-                "artifact_sha256": artifact.sha256,
-                "artifact_size": artifact.size_bytes,
-                "apply": "on_idle",
-            }
-            _, identity = _profile_and_identity(client.profile.name)
-            created = _create_maintenance_job(
-                client,
-                identity,
-                broker_id=broker_id,
-                worker=worker,
-                spec=spec,
-            )
-            upload_ticket = created.get("upload_ticket")
-            if isinstance(upload_ticket, Mapping):
-                print(f"正在上传 Worker {artifact.version} 更新包…", file=sys.stderr)
-                ticket = _maintenance_upload_ticket(
-                    upload_ticket,
-                    expected_size=artifact.size_bytes,
-                    expected_sha256=artifact.sha256,
-                )
-                adapter = (
-                    OssStsArtifactAdapter()
-                    if ticket.url.startswith("oss://")
-                    else HttpArtifactAdapter()
-                )
-                adapter.upload(ticket, artifact.path)
-                committed = client.commit_worker_maintenance(str(created["id"]))
-                if not isinstance(committed, dict):
-                    raise ValueError("Gateway returned an invalid committed maintenance job")
-            elif created.get("state") in {"queued", "leased", "running", "restarting"}:
-                # A prior invocation may already have uploaded and committed the
-                # same digest. The Gateway deduplicates that active job and must
-                # not mint a second upload capability.
-                committed = created
-            else:
-                raise ValueError("Gateway update job has no upload ticket")
-            result = (
-                _wait_for_maintenance(
-                    client,
-                    str(committed.get("id") or created["id"]),
-                    interval=args.interval,
-                    timeout=args.timeout,
-                )
-                if args.wait
-                else committed
-            )
-            _json(result)
-            if args.wait:
-                _raise_for_unsuccessful_maintenance(result)
+            _json(_apply_worker_update(client, args, args.wheel))
         elif args.broker_action == "model-install":
             broker_id = _maintenance_broker_id(client, args.broker)
             worker = _select_owned_worker(client, args.worker)
@@ -1969,7 +2001,12 @@ def _worker_command(args: argparse.Namespace) -> None:
 
     client = _client(args.profile)
     try:
-        if args.worker_action == "add":
+        if args.worker_action == "upgrade":
+            print("正在检查 stable Worker 版本并校验发布包…", file=sys.stderr)
+            with stable_worker_wheel(client.profile) as (version, wheel):
+                print(f"已验证 stable Worker {version}，准备远程更新…", file=sys.stderr)
+                _json(_apply_worker_update(client, args, wheel))
+        elif args.worker_action == "add":
             _, owner_identity = _profile_and_identity(client.profile.name)
             enrollment_id, workspace_id, invite_uri = _create_worker_invite(
                 client, owner_identity, args
@@ -3487,6 +3524,20 @@ def build_parser() -> argparse.ArgumentParser:
     worker_add.add_argument("--interval", type=float, default=2)
     worker_add.add_argument("--timeout", type=float, default=1800)
     worker_add.add_argument("--profile")
+    worker_upgrade = worker_sub.add_parser(
+        "upgrade",
+        help="download the trusted stable Worker and apply it remotely when idle",
+    )
+    worker_upgrade.add_argument(
+        "--worker", help="owned Worker name or ID; automatic when unique"
+    )
+    worker_upgrade.add_argument(
+        "--broker", help="Broker ID; defaults to this profile's Home Broker"
+    )
+    worker_upgrade.add_argument("--wait", action="store_true")
+    worker_upgrade.add_argument("--interval", type=float, default=2)
+    worker_upgrade.add_argument("--timeout", type=float, default=3600)
+    worker_upgrade.add_argument("--profile")
     worker_list = worker_sub.add_parser("list")
     worker_list.add_argument("--workspace")
     worker_list.add_argument("--profile")

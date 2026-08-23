@@ -163,7 +163,8 @@ def test_serve_once_claims_and_executes_one_authenticated_lease(
     assert status["mode"] == "executed"
     assert status["attempt_id"] == "atm_test"
     assert status["succeeded"] is True
-    assert gateway.announced == {"executors": [{"type": "fake"}]}
+    assert gateway.announced["executors"] == [{"type": "fake"}]
+    assert gateway.announced["worker_runtime_version"]
 
 
 def test_worker_refuses_credentials_pinned_to_another_gateway(

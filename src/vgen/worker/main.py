@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import requests
 from platformdirs import user_data_path
 
+from vgen import __version__
 from vgen.artifacts import (
     ArtifactAdapterRegistry,
     HttpArtifactAdapter,
@@ -494,6 +495,7 @@ def _announced_capabilities(status: Mapping[str, Any]) -> dict[str, Any]:
         raise WorkerConfigurationError("Executor status must be an object.")
     capabilities = executor.get("capabilities")
     return {
+        "worker_runtime_version": __version__,
         "executors": [
             {
                 "type": executor["type"],
@@ -662,9 +664,13 @@ def run(
 
                     # Announce a generic descriptor even if ComfyUI is down or
                     # models are missing, so the Gateway can deliver maintenance.
-                    gateway.announce(
-                        core.capabilities() if status["ok"] else _announced_capabilities(status)
+                    announced = dict(
+                        core.capabilities()
+                        if status["ok"]
+                        else _announced_capabilities(status)
                     )
+                    announced["worker_runtime_version"] = __version__
+                    gateway.announce(announced)
                     resumed = core.resume_pending(gateway)
                     if resumed is not None:
                         status["mode"] = "upload_resumed"

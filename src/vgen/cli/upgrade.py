@@ -13,6 +13,8 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -345,6 +347,24 @@ def _extract_bundle(archive_path: Path, output: Path, version: str) -> Path:
     except zipfile.BadZipFile as exc:
         raise UpgradeError("macOS CLI artifact is not a valid ZIP") from exc
     return output / prefix.rstrip("/")
+
+
+@contextmanager
+def stable_worker_wheel(profile: GatewayProfile) -> Iterator[tuple[str, Path]]:
+    """Yield the stable Worker wheel through the installer-pinned release trust chain."""
+
+    release_origin = _configured_release_origin(profile.endpoint)
+    opener = urllib.request.build_opener(_SameOriginRedirects(release_origin))
+    candidate = _candidate(release_origin, opener)
+    with tempfile.TemporaryDirectory(prefix="vgen-worker-upgrade-") as temporary:
+        work = Path(temporary)
+        archive = work / candidate.filename
+        _download(opener, candidate, archive, release_origin)
+        bundle = _extract_bundle(archive, work / "bundle", candidate.version)
+        wheel = bundle / f"vgen-{candidate.version}-py3-none-any.whl"
+        if wheel.is_symlink() or not wheel.is_file():
+            raise UpgradeError("stable release bundle has no regular Worker wheel")
+        yield candidate.version, wheel
 
 
 def _managed_launcher() -> tuple[Path, str, Path]:

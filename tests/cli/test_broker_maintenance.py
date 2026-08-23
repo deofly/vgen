@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,7 +13,13 @@ import pytest
 import yaml
 
 from vgen.cli.identity_store import DeviceIdentityStore
-from vgen.cli.main import _broker_command, _worker_command, build_parser, main
+from vgen.cli.main import (
+    _apply_worker_update,
+    _broker_command,
+    _worker_command,
+    build_parser,
+    main,
+)
 from vgen.crypto import verify_maintenance_intent
 from vgen.market.models import WorkflowManifest
 from vgen.protocol import ErrorCode
@@ -151,6 +158,11 @@ def test_parser_exposes_simple_broker_maintenance_commands() -> None:
     assert manager.worker is None
     assert manager.broker is None
 
+    stable_update = build_parser().parse_args(["worker", "upgrade", "--wait"])
+    assert stable_update.worker_action == "upgrade"
+    assert stable_update.worker is None
+    assert stable_update.wait is True
+
 
 def test_worker_update_uploads_verified_wheel_before_commit_and_signs_policy_spec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -200,6 +212,72 @@ def test_worker_update_uploads_verified_wheel_before_commit_and_signs_policy_spe
     assert adapter.uploads[0][1] == wheel
     assert client.committed == ["mtn_example"]
     assert client.closed
+
+
+def test_worker_upgrade_downloads_stable_wheel_and_reuses_broker_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    client = MaintenanceClient(_worker())
+    adapter = RecordingArtifactAdapter()
+    wheel = _test_wheel(tmp_path, version="0.3.0")
+
+    @contextmanager
+    def stable_worker_wheel(_profile):  # type: ignore[no-untyped-def]
+        yield "0.3.0", wheel
+
+    monkeypatch.setattr("vgen.cli.main._client", lambda _: client)
+    monkeypatch.setattr("vgen.cli.main._profile_and_identity", lambda _: (client.profile, identity))
+    monkeypatch.setattr("vgen.cli.main.HttpArtifactAdapter", lambda: adapter)
+    monkeypatch.setattr("vgen.cli.main.stable_worker_wheel", stable_worker_wheel)
+
+    _worker_command(
+        argparse.Namespace(
+            worker_action="upgrade",
+            worker=None,
+            broker=None,
+            wait=False,
+            interval=0.01,
+            timeout=1,
+            profile=None,
+        )
+    )
+
+    assert client.created[0]["spec"]["target_version"] == "0.3.0"
+    assert adapter.uploads[0][1] == wheel
+    assert client.committed == ["mtn_example"]
+    assert client.closed
+
+
+def test_worker_upgrade_is_idempotent_when_worker_already_reports_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    worker = _worker()
+    worker["capabilities"]["worker_runtime_version"] = "0.3.0"
+    client = MaintenanceClient(worker)
+    wheel = _test_wheel(tmp_path, version="0.3.0")
+    monkeypatch.setattr("vgen.cli.main._profile_and_identity", lambda _: (client.profile, identity))
+
+    result = _apply_worker_update(
+        client,
+        argparse.Namespace(
+            worker=None,
+            broker=None,
+            wait=True,
+            interval=0.01,
+            timeout=1,
+        ),
+        wheel,
+    )
+
+    assert result == {
+        "worker_id": "wrk_example",
+        "state": "already_up_to_date",
+        "current_version": "0.3.0",
+        "target_version": "0.3.0",
+    }
+    assert client.created == []
 
 
 def test_model_install_only_sends_missing_digests_and_license_acceptances(

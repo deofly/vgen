@@ -541,19 +541,39 @@ vgen broker maintenance-cancel <job_id>
 
 ### 6.2 更新 VGen Worker
 
-先从可信 Release 获取并复核新的纯 Python VGen wheel，再运行：
+Windows 首次安装后，日常 VGen Worker 更新不需要重新下载或执行 PowerShell 安装脚本。在
+Workspace Owner 的 Mac 上运行：
+
+```bash
+vgen worker upgrade --worker "Windows GPU Worker" --wait
+```
+
+仅有一台自有 Worker 时可省略 `--worker`：
+
+```bash
+vgen worker upgrade --wait
+```
+
+CLI 使用首次安装时固定保存的 release origin，验证 stable 指针、不可变 manifest、Mac 发布包
+大小与 SHA-256、ZIP 安全路径和包内 `SHA256SUMS`，然后取出同版本纯 Python Worker wheel。
+Broker 签名授权更新，等待 Worker 空闲后安装到独立 runtime；Windows 前台监督器负责切换版本、
+重新上线和激活失败时回退上一 runtime。重复运行且 Worker 已是 stable 时直接返回
+`already_up_to_date`，不会重复部署或降级。
+
+只有 PowerShell 安装器、ComfyUI 接入、Python/系统依赖或安装目录结构发生变化时，才需要在
+Windows 重新执行官方 `install-windows-worker.ps1`。普通 VGen Python 运行时更新不需要操作
+Windows。
+
+离线调试或部署指定的已审查 wheel 时，仍可使用底层命令：
 
 ```bash
 vgen broker worker-update ~/Downloads/vgen-<版本>-py3-none-any.whl \
   --worker "Windows GPU Worker" --wait
 ```
 
-更新等待 Worker 空闲后安装到独立 runtime。Windows 前台监督器负责切换版本、重新上线和
-激活失败时回退上一 runtime。
-
-该命令只更新 VGen Worker wheel，**不会**更新 Gateway、Mac CLI、ComfyUI、custom nodes、
-Python、CUDA、显卡驱动或模型。授权维护 Broker 能向 Worker 部署代码，因此只使用管理员
-已经核验来源和摘要的 wheel。
+两个命令都只更新 VGen Worker wheel，**不会**更新 Gateway、Mac CLI、ComfyUI、custom
+nodes、Python、CUDA、显卡驱动或模型。授权维护 Broker 能向 Worker 部署代码，因此默认仍由
+Workspace Owner 显式执行命令；当前不在后台静默自动升级。
 
 ## 7. 真实 0/1/2 图测试
 

@@ -178,6 +178,36 @@ def test_upgrade_extracts_closed_bundle_and_rejects_traversal(tmp_path) -> None:
         upgrade._extract_bundle(unsafe, tmp_path / "unsafe", "0.5.0")
 
 
+def test_stable_worker_wheel_comes_from_verified_release_bundle(
+    tmp_path, monkeypatch
+) -> None:
+    profile = GatewayProfile("home", "https://gateway.example")
+    candidate = upgrade.UpgradeCandidate(
+        "0.5.0",
+        "https://downloads.example/releases/0.5.0/VGen-macOS-0.5.0.zip",
+        "VGen-macOS-0.5.0.zip",
+        1,
+        "0" * 64,
+    )
+    monkeypatch.setattr(
+        upgrade, "_configured_release_origin", lambda _endpoint: "https://downloads.example"
+    )
+    monkeypatch.setattr(upgrade, "_candidate", lambda *_args: candidate)
+
+    def download(_opener, _candidate, destination, _origin):  # type: ignore[no-untyped-def]
+        _zip(destination)
+
+    monkeypatch.setattr(upgrade, "_download", download)
+
+    with upgrade.stable_worker_wheel(profile) as (version, wheel):
+        assert version == "0.5.0"
+        assert wheel.name == "vgen-0.5.0-py3-none-any.whl"
+        assert wheel.read_bytes() == b"wheel"
+        temporary_wheel = wheel
+
+    assert not temporary_wheel.exists()
+
+
 def test_upgrade_requires_managed_launcher(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     release = (
