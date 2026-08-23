@@ -249,6 +249,7 @@ try {
         -not [string]::IsNullOrEmpty($gateway.Fragment)) {
         throw "Worker bundle Gateway must be an HTTPS origin."
     }
+    $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
 
     $checksumRecords = @{}
     foreach ($line in [System.IO.File]::ReadAllLines($checksumsPath)) {
@@ -314,7 +315,6 @@ try {
 
     $replaceExistingCredential = $false
     if (Test-Path -LiteralPath $credentialPath -PathType Leaf) {
-        $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
         $credentialCheckMode = if ($Reenroll) { "--reenroll-existing" } else { "--check-existing" }
         Write-Step "Verifying the existing Worker identity with this Gateway"
         & $bootstrapPython -I -B -m vgen.cli.worker_enrollment `
@@ -337,7 +337,6 @@ try {
 
     if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf) -or
         $replaceExistingCredential) {
-        $gatewayOrigin = ([string]$gateway.AbsoluteUri).TrimEnd("/")
         if ([string]::IsNullOrWhiteSpace($WorkerName)) {
             $defaultName = if ([string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
                 "Windows GPU Worker"
@@ -390,7 +389,10 @@ try {
     }
 
     Write-Step "Enrollment completed; continuing with reviewed Worker setup"
-    $setupArguments = @("-WorkerCredentials", $credentialPath)
+    $setupArguments = @(
+        "-GatewayUrl", $gatewayOrigin,
+        "-WorkerCredentials", $credentialPath
+    )
     if (-not [string]::IsNullOrWhiteSpace($ComfyUIRoot)) {
         $setupArguments += @("-ComfyUIRoot", $ComfyUIRoot)
     }

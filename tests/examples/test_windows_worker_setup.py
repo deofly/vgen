@@ -48,6 +48,8 @@ def test_windows_worker_script_auto_loads_bundle_and_keeps_advanced_inputs() -> 
     assert '$Url.AbsolutePath -notin @("", "/")' in text
     assert '"vgen-worker-bundle.json"' in text
     assert '"vgen-windows-worker-bundle"' in text
+    assert '$GatewayUrlWasProvided = $PSBoundParameters.ContainsKey("GatewayUrl")' in text
+    assert "if ($GatewayUrlWasProvided)" in text
     assert "function Resolve-AutomaticComfyRoot" in text
     assert "[Parameter(Mandatory = $true)]" not in text.split("Set-StrictMode", 1)[0]
     assert not re.search(r"(?im)^\s*(?:&\s*)?docker(?:\.exe)?\b", text)
@@ -758,6 +760,7 @@ def test_windows_worker_reinstall_verifies_identity_and_stages_safe_reenrollment
     assert "Remove-Item -LiteralPath $credentialPath" not in enrollment
     assert "Move-Item -LiteralPath $credentialPath" not in enrollment
     assert enrollment.index("--check-existing") < enrollment.index("$setupArguments")
+    assert '"-GatewayUrl", $gatewayOrigin' in enrollment
     assert 'if /I not "%~1"=="-Reenroll"' in launcher
     assert 'if not "%~2"==""' in launcher
     assert "%*" not in launcher

@@ -31,6 +31,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$GatewayUrlWasProvided = $PSBoundParameters.ContainsKey("GatewayUrl")
 $gitBoundaryVariables = @(
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -1025,8 +1026,11 @@ function Resolve-WorkerBundleSettings {
         throw "vgen-worker-bundle.json is required. Download and extract the official universal Windows Worker installer again."
     }
 
-    $resolvedGateway = $GatewayUrl
-    if ($null -eq $resolvedGateway -and $null -ne $config) {
+    $resolvedGateway = $null
+    if ($GatewayUrlWasProvided) {
+        $resolvedGateway = $GatewayUrl
+    }
+    elseif ($null -ne $config) {
         try {
             $resolvedGateway = [Uri](Get-RequiredJsonProperty $config "gateway_url" "BundleConfig")
         }
