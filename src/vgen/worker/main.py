@@ -298,6 +298,7 @@ def _build_gateway(
         session=session,
         lease_ttl_seconds=arguments.lease_ttl,
         allow_http=arguments.allow_http,
+        report_progress=True,
         session_token_provider=(
             (lambda: _session_token(arguments) or "")
             if arguments.session_token_file is not None

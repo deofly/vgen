@@ -6017,7 +6017,10 @@ class GatewayRepository:
         value.pop("encrypted_payload", None)
         value.pop("reader_envelope", None)
         value["attempts"] = [
-            row_dict(row, json_columns={"rate_snapshot", "safe_failure_details"})
+            row_dict(
+                row,
+                json_columns={"progress", "rate_snapshot", "safe_failure_details"},
+            )
             for row in self.db.fetchall(
                 "SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_number", (task_id,)
             )

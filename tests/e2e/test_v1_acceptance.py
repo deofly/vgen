@@ -1131,6 +1131,13 @@ def test_worker_leave_revoke_and_fencing_reject_late_result(tmp_path: Path) -> N
             headers=worker.headers,
         )
         assert running.status_code == 200, running.text
+        task = client.get(
+            f"/api/v1/tasks/{prepared['id']}", headers=owner.headers
+        ).json()
+        assert task["attempts"][-1]["progress"] == {
+            "fraction": 0.5,
+            "stage": "fake",
+        }
 
         leave = client.post(
             f"/api/v1/workers/{worker.worker_id}/leave",

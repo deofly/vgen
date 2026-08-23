@@ -193,19 +193,79 @@ def test_task_preflight_uses_submit_requirements_without_sending_private_inputs(
 def test_wait_for_task_returns_only_after_terminal_state(monkeypatch, capsys) -> None:
     class TaskClient:
         def __init__(self) -> None:
-            self.states = iter(("queued", "running", "succeeded"))
+            self.tasks = iter(
+                (
+                    {"state": "committed", "attempts": []},
+                    {
+                        "state": "running",
+                        "attempts": [
+                            {
+                                "id": "atm_example",
+                                "progress": {
+                                    "fraction": 0.08,
+                                    "stage": "downloading_inputs",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "state": "running",
+                        "attempts": [
+                            {
+                                "id": "atm_example",
+                                "progress": '{"fraction":0.34,"stage":"sampling"}',
+                            }
+                        ],
+                    },
+                    {
+                        "state": "running",
+                        "attempts": [
+                            {
+                                "id": "atm_example",
+                                "progress": {"fraction": 0.35, "stage": "sampling"},
+                            }
+                        ],
+                    },
+                    {
+                        "state": "running",
+                        "attempts": [
+                            {
+                                "id": "atm_example",
+                                "progress": {"fraction": 0.57, "stage": "sampling"},
+                            }
+                        ],
+                    },
+                    {
+                        "state": "succeeded",
+                        "attempts": [
+                            {
+                                "id": "atm_example",
+                                "progress": {
+                                    "fraction": 1.0,
+                                    "stage": "uploading_outputs",
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
 
         def get_task(self, task_id: str):
             assert task_id == "tsk_example"
-            return {"id": task_id, "state": next(self.states)}
+            return {"id": task_id, **next(self.tasks)}
 
     monkeypatch.setattr(cli_main.time, "sleep", lambda _seconds: None)
     result = _wait_for_task(TaskClient(), "tsk_example", interval=0.1, timeout=10)
     assert result["state"] == "succeeded"
     status = capsys.readouterr().err
-    assert "queued" in status
+    assert "committed" in status
     assert "running" in status
     assert "succeeded" in status
+    assert "准备输入：8%" in status
+    assert "生成采样：34%" in status
+    assert "生成采样：35%" not in status
+    assert "生成采样：57%" in status
+    assert "上传结果：100%" in status
 
 
 def test_task_download_repairs_legacy_bin_extension_from_allowlisted_media_type(
@@ -260,6 +320,108 @@ def test_task_download_repairs_legacy_bin_extension_from_allowlisted_media_type(
         "task_id": "tsk_example",
         "outputs": [{"artifact_id": "art_output", "path": str(output), "size": 5}],
     }
+
+
+def test_task_download_preserves_different_output_and_reuses_identical_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TaskClient:
+        def get_task(self, task_id: str):
+            return {
+                "id": task_id,
+                "artifacts": [
+                    {
+                        "id": "art_output",
+                        "attempt_id": "atm_example",
+                        "direction": "output",
+                        "state": "available",
+                        "download_ticket": {"url": "https://storage.invalid/ciphertext"},
+                        "media_metadata": {
+                            "filename": "output-00.mp4",
+                            "media_type": "video/mp4",
+                        },
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        cli_main,
+        "_task_reader_context",
+        lambda _client, _task_id: (
+            {"workspace_id": "wsp_example"},
+            b"k" * 32,
+            "atm_example",
+            1,
+        ),
+    )
+
+    def download(_artifact, destination: Path, **_kwargs):
+        destination.write_bytes(b"new-video")
+        return SimpleNamespace(size_bytes=9)
+
+    monkeypatch.setattr(cli_main, "download_and_decrypt_output", download)
+    original = tmp_path / "output-00.mp4"
+    original.write_bytes(b"old-video")
+
+    first = cli_main._download_task_outputs(
+        TaskClient(), "tsk_example", output_dir=tmp_path, overwrite=False
+    )
+    unique = tmp_path / "output-00-01.mp4"
+    assert original.read_bytes() == b"old-video"
+    assert unique.read_bytes() == b"new-video"
+    assert first["outputs"][0]["path"] == str(unique)
+
+    second = cli_main._download_task_outputs(
+        TaskClient(), "tsk_example", output_dir=tmp_path, overwrite=False
+    )
+    assert second["outputs"][0]["path"] == str(unique)
+    assert not (tmp_path / "output-00-02.mp4").exists()
+    assert not list(tmp_path.glob(".vgen-output-*.part"))
+
+
+def test_task_download_overwrites_only_when_explicitly_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TaskClient:
+        def get_task(self, task_id: str):
+            return {
+                "id": task_id,
+                "artifacts": [
+                    {
+                        "id": "art_output",
+                        "attempt_id": "atm_example",
+                        "direction": "output",
+                        "state": "available",
+                        "download_ticket": {"url": "https://storage.invalid/ciphertext"},
+                        "media_metadata": {"filename": "output.mp4"},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        cli_main,
+        "_task_reader_context",
+        lambda _client, _task_id: (
+            {"workspace_id": "wsp_example"},
+            b"k" * 32,
+            "atm_example",
+            1,
+        ),
+    )
+    def download(_artifact, destination: Path, **_kwargs):
+        destination.write_bytes(b"replacement")
+        return SimpleNamespace(size_bytes=11)
+
+    monkeypatch.setattr(cli_main, "download_and_decrypt_output", download)
+    output = tmp_path / "output.mp4"
+    output.write_bytes(b"original")
+
+    result = cli_main._download_task_outputs(
+        TaskClient(), "tsk_example", output_dir=tmp_path, overwrite=True
+    )
+
+    assert output.read_bytes() == b"replacement"
+    assert result["outputs"][0]["path"] == str(output)
 
 
 def test_task_pool_resolution_uses_explicit_then_profile_default_then_unique() -> None:

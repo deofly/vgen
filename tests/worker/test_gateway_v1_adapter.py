@@ -371,6 +371,22 @@ def test_late_fencing_error_maps_to_lease_lost() -> None:
         client.heartbeat(reference, ProgressEvent(0.5, "sampling"))
 
 
+def test_attempt_heartbeat_reports_progress_when_enabled() -> None:
+    session = RecordingSession()
+    client = GatewayV1Client(
+        "https://gateway.example.test",
+        WorkerCredentials("wrk_contract", DeviceKeys.generate(), "short-session"),
+        session=session,  # type: ignore[arg-type]
+        report_progress=True,
+    )
+    reference = LeaseReference("lea_1", "tsk_1", "atm_1", "wrk_contract", 5)
+
+    client.heartbeat(reference, ProgressEvent(0.57, "sampling"))
+
+    body = json.loads(session.requests[-1][2]["data"])
+    assert body["progress"] == {"fraction": 0.57, "stage": "sampling"}
+
+
 def test_invalid_encrypted_payload_is_safely_failed_before_execution(tmp_path: Path) -> None:
     keys = DeviceKeys.generate()
     wire, _task_key = encrypted_lease(tmp_path, keys)

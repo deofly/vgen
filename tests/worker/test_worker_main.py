@@ -13,6 +13,7 @@ from vgen.worker.main import (
     EXIT_OK,
     EXIT_UNAVAILABLE,
     EXIT_UPDATE_RESTART,
+    _build_gateway,
     run,
 )
 from vgen.worker.maintenance import MaintenanceOutcome
@@ -36,6 +37,23 @@ class FakeExecutor:
 
     def cancel(self, handle: str | None = None) -> None:
         return None
+
+
+def test_worker_gateway_enables_attempt_progress_reporting() -> None:
+    arguments = SimpleNamespace(
+        gateway_url="https://gateway.example.test",
+        lease_ttl=60,
+        allow_http=False,
+        session_token_file=None,
+    )
+
+    gateway = _build_gateway(
+        arguments,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+        SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    assert gateway._report_progress is True
 
 
 def test_doctor_outputs_machine_readable_executor_status(capsys: Any) -> None:

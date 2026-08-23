@@ -2564,17 +2564,20 @@ def _download_task_outputs(
             filename = f"{index:02d}-{filename}"
         used_names.add(filename)
         destination = destination_root / filename
-        if destination.exists() and not overwrite:
-            raise ValueError(f"refusing to overwrite output: {destination}")
-        receipt = download_and_decrypt_output(
-            artifact,
-            destination,
-            task_data_key=task_data_key,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            artifact_attempt_id=str(artifact.get("attempt_id") or content_attempt_id),
-            key_version=key_version,
-        )
+        staged = destination_root / f".vgen-output-{uuid.uuid4().hex}.part"
+        try:
+            receipt = download_and_decrypt_output(
+                artifact,
+                staged,
+                task_data_key=task_data_key,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                artifact_attempt_id=str(artifact.get("attempt_id") or content_attempt_id),
+                key_version=key_version,
+            )
+            destination = _publish_task_output(staged, destination, overwrite=overwrite)
+        finally:
+            staged.unlink(missing_ok=True)
         downloaded.append(
             {
                 "artifact_id": artifact["id"],
@@ -2583,6 +2586,45 @@ def _download_task_outputs(
             }
         )
     return {"task_id": task_id, "outputs": downloaded}
+
+
+def _file_content_fingerprint(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            size += len(block)
+            digest.update(block)
+    return size, digest.hexdigest()
+
+
+def _publish_task_output(staged: Path, requested: Path, *, overwrite: bool) -> Path:
+    """Publish a decrypted output without turning a safe name collision into task failure."""
+
+    if overwrite:
+        os.replace(staged, requested)
+        return requested
+
+    staged_fingerprint: tuple[int, str] | None = None
+    for sequence in range(10_000):
+        candidate = (
+            requested
+            if sequence == 0
+            else requested.with_name(
+                f"{requested.stem}-{sequence:02d}{requested.suffix}"
+            )
+        )
+        try:
+            os.link(staged, candidate)
+            return candidate
+        except FileExistsError:
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            if staged_fingerprint is None:
+                staged_fingerprint = _file_content_fingerprint(staged)
+            if _file_content_fingerprint(candidate) == staged_fingerprint:
+                return candidate
+    raise ValueError(f"could not allocate a unique output filename below: {requested.parent}")
 
 
 def _wait_for_task(
@@ -2595,18 +2637,89 @@ def _wait_for_task(
     if interval <= 0 or timeout <= 0:
         raise ValueError("task wait interval and timeout must be positive")
     deadline = time.monotonic() + timeout
-    last_state: str | None = None
+    display: dict[str, Any] = {
+        "state": None,
+        "attempt_id": None,
+        "stage": None,
+        "percent": -1,
+    }
     while True:
         task = client.get_task(task_id)
+        _print_task_update(task, display)
         state = str(task.get("state") or "unknown")
-        if state != last_state:
-            print(f"任务状态：{state}", file=sys.stderr)
-            last_state = state
         if state in {"succeeded", "failed", "cancelled", "expired"}:
             return task
         if time.monotonic() >= deadline:
             raise TimeoutError("task wait timed out")
         time.sleep(interval)
+
+
+def _task_progress(task: Mapping[str, Any]) -> tuple[str, str, int] | None:
+    attempts = task.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    for index in range(len(attempts) - 1, -1, -1):
+        attempt = attempts[index]
+        if not isinstance(attempt, Mapping):
+            continue
+        progress = attempt.get("progress")
+        if isinstance(progress, str):
+            try:
+                progress = json.loads(progress)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(progress, Mapping):
+            continue
+        fraction = progress.get("fraction")
+        stage = progress.get("stage")
+        if (
+            not isinstance(fraction, (int, float))
+            or isinstance(fraction, bool)
+            or not 0 <= float(fraction) <= 1
+            or not isinstance(stage, str)
+            or not stage
+        ):
+            continue
+        attempt_id = str(attempt.get("id") or f"attempt-{index}")
+        return attempt_id, stage, min(100, max(0, round(float(fraction) * 100)))
+    return None
+
+
+def _task_progress_label(stage: str) -> str:
+    if stage in {"preparing", "downloading_inputs"}:
+        return "准备输入"
+    if stage in {"queued", "sampling", "sampled"}:
+        return "生成采样"
+    if stage.startswith("node:"):
+        return "生成处理"
+    if stage == "uploading_outputs":
+        return "上传结果"
+    return "任务处理"
+
+
+def _print_task_update(task: Mapping[str, Any], display: dict[str, Any]) -> None:
+    state = str(task.get("state") or "unknown")
+    if state != display["state"]:
+        print(f"任务状态：{state}", file=sys.stderr)
+        display["state"] = state
+
+    progress = _task_progress(task)
+    if progress is None:
+        return
+    attempt_id, stage, percent = progress
+    if attempt_id != display["attempt_id"]:
+        display["attempt_id"] = attempt_id
+        display["stage"] = None
+        display["percent"] = -1
+    previous_percent = int(display["percent"])
+    if percent < previous_percent:
+        return
+    stage_changed = stage != display["stage"]
+    if not stage_changed and percent < previous_percent + 2 and percent != 100:
+        return
+    print(f"{_task_progress_label(stage)}：{percent}%", file=sys.stderr)
+    display["stage"] = stage
+    display["percent"] = percent
 
 
 def _task_command(args: argparse.Namespace) -> None:
@@ -2833,16 +2946,14 @@ def _task_command(args: argparse.Namespace) -> None:
                 )
             )
         elif args.task_action == "watch":
-            deadline = time.monotonic() + args.timeout
-            while True:
-                task = client.get_task(args.task_id)
-                state = task.get("state")
-                _json(task)
-                if state in {"succeeded", "failed", "cancelled", "expired"}:
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("task watch timed out")
-                time.sleep(args.interval)
+            _json(
+                _wait_for_task(
+                    client,
+                    args.task_id,
+                    interval=args.interval,
+                    timeout=args.timeout,
+                )
+            )
         elif args.task_action == "usage":
             workspace_id = args.workspace or client.profile.default_workspace
             if not workspace_id:
