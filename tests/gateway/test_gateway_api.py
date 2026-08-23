@@ -153,6 +153,10 @@ def test_public_health_is_minimal_and_authenticated_status_has_counts(tmp_path) 
         assert health.status_code == 200
         assert health.json() == {"ok": True}
 
+        legacy_health = client.get("/api/v1/health")
+        assert legacy_health.status_code == 200
+        assert legacy_health.json() == {"ok": True}
+
         unauthorized = client.get("/api/v1/status")
         assert unauthorized.status_code == 401
 

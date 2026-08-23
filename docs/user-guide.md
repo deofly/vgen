@@ -457,6 +457,15 @@ vgen broker worker-update ~/Downloads/vgen-<version>-py3-none-any.whl \
 These commands update only the VGen Worker wheel, not the Gateway, Mac CLI,
 ComfyUI, custom nodes, Python, CUDA, drivers, or model weights.
 
+The long-running `vgen worker serve` process contains its own stable supervisor.
+After the Broker-authorized wheel is verified and staged, that supervisor starts
+the new isolated runtime, waits for its authenticated Gateway announce, and
+returns to the previous runtime if activation fails. The Windows launcher keeps
+the same compatibility behavior for Workers installed by an older package.
+Do not run the Worker under an external loop that replaces its whole Python
+environment; keep the original foreground command running and let VGen switch
+the child runtime.
+
 ## 7. Real zero-, one-, and two-image tests
 
 Check health and run a read-only scheduler preflight first:

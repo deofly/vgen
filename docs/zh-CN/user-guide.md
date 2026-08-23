@@ -564,6 +564,12 @@ Broker 签名授权更新，等待 Worker 空闲后安装到独立 runtime；Win
 重新上线和激活失败时回退上一 runtime。重复运行且 Worker 已是 stable 时直接返回
 `already_up_to_date`，不会重复部署或降级。
 
+长期运行的 `vgen worker serve` 自带稳定监督进程，不再依赖特定 PowerShell 启动方式。更新包
+校验并暂存后，监督进程启动新的隔离 runtime；新版本只有完成 Gateway 认证上线后才会生效，
+激活失败会自动启动上一 runtime 并向 Gateway 回报失败。旧安装包中的 Windows 启动器仍保留
+同等兼容逻辑。不要在外部脚本中反复重建整个 Python 环境；保持原前台命令运行，让 VGen 自己
+切换子运行时。
+
 只有 PowerShell 安装器、ComfyUI 接入、Python/系统依赖或安装目录结构发生变化时，才需要在
 Windows 重新执行官方 `install-windows-worker.ps1`。普通 VGen Python 运行时更新不需要操作
 Windows。

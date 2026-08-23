@@ -44,6 +44,12 @@ from .credentials import (
 )
 from .gateway import GatewayV1Client
 from .maintenance import MaintenanceOutcome, WorkerMaintenanceController
+from .supervisor import (
+    EXIT_UPDATE_RESTART,
+    EXIT_UPDATE_ROLLBACK,
+    is_supervised_child,
+    supervise_worker,
+)
 from .updater import WorkerUpdateError
 
 logger = logging.getLogger("vgen.worker")
@@ -53,7 +59,6 @@ EXIT_CONFIG = 2
 EXIT_UNAVAILABLE = 5
 EXIT_EXECUTION_FAILED = 6
 EXIT_CRYPTO = 7
-EXIT_UPDATE_RESTART = 75
 
 ExecutorFactory = Callable[[argparse.Namespace], Executor]
 GatewayFactory = Callable[
@@ -659,6 +664,9 @@ def run(
                     if recovered is not None:
                         _apply_maintenance_outcome(status, recovered)
                         status["gateway"] = {"ok": True, "status": "connected"}
+                        if recovered.rollback_required:
+                            _write_status(status, json_output=arguments.json)
+                            return EXIT_UPDATE_ROLLBACK
                         if recovered.restart_required:
                             _write_status(status, json_output=arguments.json)
                             return EXIT_UPDATE_RESTART
@@ -690,6 +698,9 @@ def run(
                         if maintenance_outcome is not None:
                             _apply_maintenance_outcome(status, maintenance_outcome)
                             status["gateway"] = {"ok": True, "status": "connected"}
+                            if maintenance_outcome.rollback_required:
+                                _write_status(status, json_output=arguments.json)
+                                return EXIT_UPDATE_ROLLBACK
                             if maintenance_outcome.restart_required:
                                 _write_status(status, json_output=arguments.json)
                                 return EXIT_UPDATE_RESTART
@@ -785,12 +796,24 @@ def run(
         return EXIT_CONFIG
 
 
+def run_entrypoint(argv: Sequence[str] | None = None) -> int:
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    arguments = build_parser().parse_args(selected_argv)
+    if arguments.command == "serve" and not arguments.once and not is_supervised_child():
+        try:
+            return supervise_worker(selected_argv, work_root=_worker_work_root(arguments))
+        except WorkerUpdateError as exc:
+            print(f"vgen-worker: {exc.code}", file=sys.stderr)
+            return EXIT_CONFIG
+    return run(selected_argv)
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("VGEN_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    raise SystemExit(run())
+    raise SystemExit(run_entrypoint())
 
 
 if __name__ == "__main__":

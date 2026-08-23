@@ -336,6 +336,12 @@ Package manifest 描述公共参数 schema、Executor variant、payload format�
 `manual_download`。Broker 发起 `model-install` 时，Worker 仍以机器管理员本地 policy 为最终
 授权；remote spec 不能覆盖 source、目标路径或许可证。gated/manual model 不得自动下载。
 
+Worker wheel 更新复用同一条签名 maintenance 链路。前台 Worker 入口是稳定的父监督进程，
+`serve` 运行在子解释器中；监督进程只接受 Worker 私有 `runtime-releases` 目录下的原子运行时
+指针。新 runtime 完成 Gateway 认证上线后才清除待激活状态；激活失败时，监督进程用明确的
+rollback 标记启动上一 runtime，由旧 runtime 先向 Gateway 回报失败，再清理本地 pending 状态。
+Gateway 和未签名的远程指令都不能指定任意可执行文件路径。
+
 `comfyui-api-graph/v1` mapping 把通用参数映射到 node title/input。优先使用唯一 `_meta.title`，
 未知参数、缺失/歧义 node、连接覆盖或类型不匹配都在 prepare 前失败。MiniMax 参考包的图片语义：
 

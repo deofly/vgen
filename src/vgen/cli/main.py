@@ -1961,7 +1961,7 @@ def _approve_worker_enrollment(
 
 def _worker_command(args: argparse.Namespace) -> None:
     if args.worker_action == "serve":
-        from vgen.worker.main import run as run_worker
+        from vgen.worker.main import run_entrypoint as run_worker
 
         worker_args = ["serve"]
         for name in (

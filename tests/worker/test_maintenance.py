@@ -366,11 +366,49 @@ def test_pending_update_activation_probe_failure_rolls_back(tmp_path: Path) -> N
     ).recover_pending_update(activation_probe=unavailable)
 
     assert outcome is not None and not outcome.succeeded
-    assert outcome.restart_required
+    assert outcome.rollback_required
     assert outcome.error_code == int(ErrorCode.UPDATE_ACTIVATION_FAILED)
-    assert updater.rolled_back
+    assert not updater.rolled_back
     assert not updater.succeeded
     assert gateway.completions == []
+
+
+def test_previous_runtime_reports_failed_activation_before_clearing_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+    gateway = FakeGateway()
+    monkeypatch.setenv("VGEN_WORKER_UPDATE_ROLLBACK", "1")
+
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update()
+
+    assert outcome is not None and not outcome.succeeded
+    assert outcome.mode == "maintenance_update_rolled_back"
+    assert updater.rolled_back
+    assert gateway.completions[-1]["succeeded"] is False
+    assert gateway.completions[-1]["result"]["status"] == "rolled_back"
 
 
 def test_cancelled_update_resets_pending_pointer_and_never_activates(tmp_path: Path) -> None:

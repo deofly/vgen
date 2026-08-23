@@ -244,6 +244,15 @@ install custom-node code, or execute setup scripts. Model acquisition is an
 explicit Broker maintenance job with license confirmation and revision, size,
 and SHA-256 checks.
 
+Worker wheel updates use the same signed maintenance path. The foreground
+Worker entry point is a stable parent supervisor; it launches `serve` in a child
+interpreter, follows only an atomic runtime pointer under the Worker's private
+`runtime-releases` directory, and keeps the previous interpreter until the new
+runtime completes an authenticated announce. A failed activation starts the
+previous runtime with an explicit rollback marker so it can report the failed
+job before clearing pending state. Neither the Gateway nor an unsigned remote
+instruction may select an arbitrary executable path.
+
 ## 6. Development environment
 
 Use Python 3.11 or later:

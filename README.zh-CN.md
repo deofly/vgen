@@ -13,7 +13,8 @@ VGen 是一个开源 GPU 工作流控制面，由公网 Gateway、Mac CLI/Home B
 - 按 allocation、容量、lease 和 fencing 安全调度任务。
 - 通过内置 ComfyUI Executor 执行文生视频、首帧图生视频和首尾帧视频任务。
 - CLI、Worker 与私有 OSS 使用短期凭据直接传输加密任务媒体。
-- 由 Mac Broker 安装固定版本的工作流模型并更新 Windows Worker。
+- 由 Mac Broker 安装固定版本的工作流模型，并远程更新或回滚 Windows Worker；首次安装完成后
+  无需到 Windows 电脑旁操作。
 - Mac CLI/Home Broker 支持校验、原子升级和失败回滚。
 - Gateway API 与公开安装包使用独立域名。
 - 为每个 Attempt 记录输出视频时长和生成耗时，为后续按时长计算 `billing_token` 预留扩展点。

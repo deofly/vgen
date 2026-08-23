@@ -13,8 +13,10 @@ from vgen.worker.main import (
     EXIT_OK,
     EXIT_UNAVAILABLE,
     EXIT_UPDATE_RESTART,
+    EXIT_UPDATE_ROLLBACK,
     _build_gateway,
     run,
+    run_entrypoint,
 )
 from vgen.worker.maintenance import MaintenanceOutcome
 
@@ -391,3 +393,64 @@ def test_pending_update_requests_supervisor_restart_before_other_work(
     )
     assert events == ["recover_update"]
     assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_update_restart"
+
+
+def test_failed_target_activation_requests_supervisor_rollback(
+    tmp_path: Path, capsys: Any
+) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+    )
+
+    class FakeMaintenance:
+        def recover_pending_update(self, **_kwargs: Any) -> MaintenanceOutcome:
+            return MaintenanceOutcome(
+                "maintenance_update_activation_failed",
+                False,
+                rollback_required=True,
+                job_id="mtn_test",
+            )
+
+    assert (
+        run(
+            [
+                "serve",
+                "--once",
+                "--json",
+                "--gateway-url",
+                "https://gateway.example.test",
+                "--credentials-file",
+                str(credential_file),
+            ],
+            executor_factory=lambda _arguments: FakeExecutor(),
+            gateway_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
+            core_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
+            maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
+        )
+        == EXIT_UPDATE_ROLLBACK
+    )
+    assert json.loads(capsys.readouterr().out)["mode"] == (
+        "maintenance_update_activation_failed"
+    )
+
+
+def test_foreground_serve_uses_builtin_supervisor(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    calls: list[tuple[list[str], Path]] = []
+
+    def fake_supervisor(argv: list[str], *, work_root: Path) -> int:
+        calls.append((argv, work_root))
+        return 23
+
+    monkeypatch.setattr("vgen.worker.main.supervise_worker", fake_supervisor)
+
+    assert (
+        run_entrypoint(["serve", "--work-root", str(tmp_path), "--json"])
+        == 23
+    )
+    assert calls == [
+        (["serve", "--work-root", str(tmp_path), "--json"], tmp_path)
+    ]

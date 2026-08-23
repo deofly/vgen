@@ -17,7 +17,8 @@ keys.
   through the built-in ComfyUI Executor.
 - Transfer encrypted task media directly between clients, Workers, and private
   OSS using short-lived credentials.
-- Install pinned workflow models and update Windows Workers from the Mac Broker.
+- Install pinned workflow models and remotely update or roll back Windows
+  Workers from the Mac Broker, without physical access after initial setup.
 - Upgrade the Mac CLI/Home Broker atomically with verification and rollback.
 - Keep Gateway API traffic independent from public release downloads.
 - Record output video duration and generation elapsed time for every Attempt,

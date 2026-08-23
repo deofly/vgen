@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -35,6 +36,13 @@ class WorkerUpdateError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRuntimeState:
+    active_python: Path
+    previous_python: Path | None
+    pending: bool
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -341,6 +349,37 @@ class RuntimeUpdater:
             return (fallback or self.current_python).resolve()
         return Path(raw).resolve()
 
+    def supervisor_state(self, *, fallback: Path | None = None) -> WorkerRuntimeState:
+        """Return a pointer state safe for launching a Worker subprocess."""
+
+        trusted_fallback = (fallback or self.current_python).resolve()
+        value = self._read_pointer()
+        if value is None:
+            return WorkerRuntimeState(trusted_fallback, None, False)
+        active = self._supervisor_python(value.get("active_python"), trusted_fallback)
+        pending = isinstance(value.get("pending_job_id"), str) and bool(
+            value["pending_job_id"].strip()
+        )
+        previous = None
+        if pending:
+            previous = self._supervisor_python(value.get("previous_python"), trusted_fallback)
+        return WorkerRuntimeState(active, previous, pending)
+
+    def _supervisor_python(self, raw: object, trusted_fallback: Path) -> Path:
+        if not isinstance(raw, str) or not raw:
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        try:
+            candidate = Path(raw).resolve()
+            releases_root = self.releases_root.resolve()
+            in_releases = candidate.is_relative_to(releases_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID") from exc
+        if candidate != trusted_fallback and not in_releases:
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        if not candidate.is_file() or (candidate != trusted_fallback and _is_reparse(candidate)):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        return candidate
+
     def _verify_installed_runtime(self, runtime: Path, expected_version: str) -> None:
         python = _runtime_python(runtime)
         if not python.is_file() or _is_reparse(python):
@@ -413,4 +452,4 @@ def _is_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(attributes & reparse_flag)
 
 
-__all__ = ["RuntimeUpdater", "WorkerUpdateError"]
+__all__ = ["RuntimeUpdater", "WorkerRuntimeState", "WorkerUpdateError"]

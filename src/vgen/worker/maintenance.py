@@ -91,6 +91,7 @@ class MaintenanceOutcome:
     mode: str
     succeeded: bool
     restart_required: bool = False
+    rollback_required: bool = False
     job_id: str | None = None
     error_code: int | None = None
 
@@ -271,11 +272,14 @@ class WorkerMaintenanceController:
                 },
             )
         except BaseException:
-            self._updater.mark_activation_rolled_back(pointer)
+            # Keep the pending pointer until the previous runtime starts with
+            # the rollback marker. It must report the signed failure before
+            # clearing local activation state; otherwise the Gateway would
+            # leave the maintenance job in a restart loop.
             return MaintenanceOutcome(
-                "maintenance_update_rolled_back",
+                "maintenance_update_activation_failed",
                 False,
-                restart_required=True,
+                rollback_required=True,
                 job_id=job_id,
                 error_code=int(ErrorCode.UPDATE_ACTIVATION_FAILED),
             )

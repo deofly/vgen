@@ -1018,7 +1018,12 @@ def create_app(
                     details={"max_bytes": request_body_limit},
                 )
         protocol_exempt = (
-            request.url.path in {"/healthz", "/docs", "/openapi.json"}
+            request.url.path in {
+                "/healthz",
+                "/api/v1/health",
+                "/docs",
+                "/openapi.json",
+            }
             or request.url.path.startswith("/docs/")
             or request.url.path.startswith("/api/v1/artifacts/transfer/")
             or request.url.path.startswith("/api/v1/releases/")
@@ -1468,6 +1473,17 @@ def create_app(
 
     @app.get("/healthz", tags=["system"], response_model=HealthResponse)
     def health() -> dict[str, bool]:
+        return {"ok": True}
+
+    # Compatibility-only alias for pre-0.9.0 Windows installers. Keep it out
+    # of the current API contract and never restore the former database/status
+    # payload here; operational details belong to authenticated /api/v1/status.
+    @app.get(
+        "/api/v1/health",
+        response_model=HealthResponse,
+        include_in_schema=False,
+    )
+    def legacy_health() -> dict[str, bool]:
         return {"ok": True}
 
     @app.get("/api/v1/status", tags=["system"], response_model=StatusResponse)

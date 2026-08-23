@@ -128,6 +128,10 @@ def test_stages_separate_runtime_and_writes_pending_activation_pointer(
     assert Path(pointer["active_python"]).is_file()
     assert Path(pointer["active_python"]) != python.resolve()
     assert updater.pending_activation() == pointer
+    state = updater.supervisor_state(fallback=python)
+    assert state.active_python == Path(pointer["active_python"])
+    assert state.previous_python == python.resolve()
+    assert state.pending
     pip_command, pip_kwargs = next(item for item in calls if "pip" in item[0])
     assert pip_command[1:5] == ["-I", "-m", "pip", "--isolated"]
     assert "--no-deps" in pip_command

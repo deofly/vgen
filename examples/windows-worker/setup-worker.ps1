@@ -3013,6 +3013,9 @@ try {
     if (-not (Test-Path -LiteralPath $workRoot -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
     }
+    # Current Workers supervise versioned child runtimes themselves. Keep this
+    # outer loop so a pre-supervisor Worker can still complete its first remote
+    # upgrade without reinstalling the Windows package.
     $workerExitCode = 1
     $activeWorkerPython = (Get-WorkerRuntimeState $workRoot $runtimePython).ActivePython
     $restartAttempts = 0
