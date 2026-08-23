@@ -760,6 +760,7 @@ verify_resume_preconditions() {
 }
 
 gateway_local_health_is_ok() {
+  local validator="${1:-health_payload_is_ok}"
   local health_file
   health_file="$(mktemp /tmp/vgen-local-health.XXXXXX)"
   if curl --fail --silent --max-time 3 \
@@ -768,7 +769,7 @@ gateway_local_health_is_ok() {
     --header 'Connection: close' \
     --output "${health_file}" \
     "http://127.0.0.1:${GATEWAY_PORT}/healthz" 2>/dev/null && \
-    health_payload_is_ok <"${health_file}"; then
+    "${validator}" <"${health_file}"; then
     rm -f -- "${health_file}"
     return 0
   fi
@@ -777,13 +778,14 @@ gateway_local_health_is_ok() {
 }
 
 gateway_local_health_with_retry() {
+  local validator="${1:-health_payload_is_ok}"
   local deadline attempt consecutive
   deadline=$((SECONDS + 30))
   attempt=0
   consecutive=0
   while ((SECONDS < deadline)); do
     attempt=$((attempt + 1))
-    if gateway_local_health_is_ok; then
+    if gateway_local_health_is_ok "${validator}"; then
       consecutive=$((consecutive + 1))
       if ((consecutive >= 2)); then
         log "Gateway local health passed 2 consecutive fresh checks after ${attempt} attempt(s)"
@@ -1234,7 +1236,21 @@ raise SystemExit(0 if valid else 1)
 '
 }
 
+health_payload_reports_ok() {
+  python3.11 -c '
+import json
+import sys
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+valid = isinstance(payload, dict) and payload.get("ok") is True
+raise SystemExit(0 if valid else 1)
+'
+}
+
 gateway_https_health_with_retry() {
+  local validator="${1:-health_payload_is_ok}"
   local deadline response_file attempt remaining max_time consecutive
   deadline=$((SECONDS + 30))
   response_file="$(mktemp /tmp/vgen-https-health.XXXXXX)"
@@ -1252,7 +1268,7 @@ gateway_https_health_with_retry() {
       --output "${response_file}" \
       --resolve "${DOMAIN}:443:127.0.0.1" \
       "https://${DOMAIN}/healthz" 2>/dev/null && \
-      health_payload_is_ok <"${response_file}"; then
+      "${validator}" <"${response_file}"; then
       consecutive=$((consecutive + 1))
       if ((consecutive >= 2)); then
         rm -f -- "${response_file}"
@@ -1851,8 +1867,10 @@ verify_upgrade_preconditions() {
     die "upgrade refused: Gateway service is not enabled"
   runuser -u vgen -- "${INSTALL_ROOT}/venv/bin/vgen-gateway" \
     --database "${DATABASE_PATH}" doctor >/dev/null
-  gateway_local_health_with_retry || die "upgrade refused: local Gateway health is not ready"
-  gateway_https_health_with_retry || die "upgrade refused: public Gateway health is not ready"
+  gateway_local_health_with_retry health_payload_reports_ok || \
+    die "upgrade refused: local Gateway health is not ready"
+  gateway_https_health_with_retry health_payload_reports_ok || \
+    die "upgrade refused: public Gateway health is not ready"
 
   version_order="$(compare_release_versions "${INSTALLED_VGEN_VERSION}" "${VGEN_VERSION}")"
   case "${version_order}" in
@@ -2059,10 +2077,10 @@ handle_upgrade_error() {
 
   systemctl daemon-reload || rollback_ok=0
   systemctl start "${SERVICE_NAME}" || rollback_ok=0
-  if ! gateway_local_health_with_retry; then
+  if ! gateway_local_health_with_retry health_payload_reports_ok; then
     rollback_ok=0
   fi
-  if ! gateway_https_health_with_retry; then
+  if ! gateway_https_health_with_retry health_payload_reports_ok; then
     rollback_ok=0
   fi
   if [[ "${rollback_ok}" -eq 1 ]]; then

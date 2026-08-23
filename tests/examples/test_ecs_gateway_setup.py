@@ -569,6 +569,31 @@ printf 'attempts=%s\n' "${{attempts}}"
     assert "PRIVATE_UPSTREAM_FAILURE" not in result.stderr
 
 
+def test_upgrade_health_accepts_legacy_payload_without_weakening_new_health_contract(
+    tmp_path: Path,
+) -> None:
+    command_root = tmp_path / "commands"
+    command_root.mkdir()
+    (command_root / "python3.11").symlink_to(sys.executable)
+    command = f"""
+export PATH={str(command_root)!r}:"$PATH"
+export VGEN_SETUP_LIBRARY_ONLY=1
+source {str(INSTALLER)!r}
+set +e
+printf '%s' '{{"ok":true,"schema_version":1,"counts":{{}}}}' | health_payload_is_ok
+strict_legacy=$?
+printf '%s' '{{"ok":true,"schema_version":1,"counts":{{}}}}' | health_payload_reports_ok
+compatible_legacy=$?
+printf '%s' '{{"ok":true}}' | health_payload_is_ok
+strict_current=$?
+printf '%s %s %s\n' "${{strict_legacy}}" "${{compatible_legacy}}" "${{strict_current}}"
+"""
+    result = subprocess.run(["bash", "-c", command], check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1 0 0"
+
+
 def test_activate_reuses_only_the_exact_healthy_rolled_back_state() -> None:
     source = INSTALLER.read_text(encoding="utf-8")
     activate_body = source.split("activate_gateway() {", 1)[1].split("\n}", 1)[0]
@@ -672,6 +697,8 @@ def test_gateway_upgrade_is_staged_backed_up_health_gated_and_reversible() -> No
     assert "systemctl is-enabled --quiet" in preconditions
     assert "gateway_local_health_with_retry" in preconditions
     assert "gateway_https_health_with_retry" in preconditions
+    assert "gateway_local_health_with_retry health_payload_reports_ok" in preconditions
+    assert "gateway_https_health_with_retry health_payload_reports_ok" in preconditions
 
     assert 'mv -- "${INSTALL_ROOT}/venv" "${UPGRADE_PREVIOUS_RUNTIME}"' in source
     assert 'mv -- "${candidate_runtime}" "${INSTALL_ROOT}/venv"' in source
@@ -683,6 +710,8 @@ def test_gateway_upgrade_is_staged_backed_up_health_gated_and_reversible() -> No
     assert 'systemctl start "${SERVICE_NAME}"' in rollback_body
     assert "gateway_local_health_with_retry" in rollback_body
     assert "gateway_https_health_with_retry" in rollback_body
+    assert "gateway_local_health_with_retry health_payload_reports_ok" in rollback_body
+    assert "gateway_https_health_with_retry health_payload_reports_ok" in rollback_body
     assert "rm -rf" not in source
 
 
