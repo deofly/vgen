@@ -389,15 +389,15 @@ try {
     }
 
     Write-Step "Enrollment completed; continuing with reviewed Worker setup"
-    $setupArguments = @(
-        "-GatewayUrl", $gatewayOrigin,
-        "-WorkerCredentials", $credentialPath
-    )
+    $setupArguments = @{
+        GatewayUrl = $gatewayOrigin
+        WorkerCredentials = $credentialPath
+    }
     if (-not [string]::IsNullOrWhiteSpace($ComfyUIRoot)) {
-        $setupArguments += @("-ComfyUIRoot", $ComfyUIRoot)
+        $setupArguments["ComfyUIRoot"] = $ComfyUIRoot
     }
     if (-not [string]::IsNullOrWhiteSpace($ComfyUIDataRoot)) {
-        $setupArguments += @("-ComfyUIDataRoot", $ComfyUIDataRoot)
+        $setupArguments["ComfyUIDataRoot"] = $ComfyUIDataRoot
     }
     & $setupPath @setupArguments
     exit $LASTEXITCODE
