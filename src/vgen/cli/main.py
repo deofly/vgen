@@ -62,7 +62,7 @@ from vgen.market.registry import (
     sign_package,
     validate_package,
 )
-from vgen.protocol import ErrorCode, VGenError, get_error_spec, new_id
+from vgen.protocol import ErrorCode, TaskState, VGenError, get_error_spec, new_id
 from vgen.protocol.user_enrollment import user_verification_code
 
 from .artifacts import (
@@ -238,6 +238,9 @@ def _maintenance_target(row: Mapping[str, Any]) -> object:
     return spec.get("target_version") or spec.get("workflow_ref")
 
 
+TASK_STATE_COLUMN_WIDTH = max(len(state.value) for state in TaskState)
+
+
 def _print_task_list(page: Mapping[str, Any]) -> None:
     items = page.get("items")
     rows = items if isinstance(items, list) else []
@@ -250,7 +253,8 @@ def _print_task_list(page: Mapping[str, Any]) -> None:
     time_field = "updated_at" if sort == "updated" else "created_at"
     time_heading = "UPDATED" if sort == "updated" else "CREATED"
     print(
-        f"{'TASK ID':<31} {'STATE':<12} {'PRI':>3} {time_heading:<19} "
+        f"{'TASK ID':<31} {'STATE':<{TASK_STATE_COLUMN_WIDTH}} {'PRI':>3} "
+        f"{time_heading:<19} "
         f"{'SUBMITTER':<16} {'WORKER':<22} WORKFLOW"
     )
     for item in rows:
@@ -260,13 +264,13 @@ def _print_task_list(page: Mapping[str, Any]) -> None:
         submitter_name = submitter.get("display_name") if isinstance(submitter, Mapping) else None
         worker = item.get("worker")
         worker_name = worker.get("name") if isinstance(worker, Mapping) else None
-        state = _task_list_cell(item.get("state"), width=12)
+        state = _task_list_cell(item.get("state"), width=TASK_STATE_COLUMN_WIDTH)
         queue_position = item.get("queue_position")
         if state == "queued" and isinstance(queue_position, int) and queue_position > 0:
-            state = _task_list_cell(f"queued #{queue_position}", width=12)
+            state = _task_list_cell(f"queued #{queue_position}", width=TASK_STATE_COLUMN_WIDTH)
         print(
             f"{_task_list_cell(item.get('id'), width=31):<31} "
-            f"{state:<12} "
+            f"{state:<{TASK_STATE_COLUMN_WIDTH}} "
             f"{int(item.get('priority') or 0):>3} "
             f"{_task_list_datetime(item.get(time_field)):<19} "
             f"{_task_list_cell(submitter_name, width=16):<16} "

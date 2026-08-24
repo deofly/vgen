@@ -202,6 +202,29 @@ def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
     assert "查看明细：vgen task show <task_id>" in output
 
 
+def test_task_list_prints_rekey_required_without_truncation(capsys) -> None:
+    _print_task_list(
+        {
+            "items": [
+                {
+                    "id": "tsk_rekey",
+                    "state": "rekey_required",
+                    "priority": 0,
+                    "created_at": 1_787_552_404.159,
+                    "submitted_by": {"display_name": "Alice"},
+                    "worker": {"name": "GPU Worker"},
+                    "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
+                }
+            ],
+            "total": 1,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "rekey_required" in output
+    assert "rekey_requi…" not in output
+
+
 def test_task_list_datetime_rejects_invalid_values() -> None:
     assert _task_list_datetime(None) == "-"
     assert _task_list_datetime("not-a-timestamp") == "-"
