@@ -812,7 +812,13 @@ Windows 安装器必须支持 PowerShell 5.1，自动识别 AppData、Program Fi
 (x86)、Desktop installation records、Standalone、adopted/ComfyBuilder 和 Portable。无法唯一
 确认时交互选择或要求显式 `-ComfyUIRoot`/`-ComfyUIDataRoot`，不得扫描整盘、猜 Documents、
 写 Program Files 或覆盖用户 custom nodes。VGen custom nodes/input/output/temp/database 使用
-独立 `%LOCALAPPDATA%\VGen` 目录，模型目录只读复用或经 Broker maintenance 安全写入。
+独立 `%LOCALAPPDATA%\VGen` 目录，模型目录只读复用或经 Broker maintenance 安全写入。公开
+安装入口完整校验并解压可信版本后，必须原子更新固定入口
+`%LOCALAPPDATA%\VGen\start-worker.cmd`，让它只转发到本次校验通过的精确版本目录，并创建或
+刷新当前用户桌面的 `VGen Worker` 快捷方式。快捷方式只能指向固定入口，不得按目录时间猜测
+版本，也不得绕过现有 Worker runtime pointer、supervisor 和回滚逻辑。创建桌面快捷方式失败时
+应明确警告，但不能阻断已经校验通过的前台 Worker 启动。这个入口不是 Windows Service，也不
+提供开机自启。
 
 `examples/docker-compose.yml` 是开发/评审基线，不是面向普通用户的一键生产方案。容器必须以
 非 root UID 运行，credential 挂载为 owner-only，Gateway 端口只绑定 loopback；可选 TLS 反代

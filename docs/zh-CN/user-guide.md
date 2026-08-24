@@ -34,8 +34,8 @@ ECS Gateway（公网 HTTPS 控制面和密文任务状态）
 7. 分别提交 0、1、2 张图片的视频任务进行验收。
 
 当前 Gateway 由 systemd 常驻，Mac Home Broker 由安装器配置为当前用户的 LaunchAgent。
-Windows Worker 暂时必须保持 PowerShell 窗口打开；当前版本不安装 Windows Service，也不
-提供后台常驻或开机自启。
+Windows Worker 暂时必须保持 PowerShell 窗口打开。安装器会创建固定的桌面快捷方式，方便
+电脑重启后再次启动；当前版本不安装 Windows Service，也不提供后台常驻或开机自启。
 
 > **工作流安装不等于模型权重下载。** Mac 初始化时安装的是
 > `vgen/minimax-h3-8step` 工作流清单、参数定义和 ComfyUI 图。实际模型权重位于 Windows
@@ -450,6 +450,12 @@ Python、pip、winget 在安装时显示的进度只写入当前窗口，不会�
 控制台，不应再弹出第二个空白 Terminal；其输出仍写入 `%LOCALAPPDATA%\VGen\logs`。按
 `Ctrl+C` 可让脚本停止本次由它启动的 Worker 和 ComfyUI；如果直接强制关闭窗口导致残留
 进程，先在任务管理器结束残留的 ComfyUI/Python，再重新启动。
+
+安装器会创建固定入口 `%LOCALAPPDATA%\VGen\start-worker.cmd`，并在当前用户桌面创建
+`VGen Worker` 快捷方式。Windows 重启后，先退出单独打开的 ComfyUI，再双击同一个快捷方式，
+并保持弹出的 PowerShell 窗口开启。快捷方式始终指向固定入口；以后运行可信的新版本安装器时，
+只会更新固定入口内部指向的版本目录，快捷方式路径不会变化。普通重启不需要重新执行公开的
+`irm` 安装命令。
 
 ### 5.3 Desktop、Portable 和自定义数据目录
 

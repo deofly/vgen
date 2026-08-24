@@ -41,8 +41,9 @@ Install the components in this order:
 
 The Gateway runs under systemd. The installer configures the Mac Home Broker as
 a per-user LaunchAgent. The Windows Worker currently requires its foreground
-PowerShell window to remain open; it is not installed as a Windows Service and
-does not yet run in the background or start at boot.
+PowerShell window to remain open. The installer creates a stable `VGen Worker`
+Desktop shortcut for starting it again after a reboot, but it is not installed
+as a Windows Service and does not start automatically at boot.
 
 > Installing a workflow does not download its model weights. Initialization
 > installs the `vgen/minimax-h3-8step` manifest, parameter definitions, and
@@ -374,6 +375,14 @@ reuses reviewed, pinned custom-node repositories and preserves models. Keep one
 PowerShell window open after polling starts. `Ctrl+C` stops the Worker and any
 ComfyUI instance started by the supervisor. Logs are under
 `%LOCALAPPDATA%\VGen\logs`.
+
+The installer creates `%LOCALAPPDATA%\VGen\start-worker.cmd` and a `VGen Worker`
+shortcut on the current user's Desktop. After Windows restarts, exit any ComfyUI
+instance that was opened separately, double-click that same shortcut, and keep
+the resulting PowerShell window open. The shortcut always targets the stable
+launcher; a later reviewed installer updates the launcher's internal version
+target without changing the shortcut. Rerunning the public `irm` command is not
+required for an ordinary restart.
 
 ### 5.3 Desktop, Portable, and custom data roots
 

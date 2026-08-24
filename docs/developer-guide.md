@@ -480,7 +480,15 @@ LaunchAgent. Existing profiles are upgraded, never bootstrapped again.
 The Windows installer must support PowerShell 5.1, detect common Desktop and
 Portable layouts, and request explicit roots when ambiguous. It must not scan
 the whole disk, guess a Documents path, write Program Files, or overwrite user
-custom nodes. VGen data remains isolated under `%LOCALAPPDATA%\VGen`.
+custom nodes. VGen data remains isolated under `%LOCALAPPDATA%\VGen`. After a
+reviewed version is fully verified and extracted, the public bootstrap
+atomically updates `%LOCALAPPDATA%\VGen\start-worker.cmd` to delegate to that
+exact version and creates or refreshes the current user's `VGen Worker` Desktop
+shortcut. The shortcut targets only the stable launcher; it never discovers a
+version by directory timestamps and never bypasses the existing Worker runtime
+pointer, supervisor, or rollback logic. Shortcut creation failure is reported
+without blocking the verified foreground Worker startup. This convenience
+entry is not a Windows Service or an automatic startup mechanism.
 
 ## 10. Migration from legacy shared-token deployments
 

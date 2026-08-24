@@ -11,7 +11,9 @@ SCRIPT = ROOT / "examples" / "windows-worker" / "setup-worker.ps1"
 ENROLLMENT_SCRIPT = ROOT / "examples" / "windows-worker" / "enroll-worker.ps1"
 WORKER_LAUNCHER = ROOT / "examples" / "windows-worker" / "start-worker.cmd"
 USER_GUIDE = ROOT / "docs" / "user-guide.md"
+ZH_USER_GUIDE = ROOT / "docs" / "zh-CN" / "user-guide.md"
 DEVELOPER_GUIDE = ROOT / "docs" / "developer-guide.md"
+ZH_DEVELOPER_GUIDE = ROOT / "docs" / "zh-CN" / "developer-guide.md"
 MANIFEST = ROOT / "workflows" / "vgen" / "minimax-h3-8step" / "1.0.0" / "manifest.yaml"
 POLICY = ROOT / "examples" / "comfyui-minimax-h3-policy.yaml"
 
@@ -824,7 +826,9 @@ def test_windows_worker_normal_setup_uses_fixed_winget_packages_and_absolute_dis
 
 def test_two_handbooks_are_the_only_documentation_sources_for_operations_and_release() -> None:
     user = USER_GUIDE.read_text(encoding="utf-8")
+    zh_user = ZH_USER_GUIDE.read_text(encoding="utf-8")
     developer = DEVELOPER_GUIDE.read_text(encoding="utf-8")
+    zh_developer = ZH_DEVELOPER_GUIDE.read_text(encoding="utf-8")
 
     assert "single operations handbook for VGen deployers and users" in user
     assert "single authoritative handbook for VGen developers" in developer
@@ -839,6 +843,14 @@ def test_two_handbooks_are_the_only_documentation_sources_for_operations_and_rel
     assert "sudo rm -f /var/lib/vgen/bootstrap-code" in user
     assert "start-worker.cmd" in user
     assert "%LOCALAPPDATA%\\VGen" in user
+    assert "%LOCALAPPDATA%\\VGen\\start-worker.cmd" in user
+    assert "Desktop shortcut for starting it again after a reboot" in user
+    assert "does not start automatically at boot" in user
+    assert "%LOCALAPPDATA%\\VGen\\start-worker.cmd" in zh_user
+    assert "`VGen Worker` 快捷方式" in zh_user
+    assert "普通重启不需要重新执行" in zh_user
+    assert "%LOCALAPPDATA%\\VGen\\start-worker.cmd" in zh_developer
+    assert "不得按目录时间猜测" in zh_developer
     assert "vgen broker model-install" in user
     assert "vgen broker worker-update" in user
     assert "--wait --output-dir" in user

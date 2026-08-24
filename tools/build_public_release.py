@@ -822,6 +822,145 @@ function Get-Sha256([byte[]]$Bytes) {{
     finally {{ $sha.Dispose() }}
 }}
 
+function Resolve-SafeVGenDirectory([string]$Path, [string]$Description) {{
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {{
+        throw "$Description is missing or is not a directory."
+    }}
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+        throw "$Description must not be a reparse point."
+    }}
+    return $item.FullName
+}}
+
+function Install-VGenWorkerLauncher([string]$InstallRoot) {{
+    $installerRoot = Split-Path -Parent $InstallRoot
+    $vgenRoot = Split-Path -Parent $installerRoot
+    $vgenRoot = Resolve-SafeVGenDirectory $vgenRoot "The VGen application data directory"
+    $installerRoot = Resolve-SafeVGenDirectory $installerRoot "The VGen installer directory"
+    $InstallRoot = Resolve-SafeVGenDirectory $InstallRoot "The verified Worker installer directory"
+    $installLeaf = Split-Path -Leaf $InstallRoot
+    $expectedLeaf = "$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"
+    if ($installLeaf -cne $expectedLeaf) {{
+        throw "The verified Worker installer path is invalid."
+    }}
+
+    $stableLauncher = Join-Path $vgenRoot "start-worker.cmd"
+    if (Test-Path -LiteralPath $stableLauncher) {{
+        $existingLauncher = Get-Item -LiteralPath $stableLauncher -Force
+        if ($existingLauncher.PSIsContainer -or
+            ($existingLauncher.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+            throw "The stable VGen Worker launcher path is unsafe."
+        }}
+    }}
+
+    $launcherContent = @"
+@echo off
+setlocal
+set "VGEN_WORKER_REENROLL_ARG="
+if not "%~1"=="" (
+  if /I not "%~1"=="-Reenroll" (
+    echo [vgen] Only the reviewed -Reenroll recovery switch is accepted.
+    exit /b 2
+  )
+  if not "%~2"=="" (
+    echo [vgen] -Reenroll does not accept additional arguments.
+    exit /b 2
+  )
+  set "VGEN_WORKER_REENROLL_ARG=-Reenroll"
+)
+set "VGEN_WORKER_VERSION_LAUNCHER=%~dp0installer\$installLeaf\start-worker.cmd"
+if not exist "%VGEN_WORKER_VERSION_LAUNCHER%" (
+  echo [vgen] The installed Worker launcher is missing.
+  echo [vgen] Run the public Windows Worker installer again to repair it.
+  pause
+  exit /b 1
+)
+if defined VGEN_WORKER_REENROLL_ARG goto vgen_worker_reenroll
+"%VGEN_WORKER_VERSION_LAUNCHER%"
+exit /b %ERRORLEVEL%
+
+:vgen_worker_reenroll
+"%VGEN_WORKER_VERSION_LAUNCHER%" -Reenroll
+exit /b %ERRORLEVEL%
+"@
+    $launcherContent = $launcherContent.Replace("`r`n", "`n").Replace("`n", "`r`n")
+    $launcherBytes = [Text.Encoding]::ASCII.GetBytes($launcherContent)
+    if (Test-Path -LiteralPath $stableLauncher) {{
+        $existingBytes = [IO.File]::ReadAllBytes($stableLauncher)
+        if ((Get-Sha256 $existingBytes) -eq (Get-Sha256 $launcherBytes)) {{
+            Write-Host "[vgen] Stable Worker launcher is current: $stableLauncher"
+            return $stableLauncher
+        }}
+    }}
+    $launcherStaging = Join-Path $vgenRoot ".start-worker-$([Guid]::NewGuid().ToString('N')).cmd"
+    try {{
+        [IO.File]::WriteAllBytes($launcherStaging, $launcherBytes)
+        if (Test-Path -LiteralPath $stableLauncher) {{
+            [IO.File]::Replace($launcherStaging, $stableLauncher, $null)
+        }}
+        else {{
+            [IO.File]::Move($launcherStaging, $stableLauncher)
+        }}
+    }}
+    finally {{
+        if (Test-Path -LiteralPath $launcherStaging) {{
+            Remove-Item -LiteralPath $launcherStaging -Force
+        }}
+    }}
+    Write-Host "[vgen] Installed stable Worker launcher: $stableLauncher"
+    return $stableLauncher
+}}
+
+function Install-VGenWorkerDesktopShortcut([string]$LauncherPath, [string]$DesktopPath) {{
+    try {{
+        $desktop = $DesktopPath
+        if ([string]::IsNullOrWhiteSpace($desktop)) {{
+            $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+        }}
+        if ([string]::IsNullOrWhiteSpace($desktop) -or
+            -not (Test-Path -LiteralPath $desktop -PathType Container)) {{
+            throw "The current user's Desktop directory could not be located."
+        }}
+        $shortcutPath = Join-Path $desktop "VGen Worker.lnk"
+        if (Test-Path -LiteralPath $shortcutPath) {{
+            $existingShortcut = Get-Item -LiteralPath $shortcutPath -Force
+            if ($existingShortcut.PSIsContainer -or
+                ($existingShortcut.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+                throw "The VGen Worker shortcut path is unsafe."
+            }}
+        }}
+
+        $shortcutStaging = Join-Path $desktop ".VGen-Worker-$([Guid]::NewGuid().ToString('N')).lnk"
+        try {{
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut($shortcutStaging)
+            $shortcut.TargetPath = $LauncherPath
+            $shortcut.WorkingDirectory = Split-Path -Parent $LauncherPath
+            $shortcut.Description = "Start VGen Worker"
+            $shortcut.Save()
+            if (-not (Test-Path -LiteralPath $shortcutStaging -PathType Leaf)) {{
+                throw "Windows did not create the VGen Worker shortcut."
+            }}
+            if (Test-Path -LiteralPath $shortcutPath) {{
+                [IO.File]::Replace($shortcutStaging, $shortcutPath, $null)
+            }}
+            else {{
+                [IO.File]::Move($shortcutStaging, $shortcutPath)
+            }}
+        }}
+        finally {{
+            if (Test-Path -LiteralPath $shortcutStaging) {{
+                Remove-Item -LiteralPath $shortcutStaging -Force
+            }}
+        }}
+        Write-Host "[vgen] Installed desktop shortcut: $shortcutPath"
+    }}
+    catch {{
+        Write-Warning "The VGen Worker desktop shortcut could not be installed: $($_.Exception.Message)"
+    }}
+}}
+
 Write-Host "[vgen] Checking the latest Windows Worker installer..."
 $stableBytes = Get-VGenBytes "$ReleaseOrigin/releases/channels/stable.json" 1048576
 $stable = [Text.Encoding]::UTF8.GetString($stableBytes) | ConvertFrom-Json
@@ -860,9 +999,20 @@ if ($archiveBytes.LongLength -ne [int64]$artifact.size -or
     throw "Windows Worker installer size or SHA-256 mismatch."
 }}
 
-$installRoot = Join-Path $env:LOCALAPPDATA "VGen\installer\$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"
-$parent = Split-Path -Parent $installRoot
-[IO.Directory]::CreateDirectory($parent) | Out-Null
+if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {{
+    throw "LOCALAPPDATA is required for the VGen Worker installer."
+}}
+$vgenRoot = Join-Path $env:LOCALAPPDATA "VGen"
+if (-not (Test-Path -LiteralPath $vgenRoot)) {{
+    [IO.Directory]::CreateDirectory($vgenRoot) | Out-Null
+}}
+$vgenRoot = Resolve-SafeVGenDirectory $vgenRoot "The VGen application data directory"
+$parent = Join-Path $vgenRoot "installer"
+if (-not (Test-Path -LiteralPath $parent)) {{
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+}}
+$parent = Resolve-SafeVGenDirectory $parent "The VGen installer directory"
+$installRoot = Join-Path $parent "$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"
 $staging = "$installRoot.staging-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory($staging) | Out-Null
 $archivePath = Join-Path $staging $ExpectedArtifact
@@ -912,8 +1062,10 @@ try {{
     throw
 }}
 
+$stableLauncher = Install-VGenWorkerLauncher $installRoot
+Install-VGenWorkerDesktopShortcut $stableLauncher
 Write-Host "[vgen] Verified. Starting the universal Worker installer..."
-& (Join-Path $installRoot "start-worker.cmd")
+& $stableLauncher
 if ($LASTEXITCODE -ne 0) {{ throw "Windows Worker setup stopped with exit code $LASTEXITCODE." }}
 '''
     return script.encode("utf-8")

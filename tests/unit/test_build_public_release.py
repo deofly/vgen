@@ -343,8 +343,70 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert "Get-Sha256 $archiveBytes" in windows
     assert "Installer ZIP contains an unexpected or unsafe path" in windows
     assert '"start-worker.cmd"' in windows
+    assert 'Join-Path $vgenRoot "start-worker.cmd"' in windows
+    assert 'Join-Path $desktop "VGen Worker.lnk"' in windows
     for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):
         assert secret_word not in windows
+
+
+def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> None:
+    first_digest = "1" * 64
+    second_digest = "2" * 64
+    first = MODULE._windows_worker_bootstrap(
+        release_origin="https://downloads.example",
+        version="0.9.1",
+        manifest_sha256=first_digest,
+    ).decode("utf-8")
+    second = MODULE._windows_worker_bootstrap(
+        release_origin="https://downloads.example",
+        version="0.9.2",
+        manifest_sha256=second_digest,
+    ).decode("utf-8")
+
+    stable_path = '$stableLauncher = Join-Path $vgenRoot "start-worker.cmd"'
+    shortcut_path = '$shortcutPath = Join-Path $desktop "VGen Worker.lnk"'
+    delegate = (
+        'set "VGEN_WORKER_VERSION_LAUNCHER='
+        '%~dp0installer\\$installLeaf\\start-worker.cmd"'
+    )
+    for script in (first, second):
+        assert stable_path in script
+        assert shortcut_path in script
+        assert delegate in script
+        assert '"%VGEN_WORKER_VERSION_LAUNCHER%"\n' in script
+        assert '"%VGEN_WORKER_VERSION_LAUNCHER%" -Reenroll' in script
+        assert 'call "%VGEN_WORKER_VERSION_LAUNCHER%"' not in script
+        assert "Run the public Windows Worker installer again to repair it." in script
+        assert "Get-ChildItem" not in script
+        assert "Sort-Object CreationTime" not in script
+        assert 'Resolve-SafeVGenDirectory $parent "The VGen installer directory"' in script
+        assert (
+            'Resolve-SafeVGenDirectory $InstallRoot "The verified Worker installer directory"'
+            in script
+        )
+        assert '[IO.File]::Replace($launcherStaging, $stableLauncher, $null)' in script
+        assert '[Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)' in script
+        assert "$shell.CreateShortcut($shortcutStaging)" in script
+        assert "$shortcut.TargetPath = $LauncherPath" in script
+        assert "$shortcut.WorkingDirectory = Split-Path -Parent $LauncherPath" in script
+        assert "The VGen Worker desktop shortcut could not be installed" in script
+        assert script.index("Move-Item -LiteralPath $staging -Destination $installRoot") < script.index(
+            "$stableLauncher = Install-VGenWorkerLauncher $installRoot"
+        )
+        assert script.index("$stableLauncher = Install-VGenWorkerLauncher $installRoot") < script.index(
+            "& $stableLauncher"
+        )
+
+    install_root = (
+        '$installRoot = Join-Path $parent '
+        '"$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"'
+    )
+    assert install_root in first
+    assert install_root in second
+    assert '$ExpectedVersion = "0.9.1"' in first
+    assert '$ExpectedVersion = "0.9.2"' in second
+    assert first_digest in first
+    assert second_digest in second
 
 
 def test_gateway_and_release_origins_are_independent(tmp_path: Path) -> None:
