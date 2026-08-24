@@ -549,9 +549,17 @@ machine-readable CLI response with `--format=json`:
 vgen task list
 vgen task list --limit 20 --cursor <next_cursor>
 vgen task list --state queued
+vgen task list --sort priority --order desc
+vgen task list --sort updated --order desc
 vgen task list --format=json
 vgen task show <task_id>
 ```
+
+The default is `--sort created --order desc`, with the task ID as the final
+stable tie-breaker. `created`, `updated`, `priority`, and `state` are supported.
+The created-time order is immutable and gives the strongest pagination
+stability. State and update-time order reflect live task changes, so tasks may
+move between pages while they are running.
 
 A Member cannot use another user's Task ID to bypass this list restriction.
 

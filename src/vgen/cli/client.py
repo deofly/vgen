@@ -227,8 +227,15 @@ class GatewayClient:
         limit: int = 20,
         cursor: str | None = None,
         state: str | None = None,
+        sort: str = "created",
+        order: str = "desc",
     ) -> Any:
-        params: dict[str, Any] = {"workspace_id": workspace_id, "limit": limit}
+        params: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "limit": limit,
+            "sort": sort,
+            "order": order,
+        }
         if cursor:
             params["cursor"] = cursor
         if state:

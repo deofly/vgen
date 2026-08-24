@@ -422,6 +422,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_queue
     ON tasks(pool_id, state, priority DESC, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_history
     ON tasks(workspace_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_workspace_updated
+    ON tasks(workspace_id, updated_at DESC, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_workspace_priority
+    ON tasks(workspace_id, priority DESC, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_workspace_state
+    ON tasks(workspace_id, state, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS task_attempts (
     id TEXT PRIMARY KEY,

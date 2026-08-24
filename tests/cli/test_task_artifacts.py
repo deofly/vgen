@@ -14,6 +14,7 @@ from vgen.cli.artifacts import LocalTaskInput
 from vgen.cli.main import (
     _comfy_input_bindings,
     _effective_parameters,
+    _normalize_task_list_sort,
     _print_task_list,
     _resolve_pool_id,
     _task_list_datetime,
@@ -93,7 +94,20 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     show = parser.parse_args(["task", "show", "tsk_example"])
     get = parser.parse_args(["task", "get", "tsk_example", "--output-dir", "results"])
     listing = parser.parse_args(
-        ["task", "list", "--limit", "10", "--cursor", "cursor-example", "--state", "queued"]
+        [
+            "task",
+            "list",
+            "--limit",
+            "10",
+            "--cursor",
+            "cursor-example",
+            "--state",
+            "queued",
+            "--sort",
+            "priority",
+            "--order",
+            "asc",
+        ]
     )
     json_listing = parser.parse_args(["task", "list", "--format=json"])
     members = parser.parse_args(["workspace", "member-list", "--include-revoked"])
@@ -113,6 +127,8 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     assert listing.limit == 10
     assert listing.cursor == "cursor-example"
     assert listing.state == "queued"
+    assert listing.sort == "priority"
+    assert listing.order == "asc"
     assert listing.format == "text"
     assert json_listing.format == "json"
     assert members.workspace_action == "member-list"
@@ -144,13 +160,17 @@ def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
                     "id": "tsk_example",
                     "state": "queued",
                     "queue_position": 2,
+                    "priority": 8,
                     "created_at": 1_787_552_404.159,
+                    "updated_at": 1_787_552_500.0,
                     "submitted_by": {"display_name": "Alice\nAdmin"},
                     "worker": {"name": "GPU\x1bWorker"},
                     "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
                 }
             ],
             "total": 21,
+            "sort": "priority",
+            "order": "desc",
             "next": "vgen task list --cursor next-page --limit 20",
         }
     )
@@ -159,12 +179,14 @@ def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
     assert "TASK ID" in output
     assert "tsk_example" in output
     assert "queued #2" in output
+    assert "PRI" in output
+    assert "  8 " in output
     assert "Alice Admin" in output
     assert "GPU Worker" in output
     assert "\x1b" not in output
     assert "1787552404.159" not in output
     assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", output)
-    assert "本页 1 条，共 21 条" in output
+    assert "本页 1 条，共 21 条（排序：priority desc）" in output
     assert "下一页：vgen task list --cursor next-page --limit 20" in output
     assert "查看明细：vgen task show <task_id>" in output
 
@@ -172,6 +194,48 @@ def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
 def test_task_list_datetime_rejects_invalid_values() -> None:
     assert _task_list_datetime(None) == "-"
     assert _task_list_datetime("not-a-timestamp") == "-"
+
+
+def test_task_list_uses_updated_time_when_sorted_by_updated(capsys) -> None:
+    _print_task_list(
+        {
+            "items": [
+                {
+                    "id": "tsk_updated",
+                    "state": "running",
+                    "priority": 0,
+                    "created_at": 1_700_000_000,
+                    "updated_at": 1_787_552_404.159,
+                    "submitted_by": {"display_name": "Alice"},
+                    "worker": None,
+                    "workflow_ref": "vgen/example@1.0.0",
+                }
+            ],
+            "total": 1,
+            "sort": "updated",
+            "order": "desc",
+            "next": None,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "UPDATED" in output
+    assert _task_list_datetime(1_787_552_404.159) in output
+    assert _task_list_datetime(1_700_000_000) not in output
+
+
+def test_task_list_sort_requires_gateway_support_for_non_default_order() -> None:
+    legacy_page: dict = {"items": [], "next_cursor": None}
+    _normalize_task_list_sort(legacy_page, sort="created", order="desc")
+    assert legacy_page["sort"] == "created"
+    assert legacy_page["order"] == "desc"
+
+    with pytest.raises(ValueError, match="upgrade the Gateway"):
+        _normalize_task_list_sort({}, sort="priority", order="desc")
+    with pytest.raises(ValueError, match="different task list sort"):
+        _normalize_task_list_sort(
+            {"sort": "created", "order": "desc"}, sort="priority", order="desc"
+        )
 
 
 def test_task_preflight_uses_submit_requirements_without_sending_private_inputs(

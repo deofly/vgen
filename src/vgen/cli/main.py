@@ -143,8 +143,11 @@ def _print_task_list(page: Mapping[str, Any]) -> None:
         print(f"本页 0 条，共 {int(page.get('total') or 0)} 条")
         return
 
+    sort = str(page.get("sort") or "created")
+    time_field = "updated_at" if sort == "updated" else "created_at"
+    time_heading = "UPDATED" if sort == "updated" else "CREATED"
     print(
-        f"{'TASK ID':<31} {'STATE':<12} {'CREATED':<19} "
+        f"{'TASK ID':<31} {'STATE':<12} {'PRI':>3} {time_heading:<19} "
         f"{'SUBMITTER':<16} {'WORKER':<22} WORKFLOW"
     )
     for item in rows:
@@ -161,18 +164,37 @@ def _print_task_list(page: Mapping[str, Any]) -> None:
         print(
             f"{_task_list_cell(item.get('id'), width=31):<31} "
             f"{state:<12} "
-            f"{_task_list_datetime(item.get('created_at')):<19} "
+            f"{int(item.get('priority') or 0):>3} "
+            f"{_task_list_datetime(item.get(time_field)):<19} "
             f"{_task_list_cell(submitter_name, width=16):<16} "
             f"{_task_list_cell(worker_name, width=22):<22} "
             f"{_task_list_cell(item.get('workflow_ref'), width=48)}"
         )
 
     print()
-    print(f"本页 {len(rows)} 条，共 {int(page.get('total') or 0)} 条")
+    order = str(page.get("order") or "desc")
+    print(
+        f"本页 {len(rows)} 条，共 {int(page.get('total') or 0)} 条"
+        f"（排序：{sort} {order}）"
+    )
     next_command = page.get("next")
     if isinstance(next_command, str) and next_command:
         print(f"下一页：{next_command}")
     print("查看明细：vgen task show <task_id>")
+
+
+def _normalize_task_list_sort(page: dict[str, Any], *, sort: str, order: str) -> None:
+    response_sort = page.get("sort")
+    response_order = page.get("order")
+    if response_sort is None and response_order is None:
+        if sort != "created" or order != "desc":
+            raise ValueError(
+                "Gateway does not support task list sorting; upgrade the Gateway first"
+            )
+    elif response_sort != sort or response_order != order:
+        raise ValueError("Gateway returned a different task list sort than requested")
+    page["sort"] = sort
+    page["order"] = order
 
 
 LEGACY_OWNER_MIGRATION_CONFIRMATION = "MIGRATE-LEGACY-OWNER"
@@ -2990,7 +3012,10 @@ def _task_command(args: argparse.Namespace) -> None:
                 limit=args.limit,
                 cursor=args.cursor,
                 state=args.state,
+                sort=args.sort,
+                order=args.order,
             )
+            _normalize_task_list_sort(page, sort=args.sort, order=args.order)
             page["items"] = [
                 {
                     **item,
@@ -3009,6 +3034,10 @@ def _task_command(args: argparse.Namespace) -> None:
                 str(page["next_cursor"]),
                 "--limit",
                 str(args.limit),
+                "--sort",
+                args.sort,
+                "--order",
+                args.order,
             ]
             if args.workspace:
                 next_args.extend(("--workspace", args.workspace))
@@ -3341,6 +3370,10 @@ _OPTION_HELP: dict[str, str] = {
 
 
 _COMMAND_ARGUMENT_HELP: dict[tuple[str, ...], str] = {
+    ("task", "list", "order"): "排序方向：desc 倒序，asc 正序。",
+    ("task", "list", "sort"): (
+        "排序因子：created 提交时间、updated 更新时间、priority 优先级、state 状态。"
+    ),
     ("task", "list", "state"): (
         "按任务状态筛选，例如 queued、running、succeeded 或 failed。"
     ),
@@ -3967,6 +4000,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_list.add_argument("--state", help="only show tasks in this state")
     task_list.add_argument("--limit", type=int, default=20, help="summary rows per page (1-100)")
     task_list.add_argument("--cursor", help="opaque next-page cursor returned by the prior page")
+    task_list.add_argument(
+        "--sort", choices=("created", "updated", "priority", "state"), default="created"
+    )
+    task_list.add_argument("--order", choices=("asc", "desc"), default="desc")
     task_list.add_argument("--format", choices=("text", "json"), default="text")
     task_list.add_argument("--profile", help="local Profile to use")
     watch = task_sub.add_parser("watch")

@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -2961,6 +2961,8 @@ def create_app(
         workspace_id: str,
         principal: Principal = Depends(task_principal),
         state: str | None = None,
+        sort: Literal["created", "updated", "priority", "state"] = "created",
+        order: Literal["asc", "desc"] = "desc",
         limit: int = Query(default=20, ge=1, le=100),
         cursor: str | None = None,
     ) -> dict[str, Any]:
@@ -2972,6 +2974,8 @@ def create_app(
             principal_type=principal.principal_type,
             principal_id=principal.principal_id,
             state=state,
+            sort=sort,
+            order=order,
             limit=limit,
             cursor=cursor,
         )

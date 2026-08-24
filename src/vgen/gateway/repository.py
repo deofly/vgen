@@ -136,6 +136,12 @@ _MAINTENANCE_TERMINAL_STATES = frozenset(
 )
 _WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
 MAX_QUEUED_TASKS_PER_WORKER = 100
+TASK_LIST_SORTS: dict[str, tuple[str, str]] = {
+    "created": ("t.created_at", "created_at"),
+    "updated": ("t.updated_at", "updated_at"),
+    "priority": ("t.priority", "priority"),
+    "state": ("t.state", "state"),
+}
 
 
 class GatewayRepository:
@@ -6294,18 +6300,60 @@ class GatewayRepository:
         return values
 
     @staticmethod
-    def _encode_task_cursor(row: sqlite3.Row | dict[str, Any]) -> str:
+    def _encode_task_cursor(
+        row: sqlite3.Row | dict[str, Any], *, sort: str, order: str
+    ) -> str:
+        _expression, field = TASK_LIST_SORTS[sort]
+        value: str | int | float
+        if field == "state":
+            value = str(row[field])
+        elif field == "priority":
+            value = int(row[field])
+        else:
+            value = float(row[field])
         return b64url_encode(
-            json_text({"created_at": float(row["created_at"]), "id": str(row["id"])}).encode()
+            json_text(
+                {
+                    "v": 2,
+                    "sort": sort,
+                    "order": order,
+                    "value": value,
+                    "created_at": float(row["created_at"]),
+                    "id": str(row["id"]),
+                }
+            ).encode()
         )
 
     @staticmethod
-    def _decode_task_cursor(cursor: str) -> tuple[float, str]:
+    def _decode_task_cursor(
+        cursor: str, *, sort: str, order: str
+    ) -> tuple[str | int | float, float, str]:
         try:
             value = json.loads(b64url_decode(cursor).decode("utf-8"))
+            if set(value) == {"created_at", "id"} and sort == "created" and order == "desc":
+                primary: str | int | float = float(value["created_at"])
+            else:
+                if (
+                    set(value) != {"v", "sort", "order", "value", "created_at", "id"}
+                    or value["v"] != 2
+                    or value["sort"] != sort
+                    or value["order"] != order
+                ):
+                    raise ValueError
+                primary = value["value"]
+                if sort == "state":
+                    if not isinstance(primary, str) or not primary or len(primary) > 64:
+                        raise ValueError
+                elif sort == "priority":
+                    if not isinstance(primary, int) or isinstance(primary, bool):
+                        raise ValueError
+                else:
+                    primary = float(primary)
+                    if not math.isfinite(primary):
+                        raise ValueError
             created_at = float(value["created_at"])
             task_id = str(value["id"])
-            if set(value) != {"created_at", "id"} or not math.isfinite(created_at):
+            if not math.isfinite(created_at):
                 raise ValueError
             if not task_id or len(task_id) > 120:
                 raise ValueError
@@ -6316,7 +6364,7 @@ class GatewayRepository:
                 "Task list cursor is invalid.",
                 422,
             ) from exc
-        return created_at, task_id
+        return primary, created_at, task_id
 
     def _task_list_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         consumer_name = row["consumer_display_name"] or row["consumer_service_name"]
@@ -6327,6 +6375,7 @@ class GatewayRepository:
             "executor_type": row["executor_type"],
             "priority": int(row["priority"]),
             "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
             "committed_at": row["committed_at"],
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
@@ -6353,9 +6402,18 @@ class GatewayRepository:
         principal_type: str = "device",
         principal_id: str = "",
         state: str | None = None,
+        sort: str = "created",
+        order: str = "desc",
         limit: int = 20,
         cursor: str | None = None,
     ) -> dict[str, Any]:
+        if sort not in TASK_LIST_SORTS or order not in {"asc", "desc"}:
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "TASK_SORT_INVALID",
+                "Task list sort or order is invalid.",
+                422,
+            )
         member = None
         if principal_type == "service":
             self.require_service(workspace_id, principal_id)
@@ -6381,11 +6439,21 @@ class GatewayRepository:
             )["n"]
         )
         if cursor:
-            created_at, task_id = self._decode_task_cursor(cursor)
-            where.append("(t.created_at<? OR (t.created_at=? AND t.id<?))")
-            args.extend((created_at, created_at, task_id))
+            primary, created_at, task_id = self._decode_task_cursor(
+                cursor, sort=sort, order=order
+            )
+            expression, _field = TASK_LIST_SORTS[sort]
+            comparator = ">" if order == "asc" else "<"
+            where.append(
+                f"({expression}{comparator}? OR "
+                f"({expression}=? AND "
+                "(t.created_at<? OR (t.created_at=? AND t.id<?))))"
+            )
+            args.extend((primary, primary, created_at, created_at, task_id))
         page_limit = min(max(limit, 1), 100)
         args.append(page_limit + 1)
+        expression, _field = TASK_LIST_SORTS[sort]
+        direction = "ASC" if order == "asc" else "DESC"
         rows = self.db.fetchall(
             f"""SELECT t.*,u.display_name AS consumer_display_name,
                        s.name AS consumer_service_name,w.name AS worker_name,
@@ -6395,9 +6463,9 @@ class GatewayRepository:
                   LEFT JOIN users u ON u.id=t.consumer_user_id
                   LEFT JOIN services s ON s.id=t.consumer_principal_id
                        AND t.consumer_principal_type='service'
-                  LEFT JOIN workers w ON w.id=t.assigned_worker_id
+                 LEFT JOIN workers w ON w.id=t.assigned_worker_id
                  WHERE {' AND '.join(where)}
-                 ORDER BY t.created_at DESC,t.id DESC LIMIT ?""",
+                 ORDER BY {expression} {direction},t.created_at DESC,t.id DESC LIMIT ?""",
             tuple(args),
         )
         has_more = len(rows) > page_limit
@@ -6406,8 +6474,14 @@ class GatewayRepository:
             "workspace_id": workspace_id,
             "total": total,
             "count": len(visible),
+            "sort": sort,
+            "order": order,
             "items": [self._task_list_summary(row) for row in visible],
-            "next_cursor": self._encode_task_cursor(visible[-1]) if has_more and visible else None,
+            "next_cursor": (
+                self._encode_task_cursor(visible[-1], sort=sort, order=order)
+                if has_more and visible
+                else None
+            ),
         }
 
     def cancel_task(

@@ -669,9 +669,15 @@ vgen task submit "镜头平滑推进，主体动作连续自然" \
 vgen task list
 vgen task list --limit 20 --cursor <next_cursor>
 vgen task list --state queued
+vgen task list --sort priority --order desc
+vgen task list --sort updated --order desc
 vgen task list --format=json
 vgen task show <task_id>
 ```
+
+默认排序是 `--sort created --order desc`，即按提交时间倒序，任务 ID 作为最终稳定排序键。
+可选排序因子为 `created`、`updated`、`priority`、`state`。提交时间不可变，分页最稳定；按状态或
+更新时间排序时，运行中的任务会实时变化，因此翻页期间任务可能移动到新的位置。
 
 `task show` 返回该 Task 的 Attempt、进度和产物元数据；普通 Member 也不能借助别人的 Task ID
 读取其明细。

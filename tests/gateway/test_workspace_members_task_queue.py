@@ -125,6 +125,7 @@ def _submit(
     workspace_id: str,
     pool_id: str,
     key: str,
+    priority: int = 0,
 ) -> dict:
     prepared = client.post(
         "/api/v1/tasks/prepare",
@@ -135,6 +136,7 @@ def _submit(
             "workflow_digest": "sha256:" + key[0] * 64,
             "executor_type": "comfyui",
             "public_requirements": {},
+            "priority": priority,
         },
         headers={**headers, "Idempotency-Key": f"prepare-{key}"},
     )
@@ -248,8 +250,12 @@ def test_task_page_is_short_paginated_and_member_cannot_read_other_users_tasks(t
         ).json()
         _member_id, member_headers = _add_member(app, workspace["id"])
         _add_worker(app, boot["user"]["id"], workspace["id"], pool["id"], owner_identity)
-        owner_task = _submit(client, owner_headers, workspace["id"], pool["id"], "c-owner")
-        member_task = _submit(client, member_headers, workspace["id"], pool["id"], "d-member")
+        owner_task = _submit(
+            client, owner_headers, workspace["id"], pool["id"], "c-owner", priority=10
+        )
+        member_task = _submit(
+            client, member_headers, workspace["id"], pool["id"], "d-member", priority=1
+        )
 
         first_page = client.get(
             "/api/v1/tasks/page",
@@ -260,6 +266,10 @@ def test_task_page_is_short_paginated_and_member_cannot_read_other_users_tasks(t
         assert first_page.json()["total"] == 2
         assert first_page.json()["count"] == 1
         assert first_page.json()["next_cursor"]
+        assert first_page.json()["sort"] == "created"
+        assert first_page.json()["order"] == "desc"
+        assert first_page.json()["items"][0]["id"] == member_task["id"]
+        assert "updated_at" in first_page.json()["items"][0]
         assert "public_requirements" not in first_page.json()["items"][0]
         second_page = client.get(
             "/api/v1/tasks/page",
@@ -273,6 +283,47 @@ def test_task_page_is_short_paginated_and_member_cannot_read_other_users_tasks(t
         assert second_page.status_code == 200, second_page.text
         assert second_page.json()["count"] == 1
         assert second_page.json()["next_cursor"] is None
+        assert second_page.json()["items"][0]["id"] == owner_task["id"]
+
+        priority_page = client.get(
+            "/api/v1/tasks/page",
+            params={
+                "workspace_id": workspace["id"],
+                "limit": 1,
+                "sort": "priority",
+                "order": "desc",
+            },
+            headers=owner_headers,
+        )
+        assert priority_page.status_code == 200, priority_page.text
+        assert priority_page.json()["items"][0]["id"] == owner_task["id"]
+        assert priority_page.json()["sort"] == "priority"
+        assert priority_page.json()["order"] == "desc"
+        next_priority_page = client.get(
+            "/api/v1/tasks/page",
+            params={
+                "workspace_id": workspace["id"],
+                "limit": 1,
+                "sort": "priority",
+                "order": "desc",
+                "cursor": priority_page.json()["next_cursor"],
+            },
+            headers=owner_headers,
+        )
+        assert next_priority_page.status_code == 200, next_priority_page.text
+        assert next_priority_page.json()["items"][0]["id"] == member_task["id"]
+        mismatched_cursor = client.get(
+            "/api/v1/tasks/page",
+            params={
+                "workspace_id": workspace["id"],
+                "limit": 1,
+                "sort": "created",
+                "order": "desc",
+                "cursor": priority_page.json()["next_cursor"],
+            },
+            headers=owner_headers,
+        )
+        assert mismatched_cursor.status_code == 422
         assert {
             first_page.json()["items"][0]["id"],
             second_page.json()["items"][0]["id"],
