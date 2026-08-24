@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,9 @@ from vgen.cli.artifacts import LocalTaskInput
 from vgen.cli.main import (
     _comfy_input_bindings,
     _effective_parameters,
+    _print_task_list,
     _resolve_pool_id,
+    _task_list_datetime,
     _verify_prepared_allocation,
     _verify_prepared_worker_certificate,
     _wait_for_task,
@@ -92,6 +95,7 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     listing = parser.parse_args(
         ["task", "list", "--limit", "10", "--cursor", "cursor-example", "--state", "queued"]
     )
+    json_listing = parser.parse_args(["task", "list", "--format=json"])
     members = parser.parse_args(["workspace", "member-list", "--include-revoked"])
     submit = parser.parse_args(
         [
@@ -109,6 +113,8 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     assert listing.limit == 10
     assert listing.cursor == "cursor-example"
     assert listing.state == "queued"
+    assert listing.format == "text"
+    assert json_listing.format == "json"
     assert members.workspace_action == "member-list"
     assert members.include_revoked is True
     assert submit.pool is None
@@ -128,6 +134,44 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     assert preflight.task_action == "preflight"
     assert preflight.image == "first.png"
     assert preflight.last_image == "last.png"
+
+
+def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
+    _print_task_list(
+        {
+            "items": [
+                {
+                    "id": "tsk_example",
+                    "state": "queued",
+                    "queue_position": 2,
+                    "created_at": 1_787_552_404.159,
+                    "submitted_by": {"display_name": "Alice\nAdmin"},
+                    "worker": {"name": "GPU\x1bWorker"},
+                    "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
+                }
+            ],
+            "total": 21,
+            "next": "vgen task list --cursor next-page --limit 20",
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "TASK ID" in output
+    assert "tsk_example" in output
+    assert "queued #2" in output
+    assert "Alice Admin" in output
+    assert "GPU Worker" in output
+    assert "\x1b" not in output
+    assert "1787552404.159" not in output
+    assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", output)
+    assert "本页 1 条，共 21 条" in output
+    assert "下一页：vgen task list --cursor next-page --limit 20" in output
+    assert "查看明细：vgen task show <task_id>" in output
+
+
+def test_task_list_datetime_rejects_invalid_values() -> None:
+    assert _task_list_datetime(None) == "-"
+    assert _task_list_datetime("not-a-timestamp") == "-"
 
 
 def test_task_preflight_uses_submit_requirements_without_sending_private_inputs(

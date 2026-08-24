@@ -11,6 +11,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,67 @@ from .workspace_keys import WorkspaceKeyError, WorkspaceKeyStore
 
 def _json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _task_list_datetime(value: object) -> str:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    try:
+        return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return "-"
+
+
+def _task_list_cell(value: object, *, width: int | None = None) -> str:
+    raw = "" if value is None else str(value)
+    normalized = " ".join("".join(char if char.isprintable() else " " for char in raw).split())
+    if not normalized:
+        normalized = "-"
+    if width is not None and len(normalized) > width:
+        return normalized[: max(1, width - 1)] + "…"
+    return normalized
+
+
+def _print_task_list(page: Mapping[str, Any]) -> None:
+    items = page.get("items")
+    rows = items if isinstance(items, list) else []
+    if not rows:
+        print("没有符合条件的任务。")
+        print(f"本页 0 条，共 {int(page.get('total') or 0)} 条")
+        return
+
+    print(
+        f"{'TASK ID':<31} {'STATE':<12} {'CREATED':<19} "
+        f"{'SUBMITTER':<16} {'WORKER':<22} WORKFLOW"
+    )
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        submitter = item.get("submitted_by")
+        submitter_name = submitter.get("display_name") if isinstance(submitter, Mapping) else None
+        worker = item.get("worker")
+        worker_name = worker.get("name") if isinstance(worker, Mapping) else None
+        state = _task_list_cell(item.get("state"), width=12)
+        queue_position = item.get("queue_position")
+        if state == "queued" and isinstance(queue_position, int) and queue_position > 0:
+            state = _task_list_cell(f"queued #{queue_position}", width=12)
+        print(
+            f"{_task_list_cell(item.get('id'), width=31):<31} "
+            f"{state:<12} "
+            f"{_task_list_datetime(item.get('created_at')):<19} "
+            f"{_task_list_cell(submitter_name, width=16):<16} "
+            f"{_task_list_cell(worker_name, width=22):<22} "
+            f"{_task_list_cell(item.get('workflow_ref'), width=48)}"
+        )
+
+    print()
+    print(f"本页 {len(rows)} 条，共 {int(page.get('total') or 0)} 条")
+    next_command = page.get("next")
+    if isinstance(next_command, str) and next_command:
+        print(f"下一页：{next_command}")
+    print("查看明细：vgen task show <task_id>")
 
 
 LEGACY_OWNER_MIGRATION_CONFIRMATION = "MIGRATE-LEGACY-OWNER"
@@ -2954,8 +3016,13 @@ def _task_command(args: argparse.Namespace) -> None:
                 next_args.extend(("--state", args.state))
             if args.profile:
                 next_args.extend(("--profile", args.profile))
+            if args.format == "json":
+                next_args.append("--format=json")
             page["next"] = shlex.join(next_args) if page.get("next_cursor") else None
-            _json(page)
+            if args.format == "json":
+                _json(page)
+            else:
+                _print_task_list(page)
         elif args.task_action == "cancel":
             _json(client.close_task(args.task_id))
         elif args.task_action == "retry":
@@ -3139,7 +3206,7 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("task", "cancel"): "取消尚未结束的任务。",
     ("task", "retry"): "为失败或需要重封装的任务创建新 Attempt。",
     ("task", "get"): "下载并解密已完成任务的输出文件。",
-    ("task", "list"): "列出 Workspace 中的任务。",
+    ("task", "list"): "以日志式短列表分页显示 Workspace 中的任务。",
     ("task", "watch"): "持续等待任务结束并显示最终状态。",
     ("task", "usage"): "查看任务 Attempt 的原始用量和计费记录。",
     ("usage",): "查询跨任务的 Worker 用量和 billing_token 账本。",
@@ -3185,6 +3252,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "executor_version": "Worker 对外声明的执行器版本。",
     "expected_key_version": "预期的当前密钥版本；不匹配时拒绝轮换以避免并发覆盖。",
     "force": "立即停止当前 Attempt 并退出，不等待任务自然结束。",
+    "format": "输出格式：text 适合终端阅读，json 适合脚本处理。",
     "forget_local": "只删除本机设备密钥；不会向 Gateway 撤销远端设备。",
     "gateway_url": "Gateway 的完整 HTTPS 地址。",
     "generate_identity": "为 Worker 新生成独立密钥。",
@@ -3899,6 +3967,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_list.add_argument("--state", help="only show tasks in this state")
     task_list.add_argument("--limit", type=int, default=20, help="summary rows per page (1-100)")
     task_list.add_argument("--cursor", help="opaque next-page cursor returned by the prior page")
+    task_list.add_argument("--format", choices=("text", "json"), default="text")
     task_list.add_argument("--profile", help="local Profile to use")
     watch = task_sub.add_parser("watch")
     watch.add_argument("task_id")

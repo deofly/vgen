@@ -538,15 +538,18 @@ kept per Worker. Higher priority runs first; equal priority is FIFO. Capacity is
 checked again when leasing, so a capacity-one ComfyUI Worker never runs two
 generations concurrently.
 
-Task history defaults to 20 compact rows. Owners/Admins see the Workspace
-history; regular Members see only their own Tasks. Follow `next` for another
-page and use the per-row `show_command` for full Attempt, progress, and artifact
-metadata:
+Task history defaults to 20 compact, human-readable rows. Owners/Admins see the
+Workspace history; regular Members see only their own Tasks. Timestamps use the
+computer's local `YYYY-MM-DD HH:MM:SS` time. Follow the printed `Next page`
+command for another page and use `task show` for full Attempt, progress, and
+artifact metadata. The Gateway API remains JSON; scripts can request the same
+machine-readable CLI response with `--format=json`:
 
 ```bash
 vgen task list
 vgen task list --limit 20 --cursor <next_cursor>
 vgen task list --state queued
+vgen task list --format=json
 vgen task show <task_id>
 ```
 
