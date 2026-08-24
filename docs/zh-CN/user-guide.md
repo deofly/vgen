@@ -696,7 +696,8 @@ vgen task show <task_id>
 ### 8.1 Worker 正常退出或立即撤销
 
 先从 `vgen worker list` 取得 Worker ID。正常退出会进入 draining，停止领取新任务并等待当前
-Attempt 完成：
+已开始的 Attempt 完成。尚未领取的排队任务会离开该 Worker 队列并进入安全换 Worker 流程；
+尚未提交完成的 prepared 任务会过期，需要提交方重新发起：
 
 ```bash
 vgen worker leave <worker_id>

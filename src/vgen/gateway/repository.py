@@ -4029,12 +4029,75 @@ class GatewayRepository:
             raise RepositoryError(FORBIDDEN, "WORKER_ACCESS_DENIED", "Worker access denied.", 403)
         stamp = now()
         with self.db.transaction(immediate=True) as conn:
-            has_active_attempt = conn.execute(
+            has_active_execution = conn.execute(
                 """SELECT 1 FROM task_attempts
-                   WHERE worker_id=? AND state IN ('reserved','leased','running') LIMIT 1""",
+                   WHERE worker_id=? AND state IN ('leased','running') LIMIT 1""",
                 (worker_id,),
             ).fetchone()
-            status = "revoked" if force or has_active_attempt is None else "draining"
+            status = "revoked" if force or has_active_execution is None else "draining"
+
+            # A Task prepared for this Worker has no committed ciphertext that a
+            # Broker can safely rewrap. Expire it before revoking the allocation
+            # so a later commit cannot strand work on the departing Worker.
+            prepared_tasks = conn.execute(
+                """SELECT id FROM tasks
+                   WHERE assigned_worker_id=? AND state='prepared'""",
+                (worker_id,),
+            ).fetchall()
+            if prepared_tasks:
+                prepared_ids = json_text([task["id"] for task in prepared_tasks])
+                conn.execute(
+                    """UPDATE task_attempts SET state='expired',finished_at=?
+                       WHERE task_id IN (SELECT value FROM json_each(?)) AND state='reserved'""",
+                    (stamp, prepared_ids),
+                )
+                conn.execute(
+                    """UPDATE tasks SET state='expired',finished_at=?,updated_at=?
+                       WHERE id IN (SELECT value FROM json_each(?))""",
+                    (stamp, stamp, prepared_ids),
+                )
+
+            if not force:
+                # Graceful drain means finish only work already leased/running.
+                # Unleased queued Tasks must leave this Worker's queue, otherwise
+                # their reserved Attempts would keep the Worker draining forever
+                # while a draining Worker correctly refuses to lease them.
+                queued_tasks = conn.execute(
+                    """SELECT t.id,
+                              (SELECT a.id FROM task_attempts a WHERE a.task_id=t.id
+                               ORDER BY a.attempt_number DESC LIMIT 1) AS source_attempt_id
+                       FROM tasks t
+                       WHERE t.assigned_worker_id=?
+                         AND (t.state IN ('committed','queued') OR
+                              (t.state='rekey_required' AND EXISTS (
+                                  SELECT 1 FROM task_attempts pending
+                                  WHERE pending.task_id=t.id AND pending.worker_id=?
+                                    AND pending.state='reserved'
+                              )))""",
+                    (worker_id, worker_id),
+                ).fetchall()
+                if queued_tasks:
+                    queued_ids = json_text([task["id"] for task in queued_tasks])
+                    conn.execute(
+                        """UPDATE task_attempts
+                           SET state='cancelled',responsibility='provider',failure_code=?,finished_at=?
+                           WHERE task_id IN (SELECT value FROM json_each(?)) AND state='reserved'""",
+                        (WORKER_DRAINING, stamp, queued_ids),
+                    )
+                    conn.execute(
+                        """UPDATE tasks SET state='rekey_required',reservation_expires_at=NULL,
+                                  updated_at=?
+                           WHERE id IN (SELECT value FROM json_each(?))""",
+                        (stamp, queued_ids),
+                    )
+                    for task in queued_tasks:
+                        self._enqueue_task_rekey_command(
+                            conn,
+                            task_id=task["id"],
+                            source_attempt_id=str(task["source_attempt_id"] or "none"),
+                            reason="worker_draining",
+                            stamp=stamp,
+                        )
             conn.execute(
                 "UPDATE workers SET status=?,updated_at=?,revoked_at=CASE WHEN ? THEN ? ELSE revoked_at END WHERE id=?",
                 (status, stamp, int(status == "revoked"), stamp, worker_id),

@@ -571,7 +571,10 @@ A Member cannot use another user's Task ID to bypass this list restriction.
 
 ## 8. Removing Workers and devices
 
-Gracefully drain or immediately stop a Worker:
+Gracefully drain or immediately stop a Worker. A graceful drain finishes only
+Attempts that are already leased or running. Unleased queued Tasks enter the
+safe Worker-rekey flow, while uncommitted prepared Tasks expire and must be
+submitted again:
 
 ```bash
 vgen worker leave <worker_id>

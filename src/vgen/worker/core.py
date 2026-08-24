@@ -81,7 +81,7 @@ class WorkerGateway(Protocol):
         self, reference: LeaseReference, progress: ProgressEvent
     ) -> HeartbeatDirective: ...
 
-    def mark_started(self, reference: LeaseReference) -> None: ...
+    def mark_started(self, reference: LeaseReference) -> HeartbeatDirective: ...
 
     def complete(self, reference: LeaseReference, result: WorkerResult) -> None: ...
 
@@ -317,7 +317,15 @@ class WorkerCore:
                         responsibility="consumer",
                     )
 
-                gateway.mark_started(lease.reference)
+                start_directive = gateway.mark_started(lease.reference)
+                cancelled = cancelled or start_directive.cancelled
+                if cancelled:
+                    raise ExecutorFailure(
+                        ErrorCode.EXECUTION_CANCELLED,
+                        "EXECUTION_CANCELLED",
+                        "Execution was cancelled at the start boundary.",
+                        responsibility="consumer",
+                    )
                 started = True
                 phase = "executing"
                 wall_started = time.monotonic()

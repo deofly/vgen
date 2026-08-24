@@ -86,8 +86,9 @@ class FakeGateway:
         cancelled = self.cancel_on_first_heartbeat and len(self.events) == 1
         return HeartbeatDirective(cancelled=cancelled)
 
-    def mark_started(self, reference: LeaseReference) -> None:
+    def mark_started(self, reference: LeaseReference) -> HeartbeatDirective:
         self.events.append(("started", reference))
+        return HeartbeatDirective()
 
     def complete(self, reference: LeaseReference, result: WorkerResult) -> None:
         self.events.append(("complete", (reference, result)))
@@ -234,6 +235,28 @@ def test_worker_core_cancellation_before_start_is_not_billable(tmp_path: Path) -
     assert [name for name, _ in gateway.events][-1] == "failed"
 
 
+def test_worker_core_cancellation_at_start_boundary_never_runs_executor(tmp_path: Path) -> None:
+    class CancelAtStartGateway(FakeGateway):
+        def mark_started(self, reference: LeaseReference) -> HeartbeatDirective:
+            super().mark_started(reference)
+            return HeartbeatDirective(cancelled=True)
+
+    executor = FakeExecutor()
+    core = WorkerCore(
+        ExecutorRegistry(executor),
+        ArtifactAdapterRegistry(LocalArtifactAdapter((tmp_path,))),
+    )
+    gateway = CancelAtStartGateway()
+
+    outcome = core.process(make_lease(tmp_path), gateway)
+
+    assert outcome.failure is not None
+    assert outcome.failure.code == ErrorCode.EXECUTION_CANCELLED
+    assert outcome.failure.occurred_after_start is False
+    assert executor.executed is False
+    assert [name for name, _ in gateway.events][-2:] == ["started", "failed"]
+
+
 def test_worker_core_running_cancellation_reports_measured_usage(tmp_path: Path) -> None:
     class RunningCancelGateway(FakeGateway):
         def __init__(self) -> None:
@@ -246,9 +269,9 @@ def test_worker_core_running_cancellation_reports_measured_usage(tmp_path: Path)
             self.events.append(("heartbeat", (reference, progress)))
             return HeartbeatDirective(cancelled=self.execution_started)
 
-        def mark_started(self, reference: LeaseReference) -> None:
+        def mark_started(self, reference: LeaseReference) -> HeartbeatDirective:
             self.execution_started = True
-            super().mark_started(reference)
+            return super().mark_started(reference)
 
     class CooperativeExecutor(FakeExecutor):
         def execute(self, request: ExecutionRequest, context: ExecutionContext) -> ExecutionResult:
@@ -319,7 +342,7 @@ def test_generic_lease_models_have_no_provider_or_comfy_fields() -> None:
 
 def test_gateway_unavailable_is_left_for_daemon_journal_to_retry(tmp_path: Path) -> None:
     class OfflineGateway(FakeGateway):
-        def mark_started(self, reference: LeaseReference) -> None:
+        def mark_started(self, reference: LeaseReference) -> HeartbeatDirective:
             raise GatewayUnavailableError()
 
     core = WorkerCore(

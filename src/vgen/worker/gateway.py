@@ -394,8 +394,12 @@ class GatewayV1Client:
             lease_expires_at=_optional_number(value.get("expires_at")),
         )
 
-    def mark_started(self, reference: LeaseReference) -> None:
-        self._attempt_heartbeat(reference, started=True)
+    def mark_started(self, reference: LeaseReference) -> HeartbeatDirective:
+        value = self._attempt_heartbeat(reference, started=True)
+        return HeartbeatDirective(
+            cancelled=bool(value.get("cancelled", False)),
+            lease_expires_at=_optional_number(value.get("expires_at")),
+        )
 
     def renew_output_tickets(
         self,

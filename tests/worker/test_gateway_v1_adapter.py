@@ -387,6 +387,28 @@ def test_attempt_heartbeat_reports_progress_when_enabled() -> None:
     assert body["progress"] == {"fraction": 0.57, "stage": "sampling"}
 
 
+def test_mark_started_preserves_gateway_cancellation_directive() -> None:
+    class CancelAtStartSession(RecordingSession):
+        def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+            self.requests.append((method, url, kwargs))
+            return response(
+                200,
+                {"ok": True, "cancelled": True, "expires_at": 4_000_000_000},
+            )
+
+    client = GatewayV1Client(
+        "https://gateway.example.test",
+        WorkerCredentials("wrk_contract", DeviceKeys.generate(), "short-session"),
+        session=CancelAtStartSession(),  # type: ignore[arg-type]
+    )
+    reference = LeaseReference("lea_1", "tsk_1", "atm_1", "wrk_contract", 5)
+
+    directive = client.mark_started(reference)
+
+    assert directive.cancelled is True
+    assert directive.lease_expires_at == 4_000_000_000
+
+
 def test_invalid_encrypted_payload_is_safely_failed_before_execution(tmp_path: Path) -> None:
     keys = DeviceKeys.generate()
     wire, _task_key = encrypted_lease(tmp_path, keys)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from fastapi.testclient import TestClient
@@ -8,6 +9,7 @@ from tests.gateway.test_gateway_api import bootstrap_identity, worker_owner_cert
 from vgen.crypto import DeviceKeys, IdentityKeys, b64url_encode, issue_device_certificate
 from vgen.gateway.app import create_app
 from vgen.gateway.database import json_text, new_id, now
+from vgen.protocol.errors import ErrorCode
 
 
 def _add_member(app, workspace_id: str) -> tuple[str, dict[str, str]]:  # type: ignore[no-untyped-def]
@@ -228,6 +230,235 @@ def test_single_worker_queues_tasks_and_reports_members_with_worker_usage(tmp_pa
             f"/api/v1/workspaces/{workspace['id']}/members", headers=member_headers
         )
         assert denied_roster.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    ("succeeded", "failed", "cancelled_before_start", "cancelled_while_running"),
+)
+def test_single_worker_advances_queue_after_terminal_state(tmp_path, terminal_state: str) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    with TestClient(app) as client:
+        client.headers.update({"Vgen-Protocol-Version": "1"})
+        boot, owner_headers, owner_identity, _ = bootstrap_identity(client)
+        workspace = client.post(
+            "/api/v1/workspaces", json={"name": "Queue terminal"}, headers=owner_headers
+        ).json()
+        pool = client.post(
+            f"/api/v1/workspaces/{workspace['id']}/pools",
+            json={"name": "GPU"},
+            headers=owner_headers,
+        ).json()
+        _, member_headers = _add_member(app, workspace["id"])
+        worker = _add_worker(
+            app, boot["user"]["id"], workspace["id"], pool["id"], owner_identity
+        )
+        first = _submit(client, owner_headers, workspace["id"], pool["id"], "a-first")
+        second = _submit(client, member_headers, workspace["id"], pool["id"], "b-second")
+
+        lease = app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60)
+        assert lease is not None
+        assert lease["task_id"] == first["id"]
+        reference = {
+            "attempt_id": lease["attempt_id"],
+            "worker_id": worker["id"],
+            "fencing_token": lease["fencing_token"],
+        }
+
+        if terminal_state == "cancelled_before_start":
+            app.state.repository.cancel_task(
+                task_id=first["id"], user_id=boot["user"]["id"]
+            )
+        else:
+            app.state.repository.heartbeat_attempt(
+                **reference,
+                ttl_seconds=60,
+                started=True,
+            )
+            if terminal_state == "cancelled_while_running":
+                app.state.repository.cancel_task(
+                    task_id=first["id"], user_id=boot["user"]["id"]
+                )
+                assert (
+                    app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60)
+                    is None
+                )
+                succeeded = False
+                failure_code = int(ErrorCode.EXECUTION_CANCELLED)
+                responsibility = "consumer"
+            elif terminal_state == "failed":
+                succeeded = False
+                failure_code = int(ErrorCode.GPU_OUT_OF_MEMORY)
+                responsibility = "provider"
+            else:
+                succeeded = True
+                failure_code = None
+                responsibility = "none"
+            app.state.repository.finish_attempt(
+                **reference,
+                succeeded=succeeded,
+                output_artifacts=[],
+                metrics={"executor_wall_ms": 1, "gpu_count": 1},
+                worker_signature="queue-terminal-test",
+                failure_code=failure_code,
+                responsibility=responsibility,
+                safe_failure_details={},
+            )
+
+        next_lease = app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60)
+        assert next_lease is not None
+        assert next_lease["task_id"] == second["id"]
+
+
+def test_graceful_leave_rekeys_queued_task_then_revokes_after_running_attempt(tmp_path) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    with TestClient(app) as client:
+        client.headers.update({"Vgen-Protocol-Version": "1"})
+        boot, owner_headers, owner_identity, _ = bootstrap_identity(client)
+        owner_id = boot["user"]["id"]
+        workspace = client.post(
+            "/api/v1/workspaces", json={"name": "Graceful drain"}, headers=owner_headers
+        ).json()
+        pool = client.post(
+            f"/api/v1/workspaces/{workspace['id']}/pools",
+            json={"name": "GPU"},
+            headers=owner_headers,
+        ).json()
+        _, member_headers = _add_member(app, workspace["id"])
+        worker = _add_worker(app, owner_id, workspace["id"], pool["id"], owner_identity)
+        running_task = _submit(
+            client, owner_headers, workspace["id"], pool["id"], "a-running"
+        )
+        queued_task = _submit(
+            client, member_headers, workspace["id"], pool["id"], "b-queued"
+        )
+        lease = app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60)
+        assert lease is not None
+        app.state.repository.heartbeat_attempt(
+            attempt_id=lease["attempt_id"],
+            worker_id=worker["id"],
+            fencing_token=lease["fencing_token"],
+            ttl_seconds=60,
+            started=True,
+        )
+
+        left = app.state.repository.leave_worker(
+            worker_id=worker["id"], owner_user_id=owner_id, force=False
+        )
+
+        assert left["status"] == "draining"
+        assert app.state.db.fetchone(
+            "SELECT state FROM tasks WHERE id=?", (queued_task["id"],)
+        )["state"] == "rekey_required"
+        queued_attempt = app.state.db.fetchone(
+            "SELECT state,responsibility,failure_code FROM task_attempts WHERE task_id=?",
+            (queued_task["id"],),
+        )
+        assert dict(queued_attempt) == {
+            "state": "cancelled",
+            "responsibility": "provider",
+            "failure_code": int(ErrorCode.WORKER_DRAINING),
+        }
+
+        app.state.repository.finish_attempt(
+            attempt_id=lease["attempt_id"],
+            worker_id=worker["id"],
+            fencing_token=lease["fencing_token"],
+            succeeded=True,
+            output_artifacts=[],
+            metrics={"executor_wall_ms": 1, "gpu_count": 1},
+            worker_signature="graceful-drain-test",
+            failure_code=None,
+            responsibility="none",
+            safe_failure_details={},
+        )
+        assert app.state.db.fetchone(
+            "SELECT state FROM tasks WHERE id=?", (running_task["id"],)
+        )["state"] == "succeeded"
+        assert app.state.db.fetchone(
+            "SELECT status FROM workers WHERE id=?", (worker["id"],)
+        )["status"] == "revoked"
+
+
+def test_graceful_leave_expires_prepared_task_and_rekeys_idle_queue(tmp_path) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    with TestClient(app) as client:
+        client.headers.update({"Vgen-Protocol-Version": "1"})
+        boot, owner_headers, owner_identity, _ = bootstrap_identity(client)
+        owner_id = boot["user"]["id"]
+        workspace = client.post(
+            "/api/v1/workspaces", json={"name": "Idle drain"}, headers=owner_headers
+        ).json()
+        pool = client.post(
+            f"/api/v1/workspaces/{workspace['id']}/pools",
+            json={"name": "GPU"},
+            headers=owner_headers,
+        ).json()
+        worker = _add_worker(app, owner_id, workspace["id"], pool["id"], owner_identity)
+        queued_task = _submit(
+            client, owner_headers, workspace["id"], pool["id"], "a-queued"
+        )
+        pending_rekey_task = _submit(
+            client, owner_headers, workspace["id"], pool["id"], "c-rekey"
+        )
+        app.state.db.execute(
+            "UPDATE tasks SET state='rekey_required' WHERE id=?",
+            (pending_rekey_task["id"],),
+        )
+        prepared_response = client.post(
+            "/api/v1/tasks/prepare",
+            json={
+                "workspace_id": workspace["id"],
+                "pool_id": pool["id"],
+                "workflow_ref": "vgen/test@1.0.0",
+                "workflow_digest": "sha256:" + "b" * 64,
+                "executor_type": "comfyui",
+                "public_requirements": {},
+            },
+            headers={**owner_headers, "Idempotency-Key": "prepare-before-idle-drain"},
+        )
+        assert prepared_response.status_code == 200, prepared_response.text
+        prepared_task = prepared_response.json()
+
+        left = app.state.repository.leave_worker(
+            worker_id=worker["id"], owner_user_id=owner_id, force=False
+        )
+
+        assert left["status"] == "revoked"
+        states = {
+            row["id"]: row["state"]
+            for row in app.state.db.fetchall(
+                "SELECT id,state FROM tasks WHERE id IN (?,?,?)",
+                (queued_task["id"], pending_rekey_task["id"], prepared_task["id"]),
+            )
+        }
+        assert states == {
+            queued_task["id"]: "rekey_required",
+            pending_rekey_task["id"]: "rekey_required",
+            prepared_task["id"]: "expired",
+        }
+        assert app.state.db.fetchone(
+            "SELECT state FROM task_attempts WHERE task_id=?",
+            (pending_rekey_task["id"],),
+        )["state"] == "cancelled"
+        assert app.state.db.fetchone(
+            "SELECT state FROM task_attempts WHERE task_id=?", (prepared_task["id"],)
+        )["state"] == "expired"
 
 
 def test_task_page_is_short_paginated_and_member_cannot_read_other_users_tasks(tmp_path) -> None:
