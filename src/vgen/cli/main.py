@@ -357,7 +357,7 @@ def _print_worker_list(
         return
 
     print(
-        f"{'WORKER ID':<31} {'NAME':<22} {'STATUS':<9} {'VGEN':<13} "
+        f"{'WORKER ID':<31} {'NAME':<22} {'STATUS':<9} {'VGEN':<19} "
         f"{'COMFYUI':<8} {'GPU':<26} {'VRAM':>8} {'CAP':>3} {'LAST SEEN':<19}"
     )
     outdated_owned: list[Mapping[str, Any]] = []
@@ -376,7 +376,7 @@ def _print_worker_list(
             f"{_task_list_cell(worker.get('id'), width=31):<31} "
             f"{_task_list_cell(worker.get('name'), width=22):<22} "
             f"{_task_list_cell(status, width=9):<9} "
-            f"{_task_list_cell(version_label, width=13):<13} "
+            f"{_task_list_cell(version_label, width=19):<19} "
             f"{_task_list_cell(comfyui_version, width=8):<8} "
             f"{_task_list_cell(gpu_name, width=26):<26} "
             f"{_worker_list_vram(vram_total_mb):>8} "
