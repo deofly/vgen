@@ -16,6 +16,7 @@ from vgen.cli.main import (
     _effective_parameters,
     _normalize_task_list_sort,
     _print_task_list,
+    _print_worker_list,
     _resolve_pool_id,
     _task_list_datetime,
     _verify_prepared_allocation,
@@ -110,6 +111,8 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
         ]
     )
     json_listing = parser.parse_args(["task", "list", "--format=json"])
+    worker_listing = parser.parse_args(["worker", "list"])
+    worker_json_listing = parser.parse_args(["worker", "list", "--format=json"])
     members = parser.parse_args(["workspace", "member-list", "--include-revoked"])
     submit = parser.parse_args(
         [
@@ -131,6 +134,8 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     assert listing.order == "asc"
     assert listing.format == "text"
     assert json_listing.format == "json"
+    assert worker_listing.format == "text"
+    assert worker_json_listing.format == "json"
     assert members.workspace_action == "member-list"
     assert members.include_revoked is True
     assert submit.pool is None
@@ -194,6 +199,83 @@ def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
 def test_task_list_datetime_rejects_invalid_values() -> None:
     assert _task_list_datetime(None) == "-"
     assert _task_list_datetime("not-a-timestamp") == "-"
+
+
+def test_worker_list_prints_runtime_summary_and_owned_upgrade_command(capsys) -> None:
+    _print_worker_list(
+        [
+            {
+                "id": "wrk_example",
+                "owner_user_id": "usr_me",
+                "name": "HONEYLONG\nGPU Worker",
+                "status": "active",
+                "last_seen_at": 1_787_552_404.159,
+                "capacity": 1,
+                "executor_type": "comfyui",
+                "signing_public_key": "must-not-be-printed",
+                "capabilities": {
+                    "worker_runtime_version": "0.1.0",
+                    "executors": [
+                        {
+                            "type": "comfyui",
+                            "capabilities": {
+                                "runtime_version": "0.33.0",
+                                "gpus": [
+                                    {
+                                        "name": (
+                                            "cuda:0 NVIDIA GeForce RTX 3090 : cudaMallocAsync"
+                                        ),
+                                        "vram_total_mb": 24_576,
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        current_user_id="usr_me",
+        profile_name="home",
+        stamp=1_787_552_410,
+    )
+
+    output = capsys.readouterr().out
+    assert "WORKER ID" in output
+    assert "HONEYLONG GPU Worker" in output
+    assert "online" in output
+    assert f"0.1.0 → {cli_main.__version__}" in output
+    assert "0.33.0" in output
+    assert "NVIDIA GeForce RTX 3090" in output
+    assert "24 GB" in output
+    assert _task_list_datetime(1_787_552_404.159) in output
+    assert "共 1 台，在线 1 台" in output
+    assert (
+        "vgen worker upgrade --worker wrk_example --wait --profile home" in output
+    )
+    assert "vgen worker list --format=json" in output
+    assert "must-not-be-printed" not in output
+
+
+def test_worker_list_marks_stale_active_worker_offline_without_foreign_upgrade(capsys) -> None:
+    _print_worker_list(
+        [
+            {
+                "id": "wrk_foreign",
+                "owner_user_id": "usr_other",
+                "name": "Shared Worker",
+                "status": "active",
+                "last_seen_at": 1_000,
+                "capabilities": {"worker_runtime_version": "0.1.0"},
+            }
+        ],
+        current_user_id="usr_me",
+        stamp=1_121,
+    )
+
+    output = capsys.readouterr().out
+    assert "offline" in output
+    assert "共 1 台，在线 0 台" in output
+    assert "vgen worker upgrade --worker" not in output
 
 
 def test_task_list_uses_updated_time_when_sorted_by_updated(capsys) -> None:

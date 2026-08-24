@@ -612,6 +612,11 @@ vgen worker list
 vgen broker maintenance-list --worker "Windows GPU Worker"
 ```
 
+`vgen worker list` 默认显示适合终端阅读的短表，包含 Worker ID、在线状态、VGen Worker
+版本、ComfyUI 版本、GPU/显存、并发容量和本地年月日时分秒格式的最近心跳。自有 Worker
+版本落后时还会给出可直接执行的 `vgen worker upgrade` 命令。脚本需要完整 Gateway 响应和
+原始 capabilities 时使用 `vgen worker list --format=json`。
+
 模型任务必须成功，Worker 不能仍处于 `maintenance-only`。输出目录不存在时 CLI 会按需创建。
 提交前先做一次只读能力预检：
 

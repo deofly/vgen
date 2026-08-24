@@ -183,6 +183,114 @@ def _print_task_list(page: Mapping[str, Any]) -> None:
     print("查看明细：vgen task show <task_id>")
 
 
+WORKER_ONLINE_WINDOW_SECONDS = 120.0
+
+
+def _worker_list_status(worker: Mapping[str, Any], *, stamp: float | None = None) -> str:
+    status = str(worker.get("status") or "unknown")
+    if status != "active":
+        return status
+    try:
+        last_seen_at = float(worker.get("last_seen_at"))
+    except (TypeError, ValueError):
+        return "offline"
+    current_time = time.time() if stamp is None else stamp
+    return "online" if last_seen_at > current_time - WORKER_ONLINE_WINDOW_SECONDS else "offline"
+
+
+def _worker_list_runtime(worker: Mapping[str, Any]) -> tuple[object, object, object, object]:
+    capabilities = worker.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, Mapping) else {}
+    worker_version = capabilities.get("worker_runtime_version")
+    executors = capabilities.get("executors")
+    executor_rows = executors if isinstance(executors, list) else []
+    executor_type = str(worker.get("executor_type") or "")
+    executor = next(
+        (
+            item
+            for item in executor_rows
+            if isinstance(item, Mapping) and str(item.get("type") or "") == executor_type
+        ),
+        next((item for item in executor_rows if isinstance(item, Mapping)), {}),
+    )
+    runtime = executor.get("capabilities") if isinstance(executor, Mapping) else {}
+    runtime = runtime if isinstance(runtime, Mapping) else {}
+    comfyui_version = runtime.get("runtime_version")
+    gpus = runtime.get("gpus")
+    gpu_rows = gpus if isinstance(gpus, list) else []
+    gpu = next((item for item in gpu_rows if isinstance(item, Mapping)), {})
+    gpu_name = gpu.get("name") if isinstance(gpu, Mapping) else None
+    if gpu_name:
+        gpu_name = str(gpu_name).split(" : ", 1)[0]
+        if "NVIDIA " in gpu_name:
+            gpu_name = "NVIDIA " + gpu_name.split("NVIDIA ", 1)[1]
+        if len(gpu_rows) > 1:
+            gpu_name = f"{gpu_name} +{len(gpu_rows) - 1}"
+    return worker_version, comfyui_version, gpu_name, gpu.get("vram_total_mb")
+
+
+def _worker_list_vram(value: object) -> str:
+    try:
+        megabytes = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if megabytes <= 0:
+        return "-"
+    gigabytes = megabytes / 1024
+    return f"{gigabytes:.0f} GB" if gigabytes.is_integer() else f"{gigabytes:.1f} GB"
+
+
+def _print_worker_list(
+    workers: object,
+    *,
+    current_user_id: str | None,
+    profile_name: str | None = None,
+    stamp: float | None = None,
+) -> None:
+    rows = workers if isinstance(workers, list) else []
+    worker_rows = [item for item in rows if isinstance(item, Mapping)]
+    if not worker_rows:
+        print("没有符合条件的 Worker。")
+        return
+
+    print(
+        f"{'WORKER ID':<31} {'NAME':<22} {'STATUS':<9} {'VGEN':<13} "
+        f"{'COMFYUI':<8} {'GPU':<26} {'VRAM':>8} {'CAP':>3} {'LAST SEEN':<19}"
+    )
+    outdated_owned: list[Mapping[str, Any]] = []
+    online_count = 0
+    for worker in worker_rows:
+        status = _worker_list_status(worker, stamp=stamp)
+        online_count += status == "online"
+        worker_version, comfyui_version, gpu_name, vram_total_mb = _worker_list_runtime(worker)
+        upgrade_available = _upgrade_available(worker_version)
+        version_label = str(worker_version) if worker_version else "-"
+        if upgrade_available:
+            version_label = f"{version_label} → {__version__}"
+            if current_user_id and worker.get("owner_user_id") == current_user_id:
+                outdated_owned.append(worker)
+        print(
+            f"{_task_list_cell(worker.get('id'), width=31):<31} "
+            f"{_task_list_cell(worker.get('name'), width=22):<22} "
+            f"{_task_list_cell(status, width=9):<9} "
+            f"{_task_list_cell(version_label, width=13):<13} "
+            f"{_task_list_cell(comfyui_version, width=8):<8} "
+            f"{_task_list_cell(gpu_name, width=26):<26} "
+            f"{_worker_list_vram(vram_total_mb):>8} "
+            f"{int(worker.get('capacity') or 0):>3} "
+            f"{_task_list_datetime(worker.get('last_seen_at')):<19}"
+        )
+
+    print()
+    print(f"共 {len(worker_rows)} 台，在线 {online_count} 台")
+    for worker in outdated_owned:
+        command = ["vgen", "worker", "upgrade", "--worker", str(worker.get("id")), "--wait"]
+        if profile_name:
+            command.extend(["--profile", profile_name])
+        print(f"升级 {_task_list_cell(worker.get('name'))}：{shlex.join(command)}")
+    print("完整 JSON：vgen worker list --format=json")
+
+
 def _normalize_task_list_sort(page: dict[str, Any], *, sort: str, order: str) -> None:
     response_sort = page.get("sort")
     response_order = page.get("order")
@@ -2146,7 +2254,15 @@ def _worker_command(args: argparse.Namespace) -> None:
                 _json(client.set_worker_manager(str(worker["id"]), broker_id))
         elif args.worker_action == "list":
             params = {"workspace_id": args.workspace} if args.workspace else None
-            _json(client.request("GET", "/api/v1/workers", params=params))
+            workers = client.request("GET", "/api/v1/workers", params=params)
+            if args.format == "json":
+                _json(workers)
+            else:
+                _print_worker_list(
+                    workers,
+                    current_user_id=client.profile.user_id,
+                    profile_name=args.profile,
+                )
         elif args.worker_action == "offer":
             _json(
                 client.request(
@@ -3838,8 +3954,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker_upgrade.add_argument("--interval", type=float, default=2)
     worker_upgrade.add_argument("--timeout", type=float, default=3600)
     worker_upgrade.add_argument("--profile")
-    worker_list = worker_sub.add_parser("list")
+    worker_list = worker_sub.add_parser(
+        "list", help="show a concise Worker status and runtime-version table"
+    )
     worker_list.add_argument("--workspace")
+    worker_list.add_argument("--format", choices=("text", "json"), default="text")
     worker_list.add_argument("--profile")
     manager_set = worker_sub.add_parser(
         "manager-set", help="explicitly assign an owned Worker to a Broker"

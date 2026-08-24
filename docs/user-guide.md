@@ -498,6 +498,12 @@ vgen broker maintenance-list --worker "Windows GPU Worker"
 vgen task preflight
 ```
 
+`vgen worker list` defaults to a terminal-friendly table with each Worker ID,
+online state, VGen Worker and ComfyUI versions, GPU/VRAM, capacity, and a local
+readable heartbeat time. An owned Worker behind the current VGen version also
+gets an exact `vgen worker upgrade` hint. Use `vgen worker list --format=json`
+when a script needs the complete Gateway response and raw capabilities.
+
 Preflight creates no Task or Attempt, reserves no Worker, uploads no media, and
 incurs no usage. It distinguishes immediately ready, queue available, queue
 full, offline, maintenance, allocation, capability, model, memory, and rate
