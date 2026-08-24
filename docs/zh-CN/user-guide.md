@@ -346,6 +346,18 @@ vgen completion zsh
 ```
 
 补全只读取本地命令树，不访问 Gateway，也不会建议 Invite URI、恢复词、凭据或其他敏感内容。
+Profile 名称和已安装 Workflow 引用直接读取本地存储，文件和目录参数使用 Shell 原生路径补全。
+
+Worker、Workspace 和 Task 值来自按 Profile 隔离、五分钟后失效的本地缓存。下面对应的列表命令
+成功后，只会刷新公开的 Worker ID/名称以及 Workspace/Task ID：
+
+```bash
+vgen worker list
+vgen workspace list
+vgen task list
+```
+
+如果某个值没有出现在候选中，先运行一次对应的列表命令；按 Tab 本身永远不会通过网络刷新缓存。
 
 ### 4.4 其他 Mac 加入并使用共享 Worker
 

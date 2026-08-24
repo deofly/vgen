@@ -315,7 +315,22 @@ vgen completion zsh
 ```
 
 Completion only reads the local command tree. It does not contact the Gateway
-or suggest Invite URIs, recovery words, credentials, or other secrets.
+or suggest Invite URIs, recovery words, credentials, or other secrets. Profile
+names and installed workflow references come directly from local stores, while
+file and directory arguments use the shell's native path completion.
+
+Worker, Workspace, and Task values come from a per-Profile local cache that
+expires after five minutes. The corresponding successful list command refreshes
+only public Worker IDs/names and Workspace/Task IDs:
+
+```bash
+vgen worker list
+vgen workspace list
+vgen task list
+```
+
+If one of those values is not offered, run its list command once. Pressing Tab
+never refreshes the cache over the network.
 
 ### 4.4 Join another Mac
 

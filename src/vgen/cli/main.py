@@ -76,7 +76,11 @@ from .auth import (
     login_session,
 )
 from .client import GatewayClient, VgenClientError, cli_exit_code
-from .completion import completion_command
+from .completion import (
+    completion_command,
+    configure_parser_completers,
+    remember_completion_values,
+)
 from .device_migration import register_recovered_device
 from .identity_store import DeviceIdentity, DeviceIdentityStore, IdentityStoreError
 from .join import join_command
@@ -1296,6 +1300,14 @@ def _workspace_command(args: argparse.Namespace) -> None:
             _json(workspace)
         elif args.workspace_action == "list":
             values = client.request("GET", "/api/v1/workspaces")
+            completion_profile = getattr(profile, "name", None) or args.profile
+            if completion_profile:
+                remember_completion_values(
+                    completion_profile,
+                    "workspaces",
+                    values,
+                    fields=("id",),
+                )
             if args.format == "json":
                 _json(values)
             else:
@@ -2480,6 +2492,23 @@ def _worker_command(args: argparse.Namespace) -> None:
         elif args.worker_action == "list":
             params = {"workspace_id": args.workspace} if args.workspace else None
             workers = client.request("GET", "/api/v1/workers", params=params)
+            active_workers = (
+                [
+                    worker
+                    for worker in workers
+                    if isinstance(worker, Mapping) and worker.get("status") != "revoked"
+                ]
+                if isinstance(workers, list)
+                else []
+            )
+            completion_profile = getattr(client.profile, "name", None) or args.profile
+            if completion_profile:
+                remember_completion_values(
+                    completion_profile,
+                    "workers",
+                    active_workers,
+                    fields=("id", "name"),
+                )
             if args.format == "json":
                 _json(workers)
             else:
@@ -3384,6 +3413,14 @@ def _task_command(args: argparse.Namespace) -> None:
                 }
                 for item in page.get("items", [])
             ]
+            completion_profile = getattr(client.profile, "name", None) or args.profile
+            if completion_profile:
+                remember_completion_values(
+                    completion_profile,
+                    "tasks",
+                    page["items"],
+                    fields=("id",),
+                )
             next_args = [
                 "vgen",
                 "task",
@@ -4446,6 +4483,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage_show.add_argument("--workspace")
     usage_show.add_argument("--limit", type=int, default=500)
     usage_show.add_argument("--profile")
+    configure_parser_completers(parser)
     _enhance_cli_help(parser)
     return parser
 

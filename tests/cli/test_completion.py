@@ -6,16 +6,35 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from argcomplete.completers import DirectoriesCompleter, FilesCompleter
 
+from vgen.cli import completion
 from vgen.cli.completion import (
+    COMPLETION_CACHE_TTL_SECONDS,
     MANAGED_BLOCK_END,
     MANAGED_BLOCK_START,
+    cached_completion_values,
     install_shell_completion,
+    remember_completion_values,
     shell_completion,
 )
 from vgen.cli.main import build_parser, dispatch
+from vgen.cli.profile import GatewayProfile
+
+
+def _subparser_action(*path: str, dest: str):  # type: ignore[no-untyped-def]
+    import argparse
+
+    current = build_parser()
+    for name in path:
+        subparsers = next(
+            action for action in current._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        current = subparsers.choices[name]
+    return next(action for action in current._actions if action.dest == dest)
 
 
 @pytest.mark.parametrize("shell", ("bash", "zsh"))
@@ -62,6 +81,143 @@ def test_argcomplete_protocol_reads_the_real_parser(line: str, expected: set[str
     )
 
     assert set(result.stdout.split("\v")) == expected
+
+
+def test_profile_and_workflow_values_come_only_from_local_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profiles = {
+        "home": GatewayProfile("home", "https://gateway.example"),
+        "studio": GatewayProfile("studio", "https://studio.example"),
+    }
+    installed = [
+        SimpleNamespace(manifest=SimpleNamespace(id="vgen/demo", version="1.0.0")),
+        SimpleNamespace(manifest=SimpleNamespace(id="vgen/demo", version="2.0.0")),
+        SimpleNamespace(manifest=SimpleNamespace(id="custom/portrait", version="1.1.0")),
+    ]
+    monkeypatch.setattr(
+        completion,
+        "ProfileStore",
+        lambda: SimpleNamespace(load=lambda: ("home", profiles)),
+    )
+    monkeypatch.setattr(
+        completion,
+        "WorkflowRegistry",
+        lambda: SimpleNamespace(installed=lambda: installed),
+    )
+
+    profile_action = _subparser_action("task", "list", dest="profile")
+    workflow_action = _subparser_action("task", "submit", dest="workflow")
+    workflow_id_action = _subparser_action("workflow", "remove", dest="workflow_id")
+
+    assert set(profile_action.completer()) == {"home", "studio"}
+    assert set(workflow_action.completer()) == {
+        "custom/portrait",
+        "custom/portrait@1.1.0",
+        "vgen/demo",
+        "vgen/demo@1.0.0",
+        "vgen/demo@2.0.0",
+    }
+    assert set(workflow_id_action.completer()) == {"custom/portrait", "vgen/demo"}
+
+
+def test_file_and_directory_arguments_use_native_shell_completion() -> None:
+    image = _subparser_action("task", "submit", dest="image")
+    output_dir = _subparser_action("task", "submit", dest="output_dir")
+    credentials = _subparser_action("worker", "serve", dest="credentials_file")
+
+    assert isinstance(image.completer, FilesCompleter)
+    assert isinstance(credentials.completer, FilesCompleter)
+    assert isinstance(output_dir.completer, DirectoriesCompleter)
+
+
+def test_remote_ids_use_profile_scoped_short_lived_cache_without_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "completion-values.json"
+    monkeypatch.setattr(completion, "_completion_cache_path", lambda: cache_path)
+    monkeypatch.setattr(
+        completion,
+        "ProfileStore",
+        lambda: SimpleNamespace(load=lambda: ("home", {})),
+    )
+    remember_completion_values(
+        "home",
+        "workers",
+        [
+            {
+                "id": "wrk_example",
+                "name": "Studio GPU",
+                "invite_uri": "vgen://invite/SECRET",
+                "private_key": "SECRET_KEY",
+            }
+        ],
+        fields=("id", "name"),
+        stamp=1_000,
+    )
+    remember_completion_values(
+        "other",
+        "workers",
+        [{"id": "wrk_other", "name": "Other GPU"}],
+        fields=("id", "name"),
+        stamp=1_000,
+    )
+
+    assert cached_completion_values("home", "workers", now=1_001) == (
+        "wrk_example",
+        "Studio GPU",
+    )
+    assert cached_completion_values(None, "workers", now=1_001) == (
+        "wrk_example",
+        "Studio GPU",
+    )
+    assert cached_completion_values("other", "workers", now=1_001) == (
+        "wrk_other",
+        "Other GPU",
+    )
+    assert (
+        cached_completion_values(
+            "home",
+            "workers",
+            now=1_000 + COMPLETION_CACHE_TTL_SECONDS + 1,
+        )
+        == ()
+    )
+    serialized = cache_path.read_text(encoding="utf-8")
+    assert "SECRET" not in serialized
+    assert cache_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_worker_workspace_and_task_actions_read_only_the_completion_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        completion,
+        "_completion_cache_path",
+        lambda: tmp_path / "completion-values.json",
+    )
+    monkeypatch.setattr(
+        completion,
+        "ProfileStore",
+        lambda: SimpleNamespace(load=lambda: ("home", {})),
+    )
+    for kind, field, value in (
+        ("workers", "id", "wrk_cached"),
+        ("workspaces", "id", "wsp_cached"),
+        ("tasks", "id", "tsk_cached"),
+    ):
+        remember_completion_values("home", kind, [{field: value}], fields=(field,))
+
+    worker = _subparser_action("worker", "upgrade", dest="worker")
+    workspace = _subparser_action("task", "list", dest="workspace")
+    task = _subparser_action("task", "show", dest="task_id")
+    parsed = SimpleNamespace(profile="home")
+
+    assert tuple(worker.completer(parsed_args=parsed)) == ("wrk_cached",)
+    assert tuple(workspace.completer(parsed_args=parsed)) == ("wsp_cached",)
+    assert tuple(task.completer(parsed_args=parsed)) == ("tsk_cached",)
 
 
 def test_completion_install_is_idempotent_and_preserves_existing_rc(

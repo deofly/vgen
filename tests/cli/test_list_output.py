@@ -40,6 +40,7 @@ def test_every_list_command_defaults_to_text_and_accepts_json(argv: list[str]) -
 class ListClient:
     def __init__(self) -> None:
         self.profile = SimpleNamespace(
+            name="home",
             default_workspace="wsp_example",
             user_id="usr_owner",
             principal_type="device",
@@ -150,6 +151,26 @@ class ListClient:
             }
         ]
 
+    def list_task_page(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "items": [
+                {
+                    "id": "tsk_example",
+                    "state": "queued",
+                    "priority": 0,
+                    "created_at": 1_700_000_009,
+                    "updated_at": 1_700_000_009,
+                    "submitted_by": {"display_name": "Owner"},
+                    "worker": None,
+                    "workflow_ref": "vgen/demo@1.0.0",
+                }
+            ],
+            "total": 1,
+            "next_cursor": None,
+            "sort": "created",
+            "order": "desc",
+        }
+
     def close(self) -> None:
         self.closed = True
 
@@ -241,3 +262,26 @@ def test_workflow_list_prints_flat_rows_by_default(
     assert "WORKFLOW" in output
     assert "vgen/demo" in output
     assert not output.lstrip().startswith("[")
+
+
+def test_remote_lists_refresh_only_whitelisted_completion_values(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = ListClient()
+    captured: list[tuple[str, str, tuple[str, ...]]] = []
+    monkeypatch.setattr(cli_main, "_client", lambda _profile: client)
+    monkeypatch.setattr(
+        cli_main,
+        "remember_completion_values",
+        lambda profile, kind, _rows, *, fields: captured.append((profile, kind, fields)),
+    )
+
+    for argv in (("workspace", "list"), ("worker", "list"), ("task", "list")):
+        dispatch(build_parser().parse_args(list(argv)))
+        capsys.readouterr()
+
+    assert captured == [
+        ("home", "workspaces", ("id",)),
+        ("home", "workers", ("id", "name")),
+        ("home", "tasks", ("id",)),
+    ]
