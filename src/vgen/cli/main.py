@@ -9,7 +9,7 @@ import shlex
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -160,6 +160,76 @@ def _task_list_cell(value: object, *, width: int | None = None) -> str:
     if width is not None and len(normalized) > width:
         return normalized[: max(1, width - 1)] + "…"
     return normalized
+
+
+ListColumn = tuple[str, int, Callable[[Mapping[str, Any]], object]]
+
+
+def _print_flat_list(
+    values: object,
+    *,
+    columns: Sequence[ListColumn],
+    empty_message: str,
+    summary: str | None = None,
+) -> None:
+    """Print an operator-friendly one-row-per-item list without nested JSON."""
+
+    candidates = values if isinstance(values, list) else []
+    rows = [item for item in candidates if isinstance(item, Mapping)]
+    if not rows:
+        print(empty_message)
+        return
+    print(" ".join(f"{heading:<{width}}" for heading, width, _ in columns).rstrip())
+    for row in rows:
+        print(
+            " ".join(
+                f"{_task_list_cell(value(row), width=width):<{width}}"
+                for _, width, value in columns
+            ).rstrip()
+        )
+    print()
+    print(summary or f"共 {len(rows)} 条")
+
+
+def _list_datetime(row: Mapping[str, Any], field: str) -> str:
+    return _task_list_datetime(row.get(field))
+
+
+def _broker_device_values(row: Mapping[str, Any], field: str) -> str:
+    devices = row.get("devices")
+    if not isinstance(devices, list):
+        return "-"
+    values = {
+        str(device.get(field))
+        for device in devices
+        if isinstance(device, Mapping) and device.get(field)
+    }
+    return ", ".join(sorted(values)) or "-"
+
+
+def _broker_last_seen(row: Mapping[str, Any]) -> str:
+    devices = row.get("devices")
+    if not isinstance(devices, list):
+        return "-"
+    timestamps = [
+        device.get("heartbeat_at") or device.get("last_seen_at")
+        for device in devices
+        if isinstance(device, Mapping)
+    ]
+    valid = []
+    for value in timestamps:
+        try:
+            valid.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return _task_list_datetime(max(valid)) if valid else "-"
+
+
+def _maintenance_target(row: Mapping[str, Any]) -> object:
+    spec = row.get("spec")
+    if not isinstance(spec, Mapping):
+        return None
+    return spec.get("target_version") or spec.get("workflow_ref")
 
 
 def _print_task_list(page: Mapping[str, Any]) -> None:
@@ -701,7 +771,26 @@ def _profile_command(args: argparse.Namespace) -> None:
         _json(asdict(store.get(args.name)))
     elif args.profile_action == "list":
         current, profiles = store.load()
-        _json({"current": current, "profiles": [asdict(item) for item in profiles.values()]})
+        value = {"current": current, "profiles": [asdict(item) for item in profiles.values()]}
+        if args.format == "json":
+            _json(value)
+        else:
+            rows = [
+                {**asdict(item), "selected": "*" if item.name == current else ""}
+                for item in profiles.values()
+            ]
+            _print_flat_list(
+                rows,
+                columns=(
+                    ("USE", 3, lambda row: row.get("selected")),
+                    ("PROFILE", 18, lambda row: row.get("name")),
+                    ("ENDPOINT", 36, lambda row: row.get("endpoint")),
+                    ("TYPE", 8, lambda row: row.get("principal_type")),
+                    ("WORKSPACE", 31, lambda row: row.get("default_workspace")),
+                    ("POOL", 31, lambda row: row.get("default_pool")),
+                ),
+                empty_message="没有保存的 Profile。",
+            )
     elif args.profile_action == "endpoint-set":
         current = store.get(args.profile)
         values = asdict(current)
@@ -1204,18 +1293,52 @@ def _workspace_command(args: argparse.Namespace) -> None:
                 ProfileStore().update_binding(profile.name, default_workspace=workspace["id"])
             _json(workspace)
         elif args.workspace_action == "list":
-            _json(client.request("GET", "/api/v1/workspaces"))
+            values = client.request("GET", "/api/v1/workspaces")
+            if args.format == "json":
+                _json(values)
+            else:
+                _print_flat_list(
+                    values,
+                    columns=(
+                        ("WORKSPACE ID", 31, lambda row: row.get("id")),
+                        ("NAME", 24, lambda row: row.get("name")),
+                        ("ROLE", 8, lambda row: row.get("role")),
+                        ("STATUS", 9, lambda row: row.get("status")),
+                        ("KEY", 5, lambda row: row.get("key_version")),
+                        ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
+                    ),
+                    empty_message="没有可用的 Workspace。",
+                )
         elif args.workspace_action in {"member-list", "user-list"}:
             workspace_id = args.workspace or profile.default_workspace
             if not workspace_id:
                 raise ValueError("workspace is required")
-            _json(
-                client.request(
-                    "GET",
-                    f"/api/v1/workspaces/{workspace_id}/members",
-                    params={"include_revoked": True} if args.include_revoked else None,
-                )
+            values = client.request(
+                "GET",
+                f"/api/v1/workspaces/{workspace_id}/members",
+                params={"include_revoked": True} if args.include_revoked else None,
             )
+            if args.format == "json":
+                _json(values)
+            else:
+                members = values.get("members") if isinstance(values, Mapping) else None
+                active_total = int(values.get("active_total") or 0) if isinstance(values, Mapping) else 0
+                total = int(values.get("total") or 0) if isinstance(values, Mapping) else 0
+                _print_flat_list(
+                    members,
+                    columns=(
+                        ("USER ID", 31, lambda row: row.get("user_id")),
+                        ("NAME", 22, lambda row: row.get("display_name")),
+                        ("ROLE", 8, lambda row: row.get("role")),
+                        ("STATUS", 10, lambda row: row.get("current_status")),
+                        ("DEV", 3, lambda row: row.get("active_device_count")),
+                        ("RUN", 3, lambda row: row.get("running_task_count")),
+                        ("QUEUE", 5, lambda row: row.get("queued_task_count")),
+                        ("LAST SEEN", 19, lambda row: _list_datetime(row, "last_seen_at")),
+                    ),
+                    empty_message="没有符合条件的 Workspace 用户。",
+                    summary=f"共 {total} 人，活跃成员 {active_total} 人",
+                )
         elif args.workspace_action == "pool-create":
             workspace_id = args.workspace or profile.default_workspace
             if not workspace_id:
@@ -1226,7 +1349,21 @@ def _workspace_command(args: argparse.Namespace) -> None:
             workspace_id = args.workspace or profile.default_workspace
             if not workspace_id:
                 raise ValueError("workspace is required")
-            _json(client.request("GET", f"/api/v1/workspaces/{workspace_id}/pools"))
+            values = client.request("GET", f"/api/v1/workspaces/{workspace_id}/pools")
+            if args.format == "json":
+                _json(values)
+            else:
+                _print_flat_list(
+                    values,
+                    columns=(
+                        ("POOL ID", 31, lambda row: row.get("id")),
+                        ("NAME", 24, lambda row: row.get("name")),
+                        ("STATUS", 9, lambda row: row.get("status")),
+                        ("WORKSPACE", 31, lambda row: row.get("workspace_id")),
+                        ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
+                    ),
+                    empty_message="没有可用的资源池。",
+                )
         elif args.workspace_action == "owner-migrate":
             workspace_id = args.workspace or profile.default_workspace
             if not workspace_id:
@@ -1519,20 +1656,46 @@ def _workspace_command(args: argparse.Namespace) -> None:
             if not workspace_id:
                 raise ValueError("workspace is required")
             if args.workspace_action == "enrollment-list":
-                _json(
-                    client.request(
-                        "GET",
-                        f"/api/v1/workspaces/{workspace_id}/enrollments",
-                        params={"state": args.state} if args.state else None,
-                    )
+                values = client.request(
+                    "GET",
+                    f"/api/v1/workspaces/{workspace_id}/enrollments",
+                    params={"state": args.state} if args.state else None,
                 )
+                if args.format == "json":
+                    _json(values)
+                else:
+                    _print_flat_list(
+                        values,
+                        columns=(
+                            ("ENROLLMENT ID", 31, lambda row: row.get("id")),
+                            ("KIND", 18, lambda row: row.get("kind")),
+                            ("METHOD", 16, lambda row: row.get("method")),
+                            ("STATE", 10, lambda row: row.get("state")),
+                            ("SUBJECT", 31, lambda row: row.get("subject_id") or row.get("subject_user_id")),
+                            ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
+                            ("EXPIRES", 19, lambda row: _list_datetime(row, "expires_at")),
+                        ),
+                        empty_message="没有符合条件的 Enrollment。",
+                    )
             elif args.workspace_action == "allocation-list":
-                _json(
-                    client.request(
-                        "GET",
-                        f"/api/v1/workspaces/{workspace_id}/worker-allocations",
-                    )
+                values = client.request(
+                    "GET",
+                    f"/api/v1/workspaces/{workspace_id}/worker-allocations",
                 )
+                if args.format == "json":
+                    _json(values)
+                else:
+                    _print_flat_list(
+                        values,
+                        columns=(
+                            ("ALLOCATION ID", 31, lambda row: row.get("id")),
+                            ("WORKER", 31, lambda row: row.get("worker_id")),
+                            ("POOL", 31, lambda row: row.get("pool_id")),
+                            ("STATUS", 17, lambda row: row.get("status")),
+                            ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
+                        ),
+                        empty_message="没有 Worker Allocation。",
+                    )
             else:
                 _json(
                     client.request(
@@ -1972,8 +2135,27 @@ def _broker_command(args: argparse.Namespace) -> None:
                         runtime_version = device.get("runtime_version")
                         device["upgrade_available"] = _upgrade_available(runtime_version)
                 _json(brokers)
-            else:
+            elif getattr(args, "format", "json") == "json":
                 _json(brokers)
+            else:
+                _print_flat_list(
+                    brokers,
+                    columns=(
+                        ("BROKER ID", 31, lambda row: row.get("id")),
+                        ("NAME", 24, lambda row: row.get("name")),
+                        (
+                            "DEV",
+                            3,
+                            lambda row: len(row.get("devices"))
+                            if isinstance(row.get("devices"), list)
+                            else 0,
+                        ),
+                        ("RUNTIME", 18, lambda row: _broker_device_values(row, "runtime_version")),
+                        ("LAST SEEN", 19, _broker_last_seen),
+                        ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
+                    ),
+                    empty_message="没有可用的 Broker。",
+                )
         elif args.broker_action == "device":
             _json(
                 client.request(
@@ -2067,7 +2249,21 @@ def _broker_command(args: argparse.Namespace) -> None:
                 _raise_for_unsuccessful_maintenance(result)
         elif args.broker_action == "maintenance-list":
             worker = _select_owned_worker(client, args.worker)
-            _json(client.list_worker_maintenance(str(worker["id"])))
+            values = client.list_worker_maintenance(str(worker["id"]))
+            if args.format == "json":
+                _json(values)
+            else:
+                _print_flat_list(
+                    values,
+                    columns=(
+                        ("JOB ID", 31, lambda row: row.get("id")),
+                        ("KIND", 14, lambda row: row.get("kind")),
+                        ("STATE", 16, lambda row: row.get("state")),
+                        ("TARGET", 35, _maintenance_target),
+                        ("UPDATED", 19, lambda row: _list_datetime(row, "updated_at")),
+                    ),
+                    empty_message="没有 Worker 维护任务。",
+                )
         elif args.broker_action == "maintenance-show":
             _json(client.get_worker_maintenance(args.job_id))
         elif args.broker_action == "maintenance-cancel":
@@ -2403,19 +2599,31 @@ def _workflow_command(args: argparse.Namespace) -> None:
             }
         )
     elif args.workflow_action == "list":
-        _json(
-            [
-                {
-                    "id": item.manifest.id,
-                    "version": item.manifest.version,
-                    "digest": f"sha256:{item.digest}",
-                    "signed": item.signed,
-                    "provenance": item.manifest.provenance,
-                    "path": str(item.path),
-                }
-                for item in registry.installed()
-            ]
-        )
+        values = [
+            {
+                "id": item.manifest.id,
+                "version": item.manifest.version,
+                "digest": f"sha256:{item.digest}",
+                "signed": item.signed,
+                "provenance": item.manifest.provenance,
+                "path": str(item.path),
+            }
+            for item in registry.installed()
+        ]
+        if args.format == "json":
+            _json(values)
+        else:
+            _print_flat_list(
+                values,
+                columns=(
+                    ("WORKFLOW", 36, lambda row: row.get("id")),
+                    ("VERSION", 14, lambda row: row.get("version")),
+                    ("SOURCE", 10, lambda row: row.get("provenance")),
+                    ("SIGNED", 6, lambda row: "yes" if row.get("signed") else "no"),
+                    ("DIGEST", 24, lambda row: row.get("digest")),
+                ),
+                empty_message="没有安装的 Workflow。",
+            )
     elif args.workflow_action in {"show", "verify"}:
         source = Path(args.source).expanduser().resolve()
         manifest, digest, signed = validate_package(source, allow_unsigned=True)
@@ -3276,7 +3484,22 @@ def _usage_command(args: argparse.Namespace) -> None:
             params={"limit": args.limit},
         )
         if args.usage_action == "list":
-            _json(values)
+            if args.format == "json":
+                _json(values)
+            else:
+                _print_flat_list(
+                    values,
+                    columns=(
+                        ("ENTRY ID", 31, lambda row: row.get("id")),
+                        ("TYPE", 9, lambda row: row.get("entry_type")),
+                        ("TASK", 31, lambda row: row.get("task_id")),
+                        ("WORKER", 31, lambda row: row.get("worker_id")),
+                        ("TOTAL", 14, lambda row: row.get("total_microtokens")),
+                        ("BILLABLE", 8, lambda row: "yes" if row.get("billable") else "no"),
+                        ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
+                    ),
+                    empty_message="没有用量记录。",
+                )
             return
         selected = next(
             (
@@ -3690,7 +3913,8 @@ def build_parser() -> argparse.ArgumentParser:
     profile_use.add_argument("name")
     profile_show = profile_sub.add_parser("show")
     profile_show.add_argument("name", nargs="?")
-    profile_sub.add_parser("list")
+    profile_list = profile_sub.add_parser("list")
+    profile_list.add_argument("--format", choices=("text", "json"), default="text")
     profile_endpoint_set = profile_sub.add_parser("endpoint-set")
     profile_endpoint_set.add_argument("endpoint")
     profile_endpoint_set.add_argument("--profile")
@@ -3743,6 +3967,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--use", action="store_true")
     create.add_argument("--profile")
     listing = workspace_sub.add_parser("list")
+    listing.add_argument("--format", choices=("text", "json"), default="text")
     listing.add_argument("--profile")
     member_list = workspace_sub.add_parser(
         "member-list",
@@ -3752,6 +3977,7 @@ def build_parser() -> argparse.ArgumentParser:
     member_list.add_argument(
         "--include-revoked", action="store_true", help="include revoked memberships"
     )
+    member_list.add_argument("--format", choices=("text", "json"), default="text")
     member_list.add_argument("--profile", help="local Profile to use")
     user_list = workspace_sub.add_parser(
         "user-list",
@@ -3761,6 +3987,7 @@ def build_parser() -> argparse.ArgumentParser:
     user_list.add_argument(
         "--include-revoked", action="store_true", help="include revoked memberships"
     )
+    user_list.add_argument("--format", choices=("text", "json"), default="text")
     user_list.add_argument("--profile", help="local Profile to use")
     pool_create = workspace_sub.add_parser("pool-create")
     pool_create.add_argument("name")
@@ -3769,6 +3996,7 @@ def build_parser() -> argparse.ArgumentParser:
     pool_create.add_argument("--profile")
     pool_list = workspace_sub.add_parser("pool-list")
     pool_list.add_argument("--workspace")
+    pool_list.add_argument("--format", choices=("text", "json"), default="text")
     pool_list.add_argument("--profile")
     owner_migrate = workspace_sub.add_parser(
         "owner-migrate",
@@ -3853,9 +4081,11 @@ def build_parser() -> argparse.ArgumentParser:
     enrollment_list = workspace_sub.add_parser("enrollment-list")
     enrollment_list.add_argument("--workspace")
     enrollment_list.add_argument("--state")
+    enrollment_list.add_argument("--format", choices=("text", "json"), default="text")
     enrollment_list.add_argument("--profile")
     allocation_list = workspace_sub.add_parser("allocation-list")
     allocation_list.add_argument("--workspace")
+    allocation_list.add_argument("--format", choices=("text", "json"), default="text")
     allocation_list.add_argument("--profile")
     workspace_audit = workspace_sub.add_parser("audit")
     workspace_audit.add_argument("--workspace")
@@ -3888,9 +4118,11 @@ def build_parser() -> argparse.ArgumentParser:
     broker_create = broker_sub.add_parser("create")
     broker_create.add_argument("name")
     broker_create.add_argument("--profile")
-    for action in ("list", "status"):
-        command = broker_sub.add_parser(action)
-        command.add_argument("--profile")
+    broker_list = broker_sub.add_parser("list")
+    broker_list.add_argument("--format", choices=("text", "json"), default="text")
+    broker_list.add_argument("--profile")
+    broker_status = broker_sub.add_parser("status")
+    broker_status.add_argument("--profile")
     broker_sub.add_parser(
         "local-status", help="inspect this Mac Home Broker process and runtime version"
     )
@@ -3946,6 +4178,7 @@ def build_parser() -> argparse.ArgumentParser:
         "maintenance-list", help="list maintenance jobs for an owned Worker"
     )
     maintenance_list.add_argument("--worker", help="owned Worker name or ID")
+    maintenance_list.add_argument("--format", choices=("text", "json"), default="text")
     maintenance_list.add_argument("--profile")
     maintenance_show = broker_sub.add_parser("maintenance-show", help="show a maintenance job")
     maintenance_show.add_argument("job_id")
@@ -4073,7 +4306,8 @@ def build_parser() -> argparse.ArgumentParser:
     custom = workflow_sub.add_parser("custom")
     custom.add_argument("source")
     custom.add_argument("--allow-unsigned", action="store_true")
-    workflow_sub.add_parser("list")
+    workflow_list = workflow_sub.add_parser("list")
+    workflow_list.add_argument("--format", choices=("text", "json"), default="text")
     for action in ("show", "verify"):
         command = workflow_sub.add_parser(action)
         command.add_argument("source")
@@ -4189,6 +4423,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage_list = usage_sub.add_parser("list")
     usage_list.add_argument("--workspace")
     usage_list.add_argument("--limit", type=int, default=100)
+    usage_list.add_argument("--format", choices=("text", "json"), default="text")
     usage_list.add_argument("--profile")
     usage_show = usage_sub.add_parser("show")
     usage_show.add_argument("entry_id")

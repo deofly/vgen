@@ -665,6 +665,10 @@ vgen task submit "镜头平滑推进，主体动作连续自然" \
 未完成 Task；调度按 `priority` 从高到低，同优先级按提交时间 FIFO。Worker 真正领取 Task 时
 再次执行容量检查，因此容量为 1 的 ComfyUI 不会同时运行两个生成任务。
 
+CLI 中名称为 `list` 或 `*-list` 的命令默认都使用一项一行的简洁表格，包括 Profile、Workspace、
+成员、资源池、Broker、维护任务、Worker、Workflow、Task 和用量列表。脚本需要原始机器可读结果时，
+显式传入 `--format=json`。
+
 任务历史默认显示最近 20 条适合终端阅读的精简摘要；Owner/Admin 能查看 Workspace 全部任务，
 普通 Member 只能看到自己提交的任务。时间使用本机时区的 `YYYY-MM-DD HH:MM:SS` 格式。末尾的
 “下一页”命令可继续翻页，完整明细使用 `task show` 查看。Gateway API 仍然返回 JSON；脚本需要

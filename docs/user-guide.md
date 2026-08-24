@@ -544,6 +544,11 @@ kept per Worker. Higher priority runs first; equal priority is FIFO. Capacity is
 checked again when leasing, so a capacity-one ComfyUI Worker never runs two
 generations concurrently.
 
+Every CLI command named `list` or `*-list` prints a compact, one-item-per-row
+table by default, including Profile, Workspace, member, Pool, Broker,
+maintenance, Worker, workflow, Task, and usage lists. Automation can request
+the original machine-readable response explicitly with `--format=json`.
+
 Task history defaults to 20 compact, human-readable rows. Owners/Admins see the
 Workspace history; regular Members see only their own Tasks. Timestamps use the
 computer's local `YYYY-MM-DD HH:MM:SS` time. Follow the printed `Next page`
