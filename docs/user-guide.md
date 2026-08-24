@@ -292,7 +292,32 @@ vgen broker status
 vgen broker local-status
 ```
 
-### 4.3 Join another Mac
+### 4.3 Bash and Zsh completion
+
+The Mac installer enables completion for the current login shell. Restart the
+terminal, then press Tab after `vgen`, a command group, or an option. Completion
+is generated from the same CLI parser as `--help`, so new commands and options
+arrive with `vgen upgrade` and do not require another download.
+
+To repair completion or enable both supported shells explicitly:
+
+```bash
+vgen completion install
+vgen completion install --shell all
+```
+
+For a manually managed shell configuration, print the registration script
+without changing any files:
+
+```bash
+vgen completion bash
+vgen completion zsh
+```
+
+Completion only reads the local command tree. It does not contact the Gateway
+or suggest Invite URIs, recovery words, credentials, or other secrets.
+
+### 4.4 Join another Mac
 
 For a person with no VGen User profile on that Mac, the Workspace Owner creates:
 

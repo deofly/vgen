@@ -209,6 +209,13 @@ else
   ln -s "${VGEN_BIN}" "${LAUNCHER_PATH}"
 fi
 
+if "${VGEN_BIN}" completion install --shell auto >/dev/null; then
+  printf '✓ 已启用当前 Shell 的 VGen 命令补全\n'
+else
+  printf '提示：CLI 已安装，但命令补全未自动启用；可稍后运行 "%s" completion install --shell auto。\n' \
+    "${VGEN_BIN}" >&2
+fi
+
 printf '\n✓ VGen CLI %s 已安装\n' "${VERSION}"
 printf '  命令位置：%s\n' "${VGEN_BIN}"
 

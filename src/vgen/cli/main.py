@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# PYTHON_ARGCOMPLETE_OK
 import argparse
 import getpass
 import hashlib
@@ -75,6 +76,7 @@ from .auth import (
     login_session,
 )
 from .client import GatewayClient, VgenClientError, cli_exit_code
+from .completion import completion_command
 from .device_migration import register_recovered_device
 from .identity_store import DeviceIdentity, DeviceIdentityStore, IdentityStoreError
 from .join import join_command
@@ -3521,6 +3523,10 @@ def _usage_command(args: argparse.Namespace) -> None:
 _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("setup",): "在 Mac 上完成首次初始化，创建身份、Workspace、资源池和 Home Broker。",
     ("upgrade",): "检查并升级已托管安装的 VGen CLI，同时刷新 Home Broker。",
+    ("completion",): "生成或安装 Bash、Zsh 的 VGen 命令补全。",
+    ("completion", "bash"): "输出可由 Bash 加载的 VGen 补全脚本。",
+    ("completion", "zsh"): "输出可由 Zsh 加载的 VGen 补全脚本。",
+    ("completion", "install"): "为当前用户安装并启用 VGen 命令补全。",
     ("identity",): "管理用户身份、设备登录、恢复和撤销。",
     ("identity", "init"): "创建新的本地用户身份和恢复材料。",
     ("identity", "recover"): "使用恢复词或私钥文件在当前设备恢复用户身份。",
@@ -3710,6 +3716,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "root_key_id": "用户根签名公钥的 key ID。",
     "root_signing_public_key": "经过独立核对的用户根 Ed25519 公钥。",
     "scope": "授予主体的权限 scope；可重复指定。",
+    "shell": "安装补全的 Shell；auto 使用当前登录 Shell，all 同时安装 Bash 和 Zsh。",
     "service_id": "API Service ID。",
     "session_token_file": "保存短期 Worker session token 的文件。",
     "source": "工作流目录、包文件、已安装引用或下载地址。",
@@ -3865,6 +3872,15 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade.add_argument("--profile")
     upgrade.add_argument("--check", action="store_true", help="only report whether an update exists")
     upgrade.add_argument("--yes", action="store_true", help="install without an interactive prompt")
+
+    completion = sub.add_parser("completion")
+    completion_sub = completion.add_subparsers(dest="completion_action", required=True)
+    completion_sub.add_parser("bash")
+    completion_sub.add_parser("zsh")
+    completion_install = completion_sub.add_parser("install")
+    completion_install.add_argument(
+        "--shell", choices=("auto", "bash", "zsh", "all"), default="auto"
+    )
 
     identity = sub.add_parser("identity")
     identity_sub = identity.add_subparsers(dest="identity_action", required=True)
@@ -4438,6 +4454,7 @@ def dispatch(args: argparse.Namespace) -> None:
     handlers = {
         "setup": setup_command,
         "upgrade": upgrade_command,
+        "completion": completion_command,
         "identity": _identity_command,
         "profile": _profile_command,
         "gateway": _gateway_command,
@@ -4455,7 +4472,12 @@ def dispatch(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        dispatch(build_parser().parse_args(argv))
+        parser = build_parser()
+        if argv is None:
+            import argcomplete
+
+            argcomplete.autocomplete(parser)
+        dispatch(parser.parse_args(argv))
         return 0
     except VgenClientError as exc:
         print(f"{exc.code} {exc.name}: {exc}", file=sys.stderr)

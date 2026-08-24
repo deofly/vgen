@@ -325,7 +325,29 @@ vgen broker local-status
 版本。升级器和安装器都会执行 `broker service-refresh`，把已存在的 Home Broker 切换到新 CLI
 环境，不需要重新运行 `setup`、重新绑定设备或再次输入 Bootstrap code。
 
-### 4.3 其他 Mac 加入并使用共享 Worker
+### 4.3 Bash 和 Zsh 命令补全
+
+Mac 安装器会为当前登录 Shell 自动启用补全。重新打开终端后，在 `vgen`、命令组或参数后按 Tab
+即可补全。补全直接读取与 `--help` 相同的 CLI 命令树，因此新增命令和参数会随 `vgen upgrade`
+一起生效，不需要重新下载安装器。
+
+需要修复补全，或同时启用 Bash 和 Zsh 时运行：
+
+```bash
+vgen completion install
+vgen completion install --shell all
+```
+
+如果 Shell 配置由用户自行管理，可以只输出注册脚本，不修改任何文件：
+
+```bash
+vgen completion bash
+vgen completion zsh
+```
+
+补全只读取本地命令树，不访问 Gateway，也不会建议 Invite URI、恢复词、凭据或其他敏感内容。
+
+### 4.4 其他 Mac 加入并使用共享 Worker
 
 如果对方是第一次使用 VGen、这台 Mac 上没有已绑定 User 的 Profile，Workspace Owner 先在
 自己的 Mac 运行：
