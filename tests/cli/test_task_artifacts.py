@@ -18,6 +18,7 @@ from vgen.cli.main import (
     _print_task_list,
     _print_worker_list,
     _resolve_pool_id,
+    _task_detail_view,
     _task_list_datetime,
     _verify_prepared_allocation,
     _verify_prepared_worker_certificate,
@@ -93,6 +94,8 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
 
     retry = parser.parse_args(["task", "retry", "tsk_example"])
     show = parser.parse_args(["task", "show", "tsk_example"])
+    json_show = parser.parse_args(["task", "show", "tsk_example", "--format=json"])
+    json_watch = parser.parse_args(["task", "watch", "tsk_example", "--format=json"])
     get = parser.parse_args(["task", "get", "tsk_example", "--output-dir", "results"])
     listing = parser.parse_args(
         [
@@ -126,6 +129,9 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     )
     assert retry.task_action == "retry"
     assert show.task_action == "show"
+    assert show.format == "text"
+    assert json_show.format == "json"
+    assert json_watch.format == "json"
     assert get.task_action == "get"
     assert listing.limit == 10
     assert listing.cursor == "cursor-example"
@@ -199,6 +205,112 @@ def test_task_list_prints_compact_local_time_and_pagination(capsys) -> None:
 def test_task_list_datetime_rejects_invalid_values() -> None:
     assert _task_list_datetime(None) == "-"
     assert _task_list_datetime("not-a-timestamp") == "-"
+
+
+def test_task_detail_view_formats_times_without_mutating_and_removes_download_ticket() -> None:
+    raw = {
+        "id": "tsk_example",
+        "created_at": 1_787_552_404.159,
+        "reservation_expires_at": None,
+        "attempts": [{"finished_at": 1_787_552_500.0}],
+        "artifacts": [
+            {
+                "created_at": 1_787_552_450.0,
+                "download_ticket": {
+                    "url": "https://storage.invalid/signed?secret=PRIVATE_URL",
+                    "headers": {
+                        "Authorization": "Bearer PRIVATE_HEADER",
+                        "Vgen-Artifact-Ticket": "PRIVATE_TICKET",
+                    },
+                    "credentials": {
+                        "access_key_id": "PRIVATE_ID",
+                        "access_key_secret": "PRIVATE_SECRET",
+                        "security_token": "PRIVATE_TOKEN",
+                    },
+                },
+            }
+        ],
+    }
+
+    display = _task_detail_view(raw, readable_times=True)
+
+    assert display["created_at"] == _task_list_datetime(raw["created_at"])
+    assert display["reservation_expires_at"] is None
+    assert display["attempts"][0]["finished_at"] == _task_list_datetime(
+        raw["attempts"][0]["finished_at"]
+    )
+    assert "download_ticket" not in display["artifacts"][0]
+    assert raw["artifacts"][0]["download_ticket"]["credentials"]["access_key_secret"] == (
+        "PRIVATE_SECRET"
+    )
+
+    machine = _task_detail_view(raw, readable_times=False)
+    assert machine["created_at"] == raw["created_at"]
+    assert machine["attempts"][0]["finished_at"] == raw["attempts"][0]["finished_at"]
+    assert "download_ticket" not in machine["artifacts"][0]
+
+
+def test_task_show_and_watch_use_safe_readable_task_view(monkeypatch, capsys) -> None:
+    raw = {
+        "id": "tsk_example",
+        "state": "succeeded",
+        "created_at": 1_787_552_404.159,
+        "artifacts": [
+            {
+                "id": "art_output",
+                "download_ticket": {
+                    "url": "https://storage.invalid/signed?secret=PRIVATE_URL",
+                    "headers": {
+                        "Authorization": "Bearer PRIVATE_HEADER",
+                        "Vgen-Artifact-Ticket": "PRIVATE_TICKET",
+                    },
+                    "credentials": {
+                        "access_key_id": "PRIVATE_ID",
+                        "security_token": "PRIVATE_TOKEN",
+                    },
+                },
+            }
+        ],
+    }
+
+    class TaskClient:
+        def get_task(self, task_id: str):
+            assert task_id == "tsk_example"
+            return raw
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli_main, "_client", lambda _profile=None: TaskClient())
+    monkeypatch.setattr(cli_main, "_wait_for_task", lambda *_args, **_kwargs: raw)
+
+    assert cli_main.main(["task", "show", "tsk_example"]) == 0
+    show_output = capsys.readouterr().out
+    shown = json.loads(show_output)
+    assert shown["created_at"] == _task_list_datetime(raw["created_at"])
+    assert "download_ticket" not in shown["artifacts"][0]
+    assert "PRIVATE_" not in show_output
+
+    assert cli_main.main(["task", "show", "tsk_example", "--format=json"]) == 0
+    json_output = capsys.readouterr().out
+    machine = json.loads(json_output)
+    assert machine["created_at"] == raw["created_at"]
+    assert "download_ticket" not in machine["artifacts"][0]
+    assert "PRIVATE_" not in json_output
+
+    assert cli_main.main(["task", "watch", "tsk_example"]) == 0
+    watch_output = capsys.readouterr().out
+    watched = json.loads(watch_output)
+    assert watched["created_at"] == _task_list_datetime(raw["created_at"])
+    assert "download_ticket" not in watched["artifacts"][0]
+    assert "PRIVATE_" not in watch_output
+
+    assert cli_main.main(["task", "watch", "tsk_example", "--format=json"]) == 0
+    watch_json_output = capsys.readouterr().out
+    machine_watch = json.loads(watch_json_output)
+    assert machine_watch["created_at"] == raw["created_at"]
+    assert "download_ticket" not in machine_watch["artifacts"][0]
+    assert "PRIVATE_" not in watch_json_output
 
 
 def test_worker_list_prints_runtime_summary_and_owned_upgrade_command(capsys) -> None:

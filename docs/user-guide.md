@@ -559,6 +559,7 @@ vgen task list --sort priority --order desc
 vgen task list --sort updated --order desc
 vgen task list --format=json
 vgen task show <task_id>
+vgen task show <task_id> --format=json
 ```
 
 The default is `--sort created --order desc`, with the task ID as the final
@@ -567,7 +568,13 @@ The created-time order is immutable and gives the strongest pagination
 stability. State and update-time order reflect live task changes, so tasks may
 move between pages while they are running.
 
-A Member cannot use another user's Task ID to bypass this list restriction.
+`task show` returns Attempt, progress, and artifact metadata. By default every
+`*_at` field uses the computer's local `YYYY-MM-DD HH:MM:SS` time;
+`--format=json` preserves the Gateway's numeric timestamps. Neither format
+prints temporary credentials or signed locations from download tickets; use
+`vgen task get <task_id>` to download outputs. A Member cannot use another
+user's Task ID to bypass this list restriction. `task watch` follows the same
+timestamp and `--format` rules when it finishes.
 
 ## 8. Removing Workers and devices
 

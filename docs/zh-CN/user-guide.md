@@ -678,14 +678,17 @@ vgen task list --sort priority --order desc
 vgen task list --sort updated --order desc
 vgen task list --format=json
 vgen task show <task_id>
+vgen task show <task_id> --format=json
 ```
 
 默认排序是 `--sort created --order desc`，即按提交时间倒序，任务 ID 作为最终稳定排序键。
 可选排序因子为 `created`、`updated`、`priority`、`state`。提交时间不可变，分页最稳定；按状态或
 更新时间排序时，运行中的任务会实时变化，因此翻页期间任务可能移动到新的位置。
 
-`task show` 返回该 Task 的 Attempt、进度和产物元数据；普通 Member 也不能借助别人的 Task ID
-读取其明细。
+`task show` 返回该 Task 的 Attempt、进度和产物元数据。默认输出把所有 `*_at` 时间转换为本机
+时区的 `YYYY-MM-DD HH:MM:SS`；`--format=json` 保留 Gateway 的数值时间戳。两种格式都不会
+显示下载票据中的临时凭据或签名地址，下载结果应使用 `vgen task get <task_id>`。普通 Member
+也不能借助别人的 Task ID 读取其明细。`task watch` 结束时遵循相同的时间与 `--format` 规则。
 
 下载结果默认不会覆盖同名文件：内容相同则复用已有文件，内容不同时自动使用
 `output-00-01.mp4`、`output-00-02.mp4` 等安全名称。只有明确传入 `--overwrite` 才会替换

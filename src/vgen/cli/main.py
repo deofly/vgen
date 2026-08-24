@@ -125,6 +125,33 @@ def _task_list_datetime(value: object) -> str:
         return "-"
 
 
+# A ticket may carry a signed URL, bearer header, or short-lived STS credentials.
+# Downloads consume the original API response through `task get`; terminal views
+# must omit the whole capability instead of trying to redact individual providers.
+_TASK_DETAIL_PRIVATE_FIELDS = frozenset({"download_ticket"})
+
+
+def _task_detail_view(value: Any, *, readable_times: bool, field_name: str = "") -> Any:
+    """Build a terminal-safe Task view without mutating the API response."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _task_detail_view(
+                item,
+                readable_times=readable_times,
+                field_name=str(key),
+            )
+            for key, item in value.items()
+            if str(key) not in _TASK_DETAIL_PRIVATE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_task_detail_view(item, readable_times=readable_times) for item in value]
+    if readable_times and field_name.endswith("_at") and value is not None:
+        formatted = _task_list_datetime(value)
+        return value if formatted == "-" else formatted
+    return value
+
+
 def _task_list_cell(value: object, *, width: int | None = None) -> str:
     raw = "" if value is None else str(value)
     normalized = " ".join("".join(char if char.isprintable() else " " for char in raw).split())
@@ -3109,7 +3136,12 @@ def _task_command(args: argparse.Namespace) -> None:
                     )
                 )
         elif args.task_action == "show":
-            _json(client.get_task(args.task_id))
+            _json(
+                _task_detail_view(
+                    client.get_task(args.task_id),
+                    readable_times=args.format == "text",
+                )
+            )
         elif args.task_action == "get":
             _json(
                 _download_task_outputs(
@@ -3213,11 +3245,14 @@ def _task_command(args: argparse.Namespace) -> None:
             )
         elif args.task_action == "watch":
             _json(
-                _wait_for_task(
-                    client,
-                    args.task_id,
-                    interval=args.interval,
-                    timeout=args.timeout,
+                _task_detail_view(
+                    _wait_for_task(
+                        client,
+                        args.task_id,
+                        interval=args.interval,
+                        timeout=args.timeout,
+                    ),
+                    readable_times=args.format == "text",
                 )
             )
         elif args.task_action == "usage":
@@ -4103,7 +4138,16 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--wait-interval", type=float, default=2)
     submit.add_argument("--timeout", type=float, default=3600)
     submit.add_argument("--profile")
-    for action in ("show", "cancel", "retry"):
+    show = task_sub.add_parser("show")
+    show.add_argument("task_id")
+    show.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="text formats local timestamps; json preserves numeric timestamps",
+    )
+    show.add_argument("--profile")
+    for action in ("cancel", "retry"):
         command = task_sub.add_parser(action)
         command.add_argument("task_id")
         command.add_argument("--profile")
@@ -4129,6 +4173,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("task_id")
     watch.add_argument("--interval", type=float, default=2)
     watch.add_argument("--timeout", type=float, default=3600)
+    watch.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="text formats local timestamps; json preserves numeric timestamps",
+    )
     watch.add_argument("--profile")
     usage = task_sub.add_parser("usage")
     usage.add_argument("--workspace")
