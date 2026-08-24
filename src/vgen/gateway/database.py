@@ -420,6 +420,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_queue
     ON tasks(pool_id, state, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_workspace_history
+    ON tasks(workspace_id, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS task_attempts (
     id TEXT PRIMARY KEY,

@@ -577,7 +577,8 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             headers=user_headers,
         )
         assert committed.status_code == 200, committed.text
-        assert committed.json()["state"] == "committed"
+        assert committed.json()["state"] == "queued"
+        assert committed.json()["queue_position"] == 1
 
         lease_path = f"/api/v1/workers/{worker['id']}/lease"
         lease_headers = {**worker_headers, "Idempotency-Key": "lease-lost-response"}
@@ -613,12 +614,27 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
         downloaded_input = client.get(input_download["url"], headers=input_download["headers"])
         assert downloaded_input.content == b"encrypted-input"
 
+        stale_seen_at = time.time() - 121
+        app.state.db.execute(
+            "UPDATE workers SET last_seen_at=? WHERE id=?",
+            (stale_seen_at, worker["id"]),
+        )
+        assert client.get("/api/v1/status", headers=user_headers).json()["counts"][
+            "workers_online"
+        ] == 0
         heartbeat = client.post(
             f"/api/v1/attempts/{lease['attempt_id']}/heartbeat",
             json={"fencing_token": lease["fencing_token"], "started": True},
             headers=worker_headers,
         )
         assert heartbeat.status_code == 200, heartbeat.text
+        refreshed_worker = app.state.db.fetchone(
+            "SELECT last_seen_at FROM workers WHERE id=?", (worker["id"],)
+        )
+        assert refreshed_worker["last_seen_at"] > stale_seen_at
+        assert client.get("/api/v1/status", headers=user_headers).json()["counts"][
+            "workers_online"
+        ] == 1
 
         refreshed_tickets = client.post(
             f"/api/v1/attempts/{lease['attempt_id']}/artifact-tickets",

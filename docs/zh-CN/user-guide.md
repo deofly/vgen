@@ -392,6 +392,15 @@ vgen join --resume
 完成后该 Mac 可以直接 `vgen task submit`，任务会由 Workspace/Pool 中可用的共享 Worker 执行；
 它不能管理其他用户拥有的 Worker。
 
+Owner/Admin 可查看当前 Workspace 的成员数、角色、最近在线状态、排队任务数，以及正在占用
+Worker 的用户和 Task：
+
+```bash
+vgen workspace member-list
+```
+
+普通 Member 不能读取完整成员状态。`--include-revoked` 可供管理员排障时同时查看已撤销成员。
+
 ## 5. Windows Worker 和 ComfyUI
 
 ### 5.1 一键安装和互动接入
@@ -611,8 +620,9 @@ vgen task preflight
 ```
 
 它使用与真实提交相同的公开 workflow requirements，但不创建 Task/Attempt、不预留 Worker、
-不上传 prompt/图片，也不产生用量或计费。输出会区分 `ready`、没有已分配 Worker、Worker
-offline/busy/maintenance、capability mismatch（执行器/模型/版本/内存/显存）和 rate 未审批。
+不上传 prompt/图片，也不产生用量或计费。输出会区分 `ready`、`queue_available`、队列已满、
+没有已分配 Worker、Worker offline/maintenance、capability mismatch（执行器/模型/版本/内存/显存）
+和 rate 未审批。
 1 图或 2 图模式可相应增加 `--image`、`--last-image`，这些文件在预检中不会上传。
 
 ### 0 张图：文生视频
@@ -645,6 +655,23 @@ vgen task submit "镜头平滑推进，主体动作连续自然" \
 `--wait` 和 `vgen task watch <task_id>` 会在状态变化之外显示准备输入、生成采样和上传结果的
 整体进度。显示按阶段变化或至少前进 2 个百分点节流；Worker 断线重连或新 Attempt 重试时，
 会从新 Attempt 的进度重新开始。
+
+同一 Worker 的并发容量已满时，新任务会进入等待队列而不是直接报错。队列最多保留 100 个
+未完成 Task；调度按 `priority` 从高到低，同优先级按提交时间 FIFO。Worker 真正领取 Task 时
+再次执行容量检查，因此容量为 1 的 ComfyUI 不会同时运行两个生成任务。
+
+任务历史默认显示最近 20 条精简摘要；Owner/Admin 能查看 Workspace 全部任务，普通 Member
+只能看到自己提交的任务。响应中的 `next` 可继续下一页，`show_command` 可查看某条完整明细：
+
+```bash
+vgen task list
+vgen task list --limit 20 --cursor <next_cursor>
+vgen task list --state queued
+vgen task show <task_id>
+```
+
+`task show` 返回该 Task 的 Attempt、进度和产物元数据；普通 Member 也不能借助别人的 Task ID
+读取其明细。
 
 下载结果默认不会覆盖同名文件：内容相同则复用已有文件，内容不同时自动使用
 `output-00-01.mp4`、`output-00-02.mp4` 等安全名称。只有明确传入 `--overwrite` 才会替换

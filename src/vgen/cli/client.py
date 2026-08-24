@@ -220,6 +220,21 @@ class GatewayClient:
             params["workspace_id"] = workspace_id
         return self.request("GET", "/api/v1/tasks", params=params)
 
+    def list_task_page(
+        self,
+        *,
+        workspace_id: str,
+        limit: int = 20,
+        cursor: str | None = None,
+        state: str | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {"workspace_id": workspace_id, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if state:
+            params["state"] = state
+        return self.request("GET", "/api/v1/tasks/page", params=params)
+
     def close_task(self, task_id: str) -> Any:
         return self.request(
             "POST",

@@ -14,6 +14,7 @@ from packaging.version import InvalidVersion, Version
 
 from vgen.crypto import (
     b64url_decode,
+    b64url_encode,
     build_allocation_proof_payload,
     canonical_json,
     device_key_id,
@@ -134,6 +135,7 @@ _MAINTENANCE_TERMINAL_STATES = frozenset(
     {"succeeded", "failed", "cancelled", "expired"}
 )
 _WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
+MAX_QUEUED_TASKS_PER_WORKER = 100
 
 
 class GatewayRepository:
@@ -331,32 +333,62 @@ class GatewayRepository:
         return conn.execute(sql, args).fetchall()
 
     @staticmethod
-    def _has_available_allocated_worker(
+    def _task_queue_candidate_rows(
+        conn: sqlite3.Connection | GatewayDatabase,
+        *,
+        pool_id: str,
+        executor_type: str,
+        stamp: float,
+    ) -> list[sqlite3.Row]:
+        """Return online compatible Workers even when their execution slots are full.
+
+        Tasks are encrypted for a concrete Worker before they enter the queue, so
+        only an online, allocated Worker with no pending maintenance is a safe
+        queue target. Capacity is enforced when the Worker leases the task.
+        """
+
+        sql = """SELECT w.*,a.id AS allocation_id,a.allocation_proof AS allocation_proof,
+                      a.approved_by_user_id AS allocation_approved_by,
+                      a.owner_consent_at AS allocation_owner_consent_at,
+                      (SELECT COUNT(*) FROM task_attempts ta
+                       WHERE ta.worker_id=w.id
+                         AND ta.state IN ('reserved','leased','running')) AS queued_load
+               FROM workers w JOIN worker_allocations a ON a.worker_id=w.id
+               WHERE a.pool_id=? AND a.status='active' AND a.allocation_proof IS NOT NULL
+                 AND w.status='active'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM worker_maintenance_jobs mj
+                   WHERE mj.worker_id=w.id
+                     AND mj.state IN ('queued','leased','running','restarting')
+                 )
+                 AND w.executor_type=?
+                 AND w.last_seen_at>?
+               ORDER BY queued_load ASC,COALESCE(w.last_seen_at,0) DESC,w.created_at
+               LIMIT 50"""
+        args = (pool_id, executor_type, stamp - WORKER_ONLINE_WINDOW_SECONDS)
+        if isinstance(conn, GatewayDatabase):
+            return conn.fetchall(sql, args)
+        return conn.execute(sql, args).fetchall()
+
+    @staticmethod
+    def _has_online_allocated_worker(
         conn: sqlite3.Connection | GatewayDatabase,
         *,
         pool_id: str,
         stamp: float,
     ) -> bool:
-        """Check availability without exposing or filtering on an Executor."""
-
-        sql = """SELECT 1
-                   FROM workers w JOIN worker_allocations a ON a.worker_id=w.id
-                   WHERE a.pool_id=? AND a.status='active' AND a.allocation_proof IS NOT NULL
-                     AND w.status='active'
+        sql = """SELECT 1 FROM workers w
+                   JOIN worker_allocations a ON a.worker_id=w.id
+                   WHERE a.pool_id=? AND a.status='active'
+                     AND a.allocation_proof IS NOT NULL
+                     AND w.status='active' AND w.last_seen_at>?
                      AND NOT EXISTS (
                        SELECT 1 FROM worker_maintenance_jobs mj
                        WHERE mj.worker_id=w.id
                          AND mj.state IN ('queued','leased','running','restarting')
                      )
-                     AND w.last_seen_at>?
-                     AND (SELECT COUNT(*) FROM task_attempts ta
-                          JOIN tasks active_task ON active_task.id=ta.task_id
-                          WHERE ta.worker_id=w.id
-                            AND ta.state IN ('reserved','leased','running')
-                            AND (active_task.reservation_expires_at IS NULL
-                                 OR active_task.reservation_expires_at>?)) < w.capacity
                    LIMIT 1"""
-        args = (pool_id, stamp - WORKER_ONLINE_WINDOW_SECONDS, stamp)
+        args = (pool_id, stamp - WORKER_ONLINE_WINDOW_SECONDS)
         if isinstance(conn, GatewayDatabase):
             return conn.fetchone(sql, args) is not None
         return conn.execute(sql, args).fetchone() is not None
@@ -753,6 +785,107 @@ class GatewayRepository:
                 (user_id,),
             )
         ]
+
+    def list_workspace_members(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        include_revoked: bool = False,
+    ) -> dict[str, Any]:
+        """Return an operator-safe Workspace roster with current task activity."""
+
+        self.require_admin(workspace_id, user_id)
+        membership_filter = "" if include_revoked else " AND m.status='active'"
+        rows = self.db.fetchall(
+            f"""SELECT m.workspace_id,m.user_id,m.role,m.status AS membership_status,
+                       m.created_at,m.revoked_at,u.display_name,u.status AS user_status
+                  FROM memberships m JOIN users u ON u.id=m.user_id
+                 WHERE m.workspace_id=?{membership_filter}
+                 ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                          m.created_at,m.user_id""",
+            (workspace_id,),
+        )
+        stamp = now()
+        members: list[dict[str, Any]] = []
+        for row in rows:
+            recent = self.db.fetchone(
+                """SELECT MAX(last_seen_at) AS last_seen_at FROM sessions
+                   WHERE principal_type='device' AND user_id=?
+                     AND revoked_at IS NULL AND expires_at>?""",
+                (row["user_id"], stamp),
+            )
+            device_count = int(
+                self.db.fetchone(
+                    "SELECT COUNT(*) AS n FROM devices WHERE user_id=? AND status='active'",
+                    (row["user_id"],),
+                )["n"]
+            )
+            task_rows = self.db.fetchall(
+                """SELECT t.id,t.state,t.priority,t.created_at,t.assigned_worker_id,
+                          w.name AS worker_name
+                     FROM tasks t LEFT JOIN workers w ON w.id=t.assigned_worker_id
+                    WHERE t.workspace_id=? AND t.consumer_user_id=?
+                      AND t.state IN ('prepared','committed','queued','reserved','running','rekey_required')
+                    ORDER BY CASE t.state WHEN 'running' THEN 0 WHEN 'reserved' THEN 1
+                                  WHEN 'queued' THEN 2 WHEN 'committed' THEN 2 ELSE 3 END,
+                             t.priority DESC,t.created_at,t.id""",
+                (workspace_id, row["user_id"]),
+            )
+            using_workers = [
+                {
+                    "task_id": task["id"],
+                    "task_state": task["state"],
+                    "worker_id": task["assigned_worker_id"],
+                    "worker_name": task["worker_name"],
+                }
+                for task in task_rows
+                if task["state"] in {"reserved", "running"}
+                and task["assigned_worker_id"]
+            ]
+            queued_task_count = sum(
+                task["state"] in {"prepared", "committed", "queued", "rekey_required"}
+                for task in task_rows
+            )
+            last_seen_at = recent["last_seen_at"] if recent is not None else None
+            recently_online = bool(last_seen_at and float(last_seen_at) >= stamp - 300)
+            if row["membership_status"] != "active" or row["user_status"] != "active":
+                current_status = "inactive"
+            elif any(task["state"] == "running" for task in task_rows):
+                current_status = "running"
+            elif using_workers:
+                current_status = "starting"
+            elif queued_task_count:
+                current_status = "queued"
+            elif recently_online:
+                current_status = "online"
+            else:
+                current_status = "offline"
+            members.append(
+                {
+                    "user_id": row["user_id"],
+                    "display_name": row["display_name"],
+                    "role": row["role"],
+                    "membership_status": row["membership_status"],
+                    "user_status": row["user_status"],
+                    "current_status": current_status,
+                    "last_seen_at": last_seen_at,
+                    "active_device_count": device_count,
+                    "active_task_count": len(using_workers),
+                    "running_task_count": sum(
+                        task["state"] == "running" for task in task_rows
+                    ),
+                    "queued_task_count": queued_task_count,
+                    "using_workers": using_workers,
+                }
+            )
+        active_total = sum(item["membership_status"] == "active" for item in members)
+        return {
+            "workspace_id": workspace_id,
+            "total": len(members),
+            "active_total": active_total,
+            "members": members,
+        }
 
     def create_pool(
         self, *, workspace_id: str, user_id: str, name: str, policy: dict[str, Any]
@@ -4997,7 +5130,7 @@ class GatewayRepository:
 
         def result(state: str, reason: str) -> dict[str, Any]:
             return {
-                "ready": state == "ready",
+                "ready": state in {"ready", "queue_available"},
                 "state": state,
                 "reason": reason,
                 "workspace_id": workspace_id,
@@ -5024,29 +5157,45 @@ class GatewayRepository:
             executor_type=executor_type,
             stamp=stamp,
         )
-        if not candidate_rows:
-            if self._has_available_allocated_worker(
+        candidate = next(
+            (row for row in candidate_rows if self._matches_requirements(row, public_requirements)),
+            None,
+        )
+        queueing = False
+        if candidate is None:
+            queued_rows = self._task_queue_candidate_rows(
+                self.db,
+                pool_id=pool_id,
+                executor_type=executor_type,
+                stamp=stamp,
+            )
+            candidate = next(
+                (
+                    row
+                    for row in queued_rows
+                    if self._matches_requirements(row, public_requirements)
+                ),
+                None,
+            )
+            queueing = candidate is not None
+        if candidate is None:
+            if self._has_online_allocated_worker(
                 self.db,
                 pool_id=pool_id,
                 stamp=stamp,
             ):
                 return result(
                     "capability_mismatch",
-                    "Available Workers do not provide the requested Executor.",
+                    "Online Workers do not satisfy the requested workflow requirements.",
                 )
             return result(
                 "worker_offline_or_busy",
-                "Allocated Workers are offline, draining, in maintenance, or at capacity.",
+                "Allocated Workers are offline, draining, or in maintenance.",
             )
-
-        candidate = next(
-            (row for row in candidate_rows if self._matches_requirements(row, public_requirements)),
-            None,
-        )
-        if candidate is None:
+        if queueing and int(candidate["queued_load"]) >= MAX_QUEUED_TASKS_PER_WORKER:
             return result(
-                "capability_mismatch",
-                "Available Workers do not satisfy the public workflow requirements.",
+                "queue_full",
+                "The matching Worker's task queue is full.",
             )
         rate = self.db.fetchone(
             """SELECT 1 FROM rate_cards
@@ -5059,10 +5208,12 @@ class GatewayRepository:
                 "rate_not_approved",
                 "The matching Worker has no approved rate for this Workspace.",
             )
-        return result(
-            "ready",
-            "A matching Worker and approved rate are currently available.",
-        )
+        if queueing:
+            return result(
+                "queue_available",
+                "A matching Worker is busy; a submitted task can wait in its queue.",
+            )
+        return result("ready", "A matching Worker and approved rate are currently available.")
 
     def prepare_task(
         self,
@@ -5116,7 +5267,7 @@ class GatewayRepository:
                 executor_type=executor_type,
                 stamp=stamp,
             )
-            candidates = next(
+            candidate = next(
                 (
                     row
                     for row in candidate_rows
@@ -5124,7 +5275,24 @@ class GatewayRepository:
                 ),
                 None,
             )
-            if candidates is None:
+            queueing = False
+            if candidate is None:
+                queue_rows = self._task_queue_candidate_rows(
+                    conn,
+                    pool_id=pool_id,
+                    executor_type=executor_type,
+                    stamp=stamp,
+                )
+                candidate = next(
+                    (
+                        row
+                        for row in queue_rows
+                        if self._matches_requirements(row, public_requirements)
+                    ),
+                    None,
+                )
+                queueing = candidate is not None
+            if candidate is None:
                 raise RepositoryError(
                     NO_ELIGIBLE_WORKER,
                     "NO_ELIGIBLE_WORKER",
@@ -5134,11 +5302,21 @@ class GatewayRepository:
                     "platform",
                     {"pool_id": pool_id, "executor_type": executor_type},
                 )
+            if queueing and int(candidate["queued_load"]) >= MAX_QUEUED_TASKS_PER_WORKER:
+                raise RepositoryError(
+                    NO_ELIGIBLE_WORKER,
+                    "WORKER_QUEUE_FULL",
+                    "The matching Worker's task queue is full.",
+                    503,
+                    "later",
+                    "platform",
+                    {"pool_id": pool_id, "executor_type": executor_type},
+                )
             rate = conn.execute(
                 """SELECT * FROM rate_cards
                    WHERE worker_id=? AND workspace_id=? AND status='approved'
                    ORDER BY decided_at DESC LIMIT 1""",
-                (candidates["id"], workspace_id),
+                (candidate["id"], workspace_id),
             ).fetchone()
             if rate is None:
                 raise RepositoryError(
@@ -5149,7 +5327,7 @@ class GatewayRepository:
                 )
             task_id = new_id("tsk")
             attempt_id = new_id("atm")
-            fencing = int(candidates["fencing_counter"]) + 1
+            fencing = int(candidate["fencing_counter"]) + 1
             rate_snapshot = {
                 "rate_card_id": rate["id"],
                 "rate_microtokens_per_second": rate["rate_microtokens_per_second"],
@@ -5176,7 +5354,7 @@ class GatewayRepository:
                     executor_type,
                     json_text(public_requirements),
                     content_key_version,
-                    candidates["id"],
+                    candidate["id"],
                     stamp + reservation_ttl_seconds,
                     priority,
                     stamp,
@@ -5185,7 +5363,7 @@ class GatewayRepository:
             )
             conn.execute(
                 "UPDATE workers SET fencing_counter=?,updated_at=? WHERE id=?",
-                (fencing, stamp, candidates["id"]),
+                (fencing, stamp, candidate["id"]),
             )
             conn.execute(
                 """INSERT INTO task_attempts
@@ -5195,11 +5373,11 @@ class GatewayRepository:
                 (
                     attempt_id,
                     task_id,
-                    candidates["id"],
-                    candidates["owner_user_id"],
-                    candidates["manager_broker_id"],
-                    candidates["executor_type"],
-                    candidates["executor_version"],
+                    candidate["id"],
+                    candidate["owner_user_id"],
+                    candidate["manager_broker_id"],
+                    candidate["executor_type"],
+                    candidate["executor_version"],
                     json_text(rate_snapshot),
                     fencing,
                     stamp,
@@ -5210,23 +5388,24 @@ class GatewayRepository:
             json_columns={"public_requirements"},
         )
         task["worker"] = {
-            "id": candidates["id"],
-            "encryption_public_key": candidates["encryption_public_key"],
-            "signing_public_key": candidates["signing_public_key"],
-            "certificate": candidates["certificate"],
+            "id": candidate["id"],
+            "encryption_public_key": candidate["encryption_public_key"],
+            "signing_public_key": candidate["signing_public_key"],
+            "certificate": candidate["certificate"],
             "owner_root_signing_public_key": self.db.fetchone(
                 "SELECT root_signing_public_key FROM users WHERE id=?",
-                (candidates["owner_user_id"],),
+                (candidate["owner_user_id"],),
             )["root_signing_public_key"],
-            "executor_type": candidates["executor_type"],
-            "executor_version": candidates["executor_version"],
+            "executor_type": candidate["executor_type"],
+            "executor_version": candidate["executor_version"],
         }
-        task["allocation"] = self._allocation_security_view(candidates)
+        task["allocation"] = self._allocation_security_view(candidate)
         task["rate_card_id"] = rate["id"]
         task["attempt_id"] = attempt_id
         task["content_attempt_id"] = attempt_id
         task["key_version"] = content_key_version
         task["fencing_token"] = fencing
+        task["queue_expected"] = queueing
         # Artifact stores replace these descriptors with signed PUT tickets.
         # The Gateway never embeds storage credentials in a Worker lease.
         task["artifact_tickets"] = []
@@ -5285,7 +5464,8 @@ class GatewayRepository:
                     409,
                 )
             conn.execute(
-                """UPDATE tasks SET encrypted_payload=?,reader_envelope=?,state='committed',committed_at=?,updated_at=?
+                """UPDATE tasks SET encrypted_payload=?,reader_envelope=?,state='committed',
+                          committed_at=?,updated_at=?
                    WHERE id=?""",
                 (encrypted_payload, reader_envelope, stamp, stamp, task_id),
             )
@@ -5304,9 +5484,36 @@ class GatewayRepository:
                     stamp,
                 ),
             )
-        return row_dict(
+            conn.execute(
+                """UPDATE tasks SET state='queued',reservation_expires_at=NULL,updated_at=?
+                   WHERE id=? AND state='committed'""",
+                (stamp, task_id),
+            )
+        value = row_dict(
             self.db.fetchone("SELECT * FROM tasks WHERE id=?", (task_id,)),
             json_columns={"public_requirements"},
+        )
+        value["queue_position"] = self._task_queue_position(value)
+        return value
+
+    def _task_queue_position(self, task: sqlite3.Row | dict[str, Any]) -> int | None:
+        if task["state"] not in {"committed", "queued"} or not task["assigned_worker_id"]:
+            return None
+        return int(
+            self.db.fetchone(
+                """SELECT COUNT(*)+1 AS position FROM tasks
+                   WHERE assigned_worker_id=? AND state IN ('committed','queued')
+                     AND (priority>? OR (priority=? AND
+                          (created_at<? OR (created_at=? AND id<?))))""",
+                (
+                    task["assigned_worker_id"],
+                    task["priority"],
+                    task["priority"],
+                    task["created_at"],
+                    task["created_at"],
+                    task["id"],
+                ),
+            )["position"]
         )
 
     def lease(self, *, worker_id: str, ttl_seconds: int) -> dict[str, Any] | None:
@@ -5327,6 +5534,15 @@ class GatewayRepository:
                 raise RepositoryError(
                     WORKER_OFFLINE, "WORKER_OFFLINE", "Worker is not active.", 409, "later"
                 )
+            active_count = int(
+                conn.execute(
+                    """SELECT COUNT(*) AS n FROM task_attempts
+                       WHERE worker_id=? AND state IN ('leased','running')""",
+                    (worker_id,),
+                ).fetchone()["n"]
+            )
+            if active_count >= int(worker["capacity"]):
+                return None
             maintenance = conn.execute(
                 """SELECT state FROM worker_maintenance_jobs
                    WHERE worker_id=? AND state IN ('queued','leased','running','restarting')
@@ -5335,8 +5551,9 @@ class GatewayRepository:
             ).fetchone()
             task = conn.execute(
                 """SELECT * FROM tasks
-                   WHERE assigned_worker_id=? AND state='committed' AND reservation_expires_at>?
-                   ORDER BY priority DESC,created_at LIMIT 1""",
+                   WHERE assigned_worker_id=? AND state IN ('committed','queued')
+                     AND (reservation_expires_at IS NULL OR reservation_expires_at>?)
+                   ORDER BY priority DESC,created_at,id LIMIT 1""",
                 (worker_id, stamp),
             ).fetchone()
             if maintenance is not None:
@@ -5356,7 +5573,7 @@ class GatewayRepository:
                     "No reserved attempt exists for this task.",
                     409,
                 )
-            fencing = int(attempt["fencing_token"])
+            fencing = int(worker["fencing_counter"]) + 1
             attempt_id = attempt["id"]
             lease_id = new_id("lea")
             key = conn.execute(
@@ -5374,8 +5591,13 @@ class GatewayRepository:
                     "rekey_required",
                 )
             conn.execute(
-                "UPDATE task_attempts SET state='leased',leased_at=? WHERE id=? AND state='reserved'",
-                (stamp, attempt_id),
+                """UPDATE task_attempts SET state='leased',fencing_token=?,leased_at=?
+                   WHERE id=? AND state='reserved'""",
+                (fencing, stamp, attempt_id),
+            )
+            conn.execute(
+                "UPDATE workers SET fencing_counter=?,updated_at=? WHERE id=?",
+                (fencing, stamp, worker_id),
             )
             conn.execute(
                 """INSERT INTO leases
@@ -5466,6 +5688,13 @@ class GatewayRepository:
                 raise RepositoryError(
                     LEASE_LOST, "LEASE_LOST", "Lease is no longer valid.", 409, "none", "provider"
                 )
+            # A Worker executing a long-running task reports through the Attempt
+            # heartbeat path instead of the idle lease-poll heartbeat. Treat that
+            # authenticated, fenced activity as Worker liveness as well.
+            conn.execute(
+                "UPDATE workers SET last_seen_at=?,updated_at=? WHERE id=?",
+                (stamp, stamp, worker_id),
+            )
             if lease["task_state"] == "cancelled":
                 # A running cancellation is a two-phase terminal transition:
                 # keep the exact fenced lease alive long enough for the Worker
@@ -6000,7 +6229,13 @@ class GatewayRepository:
                 user_id=user_id,
             )
         else:
-            self.require_member(task["workspace_id"], user_id)
+            self.require_task_consumer(
+                task,
+                principal_type=principal_type,
+                principal_id=principal_id,
+                user_id=user_id,
+                allow_workspace_admin=True,
+            )
         value = row_dict(task, json_columns={"public_requirements"})
         # Deliberately omit encrypted payloads and key envelopes from ordinary metadata reads.
         value.pop("encrypted_payload", None)
@@ -6032,15 +6267,19 @@ class GatewayRepository:
         state: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        member = None
         if principal_type == "service":
             self.require_service(workspace_id, principal_id)
         else:
-            self.require_member(workspace_id, user_id)
+            member = self.require_member(workspace_id, user_id)
         sql = "SELECT * FROM tasks WHERE workspace_id=?"
         args: list[Any] = [workspace_id]
         if principal_type == "service":
             sql += " AND consumer_principal_type='service' AND consumer_principal_id=?"
             args.append(principal_id)
+        elif member is not None and member["role"] == "member":
+            sql += " AND consumer_user_id=?"
+            args.append(user_id)
         if state:
             sql += " AND state=?"
             args.append(state)
@@ -6053,6 +6292,123 @@ class GatewayRepository:
             value.pop("reader_envelope", None)
             values.append(value)
         return values
+
+    @staticmethod
+    def _encode_task_cursor(row: sqlite3.Row | dict[str, Any]) -> str:
+        return b64url_encode(
+            json_text({"created_at": float(row["created_at"]), "id": str(row["id"])}).encode()
+        )
+
+    @staticmethod
+    def _decode_task_cursor(cursor: str) -> tuple[float, str]:
+        try:
+            value = json.loads(b64url_decode(cursor).decode("utf-8"))
+            created_at = float(value["created_at"])
+            task_id = str(value["id"])
+            if set(value) != {"created_at", "id"} or not math.isfinite(created_at):
+                raise ValueError
+            if not task_id or len(task_id) > 120:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "TASK_CURSOR_INVALID",
+                "Task list cursor is invalid.",
+                422,
+            ) from exc
+        return created_at, task_id
+
+    def _task_list_summary(self, row: sqlite3.Row) -> dict[str, Any]:
+        consumer_name = row["consumer_display_name"] or row["consumer_service_name"]
+        value = {
+            "id": row["id"],
+            "state": row["state"],
+            "workflow_ref": row["workflow_ref"],
+            "executor_type": row["executor_type"],
+            "priority": int(row["priority"]),
+            "created_at": row["created_at"],
+            "committed_at": row["committed_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "submitted_by": {
+                "principal_type": row["consumer_principal_type"],
+                "principal_id": row["consumer_principal_id"],
+                "user_id": row["consumer_user_id"],
+                "display_name": consumer_name,
+            },
+            "worker": (
+                {"id": row["assigned_worker_id"], "name": row["worker_name"]}
+                if row["assigned_worker_id"]
+                else None
+            ),
+            "queue_position": self._task_queue_position(row),
+        }
+        return value
+
+    def list_task_page(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str | None,
+        principal_type: str = "device",
+        principal_id: str = "",
+        state: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        member = None
+        if principal_type == "service":
+            self.require_service(workspace_id, principal_id)
+        else:
+            member = self.require_member(workspace_id, user_id)
+        where = ["t.workspace_id=?"]
+        args: list[Any] = [workspace_id]
+        if principal_type == "service":
+            where.append("t.consumer_principal_type='service'")
+            where.append("t.consumer_principal_id=?")
+            args.append(principal_id)
+        elif member is not None and member["role"] == "member":
+            where.append("t.consumer_user_id=?")
+            args.append(user_id)
+        if state:
+            where.append("t.state=?")
+            args.append(state)
+        count_args = tuple(args)
+        total = int(
+            self.db.fetchone(
+                f"SELECT COUNT(*) AS n FROM tasks t WHERE {' AND '.join(where)}",
+                count_args,
+            )["n"]
+        )
+        if cursor:
+            created_at, task_id = self._decode_task_cursor(cursor)
+            where.append("(t.created_at<? OR (t.created_at=? AND t.id<?))")
+            args.extend((created_at, created_at, task_id))
+        page_limit = min(max(limit, 1), 100)
+        args.append(page_limit + 1)
+        rows = self.db.fetchall(
+            f"""SELECT t.*,u.display_name AS consumer_display_name,
+                       s.name AS consumer_service_name,w.name AS worker_name,
+                       (SELECT MIN(a.started_at) FROM task_attempts a
+                         WHERE a.task_id=t.id AND a.started_at IS NOT NULL) AS started_at
+                  FROM tasks t
+                  LEFT JOIN users u ON u.id=t.consumer_user_id
+                  LEFT JOIN services s ON s.id=t.consumer_principal_id
+                       AND t.consumer_principal_type='service'
+                  LEFT JOIN workers w ON w.id=t.assigned_worker_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY t.created_at DESC,t.id DESC LIMIT ?""",
+            tuple(args),
+        )
+        has_more = len(rows) > page_limit
+        visible = rows[:page_limit]
+        return {
+            "workspace_id": workspace_id,
+            "total": total,
+            "count": len(visible),
+            "items": [self._task_list_summary(row) for row in visible],
+            "next_cursor": self._encode_task_cursor(visible[-1]) if has_more and visible else None,
+        }
 
     def cancel_task(
         self,
@@ -6315,9 +6671,17 @@ class GatewayRepository:
                 ),
             )
             conn.execute(
-                "UPDATE tasks SET state='committed',updated_at=? WHERE id=?", (stamp, task_id)
+                """UPDATE tasks SET state='queued',reservation_expires_at=NULL,updated_at=?
+                   WHERE id=?""",
+                (stamp, task_id),
             )
-        return {"task_id": task_id, "state": "committed", "worker_id": replacement_worker_id}
+        queued = self.db.fetchone("SELECT * FROM tasks WHERE id=?", (task_id,))
+        return {
+            "task_id": task_id,
+            "state": "queued",
+            "worker_id": replacement_worker_id,
+            "queue_position": self._task_queue_position(queued),
+        }
 
     def reader_envelope(
         self,

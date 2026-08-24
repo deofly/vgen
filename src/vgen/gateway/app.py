@@ -2055,6 +2055,18 @@ def create_app(
     def list_workspaces(principal: Principal = Depends(user_principal)) -> list[dict[str, Any]]:
         return repository.list_workspaces(principal.user_id)
 
+    @app.get("/api/v1/workspaces/{workspace_id}/members", tags=["workspace"])
+    def list_workspace_members(
+        workspace_id: str,
+        include_revoked: bool = False,
+        principal: Principal = Depends(user_principal),
+    ) -> dict[str, Any]:
+        return repository.list_workspace_members(
+            workspace_id=workspace_id,
+            user_id=principal.user_id,
+            include_revoked=include_revoked,
+        )
+
     def validate_workspace_key_grant(
         *,
         workspace_id: str,
@@ -2942,6 +2954,26 @@ def create_app(
             principal_type=principal.principal_type,
             principal_id=principal.principal_id,
             **data,
+        )
+
+    @app.get("/api/v1/tasks/page", tags=["task"])
+    def list_task_page(
+        workspace_id: str,
+        principal: Principal = Depends(task_principal),
+        state: str | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        if principal.principal_type == "service":
+            require_scope(principal, "task:read")
+        return repository.list_task_page(
+            workspace_id=workspace_id,
+            user_id=principal.user_id,
+            principal_type=principal.principal_type,
+            principal_id=principal.principal_id,
+            state=state,
+            limit=limit,
+            cursor=cursor,
         )
 
     @app.get("/api/v1/tasks/{task_id}", tags=["task"])

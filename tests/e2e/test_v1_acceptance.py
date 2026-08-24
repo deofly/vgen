@@ -432,7 +432,7 @@ def _commit_encrypted_payload(
         headers=actor.headers,
     )
     assert response.status_code == 200, response.text
-    assert response.json()["state"] == "committed"
+    assert response.json()["state"] == "queued"
     return key
 
 

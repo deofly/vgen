@@ -5,6 +5,7 @@ import getpass
 import hashlib
 import json
 import os
+import shlex
 import sys
 import time
 import uuid
@@ -985,6 +986,17 @@ def _workspace_command(args: argparse.Namespace) -> None:
             _json(workspace)
         elif args.workspace_action == "list":
             _json(client.request("GET", "/api/v1/workspaces"))
+        elif args.workspace_action in {"member-list", "user-list"}:
+            workspace_id = args.workspace or profile.default_workspace
+            if not workspace_id:
+                raise ValueError("workspace is required")
+            _json(
+                client.request(
+                    "GET",
+                    f"/api/v1/workspaces/{workspace_id}/members",
+                    params={"include_revoked": True} if args.include_revoked else None,
+                )
+            )
         elif args.workspace_action == "pool-create":
             workspace_id = args.workspace or profile.default_workspace
             if not workspace_id:
@@ -2356,6 +2368,14 @@ _PREFLIGHT_MESSAGES = {
         "当前有匹配的 Worker 和已审批费率，可以提交任务。",
         'vgen task submit "描述你想生成的视频" --wait',
     ),
+    "queue_available": (
+        "匹配的 Worker 正忙；仍可提交，任务会进入执行队列。",
+        'vgen task submit "描述你想生成的视频" --wait',
+    ),
+    "queue_full": (
+        "匹配 Worker 的等待队列已满。",
+        "请等待已有任务完成后重新预检。",
+    ),
     "no_allocated_worker": (
         "这个资源池还没有已授权的 Worker。",
         "请 Workspace 管理员先邀请或分配 Worker 到该资源池。",
@@ -2715,7 +2735,10 @@ def _print_task_update(task: Mapping[str, Any], display: dict[str, Any]) -> None
     stage_changed = stage != display["stage"]
     if not stage_changed and percent < previous_percent + 2 and percent != 100:
         return
-    print(f"{_task_progress_label(stage)}：{percent}%", file=sys.stderr)
+    if stage.startswith("node:"):
+        print("生成处理中：当前节点暂无细分进度", file=sys.stderr)
+    else:
+        print(f"{_task_progress_label(stage)}：{percent}%", file=sys.stderr)
     display["stage"] = stage
     display["percent"] = percent
 
@@ -2897,9 +2920,42 @@ def _task_command(args: argparse.Namespace) -> None:
                 )
             )
         elif args.task_action == "list":
-            _json(
-                client.list_tasks(workspace_id=args.workspace or client.profile.default_workspace)
+            workspace_id = args.workspace or client.profile.default_workspace
+            if not workspace_id:
+                raise ValueError("task list requires a default Workspace or --workspace")
+            page = client.list_task_page(
+                workspace_id=workspace_id,
+                limit=args.limit,
+                cursor=args.cursor,
+                state=args.state,
             )
+            page["items"] = [
+                {
+                    **item,
+                    "show_command": shlex.join(
+                        ["vgen", "task", "show", str(item["id"])]
+                        + (["--profile", args.profile] if args.profile else [])
+                    ),
+                }
+                for item in page.get("items", [])
+            ]
+            next_args = [
+                "vgen",
+                "task",
+                "list",
+                "--cursor",
+                str(page["next_cursor"]),
+                "--limit",
+                str(args.limit),
+            ]
+            if args.workspace:
+                next_args.extend(("--workspace", args.workspace))
+            if args.state:
+                next_args.extend(("--state", args.state))
+            if args.profile:
+                next_args.extend(("--profile", args.profile))
+            page["next"] = shlex.join(next_args) if page.get("next_cursor") else None
+            _json(page)
         elif args.task_action == "cancel":
             _json(client.close_task(args.task_id))
         elif args.task_action == "retry":
@@ -3109,6 +3165,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "capacity": "Worker 可同时执行的任务数。",
     "check": "只检查是否存在新版本，不执行安装。",
     "code": "Worker 屏幕显示的短验证码，用于人工核对公钥。",
+    "cursor": "上一页返回的不透明翻页游标。",
     "comfy_model_root": "ComfyUI 模型目录；用于模型校验和维护。",
     "comfy_output_dir": "ComfyUI 输出目录。",
     "comfy_policy_file": "本机管理员审核过的 ComfyUI 图白名单文件。",
@@ -3133,6 +3190,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "generate_identity": "为 Worker 新生成独立密钥。",
     "idempotency_key": "幂等键；网络重试时复用同一值可避免重复创建或计费。",
     "identity": "本地用户身份别名，默认使用当前 Profile 配置。",
+    "include_revoked": "同时显示已撤销的 Workspace 成员。",
     "identity_account": "Worker 身份在系统凭据存储中的账户名。",
     "identity_file": "Worker 私钥文件路径；应限制为仅当前用户可读。",
     "image": "首帧图片路径；不指定图片时执行文生视频。",
@@ -3214,6 +3272,13 @@ _OPTION_HELP: dict[str, str] = {
 }
 
 
+_COMMAND_ARGUMENT_HELP: dict[tuple[str, ...], str] = {
+    ("task", "list", "state"): (
+        "按任务状态筛选，例如 queued、running、succeeded 或 failed。"
+    ),
+}
+
+
 class _VGenHelpFormatter(argparse.RawDescriptionHelpFormatter):
     def _get_help_string(self, action: argparse.Action) -> str:
         help_text = action.help or ""
@@ -3273,9 +3338,13 @@ def _enhance_cli_help(parser: argparse.ArgumentParser) -> None:
                 (_OPTION_HELP[option] for option in action.option_strings if option in _OPTION_HELP),
                 None,
             )
-            action.help = option_help or _ARGUMENT_HELP.get(
-                action.dest,
-                f"设置 {action.dest.replace('_', '-')}。",
+            action.help = (
+                option_help
+                or _COMMAND_ARGUMENT_HELP.get((*path, action.dest))
+                or _ARGUMENT_HELP.get(
+                    action.dest,
+                    f"设置 {action.dest.replace('_', '-')}。",
+                )
             )
 
     parser.description = "VGen：通过 Gateway 安全共享 GPU Worker，并使用端到端加密提交生成任务。"
@@ -3423,6 +3492,24 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--profile")
     listing = workspace_sub.add_parser("list")
     listing.add_argument("--profile")
+    member_list = workspace_sub.add_parser(
+        "member-list",
+        help="list Workspace users, current activity, queued tasks, and Worker usage",
+    )
+    member_list.add_argument("--workspace", help="Workspace ID; defaults to the Profile binding")
+    member_list.add_argument(
+        "--include-revoked", action="store_true", help="include revoked memberships"
+    )
+    member_list.add_argument("--profile", help="local Profile to use")
+    user_list = workspace_sub.add_parser(
+        "user-list",
+        help="alias for member-list: show Workspace users and current activity",
+    )
+    user_list.add_argument("--workspace", help="Workspace ID; defaults to the Profile binding")
+    user_list.add_argument(
+        "--include-revoked", action="store_true", help="include revoked memberships"
+    )
+    user_list.add_argument("--profile", help="local Profile to use")
     pool_create = workspace_sub.add_parser("pool-create")
     pool_create.add_argument("name")
     pool_create.add_argument("--workspace")
@@ -3805,9 +3892,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_get.add_argument("--output-dir", default=".")
     task_get.add_argument("--overwrite", action="store_true")
     task_get.add_argument("--profile")
-    task_list = task_sub.add_parser("list")
-    task_list.add_argument("--workspace")
-    task_list.add_argument("--profile")
+    task_list = task_sub.add_parser(
+        "list", help="show a short paginated task history; use task show for details"
+    )
+    task_list.add_argument("--workspace", help="Workspace ID; defaults to the Profile binding")
+    task_list.add_argument("--state", help="only show tasks in this state")
+    task_list.add_argument("--limit", type=int, default=20, help="summary rows per page (1-100)")
+    task_list.add_argument("--cursor", help="opaque next-page cursor returned by the prior page")
+    task_list.add_argument("--profile", help="local Profile to use")
     watch = task_sub.add_parser("watch")
     watch.add_argument("task_id")
     watch.add_argument("--interval", type=float, default=2)

@@ -2067,6 +2067,8 @@
             "enum": [
               "no_allocated_worker",
               "worker_offline_or_busy",
+              "queue_available",
+              "queue_full",
               "capability_mismatch",
               "rate_not_approved",
               "ready"
@@ -6694,6 +6696,139 @@
         ]
       }
     },
+    "/api/v1/tasks/page": {
+      "get": {
+        "operationId": "list_task_page_api_v1_tasks_page_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/VgenProtocolVersion"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Task Page Api V1 Tasks Page Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Opaque request correlation identifier.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/VGenError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/VGenError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/VGenError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/VGenError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/VGenError409"
+          },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
+          "422": {
+            "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/VGenError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/VGenError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/VGenError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/VGenError504"
+          },
+          "507": {
+            "$ref": "#/components/responses/VGenError507"
+          }
+        },
+        "security": [
+          {
+            "VGenSession": []
+          }
+        ],
+        "summary": "List Task Page",
+        "tags": [
+          "task"
+        ]
+      }
+    },
     "/api/v1/tasks/preflight": {
       "post": {
         "operationId": "preflight_task_api_v1_tasks_preflight_post",
@@ -10653,6 +10788,105 @@
           "Content-Digest",
           "Signature-Input",
           "Signature"
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/members": {
+      "get": {
+        "operationId": "list_workspace_members_api_v1_workspaces__workspace_id__members_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_revoked",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Revoked",
+              "type": "boolean"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/VgenProtocolVersion"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Workspace Members Api V1 Workspaces  Workspace Id  Members Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Opaque request correlation identifier.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/VGenError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/VGenError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/VGenError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/VGenError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/VGenError409"
+          },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
+          "422": {
+            "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/VGenError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/VGenError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/VGenError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/VGenError504"
+          },
+          "507": {
+            "$ref": "#/components/responses/VGenError507"
+          }
+        },
+        "security": [
+          {
+            "VGenSession": []
+          }
+        ],
+        "summary": "List Workspace Members",
+        "tags": [
+          "workspace"
         ]
       }
     },

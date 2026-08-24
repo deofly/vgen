@@ -52,7 +52,7 @@ TASK_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
         {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.REKEY_REQUIRED}
     ),
     TaskState.REKEY_REQUIRED: frozenset(
-        {TaskState.RESERVED, TaskState.CANCELLED, TaskState.EXPIRED}
+        {TaskState.QUEUED, TaskState.RESERVED, TaskState.CANCELLED, TaskState.EXPIRED}
     ),
     TaskState.SUCCEEDED: frozenset(),
     TaskState.FAILED: frozenset(),

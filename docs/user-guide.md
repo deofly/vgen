@@ -340,6 +340,16 @@ If approval was pending, the joining Mac resumes without reusing the invite:
 vgen join --resume
 ```
 
+Workspace Owners and Admins can inspect member counts, roles, recent activity,
+queued tasks, and which user currently occupies each Worker:
+
+```bash
+vgen workspace member-list
+```
+
+Regular Members cannot read the full roster. Add `--include-revoked` only when
+an administrator needs revoked membership records for diagnostics.
+
 ## 5. Windows Worker and ComfyUI
 
 ### 5.1 Install and enroll
@@ -489,8 +499,9 @@ vgen task preflight
 ```
 
 Preflight creates no Task or Attempt, reserves no Worker, uploads no media, and
-incurs no usage. It distinguishes offline, busy, maintenance, allocation,
-capability, model, memory, and rate problems.
+incurs no usage. It distinguishes immediately ready, queue available, queue
+full, offline, maintenance, allocation, capability, model, memory, and rate
+problems.
 
 Text-to-video:
 
@@ -520,6 +531,26 @@ vgen task submit "A smooth push-in with continuous motion" \
 open the absolute output path, play the file, and verify the requested 0/1/2
 image semantics and visual quality. Existing different files are preserved with
 safe suffixes unless `--overwrite` is explicitly supplied.
+
+When a Worker's concurrency capacity is full, a new Task enters that Worker's
+bounded queue instead of failing immediately. At most 100 unfinished Tasks are
+kept per Worker. Higher priority runs first; equal priority is FIFO. Capacity is
+checked again when leasing, so a capacity-one ComfyUI Worker never runs two
+generations concurrently.
+
+Task history defaults to 20 compact rows. Owners/Admins see the Workspace
+history; regular Members see only their own Tasks. Follow `next` for another
+page and use the per-row `show_command` for full Attempt, progress, and artifact
+metadata:
+
+```bash
+vgen task list
+vgen task list --limit 20 --cursor <next_cursor>
+vgen task list --state queued
+vgen task show <task_id>
+```
+
+A Member cannot use another user's Task ID to bypass this list restriction.
 
 ## 8. Removing Workers and devices
 

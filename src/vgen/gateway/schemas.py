@@ -603,6 +603,8 @@ class TaskPreflightResult(WireModel):
     state: Literal[
         "no_allocated_worker",
         "worker_offline_or_busy",
+        "queue_available",
+        "queue_full",
         "capability_mismatch",
         "rate_not_approved",
         "ready",

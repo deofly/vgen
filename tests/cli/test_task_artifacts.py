@@ -87,7 +87,12 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
     assert worker.once is True
 
     retry = parser.parse_args(["task", "retry", "tsk_example"])
+    show = parser.parse_args(["task", "show", "tsk_example"])
     get = parser.parse_args(["task", "get", "tsk_example", "--output-dir", "results"])
+    listing = parser.parse_args(
+        ["task", "list", "--limit", "10", "--cursor", "cursor-example", "--state", "queued"]
+    )
+    members = parser.parse_args(["workspace", "member-list", "--include-revoked"])
     submit = parser.parse_args(
         [
             "task",
@@ -99,7 +104,13 @@ def test_cli_exposes_worker_and_encrypted_task_lifecycle() -> None:
         ]
     )
     assert retry.task_action == "retry"
+    assert show.task_action == "show"
     assert get.task_action == "get"
+    assert listing.limit == 10
+    assert listing.cursor == "cursor-example"
+    assert listing.state == "queued"
+    assert members.workspace_action == "member-list"
+    assert members.include_revoked is True
     assert submit.pool is None
     assert submit.wait is True
     assert submit.output_dir == "results"
@@ -213,6 +224,15 @@ def test_wait_for_task_returns_only_after_terminal_state(monkeypatch, capsys) ->
                         "attempts": [
                             {
                                 "id": "atm_example",
+                                "progress": {"fraction": 0.1, "stage": "node:10"},
+                            }
+                        ],
+                    },
+                    {
+                        "state": "running",
+                        "attempts": [
+                            {
+                                "id": "atm_example",
                                 "progress": '{"fraction":0.34,"stage":"sampling"}',
                             }
                         ],
@@ -264,6 +284,8 @@ def test_wait_for_task_returns_only_after_terminal_state(monkeypatch, capsys) ->
     assert "准备输入：8%" in status
     assert "生成采样：34%" in status
     assert "生成采样：35%" not in status
+    assert "生成处理中：当前节点暂无细分进度" in status
+    assert "生成处理：10%" not in status
     assert "生成采样：57%" in status
     assert "上传结果：100%" in status
 

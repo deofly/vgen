@@ -119,6 +119,7 @@ class ProtocolModelTest(unittest.TestCase):
 
     def test_state_machines_reject_terminal_or_skipped_transitions(self) -> None:
         self.assertTrue(can_transition_task(TaskState.PREPARED, TaskState.COMMITTED))
+        self.assertTrue(can_transition_task(TaskState.REKEY_REQUIRED, TaskState.QUEUED))
         self.assertFalse(can_transition_task(TaskState.PREPARED, TaskState.RUNNING))
         self.assertTrue(can_transition_attempt(AttemptState.LEASED, AttemptState.RUNNING))
         with self.assertRaises(VGenError) as caught:
