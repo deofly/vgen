@@ -247,6 +247,7 @@ def test_model_failures_use_dedicated_maintenance_codes(
         ("CAPABILITY_COMPILE_INVALID", ErrorCode.CAPABILITY_COMPILE_INVALID),
         ("CAPABILITY_GRAPH_INVALID", ErrorCode.CAPABILITY_GRAPH_INVALID),
         ("CAPABILITY_NODE_APPROVAL_MISMATCH", ErrorCode.MAINTENANCE_POLICY_DENIED),
+        ("CAPABILITY_PUBLISHER_PIN_MISMATCH", ErrorCode.MAINTENANCE_POLICY_DENIED),
     ],
 )
 def test_capability_failures_use_dedicated_maintenance_codes(

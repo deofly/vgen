@@ -106,13 +106,24 @@ class WorkerCapabilityStore:
         expected_digest = workflow_digest.removeprefix("sha256:")
         try:
             with tempfile.TemporaryDirectory(prefix="vgen-capability-verify-") as temporary:
-                registry = WorkflowRegistry(Path(temporary) / "registry")
-                installed = registry.install(
+                # A Worker capability is not a user-facing registry install.
+                # Validate the uploaded archive directly in one bounded staging
+                # directory instead of copying it through a temporary registry
+                # and adding workflow.lock.  Besides avoiding unnecessary I/O,
+                # this keeps activation identical on Windows and POSIX.
+                unpacked = WorkflowRegistry._materialize(  # noqa: SLF001
                     archive,
-                    allow_unsigned=allow_unsigned,
-                    expected_digest=workflow_digest,
-                    expected_publisher_key=publisher_key,
+                    Path(temporary),
                 )
+                manifest, digest, signed = validate_package(
+                    unpacked,
+                    allow_unsigned=allow_unsigned,
+                )
+                if publisher_key is not None and (
+                    not signed or manifest.publisher.public_key != publisher_key
+                ):
+                    raise CapabilityInstallError("CAPABILITY_PUBLISHER_PIN_MISMATCH")
+                installed = InstallResult(manifest, unpacked, digest, signed)
                 actual_ref = f"{installed.manifest.id}@{installed.manifest.version}"
                 if actual_ref != workflow_ref or installed.digest != expected_digest:
                     raise CapabilityInstallError("CAPABILITY_BINDING_MISMATCH")

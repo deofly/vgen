@@ -67,6 +67,7 @@ def test_unsigned_release_requires_explicit_owner_authorization_and_activates_at
     )
 
     assert activated.status == "activated"
+    assert not (activated.path / "workflow.lock").exists()
     assert repeated.status == "already_active"
     assert [f"{item.manifest.id}@{item.manifest.version}" for item in store.active()] == [
         "vgen/minimax-h3-8step@1.0.0"
@@ -83,7 +84,7 @@ def test_release_binding_mismatch_never_changes_active_generation(tmp_path: Path
     archive = build_archive(workflow, tmp_path / "h3.zip", allow_unsigned=True)
     store = WorkerCapabilityStore(tmp_path / "capabilities")
 
-    with pytest.raises(CapabilityInstallError, match="CAPABILITY_ARCHIVE_INVALID"):
+    with pytest.raises(CapabilityInstallError, match="CAPABILITY_BINDING_MISMATCH"):
         store.activate(
             archive,
             workflow_ref="vgen/minimax-h3-8step@1.0.0",

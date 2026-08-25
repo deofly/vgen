@@ -1030,7 +1030,10 @@ def _capability_error_code(reason: str) -> int:
         return int(ErrorCode.DOWNLOAD_INTERRUPTED)
     if any(item in reason for item in ("ROOT", "INDEX", "RELEASE_CONFLICT", "PATH")):
         return int(ErrorCode.PATH_CONFLICT)
-    if any(item in reason for item in ("NODE_APPROVAL", "REJECTED", "INTENT", "TICKET")):
+    if any(
+        item in reason
+        for item in ("NODE_APPROVAL", "PUBLISHER_PIN", "REJECTED", "INTENT", "TICKET")
+    ):
         return int(ErrorCode.MAINTENANCE_POLICY_DENIED)
     if "CONTAINS_EXECUTABLE_CONTENT" in reason:
         return int(ErrorCode.CAPABILITY_EXECUTABLE_CONTENT)
