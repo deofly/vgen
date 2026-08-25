@@ -1984,46 +1984,6 @@ def _refresh_owned_worker(client: GatewayClient, worker_id: str) -> dict[str, An
     return matches[0]
 
 
-def _accepted_model_licenses(
-    models: list[Any],
-    accepted: list[str],
-    *,
-    accepted_at: int,
-) -> list[dict[str, Any]]:
-    required = {str(model.license) for model in models}
-    supplied = set(accepted)
-    unexpected = supplied - required
-    if unexpected:
-        raise ValueError(
-            "--accept-license contains a license not required by the selected models: "
-            + ", ".join(sorted(unexpected))
-        )
-    missing = sorted(required - supplied)
-    if missing and not sys.stdin.isatty():
-        flags = " ".join(f"--accept-license {item}" for item in missing)
-        raise ValueError(f"explicit model license acceptance is required: {flags}")
-    for license_id in missing:
-        print(f"模型许可证：{license_id}", file=sys.stderr)
-        confirmation = input(f"请输入完整许可证标识 `{license_id}` 以确认接受：").strip()
-        if confirmation != license_id:
-            raise ValueError(f"license acceptance was not confirmed for {license_id}")
-        supplied.add(license_id)
-    acceptances: list[dict[str, Any]] = []
-    for model in models:
-        revision = str(model.revision or "")
-        if not revision:
-            raise ValueError("model installation requires an immutable model revision")
-        acceptances.append(
-            {
-                "model_digest": "sha256:" + str(model.sha256),
-                "license_id": str(model.license),
-                "revision": revision,
-                "accepted_at": accepted_at,
-            }
-        )
-    return acceptances
-
-
 def _unique_model_requirements(models: Sequence[Any]) -> list[Any]:
     """Collapse shared content placements to one signed model request."""
 
@@ -2262,22 +2222,11 @@ def _apply_model_install(
         f"将安装 {len(missing)} 个缺失模型，共 {total_bytes / 1_000_000_000:.2f} GB。",
         file=sys.stderr,
     )
-    print(
-        "需要接受的模型许可证：" + "、".join(sorted({model.license for model in missing})),
-        file=sys.stderr,
-    )
-    accepted_at = int(time.time())
-    acceptances = _accepted_model_licenses(
-        missing,
-        args.accept_license,
-        accepted_at=accepted_at,
-    )
     spec = {
         "kind": "model_install",
         "workflow_ref": workflow_ref,
         "workflow_digest": workflow_digest,
         "model_digests": ["sha256:" + model.sha256 for model in missing],
-        "license_acceptances": acceptances,
     }
     _, identity = _profile_and_identity(client.profile.name)
     created = _create_maintenance_job(
@@ -2466,7 +2415,6 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
             workflow=workflow_ref,
             worker=args.worker,
             broker=args.broker,
-            accept_license=args.accept_license,
             wait=args.wait,
             interval=args.interval,
             timeout=args.timeout,
@@ -2574,7 +2522,6 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
         workflow=workflow_ref,
         worker=args.worker,
         broker=args.broker,
-        accept_license=args.accept_license,
         wait=args.wait,
         interval=args.interval,
         timeout=args.timeout,
@@ -4184,7 +4131,6 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
 
 _ARGUMENT_HELP: dict[str, str] = {
     "accept_legacy_tofu": "跳过交互确认并接受屏幕显示的旧版 Owner 公钥；仅限已人工核对时使用。",
-    "accept_license": "接受模型要求的许可证标识；多个许可证可重复传入。",
     "alias": "本地身份别名，默认使用 default。",
     "allocation_id": "待批准的 Worker allocation ID。",
     "allow_http": "允许连接明文 HTTP Gateway；仅建议本机测试使用。",
@@ -4738,13 +4684,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broker_models.add_argument("--worker", help="owned Worker name or ID; automatic when unique")
     broker_models.add_argument("--broker", help="Broker ID; defaults to this profile's Home Broker")
-    broker_models.add_argument(
-        "--accept-license",
-        action="append",
-        default=[],
-        metavar="LICENSE",
-        help="accept a required model license; repeat for each distinct license",
-    )
     broker_models.add_argument("--wait", action="store_true")
     broker_models.add_argument("--interval", type=float, default=2)
     broker_models.add_argument("--timeout", type=float, default=86_400)
@@ -4759,13 +4698,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broker_workflow.add_argument(
         "--broker", help="Broker ID; defaults to this profile's Home Broker"
-    )
-    broker_workflow.add_argument(
-        "--accept-license",
-        action="append",
-        default=[],
-        metavar="LICENSE",
-        help="accept a required model license; repeat for each distinct license",
     )
     broker_workflow.add_argument(
         "--approve-nodes",

@@ -491,8 +491,11 @@ vgen broker model-install vgen/minimax-h3-8step \
   --worker "Windows GPU Worker" --wait
 ```
 
-Review and accept the displayed licenses. Downloads resume safely and install
-only after source revision, path, size, and SHA-256 all match. Inspect or cancel:
+The CLI creates the install job directly; there is no license prompt or
+`--accept-license` option. License fields in workflow manifests are read-only
+publication metadata and are not part of remote authorization. Downloads resume
+safely and install only after source revision, path, size, and SHA-256 all match.
+Inspect or cancel:
 
 ```bash
 vgen broker maintenance-list --worker "Windows GPU Worker"
@@ -524,7 +527,6 @@ vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
   --worker "Windows GPU Worker" \
   --approve-nodes \
   --allow-unsigned \
-  --accept-license LicenseRef-LTX-2.x-Community \
   --wait
 ```
 
@@ -717,8 +719,9 @@ new one has completed recovery, key sync, Broker binding, and a real task test.
   one-to-one channel.
 - Keep the OSS bucket private and keep task media off the ECS system disk.
 - Expose only HTTPS 80/443. Keep Gateway `8010` and ComfyUI `8188` private.
-- Install only reviewed workflow packages, model licenses, Executors, and
-  ComfyUI custom nodes.
+- Install only reviewed workflow packages, model sources, Executors, and
+  ComfyUI custom nodes. VGen does not decide whether your model use is legally
+  permitted.
 - Remember that E2EE protects task payloads and media, not scheduling metadata.
   The selected Worker necessarily sees task plaintext while executing it.
 

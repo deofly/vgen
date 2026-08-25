@@ -342,10 +342,11 @@ maintenance intent。Worker 在私有 staging 中重新验证这些绑定，只�
 验证失败不会移除旧 H3 policy 或其他已激活工作流。第三方 custom-node 代码仍是单独的机器管理员
 边界，当前不会远程自动安装。
 
-模型只在 manifest 中记录 source、immutable revision、SHA-256、size、license、`gated` 和
-`manual_download`。Broker 发起 `model-install` 时，Worker 仍以机器管理员本地 policy 为最终
-授权；remote spec 不能覆盖 source、目标路径或许可证。`manual_download` model 不得自动下载；
-gated model 只读取 Worker 本机 `HF_TOKEN`/`HF_TOKEN_PATH`，credential 不进入 Gateway spec。
+模型在 manifest 中记录 source、immutable revision、SHA-256、size、`gated`、
+`manual_download`，并可保留 license 作为只读发布元数据。VGen 不收集或验证用户的许可证
+接受记录。Broker 发起 `model-install` 时，Worker 仍以机器管理员本地 policy 为最终授权；
+remote spec 不能覆盖 source 或目标路径。`manual_download` model 不得自动下载；gated model
+只读取 Worker 本机 `HF_TOKEN`/`HF_TOKEN_PATH`，credential 不进入 Gateway spec。
 权重按 digest 存入共享 CAS，再用只读硬链接 materialize 到每个工作流 placement；同 digest
 只下载一次，但 readiness 仍逐工作流、逐 placement 验证。每次复用前重新核对 size/SHA-256，
 不允许一个被改写的共享 inode 静默扩散到新 placement。
@@ -528,7 +529,7 @@ Worker 的线上格式。
 | L5 product | 真实 workflow/material | 人工质量检查 |
 
 Executor 变更至少覆盖输入隔离、进度、取消、timeout、OOM、缺依赖、lease loss、stale fencing、
-上传恢复和每 Attempt 用量。维护变更至少覆盖签名/manager 篡改、许可证、私网/重定向 source、
+上传恢复和每 Attempt 用量。维护变更至少覆盖签名/manager 篡改、受限凭据、私网/重定向 source、
 断点续传、磁盘不足、路径冲突、digest mismatch、更新降级、激活失败回滚和 late completion。
 
 MiniMax H3 必须在真实 GPU 分别执行 0/1/2 图，检查实际 `/upload/image`、`/prompt`、WebSocket/

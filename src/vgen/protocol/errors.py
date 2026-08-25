@@ -120,7 +120,6 @@ class ErrorCode(IntEnum):
     ARTIFACT_INTEGRITY_FAILED = 330004
 
     # 34xxxx: Worker maintenance / model delivery / runtime update
-    LICENSE_APPROVAL_REQUIRED = 340001
     SOURCE_NOT_ALLOWED = 340002
     DISK_SPACE_INSUFFICIENT = 340003
     PATH_CONFLICT = 340004
@@ -565,13 +564,6 @@ _ERROR_SPECS = (
         422,
         ErrorOrigin.STORAGE,
         responsibility=Responsibility.PLATFORM,
-    ),
-    _spec(
-        ErrorCode.LICENSE_APPROVAL_REQUIRED,
-        "The required model license has not been accepted exactly.",
-        409,
-        ErrorOrigin.WORKER,
-        responsibility=Responsibility.CONSUMER,
     ),
     _spec(
         ErrorCode.SOURCE_NOT_ALLOWED,

@@ -352,21 +352,6 @@ class WorkerUpdateSpec(WireModel):
     apply: Literal["on_idle"] = "on_idle"
 
 
-class ModelLicenseAcceptance(WireModel):
-    model_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    license_id: str = Field(
-        min_length=1,
-        max_length=256,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._+:/()@-]{0,255}$",
-    )
-    revision: str = Field(
-        min_length=1,
-        max_length=256,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,255}$",
-    )
-    accepted_at: int = Field(ge=1)
-
-
 class ModelInstallSpec(WireModel):
     kind: Literal["model_install"]
     workflow_ref: str = Field(
@@ -376,7 +361,6 @@ class ModelInstallSpec(WireModel):
     )
     workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     model_digests: list[str] = Field(min_length=1, max_length=128)
-    license_acceptances: list[ModelLicenseAcceptance] = Field(min_length=1, max_length=128)
 
     @field_validator("model_digests")
     @classmethod
@@ -386,14 +370,6 @@ class ModelInstallSpec(WireModel):
         ):
             raise ValueError("model digests must be unique canonical SHA-256 values")
         return value
-
-    @model_validator(mode="after")
-    def every_model_has_one_exact_license_acceptance(self) -> ModelInstallSpec:
-        accepted = [item.model_digest for item in self.license_acceptances]
-        if len(accepted) != len(set(accepted)) or set(accepted) != set(self.model_digests):
-            raise ValueError("each model digest needs exactly one license acceptance")
-        return self
-
 
 class CapabilityInstallSpec(WireModel):
     kind: Literal["capability_install"]

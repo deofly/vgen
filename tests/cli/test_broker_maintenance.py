@@ -239,7 +239,6 @@ def test_model_install_rejects_known_insufficient_vram_before_download(
                 workflow="vgen/ltx-2.5-distilled-t2v@1.0.0",
                 worker=None,
                 broker=None,
-                accept_license=["LicenseRef-LTX-2.x-Community"],
                 wait=False,
                 interval=0.01,
                 timeout=1,
@@ -328,11 +327,8 @@ def test_parser_exposes_simple_broker_maintenance_commands() -> None:
     assert update.worker is None
     assert update.wait is True
 
-    models = build_parser().parse_args(
-        ["broker", "model-install", "--accept-license", "Apache-2.0"]
-    )
+    models = build_parser().parse_args(["broker", "model-install"])
     assert models.workflow == "vgen/minimax-h3-8step"
-    assert models.accept_license == ["Apache-2.0"]
 
     workflow = build_parser().parse_args(
         [
@@ -473,7 +469,7 @@ def test_worker_upgrade_is_idempotent_when_worker_already_reports_stable(
     assert client.created == []
 
 
-def test_model_install_only_sends_missing_digests_and_license_acceptances(
+def test_model_install_only_sends_missing_digests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identity = _identity()
@@ -520,7 +516,6 @@ def test_model_install_only_sends_missing_digests_and_license_acceptances(
             workflow="vgen/minimax-h3-8step",
             worker=None,
             broker=None,
-            accept_license=["Apache-2.0"],
             wait=False,
             interval=0.01,
             timeout=1,
@@ -534,10 +529,8 @@ def test_model_install_only_sends_missing_digests_and_license_acceptances(
         "workflow_ref",
         "workflow_digest",
         "model_digests",
-        "license_acceptances",
     }
     assert spec["model_digests"] == [f"sha256:{missing.sha256}"]
-    assert spec["license_acceptances"][0]["license_id"] == "Apache-2.0"
     serialized = json.dumps(spec)
     assert "source" not in serialized
     assert "filename" not in serialized
@@ -612,7 +605,6 @@ def test_workflow_install_uploads_reviewed_pack_then_requests_only_reported_mode
             workflow=workflow_ref,
             worker=None,
             broker=None,
-            accept_license=["LicenseRef-LTX-2-Community"],
             approve_nodes=True,
             allow_unsigned=True,
             wait=False,
@@ -638,9 +630,6 @@ def test_workflow_install_uploads_reviewed_pack_then_requests_only_reported_mode
     models = client.created[1]["spec"]
     assert models["kind"] == "model_install"
     assert models["model_digests"] == [model_digest]
-    assert models["license_acceptances"][0]["license_id"] == (
-        "LicenseRef-LTX-2-Community"
-    )
     serialized = json.dumps(client.created)
     assert "HF_TOKEN" not in serialized
     assert "Bearer " not in serialized
@@ -671,7 +660,6 @@ def test_workflow_install_requires_upgraded_worker_before_local_packaging(
                 workflow="vgen/ltx-2.5-distilled-t2v@1.0.0",
                 worker=None,
                 broker=None,
-                accept_license=[],
                 approve_nodes=True,
                 allow_unsigned=True,
                 wait=False,
@@ -728,7 +716,6 @@ def test_workflow_install_skips_upload_when_exact_release_is_already_ready(
             workflow=workflow_ref,
             worker=None,
             broker=None,
-            accept_license=[],
             approve_nodes=False,
             allow_unsigned=False,
             wait=False,

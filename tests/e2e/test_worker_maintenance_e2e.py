@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -218,14 +217,6 @@ def test_broker_model_job_runs_through_gateway_and_worker_with_pinned_trust(
             "workflow_ref": workflow_ref,
             "workflow_digest": workflow_digest,
             "model_digests": [model_digest],
-            "license_acceptances": [
-                {
-                    "model_digest": model_digest,
-                    "license_id": "Apache-2.0",
-                    "revision": "pinned",
-                    "accepted_at": int(time.time()),
-                }
-            ],
         }
         try:
             created = _create_maintenance_job(

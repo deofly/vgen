@@ -187,7 +187,6 @@ class WorkerMaintenanceController:
         model_installer: ModelInstaller | None = None,
         capability_store: WorkerCapabilityStore | None = None,
         ticket_resolver: TicketResolver = _default_ticket_resolver,
-        clock: Any = time.time,
     ) -> None:
         self._credentials = credentials
         self._gateway = gateway
@@ -200,7 +199,6 @@ class WorkerMaintenanceController:
         self._model_installer = model_installer
         self._capability_store = capability_store
         self._ticket_resolver = ticket_resolver
-        self._clock = clock
         self._last_progress_at = 0.0
         self._gateway_lock = threading.Lock()
 
@@ -399,12 +397,10 @@ class WorkerMaintenanceController:
             raise _MaintenanceRejected("MAINTENANCE_WORKFLOW_NOT_ALLOWED")
 
         digests = spec.get("model_digests")
-        acceptances = spec.get("license_acceptances")
         if (
             not isinstance(digests, list)
             or not digests
             or len(digests) != len(set(digests))
-            or not isinstance(acceptances, list)
         ):
             raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
         resolver = getattr(self._executor, "workflow_model_pins", None)
@@ -417,17 +413,6 @@ class WorkerMaintenanceController:
         for pin in workflow_pins:
             digest = "sha256:" + str(pin.sha256).removeprefix("sha256:").lower()
             pins.setdefault(digest, []).append(pin)
-        accepted: dict[str, Mapping[str, Any]] = {}
-        for item in acceptances:
-            if not isinstance(item, Mapping):
-                raise _MaintenanceRejected("MAINTENANCE_LICENSE_INVALID")
-            digest = item.get("model_digest")
-            if not isinstance(digest, str) or digest in accepted:
-                raise _MaintenanceRejected("MAINTENANCE_LICENSE_INVALID")
-            accepted[digest] = item
-        if set(accepted) != set(digests):
-            raise _MaintenanceRejected("MAINTENANCE_LICENSE_INVALID")
-
         if self._model_installer is None:
             if self._model_root is None:
                 raise ModelInstallError("MODEL_ROOT_UNAVAILABLE")
@@ -440,19 +425,6 @@ class WorkerMaintenanceController:
             digest_pins = pins.get(raw_digest)
             if not digest_pins:
                 raise _MaintenanceRejected("MAINTENANCE_MODEL_NOT_ALLOWED")
-            acceptance = accepted[raw_digest]
-            accepted_at = acceptance.get("accepted_at")
-            license_pairs = {(pin.license, pin.revision) for pin in digest_pins}
-            if (
-                len(license_pairs) != 1
-                or (acceptance.get("license_id"), acceptance.get("revision"))
-                != next(iter(license_pairs))
-                or not isinstance(accepted_at, int)
-                or isinstance(accepted_at, bool)
-                or accepted_at < 1
-                or accepted_at > int(self._clock()) + 300
-            ):
-                raise _MaintenanceRejected("MAINTENANCE_LICENSE_INVALID")
             requested.append((raw_digest, tuple(digest_pins)))
 
         installed: list[str] = []
@@ -1020,8 +992,6 @@ def _matches_file(path: Path, expected_size: int, expected_sha256: str) -> bool:
 
 
 def _model_error_code(reason: str) -> int:
-    if "LICENSE" in reason:
-        return int(ErrorCode.LICENSE_APPROVAL_REQUIRED)
     if any(item in reason for item in ("SOURCE_INVALID", "SOURCE_NOT_PUBLIC", "REDIRECT")):
         return int(ErrorCode.SOURCE_NOT_ALLOWED)
     if "DISK" in reason:

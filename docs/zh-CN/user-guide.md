@@ -577,9 +577,10 @@ vgen broker model-install vgen/minimax-h3-8step \
   --worker "Windows GPU Worker" --wait
 ```
 
-CLI 会显示缺失模型总量和所需许可证。交互运行时，按提示阅读许可证并输入显示的完整许可证
-标识以确认接受。下载支持断点续传，只有路径、固定来源/revision、大小和 SHA-256 全部通过
-后才原子安装；已有冲突文件不会被覆盖。
+CLI 会显示缺失模型总量并直接创建安装任务，不再要求输入许可证标识，也没有
+`--accept-license` 参数。工作流清单中的许可证字段只作为发布来源的说明和审计信息，不参与
+远程授权。下载支持断点续传，只有路径、固定来源/revision、大小和 SHA-256 全部通过后才原子
+安装；已有冲突文件不会被覆盖。
 
 查看和取消维护任务：
 
@@ -619,7 +620,6 @@ vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
   --worker "Windows GPU Worker" \
   --approve-nodes \
   --allow-unsigned \
-  --accept-license LicenseRef-LTX-2.x-Community \
   --wait
 ```
 
@@ -858,7 +858,8 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
   Gateway 替换。不要为了省一步而在交互终端使用 `--accept-legacy-tofu`；
 - API Service 当前可以认证和获得 scope，但不会新获发 Workspace Data Key，不能读取 E2EE
   任务内容；不要把“Service 已注册”理解成加密任务链路已经开放；
-- 模型任务只允许本机策略中固定的来源、revision、许可证、路径、大小和 SHA-256；
+- 模型任务只允许本机策略中固定的来源、revision、路径、大小和 SHA-256；许可证字段仅保留为
+  发布来源的只读说明；
 - Worker 更新不是任意远程 shell，但它会部署代码，只能授权可信 Broker 并使用可信 wheel；
 - 不要为了排障手工删除数据库、密钥、模型冲突文件或旧 runtime，先保留日志和状态。
 
@@ -880,7 +881,6 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
 | Worker 显示 `maintenance-only` | 保持 PowerShell 窗口在线，在 Mac 发起 `vgen broker model-install ... --wait` |
 | 提交前不确定 Worker 是否可用 | 运行只读的 `vgen task preflight`；按输出的 offline/busy、capability 或 rate 原因处理后重试 |
 | CLI 报告 Worker 没有 manager Broker | 运行 `vgen worker manager-set "Windows GPU Worker"` 后重试维护任务 |
-| `340001 LICENSE_APPROVAL_REQUIRED` | 在 Broker CLI 明确输入或传入所显示的许可证标识 |
 | `340003 DISK_SPACE_INSUFFICIENT` | 释放最终模型文件及临时下载所需空间后重试 |
 | `340004 PATH_CONFLICT` / `340005 DIGEST_MISMATCH` | 人工检查冲突路径；Worker 不会自动覆盖或删除异常文件 |
 | Worker 更新后无法上线 | 保持前台监督器运行，等待自动回退；保留上一 runtime 和日志，不要强删 |

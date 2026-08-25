@@ -1586,15 +1586,6 @@
             "title": "Kind",
             "type": "string"
           },
-          "license_acceptances": {
-            "items": {
-              "$ref": "#/components/schemas/ModelLicenseAcceptance"
-            },
-            "maxItems": 128,
-            "minItems": 1,
-            "title": "License Acceptances",
-            "type": "array"
-          },
           "model_digests": {
             "items": {
               "type": "string"
@@ -1621,47 +1612,9 @@
           "kind",
           "workflow_ref",
           "workflow_digest",
-          "model_digests",
-          "license_acceptances"
+          "model_digests"
         ],
         "title": "ModelInstallSpec",
-        "type": "object"
-      },
-      "ModelLicenseAcceptance": {
-        "additionalProperties": false,
-        "properties": {
-          "accepted_at": {
-            "minimum": 1.0,
-            "title": "Accepted At",
-            "type": "integer"
-          },
-          "license_id": {
-            "maxLength": 256,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._+:/()@-]{0,255}$",
-            "title": "License Id",
-            "type": "string"
-          },
-          "model_digest": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Model Digest",
-            "type": "string"
-          },
-          "revision": {
-            "maxLength": 256,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,255}$",
-            "title": "Revision",
-            "type": "string"
-          }
-        },
-        "required": [
-          "model_digest",
-          "license_id",
-          "revision",
-          "accepted_at"
-        ],
-        "title": "ModelLicenseAcceptance",
         "type": "object"
       },
       "OutputArtifact": {
@@ -2598,7 +2551,6 @@
               330002,
               330003,
               330004,
-              340001,
               340002,
               340003,
               340004,
@@ -2690,7 +2642,6 @@
               "OUTPUT_UPLOAD_FAILED",
               "ARTIFACT_NOT_FOUND",
               "ARTIFACT_INTEGRITY_FAILED",
-              "LICENSE_APPROVAL_REQUIRED",
               "SOURCE_NOT_ALLOWED",
               "DISK_SPACE_INSUFFICIENT",
               "PATH_CONFLICT",

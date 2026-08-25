@@ -234,14 +234,14 @@ be a production fallback.
 
 A package is identified by publisher/name/version and an immutable digest. It
 contains a manifest, parameter schema, operation mappings, reviewed Executor
-payload, dependency pins, licenses, and checksum-pinned metadata. `market/` and
+payload, dependency pins, read-only license metadata, and checksum-pinned metadata. `market/` and
 `custom/` namespaces are isolated; importing a custom workflow must never
 overwrite a market package.
 
 Workflow installation verifies structure, digest, signature policy, operation
 mapping, and dependency declarations. It does not download model weights,
 install custom-node code, or execute setup scripts. Model acquisition is an
-explicit Broker maintenance job with license confirmation and revision, size,
+explicit Broker maintenance job with revision, size,
 and SHA-256 checks.
 
 `workflow-install` binds the release ref/digest, archive SHA-256/size, publisher

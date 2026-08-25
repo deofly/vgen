@@ -165,20 +165,12 @@ def model_fixture() -> tuple[dict[str, Any], WorkerCredentials, Any]:
         "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
         "workflow_digest": "sha256:" + "b" * 64,
         "model_digests": [digest],
-        "license_acceptances": [
-            {
-                "model_digest": digest,
-                "license_id": "Apache-2.0",
-                "revision": "rev",
-                "accepted_at": int(time.time()),
-            }
-        ],
     }
     job, credentials = signed_job(spec)
     return job, credentials, pin
 
 
-def test_model_job_requires_signed_exact_local_workflow_pin_and_license(tmp_path: Path) -> None:
+def test_model_job_requires_signed_exact_local_workflow_and_model_pin(tmp_path: Path) -> None:
     job, credentials, pin = model_fixture()
     gateway = FakeGateway(job)
     executor = FakeExecutor(pin)
@@ -225,7 +217,6 @@ def test_tampered_job_is_rejected_before_model_files_change(tmp_path: Path) -> N
 @pytest.mark.parametrize(
     ("reason", "expected"),
     [
-        ("MAINTENANCE_LICENSE_INVALID", ErrorCode.LICENSE_APPROVAL_REQUIRED),
         ("MODEL_SOURCE_NOT_PUBLIC", ErrorCode.SOURCE_NOT_ALLOWED),
         ("MODEL_DISK_FULL", ErrorCode.DISK_SPACE_INSUFFICIENT),
         ("MODEL_TARGET_CONFLICT", ErrorCode.PATH_CONFLICT),
@@ -619,21 +610,11 @@ def test_model_failure_reports_models_already_installed_by_the_same_job(
     second = SimpleNamespace(
         **{**vars(first), "path": "vae/second.safetensors", "sha256": "2" * 64}
     )
-    accepted_at = int(time.time())
     spec = {
         "kind": "model_install",
         "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
         "workflow_digest": "sha256:" + "b" * 64,
         "model_digests": ["sha256:" + first.sha256, "sha256:" + second.sha256],
-        "license_acceptances": [
-            {
-                "model_digest": "sha256:" + item.sha256,
-                "license_id": item.license,
-                "revision": item.revision,
-                "accepted_at": accepted_at,
-            }
-            for item in (first, second)
-        ],
     }
     job, credentials = signed_job(spec)
     gateway = FakeGateway(job)

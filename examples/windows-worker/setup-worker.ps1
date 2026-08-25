@@ -7,7 +7,7 @@ Safely prepares and starts a VGen ComfyUI Worker on Windows without Docker.
 .DESCRIPTION
 The script installs only reviewable local runtime dependencies. Missing pinned
 model weights leave the Worker online in maintenance-only mode; a Broker can
-then submit a signed, license-bound model job. Existing files are never replaced.
+then submit a signed, digest-bound model job. Existing files are never replaced.
 Existing custom-node directories are changed only when they are clean Git
 repositories with the expected origin, and never while an existing ComfyUI
 process is reachable.
@@ -2863,8 +2863,8 @@ try {
         if ($missingModels.Count -gt 0) {
             # Missing files are no longer an installation failure.  The Worker
             # starts online without inference capacity and can receive a signed
-            # Broker model_install job whose license acceptance, immutable
-            # source revision, size, and SHA-256 are rechecked locally.
+            # Broker model_install job whose immutable source revision, size,
+            # and SHA-256 are rechecked locally.
             Write-Warning "$($missingModels.Count) policy-pinned model file(s) are missing. The Worker will start in maintenance-only mode until a Broker-authorized model download completes."
         }
     }

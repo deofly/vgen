@@ -177,14 +177,6 @@ def _model_spec(*, suffix: str = "a") -> dict[str, Any]:
         "workflow_ref": "vgen/minimax-h3-8step@0.1.0",
         "workflow_digest": "sha256:" + "f" * 64,
         "model_digests": [model_digest],
-        "license_acceptances": [
-            {
-                "model_digest": model_digest,
-                "license_id": "Apache-2.0",
-                "revision": "main",
-                "accepted_at": int(time.time()),
-            }
-        ],
     }
 
 
