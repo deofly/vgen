@@ -73,3 +73,25 @@ def test_refresh_windows_support_assets_rejects_target_symlink(tmp_path: Path) -
             asset_root=source,
             allowed_root=allowed,
         )
+
+
+def test_refresh_uses_stable_launcher_pointer_when_environment_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vgen_root = tmp_path / "VGen"
+    allowed = vgen_root / "installer"
+    target = allowed / "0.13.6-0123456789ab"
+    source = tmp_path / "reviewed"
+    _assets(target, "old")
+    _assets(source, "new")
+    stable = vgen_root / "start-worker.cmd"
+    stable.write_text(
+        '@echo off\r\nset "VGEN_WORKER_VERSION_LAUNCHER=%~dp0installer\\0.13.6-0123456789ab\\start-worker.cmd"\r\n',
+        encoding="ascii",
+    )
+    monkeypatch.delenv("VGEN_WORKER_VERSION_LAUNCHER", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert refresh_windows_support_assets(asset_root=source) == (
+        target / "start-worker.cmd"
+    ).resolve()

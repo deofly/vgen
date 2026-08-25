@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from .updater import WorkerUpdateError
 _LAUNCHER_ENV: Final = "VGEN_WORKER_VERSION_LAUNCHER"
 _ASSET_NAMES: Final = ("enroll-worker.ps1", "setup-worker.ps1", "start-worker.cmd")
 _MAX_ASSET_BYTES: Final = 2 * 1024 * 1024
+_INSTALL_LEAF: Final = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12}$")
 
 
 def refresh_windows_support_assets(
@@ -86,7 +88,27 @@ def schedule_windows_launcher_restart(launcher: Path, *, delay_seconds: int = 8)
 
 def _environment_launcher() -> Path | None:
     value = os.environ.get(_LAUNCHER_ENV)
-    return Path(value) if value else None
+    if value:
+        return Path(value)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    vgen_root = Path(local_app_data) / "VGen"
+    stable = vgen_root / "start-worker.cmd"
+    try:
+        if stable.is_symlink() or not stable.is_file() or stable.stat().st_size > 64 * 1024:
+            return None
+        content = stable.read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    match = re.search(
+        r'set "VGEN_WORKER_VERSION_LAUNCHER=%~dp0installer\\([^"\\/\r\n]+)\\start-worker\.cmd"',
+        content,
+        flags=re.IGNORECASE,
+    )
+    if match is None or not _INSTALL_LEAF.fullmatch(match.group(1)):
+        return None
+    return vgen_root / "installer" / match.group(1) / "start-worker.cmd"
 
 
 def _default_allowed_root() -> Path:
