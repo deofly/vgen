@@ -56,7 +56,9 @@ def test_setup_persists_closed_launch_config_then_hands_off_to_task() -> None:
     assert 'format = "vgen-windows-worker-launch-config"' in text
     assert 'Join-Path $workRoot "launch-config.json"' in text
     assert '[Text.UTF8Encoding]::new($false)' in text
-    assert '[IO.File]::Replace($temporary, $Path, $null)' in text
+    assert "Replace-FileAtomically $temporary $Path" in text
+    assert "[IO.File]::Replace($Source, $Destination, $backup)" in text
+    assert "[IO.File]::Replace($temporary, $Path, $null)" not in text
     assert "private_key" not in text
     assert "session_token" not in text
 
@@ -74,6 +76,9 @@ def test_enrollment_requires_and_checksums_the_supervisor_asset() -> None:
     assert "Restore-FileSnapshot" in text
     assert "restarting the previously installed supervisor" in text
     assert "-Mode Start" in text
+    assert "Replace-FileAtomically $temporary $Path" in text
+    assert "[IO.File]::Replace($Source, $Destination, $backup)" in text
+    assert "[IO.File]::Replace($temporary, $Path, $null)" not in text
 
 
 def test_runtime_update_no_longer_mutates_or_relaunches_installer_scripts() -> None:

@@ -40,6 +40,7 @@ if ($parseErrors.Count -ne 0) {
 $requiredFunctions = @(
     "Get-Sha256",
     "Resolve-SafeVGenDirectory",
+    "Replace-VGenFileAtomically",
     "Install-VGenWorkerLauncher",
     "Install-VGenWorkerDesktopShortcut"
 )
@@ -182,6 +183,14 @@ try {
 
     Install-VGenWorkerDesktopShortcut $stableLauncher $desktop
     Assert-ShortcutTarget $stableLauncher
+    Assert-Equal `
+        @(Get-ChildItem -LiteralPath $vgenRoot -Filter "*.bak" -Force).Count `
+        0 `
+        "Stable launcher replacement backup cleanup"
+    Assert-Equal `
+        @(Get-ChildItem -LiteralPath $desktop -Filter "*.bak" -Force).Count `
+        0 `
+        "Desktop shortcut replacement backup cleanup"
     & $env:ComSpec /d /c "`"$stableLauncher`""
     Assert-Equal $LASTEXITCODE 29 "Updated stable launcher exit code"
 

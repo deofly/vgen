@@ -69,6 +69,23 @@ function Test-PathInside {
         $fullPath.StartsWith($fullRoot + "\", [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Replace-FileAtomically {
+    param([string]$Source, [string]$Destination)
+
+    $parent = Split-Path -Parent $Destination
+    $backup = Join-Path $parent ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    try {
+        # Windows PowerShell 5.1 requires a real backup path here.
+        [IO.File]::Replace($Source, $Destination, $backup)
+    }
+    finally {
+        if (Test-Path -LiteralPath $backup) {
+            try { [IO.File]::Delete($backup) }
+            catch { Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }
+        }
+    }
+}
+
 function Restore-FileSnapshot {
     param([string]$Path, [byte[]]$Value, [string]$Description)
 
@@ -89,7 +106,7 @@ function Restore-FileSnapshot {
                 ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "$Description path is unsafe."
             }
-            [IO.File]::Replace($temporary, $Path, $null)
+            Replace-FileAtomically $temporary $Path
         }
         else {
             [IO.File]::Move($temporary, $Path)

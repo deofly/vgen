@@ -464,7 +464,7 @@ For a normal repair, rerun the public installer. It stops its own scheduled task
 authenticates with the existing local key, and preserves the same Worker ID.
 Do not delete credentials, ComfyUI, models, or `%LOCALAPPDATA%\VGen`.
 When migrating from a 0.13.7-or-older foreground package, close that old Worker
-window and its ComfyUI process before running the 0.13.8 installer once.
+window and its ComfyUI process before running the 0.13.8-or-newer installer once.
 
 Network failures, Gateway outages, and signature mismatches preserve the old
 credential and stop safely. Use reenrollment only after confirming that the

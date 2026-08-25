@@ -389,7 +389,11 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
             'Resolve-SafeVGenDirectory $InstallRoot "The verified Worker installer directory"'
             in script
         )
-        assert '[IO.File]::Replace($launcherStaging, $stableLauncher, $null)' in script
+        assert "function Replace-VGenFileAtomically" in script
+        assert "[IO.File]::Replace($Source, $Destination, $backup)" in script
+        assert "Replace-VGenFileAtomically $launcherStaging $stableLauncher" in script
+        assert "Replace-VGenFileAtomically $shortcutStaging $shortcutPath" in script
+        assert "[IO.File]::Replace($launcherStaging, $stableLauncher, $null)" not in script
         assert '[Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)' in script
         assert "$shell.CreateShortcut($shortcutStaging)" in script
         assert "$shortcut.TargetPath = $LauncherPath" in script

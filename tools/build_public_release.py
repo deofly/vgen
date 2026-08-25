@@ -834,6 +834,23 @@ function Resolve-SafeVGenDirectory([string]$Path, [string]$Description) {{
     return $item.FullName
 }}
 
+function Replace-VGenFileAtomically([string]$Source, [string]$Destination) {{
+    $destinationParent = Split-Path -Parent $Destination
+    $backup = Join-Path $destinationParent ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    try {{
+        # Windows PowerShell 5.1 rejects a null backup path for File.Replace.
+        # Keep the backup beside the destination so the replacement remains
+        # same-volume and atomic, then remove it after the switch succeeds.
+        [IO.File]::Replace($Source, $Destination, $backup)
+    }}
+    finally {{
+        if (Test-Path -LiteralPath $backup) {{
+            try {{ [IO.File]::Delete($backup) }}
+            catch {{ Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }}
+        }}
+    }}
+}}
+
 function Install-VGenWorkerLauncher([string]$InstallRoot) {{
     $installerRoot = Split-Path -Parent $InstallRoot
     $vgenRoot = Split-Path -Parent $installerRoot
@@ -898,7 +915,7 @@ exit /b %ERRORLEVEL%
     try {{
         [IO.File]::WriteAllBytes($launcherStaging, $launcherBytes)
         if (Test-Path -LiteralPath $stableLauncher) {{
-            [IO.File]::Replace($launcherStaging, $stableLauncher, $null)
+            Replace-VGenFileAtomically $launcherStaging $stableLauncher
         }}
         else {{
             [IO.File]::Move($launcherStaging, $stableLauncher)
@@ -944,7 +961,7 @@ function Install-VGenWorkerDesktopShortcut([string]$LauncherPath, [string]$Deskt
                 throw "Windows did not create the VGen Worker shortcut."
             }}
             if (Test-Path -LiteralPath $shortcutPath) {{
-                [IO.File]::Replace($shortcutStaging, $shortcutPath, $null)
+                Replace-VGenFileAtomically $shortcutStaging $shortcutPath
             }}
             else {{
                 [IO.File]::Move($shortcutStaging, $shortcutPath)

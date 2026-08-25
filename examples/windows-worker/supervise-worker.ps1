@@ -324,6 +324,23 @@ function Stop-OwnedProcessTree {
     }
 }
 
+function Replace-FileAtomically {
+    param([string]$Source, [string]$Destination)
+
+    $directory = Split-Path -Parent $Destination
+    $backup = Join-Path $directory ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    try {
+        # Windows PowerShell 5.1 requires a real backup path here.
+        [IO.File]::Replace($Source, $Destination, $backup)
+    }
+    finally {
+        if (Test-Path -LiteralPath $backup) {
+            try { [IO.File]::Delete($backup) }
+            catch { Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }
+        }
+    }
+}
+
 function Write-AtomicUtf8Json {
     param([string]$Path, [object]$Value)
 
@@ -339,7 +356,7 @@ function Write-AtomicUtf8Json {
                 ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "The persistent Worker supervisor configuration path is unsafe."
             }
-            [IO.File]::Replace($temporary, $Path, $null)
+            Replace-FileAtomically $temporary $Path
         }
         else {
             [IO.File]::Move($temporary, $Path)
@@ -381,7 +398,7 @@ function Install-ManagedSupervisorScript {
                 ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "The managed Worker supervisor script path is unsafe."
             }
-            [IO.File]::Replace($temporary, $Destination, $null)
+            Replace-FileAtomically $temporary $Destination
         }
         else {
             [IO.File]::Move($temporary, $Destination)
