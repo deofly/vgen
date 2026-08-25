@@ -1032,6 +1032,14 @@ def _capability_error_code(reason: str) -> int:
         return int(ErrorCode.PATH_CONFLICT)
     if any(item in reason for item in ("NODE_APPROVAL", "REJECTED", "INTENT", "TICKET")):
         return int(ErrorCode.MAINTENANCE_POLICY_DENIED)
+    if "CONTAINS_EXECUTABLE_CONTENT" in reason:
+        return int(ErrorCode.CAPABILITY_EXECUTABLE_CONTENT)
+    if "VERSION_CONFLICT" in reason:
+        return int(ErrorCode.CAPABILITY_VERSION_CONFLICT)
+    if "RELEASE_INVALID" in reason:
+        return int(ErrorCode.CAPABILITY_RELEASE_INVALID)
+    if "ARCHIVE_INVALID" in reason:
+        return int(ErrorCode.CAPABILITY_ARCHIVE_INVALID)
     if any(
         item in reason
         for item in (

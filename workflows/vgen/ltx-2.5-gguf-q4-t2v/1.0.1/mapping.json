@@ -1,0 +1,26 @@
+{
+  "duration": {
+    "input": "value",
+    "node": "405:362"
+  },
+  "fps": {
+    "input": "value",
+    "node": "405:361"
+  },
+  "height": {
+    "input": "value",
+    "node": "405:360"
+  },
+  "prompt": {
+    "input": "value",
+    "node": "405:376"
+  },
+  "seed": {
+    "input": "noise_seed",
+    "node": "405:339"
+  },
+  "width": {
+    "input": "value",
+    "node": "405:372"
+  }
+}

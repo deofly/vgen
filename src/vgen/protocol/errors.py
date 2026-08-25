@@ -132,6 +132,10 @@ class ErrorCode(IntEnum):
     UPDATE_INCOMPATIBLE = 340011
     UPDATE_DOWNGRADE_DENIED = 340012
     UPDATE_ACTIVATION_FAILED = 340013
+    CAPABILITY_ARCHIVE_INVALID = 340014
+    CAPABILITY_VERSION_CONFLICT = 340015
+    CAPABILITY_EXECUTABLE_CONTENT = 340016
+    CAPABILITY_RELEASE_INVALID = 340017
 
     # 40xxxx: crypto / key envelope
     DECRYPTION_FAILED = 400001
@@ -649,6 +653,34 @@ _ERROR_SPECS = (
         ErrorCode.UPDATE_ACTIVATION_FAILED,
         "The updated Worker runtime did not activate and was rolled back.",
         500,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.PROVIDER,
+    ),
+    _spec(
+        ErrorCode.CAPABILITY_ARCHIVE_INVALID,
+        "The workflow capability archive is invalid or cannot be compiled.",
+        422,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.CAPABILITY_VERSION_CONFLICT,
+        "This immutable workflow version already exists with different content.",
+        409,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.CAPABILITY_EXECUTABLE_CONTENT,
+        "The workflow capability archive contains executable content.",
+        422,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.CAPABILITY_RELEASE_INVALID,
+        "An existing local workflow capability release is invalid.",
+        422,
         ErrorOrigin.WORKER,
         responsibility=Responsibility.PROVIDER,
     ),

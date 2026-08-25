@@ -22,6 +22,7 @@ from vgen.protocol import ErrorCode
 from vgen.worker import WorkerCredentials
 from vgen.worker.maintenance import (
     WorkerMaintenanceController,
+    _capability_error_code,
     _model_error_code,
     _update_error_code,
 )
@@ -231,6 +232,25 @@ def test_model_failures_use_dedicated_maintenance_codes(
     reason: str, expected: ErrorCode
 ) -> None:
     assert _model_error_code(reason) == int(expected)
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("CAPABILITY_ARCHIVE_INVALID", ErrorCode.CAPABILITY_ARCHIVE_INVALID),
+        ("CAPABILITY_VERSION_CONFLICT", ErrorCode.CAPABILITY_VERSION_CONFLICT),
+        (
+            "CAPABILITY_CONTAINS_EXECUTABLE_CONTENT",
+            ErrorCode.CAPABILITY_EXECUTABLE_CONTENT,
+        ),
+        ("CAPABILITY_RELEASE_INVALID", ErrorCode.CAPABILITY_RELEASE_INVALID),
+        ("CAPABILITY_NODE_APPROVAL_MISMATCH", ErrorCode.MAINTENANCE_POLICY_DENIED),
+    ],
+)
+def test_capability_failures_use_dedicated_maintenance_codes(
+    reason: str, expected: ErrorCode
+) -> None:
+    assert _capability_error_code(reason) == int(expected)
 
 
 @pytest.mark.parametrize(
