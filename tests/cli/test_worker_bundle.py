@@ -30,6 +30,7 @@ def _write_test_wheel(directory: Path, *, version: str = __version__) -> Path:
         archive.writestr("vgen/cli/main.py", "# test CLI\n")
         archive.writestr("vgen/cli/worker_enrollment.py", "# test enrollment\n")
         archive.writestr("vgen/assets/worker/enroll-worker.ps1", "# test enrollment script\n")
+        archive.writestr("vgen/assets/worker/supervise-worker.ps1", "# test supervisor script\n")
         archive.writestr(
             f"{dist_info}/METADATA",
             f"Metadata-Version: 2.4\nName: vgen\nVersion: {version}\n",
@@ -78,6 +79,7 @@ def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Pat
             "enroll-worker.ps1",
             "start-worker.cmd",
             "setup-worker.ps1",
+            "supervise-worker.ps1",
             "vgen-worker-bundle.json",
             "comfyui-minimax-h3-policy.yaml",
             WHEEL_NAME,

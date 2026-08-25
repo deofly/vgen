@@ -273,8 +273,8 @@ maintenance actions. If a 0.9.x Gateway rejects that new field, the Worker
 retries the narrower legacy claim and periodically probes again; inference
 polling therefore continues until the Gateway is upgraded.
 
-Worker wheel updates use the same signed maintenance path. The foreground
-Worker entry point is a stable parent supervisor; it launches `serve` in a child
+Worker wheel updates use the same signed maintenance path. The Task Scheduler
+host starts a stable runtime supervisor; it launches `serve` in a child
 interpreter, follows only an atomic runtime pointer under the Worker's private
 `runtime-releases` directory, and keeps the previous interpreter until the new
 runtime completes an authenticated announce. A failed activation starts the
@@ -515,9 +515,12 @@ atomically updates `%LOCALAPPDATA%\VGen\start-worker.cmd` to delegate to that
 exact version and creates or refreshes the current user's `VGen Worker` Desktop
 shortcut. The shortcut targets only the stable launcher; it never discovers a
 version by directory timestamps and never bypasses the existing Worker runtime
-pointer, supervisor, or rollback logic. Shortcut creation failure is reported
-without blocking the verified foreground Worker startup. This convenience
-entry is not a Windows Service or an automatic startup mechanism.
+pointer, supervisor, or rollback logic. After validation, setup atomically writes
+a secret-free launch configuration and registers a limited, interactive-token
+task for the enrolled Windows user. The host starts Worker control first and
+ComfyUI separately so one failure does not take down the other. It must not use
+S4U, which lacks required network access, or LocalSystem with user-writable
+runtimes. The task starts after that user logs in; it is not a pre-login service.
 
 ## 10. Migration from legacy shared-token deployments
 

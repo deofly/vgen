@@ -26,6 +26,7 @@ _POLICY_NAME = "comfyui-minimax-h3-policy.yaml"
 _SCRIPT_NAME = "setup-worker.ps1"
 _LAUNCHER_NAME = "start-worker.cmd"
 _ENROLLMENT_SCRIPT_NAME = "enroll-worker.ps1"
+_SUPERVISOR_SCRIPT_NAME = "supervise-worker.ps1"
 _WORKER_UPDATE_VERSION = re.compile(r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$")
 
 
@@ -66,7 +67,12 @@ def _asset_bytes(name: str) -> bytes:
     if packaged.is_file():
         return packaged.read_bytes()
     repository = Path(__file__).resolve().parents[3]
-    if name in {_SCRIPT_NAME, _LAUNCHER_NAME, _ENROLLMENT_SCRIPT_NAME}:
+    if name in {
+        _SCRIPT_NAME,
+        _LAUNCHER_NAME,
+        _ENROLLMENT_SCRIPT_NAME,
+        _SUPERVISOR_SCRIPT_NAME,
+    }:
         source = repository / "examples" / "windows-worker" / name
     else:
         source = repository / "examples" / name
@@ -111,6 +117,7 @@ def _validate_public_installer_wheel(value: bytes) -> None:
         "vgen/cli/main.py",
         "vgen/cli/worker_enrollment.py",
         "vgen/assets/worker/enroll-worker.ps1",
+        "vgen/assets/worker/supervise-worker.ps1",
     }
     try:
         with zipfile.ZipFile(io.BytesIO(value)) as archive:
@@ -376,6 +383,7 @@ def create_public_windows_worker_installer_bundle(
     script = _asset_bytes(_SCRIPT_NAME)
     launcher = _asset_bytes(_LAUNCHER_NAME)
     enrollment_script = _asset_bytes(_ENROLLMENT_SCRIPT_NAME)
+    supervisor_script = _asset_bytes(_SUPERVISOR_SCRIPT_NAME)
     policy = _asset_bytes(_POLICY_NAME)
     wheel_name, wheel = load_worker_wheel(wheel_path)
     _validate_public_installer_wheel(wheel)
@@ -385,6 +393,7 @@ def create_public_windows_worker_installer_bundle(
         "gateway_url": endpoint,
         "worker_credentials": "worker-credentials.json",
         "comfyui_root": None,
+        "comfyui_data_root": None,
         "wheel": {
             "name": wheel_name,
             "version": __version__,
@@ -405,7 +414,8 @@ def create_public_windows_worker_installer_bundle(
         b"2. Double-click start-worker.cmd.\r\n"
         b"3. On the owner's Mac, run: vgen worker add\r\n"
         b"4. Paste the displayed one-time Invite only into the hidden Windows prompt.\r\n"
-        b"5. Enter the Windows verification code into the still-running Mac command.\r\n\r\n"
+        b"5. Enter the Windows verification code into the still-running Mac command.\r\n"
+        b"6. After validation, Task Scheduler keeps Worker control and ComfyUI running.\r\n\r\n"
         b"This public installer contains no Worker identity or credentials.\r\n"
     )
     _write_public_installer_bundle(
@@ -416,6 +426,7 @@ def create_public_windows_worker_installer_bundle(
             (_ENROLLMENT_SCRIPT_NAME, enrollment_script, 0o644),
             (_LAUNCHER_NAME, launcher, 0o755),
             (_SCRIPT_NAME, script, 0o644),
+            (_SUPERVISOR_SCRIPT_NAME, supervisor_script, 0o644),
             ("vgen-worker-bundle.json", config_bytes, 0o644),
             (_POLICY_NAME, policy, 0o644),
             (wheel_name, wheel, 0o644),

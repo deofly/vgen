@@ -143,6 +143,7 @@ def _windows_bundle(
         "enroll-worker.ps1": b"# enrollment\n",
         "start-worker.cmd": b"@echo off\r\n",
         "setup-worker.ps1": b"# setup\n",
+        "supervise-worker.ps1": b"# supervisor\n",
         "comfyui-minimax-h3-policy.yaml": b"version: 1\n",
         "vgen-worker-bundle.json": json.dumps(config, sort_keys=True).encode() + b"\n",
         wheel: wheel_value,
@@ -345,6 +346,7 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert '"start-worker.cmd"' in windows
     assert 'Join-Path $vgenRoot "start-worker.cmd"' in windows
     assert 'Join-Path $desktop "VGen Worker.lnk"' in windows
+    assert "pause" not in windows.lower()
     for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):
         assert secret_word not in windows
 
@@ -374,7 +376,10 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
         assert shortcut_path in script
         assert delegate in script
         assert '"%VGEN_WORKER_VERSION_LAUNCHER%"\n' in script
-        assert '"%VGEN_WORKER_VERSION_LAUNCHER%" -Reenroll' in script
+        assert '"%VGEN_WORKER_VERSION_LAUNCHER%" %VGEN_WORKER_SETUP_ARG%' in script
+        assert 'set "VGEN_WORKER_SETUP_ARG=-Reenroll"' in script
+        assert 'set "VGEN_WORKER_SETUP_ARG=-Repair"' in script
+        assert "pause" not in script.lower()
         assert 'call "%VGEN_WORKER_VERSION_LAUNCHER%"' not in script
         assert "Run the public Windows Worker installer again to repair it." in script
         assert "Get-ChildItem" not in script
@@ -396,6 +401,9 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
         assert script.index("$stableLauncher = Install-VGenWorkerLauncher $installRoot") < script.index(
             "& $stableLauncher"
         )
+
+    assert '& $stableLauncher -Repair' in first
+    assert '& $stableLauncher -Repair' in second
 
     install_root = (
         '$installRoot = Join-Path $parent '

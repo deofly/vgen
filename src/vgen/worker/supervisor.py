@@ -15,7 +15,6 @@ from .updater import RuntimeUpdater, WorkerUpdateError
 
 EXIT_UPDATE_RESTART = 75
 EXIT_UPDATE_ROLLBACK = 76
-EXIT_LAUNCHER_RESTART = 77
 _CHILD_ENV = "VGEN_WORKER_SUPERVISED_CHILD"
 _ROLLBACK_ENV = "VGEN_WORKER_UPDATE_ROLLBACK"
 _MAX_ROLLBACK_ATTEMPTS = 3
@@ -55,6 +54,11 @@ def supervise_worker(
         if not state.pending or state.previous_python is None:
             raise WorkerUpdateError("WORKER_UPDATE_ROLLBACK_UNAVAILABLE")
         selected = state.previous_python
+    elif state.pending and not state.active_available:
+        if state.previous_python is None:
+            raise WorkerUpdateError("WORKER_UPDATE_ROLLBACK_UNAVAILABLE")
+        selected = state.previous_python
+        rollback = True
     else:
         selected = state.active_python
     rollback_attempts = 0
@@ -73,6 +77,18 @@ def supervise_worker(
                 check=False,
             )
         except OSError as exc:
+            state = updater.supervisor_state(fallback=initial)
+            if (
+                state.pending
+                and state.previous_python is not None
+                and selected in {state.active_python, state.previous_python}
+            ):
+                rollback_attempts += 1
+                if rollback_attempts > _MAX_ROLLBACK_ATTEMPTS:
+                    raise WorkerUpdateError("WORKER_UPDATE_ROLLBACK_LIMIT") from exc
+                selected = state.previous_python
+                rollback = True
+                continue
             raise WorkerUpdateError("WORKER_UPDATE_RUNTIME_INVALID") from exc
 
         exit_code = int(completed.returncode)
@@ -80,16 +96,23 @@ def supervise_worker(
         if exit_code == EXIT_UPDATE_RESTART:
             if state.active_python == selected:
                 raise WorkerUpdateError("WORKER_UPDATE_POINTER_NOT_ADVANCED")
-            selected = state.active_python
-            rollback = False
+            if state.pending and not state.active_available:
+                if state.previous_python is None:
+                    raise WorkerUpdateError("WORKER_UPDATE_ROLLBACK_UNAVAILABLE")
+                selected = state.previous_python
+                rollback = True
+            else:
+                selected = state.active_python
+                rollback = False
             rollback_attempts = 0
             continue
-        if exit_code == EXIT_UPDATE_ROLLBACK or (
+        failed_pending_runtime = (
             exit_code != 0
             and state.pending
-            and state.active_python == selected
             and state.previous_python is not None
-        ):
+            and selected in {state.active_python, state.previous_python}
+        )
+        if exit_code == EXIT_UPDATE_ROLLBACK or failed_pending_runtime:
             if not state.pending or state.previous_python is None:
                 raise WorkerUpdateError("WORKER_UPDATE_ROLLBACK_UNAVAILABLE")
             rollback_attempts += 1
@@ -102,7 +125,6 @@ def supervise_worker(
 
 
 __all__ = [
-    "EXIT_LAUNCHER_RESTART",
     "EXIT_UPDATE_RESTART",
     "EXIT_UPDATE_ROLLBACK",
     "is_supervised_child",

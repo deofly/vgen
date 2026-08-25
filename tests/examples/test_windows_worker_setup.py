@@ -551,11 +551,14 @@ def test_windows_worker_desktop_launch_reuses_worker_console_and_quotes_space_pa
         "--temp-directory",
         "--database-url",
         "--front-end-root",
+        "--dont-print-server",
+        "--verbose",
     ):
         assert f'"{argument}"' in launch
     assert "$mainPath" in launch
     assert '"--temp-directory", $tempRoot' in launch
     assert '"--temp-directory", $resolvedComfyDataRoot' not in launch
+    assert '"--verbose", "ERROR"' in launch
     assert '$databasePath.Replace("\\", "/")' in text
     assert '$databaseUrl = "sqlite:///" +' in text
     assert "ConvertTo-NativeArgument" in launch
@@ -750,6 +753,7 @@ def test_windows_worker_reinstall_verifies_identity_and_stages_safe_reenrollment
     launcher = WORKER_LAUNCHER.read_text(encoding="utf-8")
 
     assert "[switch]$Reenroll" in enrollment
+    assert "[switch]$Repair" in enrollment
     assert "--check-existing" in enrollment
     assert "--reenroll-existing" in enrollment
     assert "$credentialCheckExit -eq 10" in enrollment
@@ -762,17 +766,26 @@ def test_windows_worker_reinstall_verifies_identity_and_stages_safe_reenrollment
     assert '" -Reenroll' in enrollment
     assert "Remove-Item -LiteralPath $credentialPath" not in enrollment
     assert "Move-Item -LiteralPath $credentialPath" not in enrollment
-    assert enrollment.index("--check-existing") < enrollment.index("$setupArguments")
-    assert "$setupArguments = @{" in enrollment
-    assert "GatewayUrl = $gatewayOrigin" in enrollment
-    assert "WorkerCredentials = $credentialPath" in enrollment
-    assert '$setupArguments["ComfyUIRoot"] = $ComfyUIRoot' in enrollment
-    assert '$setupArguments["ComfyUIDataRoot"] = $ComfyUIDataRoot' in enrollment
-    assert '$setupArguments = @(' not in enrollment
-    assert 'if /I not "%~1"=="-Reenroll"' in launcher
+    assert enrollment.index("--check-existing") < enrollment.index("$setupProcessArguments")
+    assert "$setupProcessArguments = @(" in enrollment
+    assert '"-File", $setupPath' in enrollment
+    assert "& $setupPowerShellPath @setupProcessArguments" in enrollment
+    setup_process = enrollment.split("$setupProcessArguments = @(", 1)[1].split(")", 1)[0]
+    assert "-NonInteractive" not in setup_process
+    assert '"-GatewayUrl", $gatewayOrigin' in enrollment
+    assert '"-WorkerCredentials", $credentialPath' in enrollment
+    assert '$setupProcessArguments += @("-ComfyUIRoot", $ComfyUIRoot)' in enrollment
+    assert '$setupProcessArguments += @("-ComfyUIDataRoot", $ComfyUIDataRoot)' in enrollment
+    assert 'if /I "%~1"=="-Reenroll"' in launcher
+    assert 'if /I "%~1"=="-Repair"' in launcher
     assert 'if not "%~2"==""' in launcher
     assert "%*" not in launcher
-    assert '"%~dp0enroll-worker.ps1" %VGEN_WORKER_REENROLL_ARG%' in launcher
+    assert '"%~dp0enroll-worker.ps1" %VGEN_WORKER_SETUP_ARG%' in launcher
+    assert "VGen\\supervisor\\supervise-worker.ps1" in launcher
+    assert "-Mode Start" in launcher
+    assert "if not errorlevel 1 exit /b 0" in launcher
+    assert 'if "%ERRORLEVEL%"=="0"' not in launcher
+    assert "pause" not in launcher.lower()
 
 
 def test_windows_worker_enrollment_secures_acl_before_any_gateway_identity_request() -> None:
@@ -844,11 +857,11 @@ def test_two_handbooks_are_the_only_documentation_sources_for_operations_and_rel
     assert "start-worker.cmd" in user
     assert "%LOCALAPPDATA%\\VGen" in user
     assert "%LOCALAPPDATA%\\VGen\\start-worker.cmd" in user
-    assert "Desktop shortcut for starting it again after a reboot" in user
-    assert "does not start automatically at boot" in user
+    assert "Windows Task Scheduler" in user
+    assert "after a reboot that" in user
     assert "%LOCALAPPDATA%\\VGen\\start-worker.cmd" in zh_user
     assert "`VGen Worker` 快捷方式" in zh_user
-    assert "普通重启不需要重新执行" in zh_user
+    assert "普通重启" in zh_user and "不需要重新执行" in zh_user
     assert "%LOCALAPPDATA%\\VGen\\start-worker.cmd" in zh_developer
     assert "不得按目录时间猜测" in zh_developer
     assert "vgen broker model-install" in user
@@ -884,7 +897,7 @@ def test_windows_worker_missing_models_start_maintenance_only_without_direct_dow
     assert "([int]$policy.models_verified + [int]$policy.models_failed) -ne 5" in text
     assert "git.exe reset" not in lowered
     assert "git.exe clean" not in lowered
-    assert "remove-item" not in lowered
+    assert "remove-item" not in model_branch.lower()
     assert "write-host $credential" not in lowered
     assert "write-output $credential" not in lowered
     assert 'status", "--porcelain"' in text
@@ -1031,6 +1044,10 @@ def test_worker_assets_are_force_included_at_stable_importlib_resource_paths() -
     ) in pyproject
     assert (
         '"examples/windows-worker/start-worker.cmd" = "vgen/assets/worker/start-worker.cmd"'
+    ) in pyproject
+    assert (
+        '"examples/windows-worker/supervise-worker.ps1" = '
+        '"vgen/assets/worker/supervise-worker.ps1"'
     ) in pyproject
     assert (
         '"examples/comfyui-minimax-h3-policy.yaml" = '

@@ -362,8 +362,8 @@ Worker 保留旧 requirement fallback，且它们不会领取
 字段而拒绝，Worker 会退回更窄的旧 claim，并定期重新探测。因此在 Gateway 完成升级前，原有
 推理轮询不会被中断。
 
-Worker wheel 更新复用同一条签名 maintenance 链路。前台 Worker 入口是稳定的父监督进程，
-`serve` 运行在子解释器中；监督进程只接受 Worker 私有 `runtime-releases` 目录下的原子运行时
+Worker wheel 更新复用同一条签名 maintenance 链路。任务计划程序宿主先启动稳定的运行时监督进程，
+`serve` 运行在子解释器中；运行时监督进程只接受 Worker 私有 `runtime-releases` 目录下的原子运行时
 指针。新 runtime 完成 Gateway 认证上线后才清除待激活状态；激活失败时，监督进程用明确的
 rollback 标记启动上一 runtime，由旧 runtime 先向 Gateway 回报失败，再清理本地 pending 状态。
 Gateway 和未签名的远程指令都不能指定任意可执行文件路径。
@@ -844,9 +844,11 @@ Windows 安装器必须支持 PowerShell 5.1，自动识别 AppData、Program Fi
 安装入口完整校验并解压可信版本后，必须原子更新固定入口
 `%LOCALAPPDATA%\VGen\start-worker.cmd`，让它只转发到本次校验通过的精确版本目录，并创建或
 刷新当前用户桌面的 `VGen Worker` 快捷方式。快捷方式只能指向固定入口，不得按目录时间猜测
-版本，也不得绕过现有 Worker runtime pointer、supervisor 和回滚逻辑。创建桌面快捷方式失败时
-应明确警告，但不能阻断已经校验通过的前台 Worker 启动。这个入口不是 Windows Service，也不
-提供开机自启。
+版本，也不得绕过现有 Worker runtime pointer、supervisor 和回滚逻辑。验证完成后必须原子写入
+不含 credential 内容的 launch config，并注册当前接入用户、Limited 权限、Interactive 登录类型的
+任务计划程序。监督器先启动 Worker 控制进程，再独立启动 ComfyUI；任一崩溃只重启自身。不得用
+S4U（没有 Gateway 所需网络能力），也不得让 LocalSystem 执行用户可写 runtime。该任务在用户
+登录后自动启动，不宣称在尚未登录时运行。
 
 `examples/docker-compose.yml` 是开发/评审基线，不是面向普通用户的一键生产方案。容器必须以
 非 root UID 运行，credential 挂载为 owner-only，Gateway 端口只绑定 loopback；可选 TLS 反代

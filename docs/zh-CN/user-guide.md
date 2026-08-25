@@ -34,8 +34,9 @@ ECS Gateway（公网 HTTPS 控制面和密文任务状态）
 7. 分别提交 0、1、2 张图片的视频任务进行验收。
 
 当前 Gateway 由 systemd 常驻，Mac Home Broker 由安装器配置为当前用户的 LaunchAgent。
-Windows Worker 暂时必须保持 PowerShell 窗口打开。安装器会创建固定的桌面快捷方式，方便
-电脑重启后再次启动；当前版本不安装 Windows Service，也不提供后台常驻或开机自启。
+Windows 首次接入并通过检查后，会安装当前 Windows 用户的任务计划程序：Worker 控制进程和
+ComfyUI 在后台分别监督，关闭安装窗口或其中一个进程崩溃都不会让另一边一起退出。它不是以
+LocalSystem 运行的 Windows Service；电脑重启后需要该 Windows 用户登录，任务随后自动启动。
 
 > **工作流安装不等于模型权重下载。** Mac 初始化时安装的是
 > `vgen/minimax-h3-8step` 工作流清单、参数定义和 ComfyUI 图。实际模型权重位于 Windows
@@ -459,7 +460,7 @@ vgen worker add --name "Windows GPU Worker" --pool "默认 GPU 池"
 只有一个 Pool 时可以省略 `--pool`。Mac 命令会显示一次性 Invite 并保持等待；把它粘贴到
 Windows 的隐藏输入框。Windows 在本机生成私钥并显示完整验证码，再把验证码输入仍在等待的
 Mac 命令。验证码一致后，Mac 自动签发 Worker certificate、批准 Pool 和费率，Windows 自动
-继续检测 ComfyUI、安装并启动 Worker。
+继续检测 ComfyUI、安装后台监督任务并启动 Worker。
 
 Invite 只能使用一次，不能发到群聊、截图或放入命令参数。通用安装包可以公开缓存和重复下载，
 但每台 Windows 都会生成不同的私钥和 Worker 身份。
@@ -467,8 +468,9 @@ Invite 只能使用一次，不能发到群聊、截图或放入命令参数。�
 ### 5.2 Worker 首次启动和重试
 
 安装器会自动检查 Gateway，准备隔离的 VGen runtime 和 custom nodes，必要时只在
-`127.0.0.1:8188` 启动 ComfyUI，然后以前台方式运行 Worker。缺模型不会使安装失败：Worker
-会以 `maintenance-only` 在线，等待 Broker 发起模型下载。
+`127.0.0.1:8188` 启动 ComfyUI，验证通过后把固定启动参数写入
+`%LOCALAPPDATA%\VGen\workers\<worker_id>\launch-config.json`，再交给任务计划程序。缺模型
+不会使安装失败：Worker 会以 `maintenance-only` 在线，等待 Broker 发起模型下载。
 
 为同一台电脑创建新 Worker 时，安装器会先检查 `%LOCALAPPDATA%\VGen\comfyui\wrk_*` 中旧
 VGen Worker 已安装的固定版本 custom nodes。只有仓库来源、固定 revision、工作区完整性和
@@ -489,16 +491,16 @@ Python、pip、winget 在安装时显示的进度只写入当前窗口，不会�
 如果某次安装中断，保留 `%LOCALAPPDATA%\VGen` 和模型，直接用修复后的 Worker ZIP 重新运行
 `start-worker.cmd`；安装器会继续准备隔离环境，不需要手工删除 `worker-runtime-*`。
 
-看到 Worker 开始轮询后保持唯一的 PowerShell 窗口打开。VGen 启动的 ComfyUI 会复用这个
-控制台，不应再弹出第二个空白 Terminal；其输出仍写入 `%LOCALAPPDATA%\VGen\logs`。按
-`Ctrl+C` 可让脚本停止本次由它启动的 Worker 和 ComfyUI；如果直接强制关闭窗口导致残留
-进程，先在任务管理器结束残留的 ComfyUI/Python，再重新启动。
+看到“Worker control is now managed by Windows Task Scheduler”后可以关闭 PowerShell 窗口。
+任务会先启动 Worker 控制进程，再独立启动 ComfyUI；ComfyUI 启动失败时 Worker 仍在线接收
+维护，Worker 或 ComfyUI 任一崩溃只重启自身。监督日志、Worker 日志和 ComfyUI 日志都位于
+`%LOCALAPPDATA%\VGen\logs`。
 
 安装器会创建固定入口 `%LOCALAPPDATA%\VGen\start-worker.cmd`，并在当前用户桌面创建
-`VGen Worker` 快捷方式。Windows 重启后，先退出单独打开的 ComfyUI，再双击同一个快捷方式，
-并保持弹出的 PowerShell 窗口开启。快捷方式始终指向固定入口；以后运行可信的新版本安装器时，
-只会更新固定入口内部指向的版本目录，快捷方式路径不会变化。普通重启不需要重新执行公开的
-`irm` 安装命令。
+`VGen Worker` 快捷方式。平时双击快捷方式只会确认后台任务已启动，不会重新接入或再跑一遍
+安装。Windows 重启并登录同一用户后，任务会自动启动；快捷方式始终指向固定入口。可信的新版本
+安装器会使用 `-Repair` 暂停旧任务、重新验证并原子更新启动配置，然后恢复后台监督。普通重启
+不需要重新执行公开的 `irm` 安装命令。
 
 ### 5.3 Desktop、Portable 和自定义数据目录
 
@@ -532,10 +534,13 @@ Portable 目录，并自动判断安装类型：
 
 日常修复不需要创建新的 Worker：
 
-1. 关闭前台 Worker；
-2. 重新运行同一条 `irm ...install-windows-worker.ps1 | iex` 安装命令；
+1. 重新运行同一条 `irm ...install-windows-worker.ps1 | iex` 安装命令；
+2. 安装器会先停止自己的后台任务，不会扫描或结束用户自行启动的其他 Python/ComfyUI；
 3. 安装器会让本机 Worker 用私钥向当前 Gateway 重新验证身份；验证成功后继续使用同一个
    Worker，并安全刷新短期登录信息。
+
+如果从 0.13.7 或更早的前台版迁移，第一次运行 0.13.8 安装器前先关闭旧 Worker 窗口及其
+ComfyUI；完成这一次迁移后，日常启停和 runtime 更新都由后台监督器处理。
 
 不要删除 ComfyUI、模型或 `%LOCALAPPDATA%\VGen` 中的 credential。重复运行公开安装入口会
 保留同一 Worker 身份，不会在 Gateway 产生重复记录。
@@ -562,7 +567,7 @@ Portable 目录，并自动判断安装类型：
 
 ## 6. Broker 发起模型下载和 Worker 更新
 
-这些命令都在 Mac 上运行，并要求 Windows Worker 的前台 PowerShell 仍在线。正常由
+这些命令都在 Mac 上运行，并要求 Windows Worker 后台任务在线。正常由
 `vgen worker add` 接入的 Worker 已绑定当前 Home Broker；如果
 CLI 明确报告没有 manager Broker，先运行：
 
@@ -609,7 +614,8 @@ vgen worker upgrade --worker "Windows GPU Worker" --wait
 
 在 Hugging Face 上阅读并接受 LTX-2.5 gate 和许可证，然后只在 Windows Worker 本机配置
 只读 token。推荐把 token 保存到仅当前 Windows 用户可读的文件，并把用户环境变量
-`HF_TOKEN_PATH` 指向该文件；修改环境变量后重新启动前台 Worker。不要把 token 放进 Mac
+`HF_TOKEN_PATH` 指向该文件；修改环境变量后停止并重新启动任务计划程序中的
+`VGen Worker Supervisor`。不要把 token 放进 Mac
 命令、Gateway 配置或工作流清单。
 
 Mac CLI 已内置摘要固定的基础 T2V 包。下面的命令会依次上传工作流包、让 Worker 原子激活、
@@ -662,15 +668,14 @@ vgen worker upgrade --wait
 
 CLI 使用首次安装时固定保存的 release origin，验证 stable 指针、不可变 manifest、Mac 发布包
 大小与 SHA-256、ZIP 安全路径和包内 `SHA256SUMS`，然后取出同版本纯 Python Worker wheel。
-Broker 签名授权更新，等待 Worker 空闲后安装到独立 runtime；Windows 前台监督器负责切换版本、
-重新上线和激活失败时回退上一 runtime。重复运行且 Worker 已是 stable 时直接返回
+Broker 签名授权更新，等待 Worker 空闲后安装到独立 runtime；Worker 内部运行时监督器负责
+切换版本、重新上线和激活失败时回退上一 runtime。重复运行且 Worker 已是 stable 时直接返回
 `already_up_to_date`，不会重复部署或降级。
 
-长期运行的 `vgen worker serve` 自带稳定监督进程，不再依赖特定 PowerShell 启动方式。更新包
+长期运行的 `vgen worker serve` 自带运行时监督进程，外层再由任务计划程序常驻。更新包
 校验并暂存后，监督进程启动新的隔离 runtime；新版本只有完成 Gateway 认证上线后才会生效，
 激活失败会自动启动上一 runtime 并向 Gateway 回报失败。旧安装包中的 Windows 启动器仍保留
-同等兼容逻辑。不要在外部脚本中反复重建整个 Python 环境；保持原前台命令运行，让 VGen 自己
-切换子运行时。
+同等兼容逻辑。不要在外部脚本中反复重建整个 Python 环境；让 VGen 自己切换子运行时。
 
 只有 PowerShell 安装器、ComfyUI 接入、Python/系统依赖或安装目录结构发生变化时，才需要在
 Windows 重新执行官方 `install-windows-worker.ps1`。普通 VGen Python 运行时更新不需要操作
@@ -878,12 +883,12 @@ key sync、Home Broker 绑定和真实任务验证后再撤销旧设备。
 | 本地复用后出现 `Filename too long` | 换用包含 Windows 长路径修复的 Worker ZIP，重新解压后运行 `start-worker.cmd`；无需删除 `%LOCALAPPDATA%\VGen`、旧 Worker 节点或模型 |
 | 清理 `pack-*.idx` 时出现“访问被拒绝” | 换用修复后的 Worker ZIP 并重新运行；安装器会在确认暂存目录确属 VGen 且不含重解析点后清除只读属性并短暂重试，不要手工删除整个 `%LOCALAPPDATA%\VGen` |
 | Python/Git 路径中混入 pip 或 winget 输出 | 换用修复后的 Worker ZIP 后直接重跑 `start-worker.cmd`；不要手工删除 `%LOCALAPPDATA%\VGen\worker-runtime-*`，安装器会把安装进度与返回路径分离 |
-| Worker 显示 `maintenance-only` | 保持 PowerShell 窗口在线，在 Mac 发起 `vgen broker model-install ... --wait` |
+| Worker 显示 `maintenance-only` | 后台控制通道已经在线；在 Mac 发起 `vgen broker model-install ... --wait`，并检查 ComfyUI 日志 |
 | 提交前不确定 Worker 是否可用 | 运行只读的 `vgen task preflight`；按输出的 offline/busy、capability 或 rate 原因处理后重试 |
 | CLI 报告 Worker 没有 manager Broker | 运行 `vgen worker manager-set "Windows GPU Worker"` 后重试维护任务 |
 | `340003 DISK_SPACE_INSUFFICIENT` | 释放最终模型文件及临时下载所需空间后重试 |
 | `340004 PATH_CONFLICT` / `340005 DIGEST_MISMATCH` | 人工检查冲突路径；Worker 不会自动覆盖或删除异常文件 |
-| Worker 更新后无法上线 | 保持前台监督器运行，等待自动回退；保留上一 runtime 和日志，不要强删 |
+| Worker 更新后无法上线 | 任务计划程序会重启控制进程，运行时监督器会自动回退；保留上一 runtime 和日志，不要强删 |
 
 CLI 的顶层帮助会说明各命令组用途并给出常用流程；进入命令组或具体操作后，会继续显示每个
 参数的含义、安全影响和默认取值来源。无需查阅源代码：

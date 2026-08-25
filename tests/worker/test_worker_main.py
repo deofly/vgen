@@ -10,7 +10,6 @@ from vgen.executors import ExecutorDescriptor, ExecutorHealth
 from vgen.worker import LeaseReference, WorkerCredentials, save_worker_credentials_file
 from vgen.worker.main import (
     EXIT_CONFIG,
-    EXIT_LAUNCHER_RESTART,
     EXIT_OK,
     EXIT_UNAVAILABLE,
     EXIT_UPDATE_RESTART,
@@ -517,7 +516,7 @@ def test_pending_update_requests_supervisor_restart_before_other_work(
     assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_update_restart"
 
 
-def test_refreshed_support_assets_request_outer_launcher_restart(
+def test_pending_update_cleanup_does_not_block_worker_announce(
     tmp_path: Path, capsys: Any
 ) -> None:
     credential_file = tmp_path / "worker-credentials.json"
@@ -525,15 +524,33 @@ def test_refreshed_support_assets_request_outer_launcher_restart(
         credential_file,
         WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
     )
+    events: list[str] = []
+
+    class FakeGateway:
+        def announce(self, _capabilities: dict[str, Any]) -> None:
+            events.append("announce")
+
+        def poll_lease(self) -> None:
+            events.append("poll")
+            return None
+
+    class FakeCore:
+        def resume_pending(self, _gateway: Any) -> None:
+            events.append("resume_upload")
+            return None
 
     class FakeMaintenance:
+        enabled = True
+
         def recover_pending_update(self, **_kwargs: Any) -> MaintenanceOutcome:
+            events.append("recover_update")
             return MaintenanceOutcome(
-                "maintenance_support_restart",
-                True,
-                launcher_restart_required=True,
-                job_id="mtn_test",
+                "maintenance_update_cleanup_pending", True, job_id="mtn_test"
             )
+
+        def run_one(self) -> None:
+            events.append("maintenance")
+            return None
 
     assert (
         run(
@@ -547,13 +564,21 @@ def test_refreshed_support_assets_request_outer_launcher_restart(
                 str(credential_file),
             ],
             executor_factory=lambda _arguments: FakeExecutor(),
-            gateway_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
-            core_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
+            gateway_factory=lambda *_arguments: FakeGateway(),  # type: ignore[arg-type,return-value]
+            core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
             maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
         )
-        == EXIT_LAUNCHER_RESTART
+        == EXIT_OK
     )
-    assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_support_restart"
+    assert events == [
+        "recover_update",
+        "announce",
+        "resume_upload",
+        "maintenance",
+        "poll",
+    ]
+    status = json.loads(capsys.readouterr().out)
+    assert status["maintenance_succeeded"] is True
 
 
 def test_failed_target_activation_requests_supervisor_rollback(

@@ -129,6 +129,9 @@ try {
     if (-not $firstLauncherContent.Contains("installer\0.9.1-111111111111\start-worker.cmd")) {
         throw "The stable launcher did not select the first verified installer."
     }
+    if ([regex]::IsMatch($firstLauncherContent, '(?im)^\s*pause\s*$')) {
+        throw "The stable launcher must not wait for interactive input on failure."
+    }
 
     Install-VGenWorkerDesktopShortcut $stableLauncher $desktop
     Assert-ShortcutTarget $stableLauncher
@@ -147,11 +150,18 @@ try {
         "-Reenroll" `
         "Stable launcher reenrollment arguments"
 
+    & $env:ComSpec /d /c "`"$stableLauncher`" -Repair"
+    Assert-Equal $LASTEXITCODE 23 "Stable launcher repair exit code"
+    Assert-Equal `
+        ([IO.File]::ReadAllText((Join-Path $firstRoot "invocation.txt")).Trim()) `
+        "-Repair" `
+        "Stable launcher repair arguments"
+
     & $env:ComSpec /d /c "`"$stableLauncher`" -Unknown"
     Assert-Equal $LASTEXITCODE 2 "Stable launcher rejected-argument exit code"
     Assert-Equal `
         ([IO.File]::ReadAllText((Join-Path $firstRoot "invocation.txt")).Trim()) `
-        "-Reenroll" `
+        "-Repair" `
         "Rejected arguments did not reach the versioned launcher"
 
     $secondRoot = New-TestInstaller "0.9.2" "2" 29
@@ -161,6 +171,9 @@ try {
     if (-not $secondLauncherContent.Contains("installer\0.9.2-222222222222\start-worker.cmd") -or
         $secondLauncherContent.Contains("installer\0.9.1-111111111111\start-worker.cmd")) {
         throw "The stable launcher did not switch atomically to the second verified installer."
+    }
+    if ([regex]::IsMatch($secondLauncherContent, '(?im)^\s*pause\s*$')) {
+        throw "The updated stable launcher must not wait for interactive input on failure."
     }
     Assert-Equal `
         (Install-VGenWorkerLauncher $secondRoot) `

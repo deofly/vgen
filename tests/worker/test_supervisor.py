@@ -125,6 +125,111 @@ def test_supervisor_restarts_previous_runtime_with_rollback_marker(
     assert launches == [(initial, False), (target, False), (initial, True)]
 
 
+def test_supervisor_rolls_back_when_target_runtime_cannot_start(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    initial = _python(source)
+    work_root = tmp_path / "work"
+    target = _python(work_root / "runtime-releases" / "0.9.1-a")
+    launches: list[tuple[Path, bool]] = []
+
+    def runner(command: list[str], **kwargs: Any) -> Any:
+        launches.append(
+            (
+                Path(command[0]),
+                kwargs["env"].get("VGEN_WORKER_UPDATE_ROLLBACK") == "1",
+            )
+        )
+        if len(launches) == 1:
+            _write_pointer(work_root, active=target, previous=initial, pending=True)
+            return SimpleNamespace(returncode=EXIT_UPDATE_RESTART)
+        if len(launches) == 2:
+            raise OSError("target interpreter is unavailable")
+        _write_pointer(work_root, active=initial)
+        return SimpleNamespace(returncode=0)
+
+    assert (
+        supervise_worker(
+            ["serve"],
+            work_root=work_root,
+            initial_python=initial,
+            source_runtime=source,
+            runner=runner,
+        )
+        == 0
+    )
+    assert launches == [(initial, False), (target, False), (initial, True)]
+
+
+def test_supervisor_rolls_back_when_staged_target_disappears_before_launch(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    initial = _python(source)
+    work_root = tmp_path / "work"
+    target = _python(work_root / "runtime-releases" / "0.9.1-a")
+    launches: list[tuple[Path, bool]] = []
+
+    def runner(command: list[str], **kwargs: Any) -> Any:
+        launches.append(
+            (
+                Path(command[0]),
+                kwargs["env"].get("VGEN_WORKER_UPDATE_ROLLBACK") == "1",
+            )
+        )
+        if len(launches) == 1:
+            _write_pointer(work_root, active=target, previous=initial, pending=True)
+            target.unlink()
+            return SimpleNamespace(returncode=EXIT_UPDATE_RESTART)
+        _write_pointer(work_root, active=initial)
+        return SimpleNamespace(returncode=0)
+
+    assert (
+        supervise_worker(
+            ["serve"],
+            work_root=work_root,
+            initial_python=initial,
+            source_runtime=source,
+            runner=runner,
+        )
+        == 0
+    )
+    assert launches == [(initial, False), (initial, True)]
+
+
+def test_supervisor_retries_crashing_rollback_runtime_within_budget(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    initial = _python(source)
+    work_root = tmp_path / "work"
+    target = _python(work_root / "runtime-releases" / "0.9.1-a")
+    work_root.mkdir(parents=True, exist_ok=True)
+    _write_pointer(work_root, active=target, previous=initial, pending=True)
+    launches: list[tuple[Path, bool]] = []
+
+    def runner(command: list[str], **kwargs: Any) -> Any:
+        launches.append(
+            (
+                Path(command[0]),
+                kwargs["env"].get("VGEN_WORKER_UPDATE_ROLLBACK") == "1",
+            )
+        )
+        if len(launches) < 3:
+            return SimpleNamespace(returncode=2)
+        _write_pointer(work_root, active=initial)
+        return SimpleNamespace(returncode=0)
+
+    assert (
+        supervise_worker(
+            ["serve"],
+            work_root=work_root,
+            initial_python=initial,
+            source_runtime=source,
+            runner=runner,
+        )
+        == 0
+    )
+    assert launches == [(target, False), (initial, True), (initial, True)]
+
+
 def test_supervisor_honors_rollback_requested_by_legacy_windows_launcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -169,6 +274,28 @@ def test_supervisor_rejects_pointer_outside_trusted_runtime_roots(
     outside = _python(tmp_path / "outside")
     work_root.mkdir(parents=True)
     _write_pointer(work_root, active=outside)
+
+    with pytest.raises(WorkerUpdateError, match="WORKER_UPDATE_POINTER_INVALID"):
+        supervise_worker(
+            ["serve"],
+            work_root=work_root,
+            initial_python=initial,
+            source_runtime=source,
+        )
+
+
+def test_supervisor_rejects_reparse_target_even_with_safe_previous_runtime(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    initial = _python(source)
+    work_root = tmp_path / "work"
+    outside = _python(tmp_path / "outside")
+    target = work_root / "runtime-releases" / "0.9.1-a" / "bin" / "python"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(outside)
+    work_root.mkdir(parents=True, exist_ok=True)
+    _write_pointer(work_root, active=target, previous=initial, pending=True)
 
     with pytest.raises(WorkerUpdateError, match="WORKER_UPDATE_POINTER_INVALID"):
         supervise_worker(

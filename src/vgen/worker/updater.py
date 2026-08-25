@@ -43,6 +43,7 @@ class WorkerRuntimeState:
     active_python: Path
     previous_python: Path | None
     pending: bool
+    active_available: bool = True
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -315,9 +316,28 @@ class RuntimeUpdater:
         except (KeyError, OSError, TypeError, ValueError):
             return False
 
+    def activation_verified(self, pointer: dict[str, Any]) -> bool:
+        """Return whether the target already passed its authenticated probe."""
+
+        value = pointer.get("activation_verified_at")
+        if value is None:
+            return False
+        if type(value) is not int or value < 1:
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        return True
+
+    def mark_activation_verified(self, pointer: dict[str, Any]) -> dict[str, Any]:
+        """Persist target health before attempting the idempotent Gateway commit."""
+
+        value = dict(pointer)
+        value["activation_verified_at"] = int(time.time())
+        self._write_pointer(value)
+        return value
+
     def mark_activation_succeeded(self, pointer: dict[str, Any]) -> None:
         value = dict(pointer)
         for key in (
+            "activation_verified_at",
             "pending_job_id",
             "pending_fencing_token",
             "previous_python",
@@ -368,26 +388,46 @@ class RuntimeUpdater:
         # so resume from the installer's trusted fallback instead.
         if rolled_back and not pending:
             return WorkerRuntimeState(trusted_fallback, None, False)
-        active = self._supervisor_python(value.get("active_python"), trusted_fallback)
+        active, active_available = self._supervisor_python(
+            value.get("active_python"),
+            trusted_fallback,
+            allow_missing=pending,
+        )
         previous = None
         if pending:
-            previous = self._supervisor_python(value.get("previous_python"), trusted_fallback)
-        return WorkerRuntimeState(active, previous, pending)
+            previous, _previous_available = self._supervisor_python(
+                value.get("previous_python"), trusted_fallback
+            )
+        return WorkerRuntimeState(active, previous, pending, active_available)
 
-    def _supervisor_python(self, raw: object, trusted_fallback: Path) -> Path:
+    def _supervisor_python(
+        self,
+        raw: object,
+        trusted_fallback: Path,
+        *,
+        allow_missing: bool = False,
+    ) -> tuple[Path, bool]:
         if not isinstance(raw, str) or not raw:
             raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
         try:
-            candidate = Path(raw).resolve()
+            raw_candidate = Path(raw)
+            if _is_reparse(raw_candidate):
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+            candidate = raw_candidate.resolve()
             releases_root = self.releases_root.resolve()
             in_releases = candidate.is_relative_to(releases_root)
+        except WorkerUpdateError:
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
             raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID") from exc
         if candidate != trusted_fallback and not in_releases:
             raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
-        if not candidate.is_file() or (candidate != trusted_fallback and _is_reparse(candidate)):
+        if candidate != trusted_fallback and _is_reparse(candidate):
             raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
-        return candidate
+        available = candidate.is_file()
+        if not available and not allow_missing:
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        return candidate, available
 
     def _verify_installed_runtime(self, runtime: Path, expected_version: str) -> None:
         python = _runtime_python(runtime)

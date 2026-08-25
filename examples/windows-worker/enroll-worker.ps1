@@ -16,12 +16,20 @@ param(
     [string]$WorkerName,
     [string]$ComfyUIRoot,
     [string]$ComfyUIDataRoot,
-    [switch]$Reenroll
+    [switch]$Reenroll,
+    [switch]$Repair
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$managedSupervisorForRecovery = $null
+$powerShellForRecovery = $null
+$supervisorStoppedForRepair = $false
+$supervisorHostConfigPath = $null
+$supervisorHostConfigSnapshot = $null
+$supervisorLaunchConfigPath = $null
+$supervisorLaunchConfigSnapshot = $null
 
 function Write-Step {
     param([string]$Message)
@@ -50,6 +58,48 @@ function Assert-RegularLocalFile {
         throw "$Description must not be a symbolic link or reparse point."
     }
     return $item.FullName
+}
+
+function Test-PathInside {
+    param([string]$Path, [string]$Root)
+
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd("\")
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd("\")
+    return $fullPath.Equals($fullRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($fullRoot + "\", [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Restore-FileSnapshot {
+    param([string]$Path, [byte[]]$Value, [string]$Description)
+
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "$Description parent directory is missing."
+    }
+    $parentItem = Get-Item -LiteralPath $parent -Force
+    if (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Description parent directory is unsafe."
+    }
+    $temporary = Join-Path $parent ".$([IO.Path]::GetFileName($Path)).$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllBytes($temporary, $Value)
+        if (Test-Path -LiteralPath $Path) {
+            $existing = Get-Item -LiteralPath $Path -Force
+            if ($existing.PSIsContainer -or
+                ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Description path is unsafe."
+            }
+            [IO.File]::Replace($temporary, $Path, $null)
+        }
+        else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
 }
 
 function Assert-CredentialAcl {
@@ -130,6 +180,7 @@ function Assert-ClosedBundleDirectory {
         "enroll-worker.ps1",
         "start-worker.cmd",
         "setup-worker.ps1",
+        "supervise-worker.ps1",
         "vgen-worker-bundle.json",
         "comfyui-minimax-h3-policy.yaml",
         "SHA256SUMS"
@@ -276,6 +327,7 @@ try {
         "enroll-worker.ps1",
         "start-worker.cmd",
         "setup-worker.ps1",
+        "supervise-worker.ps1",
         "vgen-worker-bundle.json",
         "comfyui-minimax-h3-policy.yaml",
         $wheelName
@@ -283,6 +335,97 @@ try {
     foreach ($requiredName in $requiredChecksumNames) {
         if (-not $checksumRecords.ContainsKey($requiredName)) {
             throw "Worker bundle checksum list is incomplete."
+        }
+    }
+    if ($Reenroll -or $Repair) {
+        # Always control the fixed task with the supervisor from this
+        # checksum-verified bundle. Repair must still work when the previously
+        # managed copy is missing or damaged.
+        $bundledSupervisor = Assert-RegularLocalFile `
+            (Join-Path $PSScriptRoot "supervise-worker.ps1") `
+            "Reviewed Worker supervisor"
+        $powerShellPath = [IO.Path]::Combine(
+            $env:SystemRoot,
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe"
+        )
+        if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+            throw "Windows PowerShell 5.1 could not be located for Worker repair."
+        }
+        $supervisorStatus = @(
+            & $powerShellPath `
+                -NoLogo `
+                -NoProfile `
+                -NonInteractive `
+                -ExecutionPolicy Bypass `
+                -File $bundledSupervisor `
+                -Mode Status
+        )
+        $supervisorStatusExit = $LASTEXITCODE
+        if ($supervisorStatusExit -eq 0) {
+            $supervisorWasRunning = @($supervisorStatus | ForEach-Object {
+                ([string]$_).Trim().ToLowerInvariant()
+            }) -contains "running"
+            $vgenRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "VGen"))
+            $supervisorHostConfigPath = Join-Path $vgenRoot "supervisor\worker-host.json"
+            $hostConfigItem = Get-Item -LiteralPath $supervisorHostConfigPath -Force
+            if ($hostConfigItem.PSIsContainer -or
+                ($hostConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $hostConfigItem.Length -le 0 -or $hostConfigItem.Length -gt 65536) {
+                throw "The installed Worker supervisor configuration is unsafe; the running task was left untouched."
+            }
+            try {
+                $hostConfig = [IO.File]::ReadAllText($hostConfigItem.FullName) | ConvertFrom-Json
+            }
+            catch {
+                throw "The installed Worker supervisor configuration is invalid; the running task was left untouched."
+            }
+            $supervisorLaunchConfigPath = [string]$hostConfig.launch_config
+            if ([string]::IsNullOrWhiteSpace($supervisorLaunchConfigPath) -or
+                -not [IO.Path]::IsPathRooted($supervisorLaunchConfigPath) -or
+                -not (Test-PathInside $supervisorLaunchConfigPath $vgenRoot) -or
+                -not (Test-Path -LiteralPath $supervisorLaunchConfigPath -PathType Leaf)) {
+                throw "The installed Worker launch configuration is invalid; the running task was left untouched."
+            }
+            $launchConfigItem = Get-Item -LiteralPath $supervisorLaunchConfigPath -Force
+            if (($launchConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $launchConfigItem.Length -le 0 -or $launchConfigItem.Length -gt 262144) {
+                throw "The installed Worker launch configuration is unsafe; the running task was left untouched."
+            }
+            $supervisorHostConfigSnapshot = [IO.File]::ReadAllBytes($hostConfigItem.FullName)
+            $supervisorLaunchConfigSnapshot = [IO.File]::ReadAllBytes($launchConfigItem.FullName)
+            $managedSupervisorForRecovery = $bundledSupervisor
+            $powerShellForRecovery = $powerShellPath
+            $supervisorStoppedForRepair = $supervisorWasRunning
+
+            Write-Step "Repairing the persistent supervisor controller before stopping its task"
+            & $powerShellPath `
+                -NoLogo `
+                -NoProfile `
+                -NonInteractive `
+                -ExecutionPolicy Bypass `
+                -File $bundledSupervisor `
+                -Mode Install `
+                -LaunchConfig $supervisorLaunchConfigPath
+            if ($LASTEXITCODE -ne 0) {
+                throw "The persistent Worker supervisor controller could not be repaired."
+            }
+            Write-Step "Stopping persistent Worker supervision for reviewed repair"
+            & $powerShellPath `
+                -NoLogo `
+                -NoProfile `
+                -NonInteractive `
+                -ExecutionPolicy Bypass `
+                -File $bundledSupervisor `
+                -Mode Stop
+            if ($LASTEXITCODE -ne 0) {
+                throw "The persistent Worker supervisor could not be stopped for repair."
+            }
+        }
+        elseif ($supervisorStatusExit -ne 3) {
+            throw "The persistent Worker supervisor status could not be inspected for repair."
         }
     }
     $wheelPath = Assert-RegularLocalFile (Join-Path $PSScriptRoot $wheelName) "VGen wheel"
@@ -389,20 +532,91 @@ try {
     }
 
     Write-Step "Enrollment completed; continuing with reviewed Worker setup"
-    $setupArguments = @{
-        GatewayUrl = $gatewayOrigin
-        WorkerCredentials = $credentialPath
+    $setupPowerShellPath = [IO.Path]::Combine(
+        $env:SystemRoot,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe"
+    )
+    if (-not (Test-Path -LiteralPath $setupPowerShellPath -PathType Leaf)) {
+        throw "Windows PowerShell 5.1 could not be located for Worker setup."
     }
+    # setup-worker.ps1 deliberately uses process exit codes. Run it in a child
+    # host so a failed setup returns here and the previous task can be resumed.
+    $setupProcessArguments = @(
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $setupPath,
+        "-GatewayUrl", $gatewayOrigin,
+        "-WorkerCredentials", $credentialPath
+    )
     if (-not [string]::IsNullOrWhiteSpace($ComfyUIRoot)) {
-        $setupArguments["ComfyUIRoot"] = $ComfyUIRoot
+        $setupProcessArguments += @("-ComfyUIRoot", $ComfyUIRoot)
     }
     if (-not [string]::IsNullOrWhiteSpace($ComfyUIDataRoot)) {
-        $setupArguments["ComfyUIDataRoot"] = $ComfyUIDataRoot
+        $setupProcessArguments += @("-ComfyUIDataRoot", $ComfyUIDataRoot)
     }
-    & $setupPath @setupArguments
-    exit $LASTEXITCODE
+    & $setupPowerShellPath @setupProcessArguments
+    $setupExitCode = $LASTEXITCODE
+    if ($setupExitCode -ne 0) {
+        throw "Worker setup stopped with exit code $setupExitCode."
+    }
+    exit 0
 }
 catch {
-    Write-Error $_.Exception.Message
+    $failureMessage = [string]$_.Exception.Message
+    if ($supervisorStoppedForRepair -and
+        $null -ne $managedSupervisorForRecovery -and
+        $null -ne $powerShellForRecovery) {
+        Write-Warning "Worker repair did not complete; restarting the previously installed supervisor."
+        $restoreFailures = [Collections.Generic.List[string]]::new()
+        if ($null -ne $supervisorLaunchConfigSnapshot) {
+            try {
+                Restore-FileSnapshot `
+                    $supervisorLaunchConfigPath `
+                    $supervisorLaunchConfigSnapshot `
+                    "Worker launch configuration"
+            }
+            catch { $restoreFailures.Add([string]$_.Exception.Message) }
+        }
+        if ($null -ne $supervisorHostConfigSnapshot) {
+            try {
+                Restore-FileSnapshot `
+                    $supervisorHostConfigPath `
+                    $supervisorHostConfigSnapshot `
+                    "Worker supervisor configuration"
+            }
+            catch { $restoreFailures.Add([string]$_.Exception.Message) }
+        }
+        if ($restoreFailures.Count -gt 0) {
+            Write-Warning "The previous Worker configuration could not be fully restored: $($restoreFailures -join '; ')"
+        }
+        if ($null -ne $supervisorLaunchConfigPath) {
+            & $powerShellForRecovery `
+                -NoLogo `
+                -NoProfile `
+                -NonInteractive `
+                -ExecutionPolicy Bypass `
+                -File $managedSupervisorForRecovery `
+                -Mode Install `
+                -LaunchConfig $supervisorLaunchConfigPath
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "The previous Worker supervisor definition could not be restored."
+            }
+        }
+        & $powerShellForRecovery `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $managedSupervisorForRecovery `
+            -Mode Start
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "The previously installed Worker supervisor also could not be restarted."
+        }
+    }
+    Write-Error $failureMessage
     exit 1
 }

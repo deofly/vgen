@@ -143,7 +143,11 @@ def test_stages_separate_runtime_and_writes_pending_activation_pointer(
     assert "VIRTUAL_ENV" not in isolated_env
     assert "PIP_INDEX_URL" not in isolated_env
 
-    updater.mark_activation_succeeded(pointer)
+    verified = updater.mark_activation_verified(pointer)
+    assert updater.activation_verified(verified)
+    assert updater.pending_activation() == verified
+
+    updater.mark_activation_succeeded(verified)
     assert updater.pending_activation() is None
     assert updater.active_python() == Path(pointer["active_python"])
 

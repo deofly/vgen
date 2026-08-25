@@ -2692,6 +2692,69 @@ function Get-WorkerRuntimeState {
     }
 }
 
+function Write-WorkerLaunchConfig {
+    param(
+        [string]$Path,
+        [string]$WorkerExecutable,
+        [string[]]$WorkerArguments,
+        [string]$WorkerWorkingDirectory,
+        [string]$ComfyExecutable,
+        [string[]]$ComfyArguments,
+        [string]$ComfyWorkingDirectory
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    $parentItem = Get-Item -LiteralPath $parent -Force
+    if (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The Worker launch configuration directory must not be a reparse point."
+    }
+    foreach ($executable in @($WorkerExecutable, $ComfyExecutable)) {
+        if ([string]::IsNullOrWhiteSpace($executable) -or
+            -not [IO.Path]::IsPathRooted($executable) -or
+            -not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "The Worker launch configuration contains an invalid executable."
+        }
+    }
+    $value = [ordered]@{
+        format = "vgen-windows-worker-launch-config"
+        version = 1
+        worker = [ordered]@{
+            executable = $WorkerExecutable
+            arguments = @($WorkerArguments)
+            working_directory = $WorkerWorkingDirectory
+        }
+        comfyui = [ordered]@{
+            executable = $ComfyExecutable
+            arguments = @($ComfyArguments)
+            working_directory = $ComfyWorkingDirectory
+        }
+    }
+    $temporary = Join-Path $parent ".launch-config.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $json = ($value | ConvertTo-Json -Depth 6) + "`n"
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path) {
+            $existing = Get-Item -LiteralPath $Path -Force
+            if ($existing.PSIsContainer -or
+                ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "The Worker launch configuration path is unsafe."
+            }
+            [IO.File]::Replace($temporary, $Path, $null)
+        }
+        else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+}
+
 # Dot-sourcing is reserved for the Windows PowerShell 5.1 conformance tests;
 # normal users and start-worker.cmd execute this file with -File.
 if ($MyInvocation.InvocationName -eq ".") {
@@ -2920,6 +2983,7 @@ try {
 
     $comfyStdoutPath = $null
     $comfyStderrPath = $null
+    $comfyArguments = $null
     if (-not $comfyWorkerPortRunning) {
         if ($CheckOnly) {
             Add-Finding "ComfyUI is not running; CheckOnly does not start it."
@@ -2945,7 +3009,9 @@ try {
             "--temp-directory", $tempRoot,
             "--database-url", $databaseUrl,
             "--listen", "127.0.0.1",
-            "--port", "8188"
+            "--port", "8188",
+            "--dont-print-server",
+            "--verbose", "ERROR"
         )
         if ($null -ne $comfyLayout.FrontEndRoot) {
             $comfyArguments += @("--front-end-root", [string]$comfyLayout.FrontEndRoot)
@@ -3067,10 +3133,65 @@ try {
     if ($GatewayUrl.Scheme -eq "http") {
         $workerArguments += "--allow-http"
     }
-    Write-Step "Starting authenticated Worker $workerId in the foreground"
+    Write-Step "Preparing authenticated Worker $workerId for persistent supervision"
     if (-not (Test-Path -LiteralPath $workRoot -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
     }
+    $supervisorScript = Join-Path $PSScriptRoot "supervise-worker.ps1"
+    if (Test-Path -LiteralPath $supervisorScript -PathType Leaf) {
+        $supervisorItem = Get-Item -LiteralPath $supervisorScript -Force
+        if (($supervisorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The persistent Worker supervisor script must not be a reparse point."
+        }
+        if ($null -eq $comfyArguments) {
+            throw "The persistent Worker supervisor could not capture the ComfyUI launch configuration."
+        }
+        $launchConfigPath = Join-Path $workRoot "launch-config.json"
+        Write-WorkerLaunchConfig `
+            $launchConfigPath `
+            $runtimePython `
+            (@("-I", "-m", "vgen.worker.main") + $workerArguments) `
+            $workRoot `
+            $comfyPython `
+            $comfyArguments `
+            $isolatedComfyDataRoot
+        Write-Step "Installing persistent Worker and ComfyUI supervision"
+        $powerShellPath = [IO.Path]::Combine(
+            $env:SystemRoot,
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe"
+        )
+        if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+            throw "Windows PowerShell 5.1 could not be located for persistent supervision."
+        }
+        & $powerShellPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $supervisorItem.FullName `
+            -Mode Install `
+            -LaunchConfig $launchConfigPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "The persistent Worker supervisor could not be installed."
+        }
+        Stop-VGenManagedComfyUI
+        & $powerShellPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $supervisorItem.FullName `
+            -Mode Start
+        if ($LASTEXITCODE -ne 0) {
+            throw "The persistent Worker supervisor was installed but could not be started."
+        }
+        Write-Step "Worker control is now managed by Windows Task Scheduler; this setup window may close"
+        exit 0
+    }
+    Write-Warning "Persistent supervision is unavailable in this legacy bundle; keeping the Worker in the foreground."
     # Current Workers supervise versioned child runtimes themselves. Keep this
     # outer loop so a pre-supervisor Worker can still complete its first remote
     # upgrade without reinstalling the Windows package.

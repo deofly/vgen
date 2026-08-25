@@ -40,10 +40,10 @@ Install the components in this order:
 7. Submit real zero-, one-, and two-image jobs for acceptance.
 
 The Gateway runs under systemd. The installer configures the Mac Home Broker as
-a per-user LaunchAgent. The Windows Worker currently requires its foreground
-PowerShell window to remain open. The installer creates a stable `VGen Worker`
-Desktop shortcut for starting it again after a reboot, but it is not installed
-as a Windows Service and does not start automatically at boot.
+a per-user LaunchAgent. After first-time validation, Windows Task Scheduler runs
+Worker control and ComfyUI as separately supervised processes for the enrolled
+Windows user. This is not a LocalSystem Windows Service; after a reboot that
+Windows user must log in, and the task then starts automatically.
 
 > Installing a workflow does not download its model weights. Initialization
 > installs the `vgen/minimax-h3-8step` manifest, parameter definitions, and
@@ -416,23 +416,23 @@ and rate; Windows then detects ComfyUI and starts the Worker.
 ### 5.2 Runtime behavior and retry
 
 The installer prepares an isolated VGen runtime and custom-node directories,
-starts ComfyUI only on `127.0.0.1:8188` when needed, and runs the Worker in the
-foreground. Missing models do not fail installation; the Worker comes online
-in `maintenance-only` mode so the Broker can install them.
+starts ComfyUI only on `127.0.0.1:8188`, validates the stack, and hands a closed
+launch configuration to Task Scheduler. Missing models do not fail installation;
+the Worker comes online in `maintenance-only` mode so the Broker can install them.
 
 Keep `%LOCALAPPDATA%\VGen` when repairing or reenrolling. The installer safely
-reuses reviewed, pinned custom-node repositories and preserves models. Keep one
-PowerShell window open after polling starts. `Ctrl+C` stops the Worker and any
-ComfyUI instance started by the supervisor. Logs are under
+reuses reviewed, pinned custom-node repositories and preserves models. After the
+Task Scheduler handoff message appears, the PowerShell window may close. Worker
+control starts before ComfyUI and stays online in maintenance-only mode if
+ComfyUI fails; each process is restarted independently. Logs are under
 `%LOCALAPPDATA%\VGen\logs`.
 
 The installer creates `%LOCALAPPDATA%\VGen\start-worker.cmd` and a `VGen Worker`
-shortcut on the current user's Desktop. After Windows restarts, exit any ComfyUI
-instance that was opened separately, double-click that same shortcut, and keep
-the resulting PowerShell window open. The shortcut always targets the stable
-launcher; a later reviewed installer updates the launcher's internal version
-target without changing the shortcut. Rerunning the public `irm` command is not
-required for an ordinary restart.
+shortcut on the current user's Desktop. Normally the shortcut only ensures the
+background task is running; it does not repeat enrollment or setup. After Windows
+restarts and the same user logs in, the task starts automatically. A reviewed
+installer uses the explicit repair path to stop, revalidate, and resume its own
+task. Rerunning the public `irm` command is not required for an ordinary restart.
 
 ### 5.3 Desktop, Portable, and custom data roots
 
@@ -460,9 +460,11 @@ user does not need to run `icacls` first.
 
 ### 5.4 Reinstall or reenroll
 
-For a normal repair, stop the foreground Worker and rerun the public installer.
-It authenticates with the existing local key and preserves the same Worker ID.
+For a normal repair, rerun the public installer. It stops its own scheduled task,
+authenticates with the existing local key, and preserves the same Worker ID.
 Do not delete credentials, ComfyUI, models, or `%LOCALAPPDATA%\VGen`.
+When migrating from a 0.13.7-or-older foreground package, close that old Worker
+window and its ComfyUI process before running the 0.13.8 installer once.
 
 Network failures, Gateway outages, and signature mismatches preserve the old
 credential and stop safely. Use reenrollment only after confirming that the
@@ -519,7 +521,8 @@ vgen worker upgrade --worker "Windows GPU Worker" --wait
 
 Accept the LTX-2.5 gate and license on Hugging Face. Store a read-only token only
 on the Windows Worker, preferably in a user-protected file selected by
-`HF_TOKEN_PATH`, then restart the foreground Worker. Never put that token in a
+`HF_TOKEN_PATH`, then stop and start the `VGen Worker Supervisor` scheduled task.
+Never put that token in a
 Mac command, Gateway configuration, or workflow manifest.
 
 ```bash
@@ -570,14 +573,14 @@ vgen broker worker-update ~/Downloads/vgen-<version>-py3-none-any.whl \
 These commands update only the VGen Worker wheel, not the Gateway, Mac CLI,
 ComfyUI, custom nodes, Python, CUDA, drivers, or model weights.
 
-The long-running `vgen worker serve` process contains its own stable supervisor.
+The scheduled host starts Worker control before ComfyUI and restarts them
+independently. The long-running `vgen worker serve` process also contains its own
+runtime supervisor.
 After the Broker-authorized wheel is verified and staged, that supervisor starts
 the new isolated runtime, waits for its authenticated Gateway announce, and
-returns to the previous runtime if activation fails. The Windows launcher keeps
-the same compatibility behavior for Workers installed by an older package.
-Do not run the Worker under an external loop that replaces its whole Python
-environment; keep the original foreground command running and let VGen switch
-the child runtime.
+returns to the previous runtime if activation fails. Runtime activation no longer
+rewrites or relaunches the immutable Windows installer scripts. Do not run the
+Worker under another loop that replaces its whole Python environment.
 
 ## 7. Real zero-, one-, and two-image tests
 
@@ -730,9 +733,9 @@ new one has completed recovery, key sync, Broker binding, and a real task test.
 - **Gateway returns 502 or is unhealthy:** run `setup-gateway.sh status`, check
   systemd logs and `127.0.0.1:8010`, then use `activate` only if the local
   Gateway is healthy. Use `rollback` to restore the saved Nginx route.
-- **Worker is offline:** keep its PowerShell window open, check
-  `%LOCALAPPDATA%\VGen\logs`, confirm Gateway reachability, and verify that
-  ComfyUI listens only on loopback.
+- **Worker is offline:** check the `VGen Worker Supervisor` task and
+  `%LOCALAPPDATA%\VGen\logs`, confirm Gateway reachability, and verify that the
+  enrolled Windows user has logged in after the last reboot.
 - **Worker is maintenance-only:** run the model-install command in section 6 and
   wait for every pinned dependency to verify.
 - **Preflight reports no capacity:** check allocation, online heartbeat, active

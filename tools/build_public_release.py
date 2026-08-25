@@ -323,6 +323,7 @@ def _validate_windows_bundle(path: Path, *, version: str, gateway_origin: str) -
                 "enroll-worker.ps1",
                 "start-worker.cmd",
                 "setup-worker.ps1",
+                "supervise-worker.ps1",
                 "vgen-worker-bundle.json",
                 "comfyui-minimax-h3-policy.yaml",
                 "SHA256SUMS",
@@ -857,31 +858,31 @@ function Install-VGenWorkerLauncher([string]$InstallRoot) {{
     $launcherContent = @"
 @echo off
 setlocal
-set "VGEN_WORKER_REENROLL_ARG="
+set "VGEN_WORKER_SETUP_ARG="
 if not "%~1"=="" (
-  if /I not "%~1"=="-Reenroll" (
-    echo [vgen] Only the reviewed -Reenroll recovery switch is accepted.
+  if /I "%~1"=="-Reenroll" set "VGEN_WORKER_SETUP_ARG=-Reenroll"
+  if /I "%~1"=="-Repair" set "VGEN_WORKER_SETUP_ARG=-Repair"
+  if not defined VGEN_WORKER_SETUP_ARG (
+    echo [vgen] Only the reviewed -Repair and -Reenroll switches are accepted.
     exit /b 2
   )
   if not "%~2"=="" (
-    echo [vgen] -Reenroll does not accept additional arguments.
+    echo [vgen] The recovery switch does not accept additional arguments.
     exit /b 2
   )
-  set "VGEN_WORKER_REENROLL_ARG=-Reenroll"
 )
 set "VGEN_WORKER_VERSION_LAUNCHER=%~dp0installer\$installLeaf\start-worker.cmd"
 if not exist "%VGEN_WORKER_VERSION_LAUNCHER%" (
   echo [vgen] The installed Worker launcher is missing.
   echo [vgen] Run the public Windows Worker installer again to repair it.
-  pause
   exit /b 1
 )
-if defined VGEN_WORKER_REENROLL_ARG goto vgen_worker_reenroll
+if defined VGEN_WORKER_SETUP_ARG goto vgen_worker_setup
 "%VGEN_WORKER_VERSION_LAUNCHER%"
 exit /b %ERRORLEVEL%
 
-:vgen_worker_reenroll
-"%VGEN_WORKER_VERSION_LAUNCHER%" -Reenroll
+:vgen_worker_setup
+"%VGEN_WORKER_VERSION_LAUNCHER%" %VGEN_WORKER_SETUP_ARG%
 exit /b %ERRORLEVEL%
 "@
     $launcherContent = $launcherContent.Replace("`r`n", "`n").Replace("`n", "`r`n")
@@ -1027,6 +1028,7 @@ try {{
             $required = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             @(
                 "INSTALL.txt", "enroll-worker.ps1", "start-worker.cmd", "setup-worker.ps1",
+                "supervise-worker.ps1",
                 "vgen-worker-bundle.json", "comfyui-minimax-h3-policy.yaml", "SHA256SUMS",
                 "vgen-$ExpectedVersion-py3-none-any.whl"
             ) | ForEach-Object {{ [void]$required.Add($_) }}
@@ -1065,7 +1067,7 @@ try {{
 $stableLauncher = Install-VGenWorkerLauncher $installRoot
 Install-VGenWorkerDesktopShortcut $stableLauncher
 Write-Host "[vgen] Verified. Starting the universal Worker installer..."
-& $stableLauncher
+& $stableLauncher -Repair
 if ($LASTEXITCODE -ne 0) {{ throw "Windows Worker setup stopped with exit code $LASTEXITCODE." }}
 '''
     return script.encode("utf-8")

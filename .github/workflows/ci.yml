@@ -100,7 +100,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $scripts = @(
+            "$PWD\examples\windows-worker\enroll-worker.ps1",
             "$PWD\examples\windows-worker\setup-worker.ps1",
+            "$PWD\examples\windows-worker\supervise-worker.ps1",
             "$env:RUNNER_TEMP\install-windows-worker.ps1"
           )
           foreach ($scriptPath in $scripts) {
@@ -121,6 +123,11 @@ jobs:
         run: |
           .\tests\examples\windows-powershell51-worker-launcher.ps1 `
             -BootstrapPath "$env:RUNNER_TEMP\install-windows-worker.ps1"
+      - name: Verify the persistent Worker supervisor lifecycle
+        shell: powershell
+        run: |
+          .\tests\examples\windows-powershell51-worker-supervisor.ps1 `
+            -RepositoryRoot "$PWD"
       - name: Verify repeated atomic model-path replacement
         shell: powershell
         run: .\tests\examples\windows-powershell51-model-paths.ps1

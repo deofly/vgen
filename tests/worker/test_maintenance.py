@@ -18,7 +18,7 @@ from vgen.crypto import (
     issue_device_certificate,
     sign_maintenance_intent,
 )
-from vgen.protocol import ErrorCode
+from vgen.protocol import ErrorCode, VGenError
 from vgen.worker import WorkerCredentials
 from vgen.worker.maintenance import (
     WorkerMaintenanceController,
@@ -102,8 +102,16 @@ class FakeUpdater:
     def is_target_process(self, _pointer: dict[str, Any]) -> bool:
         return True
 
+    def activation_verified(self, pointer: dict[str, Any]) -> bool:
+        return type(pointer.get("activation_verified_at")) is int
+
+    def mark_activation_verified(self, pointer: dict[str, Any]) -> dict[str, Any]:
+        self.pointer = {**pointer, "activation_verified_at": 1}
+        return self.pointer
+
     def mark_activation_succeeded(self, _pointer: dict[str, Any]) -> None:
         self.succeeded = True
+        self.pointer = None
 
     def mark_activation_rolled_back(self, _pointer: dict[str, Any]) -> None:
         self.rolled_back = True
@@ -351,7 +359,230 @@ def test_new_target_process_completes_pending_update_activation(tmp_path: Path) 
     assert gateway.completions[-1]["result"]["status"] == "activated"
 
 
-def test_new_target_refreshes_launcher_and_requests_outer_restart(tmp_path: Path) -> None:
+def test_target_journals_verified_activation_before_gateway_completion(
+    tmp_path: Path,
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+    events: list[str] = []
+
+    class OrderingUpdater(FakeUpdater):
+        def mark_activation_verified(self, value: dict[str, Any]) -> dict[str, Any]:
+            events.append("verified")
+            return super().mark_activation_verified(value)
+
+        def mark_activation_succeeded(self, value: dict[str, Any]) -> None:
+            events.append("cleaned")
+            super().mark_activation_succeeded(value)
+
+    class OrderingGateway(FakeGateway):
+        def heartbeat_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            events.append("heartbeat")
+            return super().heartbeat_maintenance(job_id, **value)
+
+        def complete_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            events.append("complete")
+            return super().complete_maintenance(job_id, **value)
+
+    updater = OrderingUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+    outcome = WorkerMaintenanceController(
+        credentials,
+        OrderingGateway(),  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update(activation_probe=lambda: events.append("probe"))
+
+    assert outcome is not None and outcome.succeeded
+    assert events == ["heartbeat", "probe", "verified", "complete", "cleaned"]
+
+
+def test_completed_activation_retries_transient_pointer_cleanup_without_reprobe(
+    tmp_path: Path,
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+
+    class CleanupRetryUpdater(FakeUpdater):
+        def __init__(self, root: Path, value: dict[str, Any]) -> None:
+            super().__init__(root, value)
+            self.cleanup_attempts = 0
+
+        def mark_activation_succeeded(self, value: dict[str, Any]) -> None:
+            self.cleanup_attempts += 1
+            if self.cleanup_attempts == 1:
+                raise PermissionError("transient Windows file lock")
+            super().mark_activation_succeeded(value)
+
+    updater = CleanupRetryUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+    gateway = FakeGateway()
+    controller = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    )
+    probes: list[str] = []
+
+    first = controller.recover_pending_update(
+        activation_probe=lambda: probes.append("announced")
+    )
+    second = controller.recover_pending_update(
+        activation_probe=lambda: pytest.fail("verified activation must not be reprobed")
+    )
+
+    assert first is not None and first.mode == "maintenance_update_cleanup_pending"
+    assert first.succeeded
+    assert second is not None and second.mode == "maintenance_update_activated"
+    assert second.succeeded
+    assert probes == ["announced"]
+    assert updater.cleanup_attempts == 2
+    assert updater.succeeded
+    assert len(gateway.completions) == 2
+    assert len(gateway.heartbeats) == 1
+
+
+def test_verified_activation_adopts_restart_lease_after_process_change(
+    tmp_path: Path,
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+        "activation_verified_at": 1,
+    }
+
+    class ChangedSessionGateway(FakeGateway):
+        def complete_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            self.completions.append({"job_id": job_id, **value})
+            if len(self.completions) == 1:
+                raise VGenError(ErrorCode.MAINTENANCE_LEASE_LOST)
+            return {"ok": True}
+
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+    gateway = ChangedSessionGateway()
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update(
+        activation_probe=lambda: pytest.fail("verified activation must not be reprobed")
+    )
+
+    assert outcome is not None and outcome.succeeded
+    assert len(gateway.completions) == 2
+    assert gateway.heartbeats == [
+        {
+            "job_id": "mtn_test",
+            "fencing_token": 4,
+            "ttl_seconds": 300,
+            "state": "restarting",
+            "adopt_restart_session": True,
+            "progress": {
+                "stage": "activating",
+                "completed_bytes": 0,
+                "total_bytes": None,
+            },
+        }
+    ]
+    assert updater.succeeded
+
+
+def test_verified_activation_rolls_back_when_restart_lease_expired(
+    tmp_path: Path,
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+        "activation_verified_at": 1,
+    }
+
+    class ExpiredLeaseGateway(FakeGateway):
+        def complete_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            self.completions.append({"job_id": job_id, **value})
+            raise VGenError(ErrorCode.MAINTENANCE_LEASE_LOST)
+
+        def heartbeat_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            self.heartbeats.append({"job_id": job_id, **value})
+            raise VGenError(ErrorCode.MAINTENANCE_LEASE_LOST)
+
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+    gateway = ExpiredLeaseGateway()
+
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update(
+        activation_probe=lambda: pytest.fail("verified activation must not be reprobed")
+    )
+
+    assert outcome is not None
+    assert outcome.rollback_required
+    assert not outcome.succeeded
+    assert outcome.mode == "maintenance_update_activation_failed"
+    assert len(gateway.completions) == 1
+    assert len(gateway.heartbeats) == 1
+    assert not updater.succeeded
+
+
+def test_new_target_activation_keeps_immutable_installer_assets_untouched(tmp_path: Path) -> None:
     pointer = {
         "pending_job_id": "mtn_test",
         "pending_fencing_token": 4,
@@ -369,9 +600,15 @@ def test_new_target_refreshes_launcher_and_requests_outer_restart(tmp_path: Path
         }
     )
     gateway = FakeGateway()
-    launcher = tmp_path / "start-worker.cmd"
-    launcher.write_text("reviewed", encoding="utf-8")
-    restarted: list[Path] = []
+    installer = tmp_path / "installer"
+    installer.mkdir()
+    launcher = installer / "start-worker.cmd"
+    setup = installer / "setup-worker.ps1"
+    checksums = installer / "SHA256SUMS"
+    launcher.write_bytes(b"reviewed launcher\r\n")
+    setup.write_bytes(b"reviewed setup\r\n")
+    checksums.write_bytes(b"immutable checksums\r\n")
+    before = {path.name: path.read_bytes() for path in installer.iterdir()}
 
     outcome = WorkerMaintenanceController(
         credentials,
@@ -380,15 +617,12 @@ def test_new_target_refreshes_launcher_and_requests_outer_restart(tmp_path: Path
         work_root=tmp_path / "work",
         model_root=None,
         updater=updater,  # type: ignore[arg-type]
-        support_refresher=lambda: launcher,
-        launcher_restarter=restarted.append,
         ticket_resolver=lambda _host, _port: ("93.184.216.34",),
     ).recover_pending_update()
 
     assert outcome is not None and outcome.succeeded
-    assert outcome.launcher_restart_required
-    assert outcome.mode == "maintenance_support_restart"
-    assert restarted == [launcher]
+    assert outcome.mode == "maintenance_update_activated"
+    assert {path.name: path.read_bytes() for path in installer.iterdir()} == before
     assert updater.succeeded
     assert gateway.completions[-1]["result"]["status"] == "activated"
 

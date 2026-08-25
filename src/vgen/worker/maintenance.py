@@ -36,7 +36,6 @@ from vgen.protocol import ErrorCode, VGenError
 from .capabilities import CapabilityInstallError, WorkerCapabilityStore
 from .credentials import WorkerCredentials
 from .model_installer import ModelInstaller, ModelInstallError
-from .support_assets import refresh_windows_support_assets, schedule_windows_launcher_restart
 from .updater import RuntimeUpdater, WorkerUpdateError
 
 logger = logging.getLogger(__name__)
@@ -103,7 +102,6 @@ class MaintenanceOutcome:
     succeeded: bool
     restart_required: bool = False
     rollback_required: bool = False
-    launcher_restart_required: bool = False
     job_id: str | None = None
     error_code: int | None = None
 
@@ -198,8 +196,6 @@ class WorkerMaintenanceController:
         updater: RuntimeUpdater | None = None,
         model_installer: ModelInstaller | None = None,
         capability_store: WorkerCapabilityStore | None = None,
-        support_refresher: Callable[[], Path | None] = refresh_windows_support_assets,
-        launcher_restarter: Callable[[Path], None] = schedule_windows_launcher_restart,
         ticket_resolver: TicketResolver = _default_ticket_resolver,
     ) -> None:
         self._credentials = credentials
@@ -212,8 +208,6 @@ class WorkerMaintenanceController:
         self._model_root = model_root
         self._model_installer = model_installer
         self._capability_store = capability_store
-        self._support_refresher = support_refresher
-        self._launcher_restarter = launcher_restarter
         self._ticket_resolver = ticket_resolver
         self._last_progress_at = 0.0
         self._gateway_lock = threading.Lock()
@@ -266,54 +260,69 @@ class WorkerMaintenanceController:
                 "maintenance_update_restart", True, restart_required=True, job_id=job_id
             )
 
-        refreshed_launcher: Path | None = None
-        try:
-            activation = self._gateway.heartbeat_maintenance(
-                job_id,
-                fencing_token=fencing_token,
-                ttl_seconds=300,
-                state="restarting",
-                adopt_restart_session=True,
-                progress={
-                    "stage": "activating",
-                    "completed_bytes": 0,
-                    "total_bytes": None,
-                },
-            )
-            if activation.get("cancelled") is True:
-                raise _MaintenanceCancelled()
-            # A new interpreter importing VGen is not sufficient proof that it
-            # can serve as a Worker.  Confirm one authenticated control-plane
-            # announce before committing the update and clearing the rollback
-            # pointer.
-            if activation_probe is not None:
-                with _LeaseKeeper(
-                    self._gateway,
+        if not self._updater.activation_verified(pointer):
+            try:
+                activation = self._gateway.heartbeat_maintenance(
                     job_id,
-                    fencing_token,
-                    stage="activating",
-                    gateway_lock=self._gateway_lock,
+                    fencing_token=fencing_token,
+                    ttl_seconds=300,
                     state="restarting",
-                ) as keeper:
-                    activation_probe()
-                    keeper.check()
-            refreshed_launcher = self._support_refresher()
-            self._gateway.complete_maintenance(
+                    adopt_restart_session=True,
+                    progress={
+                        "stage": "activating",
+                        "completed_bytes": 0,
+                        "total_bytes": None,
+                    },
+                )
+                if activation.get("cancelled") is True:
+                    raise _MaintenanceCancelled()
+                # A new interpreter importing VGen is not sufficient proof that it
+                # can serve as a Worker. Confirm one authenticated control-plane
+                # announce, then journal that proof before the remote commit. A
+                # crash or lost HTTP response can consequently retry completion
+                # without rerunning an ambiguous activation probe.
+                if activation_probe is not None:
+                    with _LeaseKeeper(
+                        self._gateway,
+                        job_id,
+                        fencing_token,
+                        stage="activating",
+                        gateway_lock=self._gateway_lock,
+                        state="restarting",
+                    ) as keeper:
+                        activation_probe()
+                        keeper.check()
+                pointer = self._updater.mark_activation_verified(pointer)
+            except BaseException:
+                # Keep the pending pointer until the previous runtime starts with
+                # the rollback marker. It must report the signed failure before
+                # clearing local activation state; otherwise the Gateway would
+                # leave the maintenance job in a restart loop.
+                return MaintenanceOutcome(
+                    "maintenance_update_activation_failed",
+                    False,
+                    rollback_required=True,
+                    job_id=job_id,
+                    error_code=int(ErrorCode.UPDATE_ACTIVATION_FAILED),
+                )
+
+        result = {
+            "kind": "worker_update",
+            "status": "activated",
+            "target_version": target_version,
+            "artifact_sha256": artifact_sha256,
+        }
+        try:
+            self._complete_verified_update(
                 job_id,
-                fencing_token=fencing_token,
-                succeeded=True,
-                result={
-                    "kind": "worker_update",
-                    "status": "activated",
-                    "target_version": target_version,
-                    "artifact_sha256": artifact_sha256,
-                },
+                fencing_token,
+                result,
             )
-        except BaseException:
-            # Keep the pending pointer until the previous runtime starts with
-            # the rollback marker. It must report the signed failure before
-            # clearing local activation state; otherwise the Gateway would
-            # leave the maintenance job in a restart loop.
+        except (_MaintenanceCancelled, VGenError):
+            # A verified target whose fenced restart lease can no longer be
+            # adopted must not remain pending forever. Roll back locally; the
+            # previous runtime clears the journal even if the expired job can
+            # no longer accept its failure report.
             return MaintenanceOutcome(
                 "maintenance_update_activation_failed",
                 False,
@@ -321,23 +330,62 @@ class WorkerMaintenanceController:
                 job_id=job_id,
                 error_code=int(ErrorCode.UPDATE_ACTIVATION_FAILED),
             )
-        self._updater.mark_activation_succeeded(pointer)
-        if refreshed_launcher is not None:
-            try:
-                self._launcher_restarter(refreshed_launcher)
-            except WorkerUpdateError:
-                # The new runtime is already healthy and committed. Keep it
-                # online if the optional outer launcher restart cannot be
-                # queued; a later update can safely retry the asset refresh.
-                logger.exception("Unable to schedule refreshed Windows Worker launcher")
-            else:
-                return MaintenanceOutcome(
-                    "maintenance_support_restart",
-                    True,
-                    launcher_restart_required=True,
-                    job_id=job_id,
-                )
+        try:
+            self._updater.mark_activation_succeeded(pointer)
+        except (OSError, WorkerUpdateError):
+            # Remote completion is idempotent and the verified marker remains.
+            # Keep serving and retry local pointer cleanup on the next loop;
+            # otherwise a transient Windows file lock would make a healthy
+            # target look offline after the Gateway already accepted it.
+            logger.debug("Worker activation pointer cleanup remains pending")
+            return MaintenanceOutcome(
+                "maintenance_update_cleanup_pending", True, job_id=job_id
+            )
         return MaintenanceOutcome("maintenance_update_activated", True, job_id=job_id)
+
+    def _complete_verified_update(
+        self,
+        job_id: str,
+        fencing_token: int,
+        result: Mapping[str, Any],
+    ) -> None:
+        """Commit a locally verified target across response loss or process restart."""
+
+        try:
+            self._gateway.complete_maintenance(
+                job_id,
+                fencing_token=fencing_token,
+                succeeded=True,
+                result=result,
+            )
+            return
+        except VGenError as exc:
+            if exc.code != ErrorCode.MAINTENANCE_LEASE_LOST:
+                raise
+        # A process can crash after journaling verification but before the
+        # completion request. Adopt the still-fenced restart lease, then retry
+        # the same idempotent result. If completion had already committed, the
+        # first call above succeeds directly without this heartbeat.
+        activation = self._gateway.heartbeat_maintenance(
+            job_id,
+            fencing_token=fencing_token,
+            ttl_seconds=300,
+            state="restarting",
+            adopt_restart_session=True,
+            progress={
+                "stage": "activating",
+                "completed_bytes": 0,
+                "total_bytes": None,
+            },
+        )
+        if activation.get("cancelled") is True:
+            raise _MaintenanceCancelled()
+        self._gateway.complete_maintenance(
+            job_id,
+            fencing_token=fencing_token,
+            succeeded=True,
+            result=result,
+        )
 
     def run_one(self) -> MaintenanceOutcome | None:
         if not self.enabled or not hasattr(self._gateway, "claim_maintenance"):

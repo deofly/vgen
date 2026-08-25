@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vgen"
-version = "0.13.7"
+version = "0.13.8"
 description = "Open, encrypted GPU workflow gateway, broker and worker runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -85,6 +85,7 @@ packages = ["src/vgen"]
 "examples/windows-worker/enroll-worker.ps1" = "vgen/assets/worker/enroll-worker.ps1"
 "examples/windows-worker/setup-worker.ps1" = "vgen/assets/worker/setup-worker.ps1"
 "examples/windows-worker/start-worker.cmd" = "vgen/assets/worker/start-worker.cmd"
+"examples/windows-worker/supervise-worker.ps1" = "vgen/assets/worker/supervise-worker.ps1"
 "examples/comfyui-minimax-h3-policy.yaml" = "vgen/assets/worker/comfyui-minimax-h3-policy.yaml"
 
 [tool.pytest.ini_options]
