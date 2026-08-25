@@ -145,6 +145,27 @@ $CustomNodePins = @(
     }
 )
 
+# Reviewed bootstrap nodes are installed by the Windows machine administrator,
+# but are not part of the legacy H3 policy. Dynamic workflow capability
+# packages may authorize their exact node classes independently after this
+# executable dependency has been staged once.
+$BootstrapCustomNodePins = @(
+    [PSCustomObject]@{
+        Name = "ComfyUI-GGUF"
+        Directory = "ComfyUI-GGUF"
+        Aliases = @("ComfyUI_GGUF")
+        Source = "https://github.com/city96/ComfyUI-GGUF"
+        Revision = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+        Requirements = $null
+    }
+)
+
+$ComfyGgufPythonRequirements = @(
+    "gguf==0.17.1",
+    "sentencepiece==0.2.1",
+    "protobuf==6.33.5"
+)
+
 $RequiredNodeClasses = @(
     "UNETLoader",
     "CLIPLoader",
@@ -2406,6 +2427,15 @@ function Test-ComfyPythonRequirements {
     return $requirementsExitCode -eq 0
 }
 
+function Test-ComfyGgufPythonRequirements {
+    param([string]$Python)
+    if ([string]::IsNullOrWhiteSpace($Python)) {
+        return $false
+    }
+    & $Python -B -c "import gguf, sentencepiece, google.protobuf; from importlib.metadata import version; assert version('gguf') == '0.17.1'; assert version('sentencepiece') == '0.2.1'; assert version('protobuf') == '6.33.5'" 2>$null | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
 function Write-ManualModelList {
     param([System.Collections.IEnumerable]$Failures)
     Write-Warning "One or more model files need attention:"
@@ -2829,12 +2859,18 @@ try {
         foreach ($pin in $CustomNodePins) {
             $null = Install-PinnedCustomNode $pin $customNodesRoot $comfyWasRunning $vgenComfyRoot
         }
+        foreach ($pin in $BootstrapCustomNodePins) {
+            $null = Install-PinnedCustomNode $pin $customNodesRoot $comfyWasRunning $vgenComfyRoot
+        }
     }
 
     if ($null -ne $comfyPython -and $CheckOnly) {
         if (-not (Test-ComfyPythonRequirements $comfyPython)) {
             $message = "The selected ComfyUI Python runtime cannot import the required Torch, audio, or Video Helper modules."
             Add-Finding $message
+        }
+        if (-not (Test-ComfyGgufPythonRequirements $comfyPython)) {
+            Add-Finding "The selected ComfyUI Python runtime does not contain the reviewed ComfyUI-GGUF dependency versions."
         }
     }
     elseif (-not $CheckOnly -and -not $comfyWasRunning -and $null -ne $comfyPython) {
@@ -2849,6 +2885,14 @@ try {
         }
         if (-not (Test-ComfyPythonRequirements $comfyPython)) {
             throw "The selected ComfyUI Python runtime cannot import the required Torch, audio, or Video Helper modules."
+        }
+        Write-Step "Installing reviewed ComfyUI-GGUF Python requirements into the ComfyUI runtime"
+        & $comfyPython -m pip install --disable-pip-version-check @ComfyGgufPythonRequirements
+        if ($LASTEXITCODE -ne 0) {
+            throw "ComfyUI could not install the reviewed ComfyUI-GGUF requirements."
+        }
+        if (-not (Test-ComfyGgufPythonRequirements $comfyPython)) {
+            throw "The selected ComfyUI Python runtime does not contain the reviewed ComfyUI-GGUF dependency versions."
         }
     }
 

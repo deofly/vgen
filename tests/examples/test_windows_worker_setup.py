@@ -972,9 +972,25 @@ def test_windows_worker_custom_node_pins_match_reference_manifest() -> None:
     ]
     actual = [
         (_quoted_value(block, "Source"), _quoted_value(block, "Revision"))
-        for block in _blocks(text, "CustomNodePins", "RequiredNodeClasses")
+        for block in _blocks(text, "CustomNodePins", "BootstrapCustomNodePins")
     ]
     assert actual == expected
+
+
+def test_windows_worker_bootstraps_reviewed_comfyui_gguf_node() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    blocks = _blocks(text, "BootstrapCustomNodePins", "ComfyGgufPythonRequirements")
+    assert len(blocks) == 1
+    assert _quoted_value(blocks[0], "Source") == "https://github.com/city96/ComfyUI-GGUF"
+    assert _quoted_value(blocks[0], "Revision") == (
+        "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+    )
+    requirements = text.split("$ComfyGgufPythonRequirements = @(", 1)[1].split(")", 1)[0]
+    assert '"gguf==0.17.1"' in requirements
+    assert '"sentencepiece==0.2.1"' in requirements
+    assert '"protobuf==6.33.5"' in requirements
+    assert "foreach ($pin in $BootstrapCustomNodePins)" in text
+    assert "function Test-ComfyGgufPythonRequirements" in text
 
 
 def test_windows_worker_required_nodes_match_machine_policy() -> None:

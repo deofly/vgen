@@ -133,6 +133,30 @@ def test_workflow_inspection_supports_zip(
     assert registry.installed() == []
 
 
+def test_workflow_package_builds_reviewed_unsigned_local_release(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    package = _make_package(tmp_path / "package", workflow_id="example/package")
+    output = tmp_path / "dist" / "workflow.zip"
+
+    dispatch(
+        build_parser().parse_args(
+            ["workflow", "package", str(package), str(output)]
+        )
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"archive": str(output.resolve())}
+    assert output.is_file()
+    manifest, _digest, signed = WorkflowRegistry(tmp_path / "registry").inspect_source(
+        output,
+        allow_unsigned=True,
+    )
+    assert manifest.id == "example/package"
+    assert signed is False
+
+
 def test_workflow_inspection_supports_https_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

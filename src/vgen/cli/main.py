@@ -3072,7 +3072,14 @@ def _workflow_command(args: argparse.Namespace) -> None:
         digest = sign_package(Path(args.source).resolve(), key)
         _json({"digest": f"sha256:{digest}", "signed": True})
     elif args.workflow_action == "package":
-        output = build_archive(Path(args.source).resolve(), Path(args.output).resolve())
+        # Packaging is a deterministic build operation, not a trust decision.
+        # Unsigned local releases remain subject to explicit approval when they
+        # are installed or sent to a Worker.
+        output = build_archive(
+            Path(args.source).resolve(),
+            Path(args.output).resolve(),
+            allow_unsigned=True,
+        )
         _json({"archive": str(output)})
     elif args.workflow_action == "publish":
         output = build_archive(Path(args.source).resolve(), Path(args.output).resolve())
