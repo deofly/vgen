@@ -2800,11 +2800,13 @@ def create_app(
         require_scope(principal, "worker:maintenance:report")
         data = payload.model_dump(mode="json")
         progress = data.pop("progress")
+        adopt_restart_session = data.pop("adopt_restart_session")
         return repository.heartbeat_worker_maintenance(
             job_id=job_id,
             worker_id=worker_id,
             session_id=principal.session_id,
             progress=progress,
+            adopt_restart_session=adopt_restart_session,
             **data,
         )
 

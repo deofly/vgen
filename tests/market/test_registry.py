@@ -369,6 +369,36 @@ def test_package_can_be_signed_and_archived(tmp_path: Path) -> None:
     assert installed.digest == package_digest(package)
 
 
+def test_inspect_source_supports_directory_zip_and_https_without_installing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = make_package(tmp_path / "package", signed=True)
+    archive = build_archive(package, tmp_path / "workflow.zip")
+    archive_bytes = archive.read_bytes()
+    registry = WorkflowRegistry(tmp_path / "installed")
+
+    def download(url: str, *, max_bytes: int, timeout: float) -> bytes:
+        assert url == "https://market.example/vgen-example-1.0.0.zip"
+        assert max_bytes == 64 * 1024**2
+        assert timeout == 60
+        return archive_bytes
+
+    monkeypatch.setattr(WorkflowRegistry, "_download", staticmethod(download))
+
+    inspected = [
+        registry.inspect_source(package),
+        registry.inspect_source(archive),
+        registry.inspect_source("https://market.example/vgen-example-1.0.0.zip"),
+    ]
+
+    assert {manifest.id for manifest, _, _ in inspected} == {"vgen/example"}
+    assert {digest for _, digest, _ in inspected} == {package_digest(package)}
+    assert all(signed for _, _, signed in inspected)
+    assert registry.installed() == []
+    assert not registry.root.exists()
+
+
 def test_builder_distinguishes_zero_one_and_two_images() -> None:
     graph = {
         "1": {

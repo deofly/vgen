@@ -3299,6 +3299,11 @@
       "WorkerMaintenanceHeartbeat": {
         "additionalProperties": false,
         "properties": {
+          "adopt_restart_session": {
+            "default": false,
+            "title": "Adopt Restart Session",
+            "type": "boolean"
+          },
           "fencing_token": {
             "minimum": 1.0,
             "title": "Fencing Token",

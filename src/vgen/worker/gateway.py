@@ -194,6 +194,7 @@ class GatewayV1Client:
         ttl_seconds: int = 60,
         state: str = "running",
         progress: Mapping[str, Any] | None = None,
+        adopt_restart_session: bool = False,
     ) -> Mapping[str, Any]:
         body: dict[str, Any] = {
             "fencing_token": int(fencing_token),
@@ -202,6 +203,8 @@ class GatewayV1Client:
         }
         if progress is not None:
             body["progress"] = dict(progress)
+        if adopt_restart_session:
+            body["adopt_restart_session"] = True
         value = self._request(
             "POST",
             f"/api/v1/workers/{self.worker_id}/maintenance-jobs/{job_id}/heartbeat",

@@ -571,8 +571,9 @@ def test_gateway_maintenance_claim_heartbeat_complete_and_relative_ticket() -> N
     client.heartbeat_maintenance(
         "mtn_test",
         fencing_token=2,
-        state="running",
-        progress={"stage": "validating", "completed_bytes": 0, "total_bytes": None},
+        state="restarting",
+        progress={"stage": "activating", "completed_bytes": 0, "total_bytes": None},
+        adopt_restart_session=True,
     )
     client.complete_maintenance(
         "mtn_test",
@@ -595,6 +596,7 @@ def test_gateway_maintenance_claim_heartbeat_complete_and_relative_ticket() -> N
     assert session.requests[0][2]["headers"]["Idempotency-Key"].startswith(
         "worker-maintenance-claim-"
     )
+    assert json.loads(session.requests[1][2]["data"])["adopt_restart_session"] is True
 
 
 def test_maintenance_claim_falls_back_for_legacy_gateway_and_reprobes() -> None:

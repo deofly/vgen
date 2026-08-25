@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -331,7 +332,121 @@ def test_new_target_process_completes_pending_update_activation(tmp_path: Path) 
     assert outcome is not None and outcome.succeeded
     assert probes == ["announced"]
     assert updater.succeeded
+    assert gateway.heartbeats[0]["adopt_restart_session"] is True
+    assert gateway.heartbeats[0]["state"] == "restarting"
     assert gateway.completions[-1]["result"]["status"] == "activated"
+
+
+def test_target_activation_renews_restarting_lease_during_slow_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+
+    class RenewingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewed = threading.Event()
+
+        def heartbeat_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            response = super().heartbeat_maintenance(job_id, **value)
+            if len(self.heartbeats) >= 2:
+                self.renewed.set()
+            return response
+
+    gateway = RenewingGateway()
+    monkeypatch.setattr("vgen.worker.maintenance._LEASE_RENEW_INTERVAL_SECONDS", 0.001)
+
+    def slow_probe() -> None:
+        assert gateway.renewed.wait(timeout=1)
+
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update(activation_probe=slow_probe)
+
+    assert outcome is not None and outcome.succeeded
+    assert gateway.heartbeats[0]["adopt_restart_session"] is True
+    assert gateway.heartbeats[1]["state"] == "restarting"
+    assert gateway.heartbeats[1]["progress"]["stage"] == "activating"
+    assert "adopt_restart_session" not in gateway.heartbeats[1]
+    assert gateway.completions[-1]["succeeded"] is True
+
+
+@pytest.mark.parametrize("failure", ["cancelled", "lease_lost"])
+def test_target_activation_renewal_failure_never_completes_with_stale_fencing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+
+    class FailingRenewalGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = threading.Event()
+
+        def heartbeat_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            if self.heartbeats:
+                self.heartbeats.append({"job_id": job_id, **value})
+                self.failed.set()
+                if failure == "lease_lost":
+                    from vgen.protocol import VGenError
+
+                    raise VGenError(ErrorCode.MAINTENANCE_LEASE_LOST)
+                return {"ok": True, "cancelled": True}
+            return super().heartbeat_maintenance(job_id, **value)
+
+    gateway = FailingRenewalGateway()
+    monkeypatch.setattr("vgen.worker.maintenance._LEASE_RENEW_INTERVAL_SECONDS", 0.001)
+
+    def slow_probe() -> None:
+        assert gateway.failed.wait(timeout=1)
+
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update(activation_probe=slow_probe)
+
+    assert outcome is not None and outcome.rollback_required
+    assert not outcome.succeeded
+    assert gateway.heartbeats[-1]["state"] == "restarting"
+    assert gateway.completions == []
 
 
 def test_pending_update_activation_probe_failure_rolls_back(tmp_path: Path) -> None:

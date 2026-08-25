@@ -206,6 +206,23 @@ class WorkflowRegistry:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or user_data_path("vgen") / "workflows"
 
+    def inspect_source(
+        self,
+        source: str | Path,
+        *,
+        allow_unsigned: bool = False,
+    ) -> tuple[WorkflowManifest, str, bool]:
+        """Materialize and validate a package without installing it.
+
+        Archive extraction and remote downloads stay inside the same bounded
+        temporary directory and use the same path, size, and redirect checks as
+        installation.  Only the validated metadata escapes that directory.
+        """
+
+        with tempfile.TemporaryDirectory(prefix="vgen-workflow-inspect-") as temp:
+            unpacked = self._materialize(source, Path(temp))
+            return validate_package(unpacked, allow_unsigned=allow_unsigned)
+
     def installed(self) -> list[InstallResult]:
         results: list[InstallResult] = []
         if not self.root.is_dir():

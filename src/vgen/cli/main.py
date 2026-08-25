@@ -56,7 +56,7 @@ from vgen.crypto import (
 )
 from vgen.market import WorkflowRegistry, comfyui_capability_facts
 from vgen.market.builder import build_comfy_graph, load_json
-from vgen.market.models import WorkflowManifest, WorkflowVariant
+from vgen.market.models import SEMVER_RE, WORKFLOW_ID_RE, WorkflowManifest, WorkflowVariant
 from vgen.market.registry import (
     RegistryError,
     build_archive,
@@ -3103,8 +3103,7 @@ def _workflow_command(args: argparse.Namespace) -> None:
                 empty_message="没有安装的 Workflow。",
             )
     elif args.workflow_action in {"show", "verify"}:
-        source = Path(args.source).expanduser().resolve()
-        manifest, digest, signed = validate_package(source, allow_unsigned=True)
+        manifest, digest, signed = _inspect_workflow_source(args.source, registry=registry)
         _json(
             {
                 "manifest": manifest.model_dump(mode="json"),
@@ -3178,12 +3177,48 @@ def _workflow_command(args: argparse.Namespace) -> None:
         )
 
 
-def _resolve_workflow(reference: str) -> tuple[WorkflowManifest, Path, str]:
+def _workflow_reference(value: str) -> bool:
+    workflow_id, separator, version = value.partition("@")
+    return bool(
+        WORKFLOW_ID_RE.fullmatch(workflow_id)
+        and (not separator or SEMVER_RE.fullmatch(version))
+    )
+
+
+def _inspect_workflow_source(
+    source: str,
+    *,
+    registry: WorkflowRegistry | None = None,
+) -> tuple[WorkflowManifest, str, bool]:
+    selected_registry = registry or WorkflowRegistry()
+    local_path = Path(source).expanduser()
+    if local_path.is_dir():
+        return selected_registry.inspect_source(local_path.resolve(), allow_unsigned=True)
+    if _workflow_reference(source):
+        _, directory, resolved_digest = _resolve_workflow(
+            source,
+            registry=selected_registry,
+        )
+        manifest, digest, signed = selected_registry.inspect_source(
+            directory,
+            allow_unsigned=True,
+        )
+        if digest != resolved_digest:
+            raise RegistryError("installed workflow digest changed during inspection")
+        return manifest, digest, signed
+    return selected_registry.inspect_source(source, allow_unsigned=True)
+
+
+def _resolve_workflow(
+    reference: str,
+    *,
+    registry: WorkflowRegistry | None = None,
+) -> tuple[WorkflowManifest, Path, str]:
     workflow_id, separator, version = reference.partition("@")
-    registry = WorkflowRegistry()
+    selected_registry = registry or WorkflowRegistry()
     matches = [
         item
-        for item in registry.installed()
+        for item in selected_registry.installed()
         if item.manifest.id == workflow_id and (not separator or item.manifest.version == version)
     ]
     if not matches:
@@ -3217,7 +3252,7 @@ def _resolve_workflow(reference: str) -> tuple[WorkflowManifest, Path, str]:
                 raise RegistryError(
                     f"CLI installation is missing bundled workflow: {workflow_id}@{release_version}"
                 )
-            installed = registry.install(
+            installed = selected_registry.install(
                 directory,
                 allow_unsigned=True,
                 expected_digest=expected_digest,

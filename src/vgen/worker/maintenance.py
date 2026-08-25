@@ -40,6 +40,7 @@ from .updater import RuntimeUpdater, WorkerUpdateError
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _WORKFLOW_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ROLLBACK_ENV = "VGEN_WORKER_UPDATE_ROLLBACK"
+_LEASE_RENEW_INTERVAL_SECONDS = 20.0
 
 TicketResolver = Callable[[str, int], Iterable[str]]
 
@@ -63,6 +64,7 @@ class MaintenanceGateway(Protocol):
         ttl_seconds: int = 60,
         state: str = "running",
         progress: Mapping[str, Any] | None = None,
+        adopt_restart_session: bool = False,
     ) -> Mapping[str, Any]: ...
 
     def complete_maintenance(
@@ -102,7 +104,7 @@ class MaintenanceOutcome:
 
 
 class _LeaseKeeper:
-    """Renew one lease while a filesystem copy or pip process is blocking."""
+    """Renew one lease while a blocking maintenance phase is in progress."""
 
     def __init__(
         self,
@@ -112,12 +114,14 @@ class _LeaseKeeper:
         *,
         stage: str,
         gateway_lock: threading.Lock,
+        state: str = "running",
     ) -> None:
         self._gateway = gateway
         self._job_id = job_id
         self._fencing_token = fencing_token
         self._stage = stage
         self._gateway_lock = gateway_lock
+        self._state = state
         self._stop = threading.Event()
         self._error: BaseException | None = None
         self._thread = threading.Thread(
@@ -145,15 +149,16 @@ class _LeaseKeeper:
     def _run(self) -> None:
         # The caller sends the first heartbeat before entering.  Renew every
         # twenty seconds and request a five-minute lease for slow Windows disk
-        # copies without widening the server's hard upper bound.
-        while not self._stop.wait(20):
+        # work without widening the server's hard upper bound. Preserve the
+        # caller-selected state so target activation remains `restarting`.
+        while not self._stop.wait(_LEASE_RENEW_INTERVAL_SECONDS):
             try:
                 with self._gateway_lock:
                     response = self._gateway.heartbeat_maintenance(
                         self._job_id,
                         fencing_token=self._fencing_token,
                         ttl_seconds=300,
-                        state="running",
+                        state=self._state,
                         progress={
                             "stage": self._stage,
                             "completed_bytes": 0,
@@ -253,6 +258,7 @@ class WorkerMaintenanceController:
                 fencing_token=fencing_token,
                 ttl_seconds=300,
                 state="restarting",
+                adopt_restart_session=True,
                 progress={
                     "stage": "activating",
                     "completed_bytes": 0,
@@ -266,7 +272,16 @@ class WorkerMaintenanceController:
             # announce before committing the update and clearing the rollback
             # pointer.
             if activation_probe is not None:
-                activation_probe()
+                with _LeaseKeeper(
+                    self._gateway,
+                    job_id,
+                    fencing_token,
+                    stage="activating",
+                    gateway_lock=self._gateway_lock,
+                    state="restarting",
+                ) as keeper:
+                    activation_probe()
+                    keeper.check()
             self._gateway.complete_maintenance(
                 job_id,
                 fencing_token=fencing_token,

@@ -536,6 +536,13 @@ class WorkerMaintenanceHeartbeat(WireModel):
     ttl_seconds: int = Field(default=60, ge=15, le=300)
     state: Literal["running", "restarting"]
     progress: WorkerMaintenanceProgress | None = None
+    adopt_restart_session: bool = False
+
+    @model_validator(mode="after")
+    def session_adoption_is_only_for_restart(self) -> WorkerMaintenanceHeartbeat:
+        if self.adopt_restart_session and self.state != "restarting":
+            raise ValueError("maintenance session adoption requires restarting state")
+        return self
 
 
 class WorkerUpdateMaintenanceResult(WireModel):

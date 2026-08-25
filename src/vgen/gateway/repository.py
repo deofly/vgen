@@ -4853,6 +4853,7 @@ class GatewayRepository:
         ttl_seconds: int,
         state: str,
         progress: dict[str, Any] | None,
+        adopt_restart_session: bool = False,
     ) -> dict[str, Any]:
         stamp = now()
         with self.db.transaction(immediate=True) as conn:
@@ -4863,13 +4864,27 @@ class GatewayRepository:
             ).fetchone()
             if row is not None and row["state"] == "cancelled":
                 return {"ok": True, "cancelled": True, "state": "cancelled"}
-            if (
-                row is None
-                or row["lease_session_id"] != session_id
-                or row["state"] not in _MAINTENANCE_LEASE_STATES
-                or float(row["lease_expires_at"] or 0) <= stamp
-                or float(row["expires_at"] or 0) <= stamp
-            ):
+            lease_unexpired = (
+                row is not None
+                and float(row["lease_expires_at"] or 0) > stamp
+                and float(row["expires_at"] or 0) > stamp
+            )
+            if adopt_restart_session:
+                lease_valid = (
+                    lease_unexpired
+                    and row is not None
+                    and row["kind"] == "worker_update"
+                    and row["state"] == "restarting"
+                    and state == "restarting"
+                )
+            else:
+                lease_valid = (
+                    lease_unexpired
+                    and row is not None
+                    and row["lease_session_id"] == session_id
+                    and row["state"] in _MAINTENANCE_LEASE_STATES
+                )
+            if not lease_valid:
                 raise RepositoryError(
                     MAINTENANCE_LEASE_LOST,
                     "MAINTENANCE_LEASE_LOST",
@@ -4879,6 +4894,16 @@ class GatewayRepository:
                     "platform",
                 )
             lease_expires_at = min(stamp + ttl_seconds, float(row["expires_at"]))
+            if adopt_restart_session:
+                # A runtime update deliberately crosses a process boundary. The
+                # explicit restart heartbeat hands the still-fenced lease to
+                # the new authenticated Worker session in this transaction.
+                conn.execute(
+                    """UPDATE worker_maintenance_jobs
+                       SET lease_session_id=?
+                       WHERE id=?""",
+                    (session_id, job_id),
+                )
             conn.execute(
                 """UPDATE worker_maintenance_jobs
                    SET state=?,progress=?,heartbeat_at=?,lease_expires_at=?,updated_at=?
@@ -4930,13 +4955,24 @@ class GatewayRepository:
                     "Worker maintenance was already completed with a different result.",
                     409,
                 )
-            if (
-                row is None
-                or row["lease_session_id"] != session_id
-                or row["state"] not in _MAINTENANCE_LEASE_STATES
-                or float(row["lease_expires_at"] or 0) <= stamp
-                or float(row["expires_at"] or 0) <= stamp
-            ):
+            active_lease = (
+                row is not None
+                and row["state"] in _MAINTENANCE_LEASE_STATES
+                and float(row["lease_expires_at"] or 0) > stamp
+                and float(row["expires_at"] or 0) > stamp
+            )
+            session_matches = row is not None and row["lease_session_id"] == session_id
+            cross_session_rollback = (
+                active_lease
+                and row is not None
+                and not session_matches
+                and row["kind"] == "worker_update"
+                and row["state"] == "restarting"
+                and not succeeded
+                and result.get("kind") == "worker_update"
+                and result.get("status") == "rolled_back"
+            )
+            if not active_lease or (not session_matches and not cross_session_rollback):
                 raise RepositoryError(
                     MAINTENANCE_LEASE_LOST,
                     "MAINTENANCE_LEASE_LOST",

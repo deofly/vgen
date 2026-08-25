@@ -35,6 +35,7 @@ class MaintenanceEnvironment:
     owner_device_id: str
     broker: dict[str, Any]
     worker: dict[str, Any]
+    worker_keys: DeviceKeys
     worker_headers: dict[str, str]
 
 
@@ -116,6 +117,7 @@ def _environment(tmp_path, *, manager: bool = True) -> MaintenanceEnvironment:
         owner_device_id=boot["device"]["id"],
         broker=broker,
         worker=worker,
+        worker_keys=worker_keys,
         worker_headers=worker_headers,
     )
 
@@ -301,15 +303,45 @@ def test_worker_update_upload_claim_and_complete_is_ticket_safe(tmp_path) -> Non
         assert cached_claim is not None
         assert b"Vgen-Artifact-Ticket" not in bytes(cached_claim["response_body"])
 
-        heartbeat = env.client.post(
-            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}"
-            "/heartbeat",
+        heartbeat_path = (
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}/heartbeat"
+        )
+        replacement_headers = _worker_session(env.client, env.worker["id"], env.worker_keys)
+        invalid_adoption_state = env.client.post(
+            heartbeat_path,
             json={
                 "fencing_token": leased["fencing_token"],
                 "ttl_seconds": 60,
                 "state": "running",
+                "adopt_restart_session": True,
+            },
+            headers=replacement_headers,
+        )
+        assert invalid_adoption_state.status_code == 422
+
+        adoption_before_restart = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "adopt_restart_session": True,
+            },
+            headers=replacement_headers,
+        )
+        assert adoption_before_restart.status_code == 409
+        assert adoption_before_restart.json()["error"]["code"] == int(
+            ErrorCode.MAINTENANCE_LEASE_LOST
+        )
+
+        heartbeat = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
                 "progress": {
-                    "stage": "installing",
+                    "stage": "staging",
                     "completed_bytes": len(artifact_bytes),
                     "total_bytes": len(artifact_bytes),
                 },
@@ -317,9 +349,108 @@ def test_worker_update_upload_claim_and_complete_is_ticket_safe(tmp_path) -> Non
             headers=env.worker_headers,
         )
         assert heartbeat.status_code == 200, heartbeat.text
+
+        ordinary_cross_session = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+            },
+            headers=replacement_headers,
+        )
+        assert ordinary_cross_session.status_code == 409
+
+        wrong_fence = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"] + 1,
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "adopt_restart_session": True,
+            },
+            headers=replacement_headers,
+        )
+        assert wrong_fence.status_code == 409
+
+        env.app.state.db.execute(
+            "UPDATE worker_maintenance_jobs SET lease_expires_at=0 WHERE id=?",
+            (created["id"],),
+        )
+        expired_adoption = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "adopt_restart_session": True,
+            },
+            headers=replacement_headers,
+        )
+        assert expired_adoption.status_code == 409
+        env.app.state.db.execute(
+            "UPDATE worker_maintenance_jobs SET lease_expires_at=? WHERE id=?",
+            (time.time() + 60, created["id"]),
+        )
+
+        adopted = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "adopt_restart_session": True,
+                "progress": {
+                    "stage": "activating",
+                    "completed_bytes": len(artifact_bytes),
+                    "total_bytes": len(artifact_bytes),
+                },
+            },
+            headers=replacement_headers,
+        )
+        assert adopted.status_code == 200, adopted.text
+        replacement_token = replacement_headers["Authorization"].removeprefix("Bearer ")
+        replacement_session = env.app.state.db.fetchone(
+            "SELECT id FROM sessions WHERE token_hash=?",
+            (hashlib.sha256(replacement_token.encode()).hexdigest(),),
+        )
+        adopted_job = env.app.state.db.fetchone(
+            "SELECT lease_session_id,progress FROM worker_maintenance_jobs WHERE id=?",
+            (created["id"],),
+        )
+        assert replacement_session is not None
+        assert adopted_job is not None
+        assert adopted_job["lease_session_id"] == replacement_session["id"]
+        assert json.loads(adopted_job["progress"])["stage"] == "activating"
+
+        stale_session = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+            },
+            headers=env.worker_headers,
+        )
+        assert stale_session.status_code == 409
+
+        adopted_heartbeat = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "running",
+                "progress": {
+                    "stage": "activating",
+                    "completed_bytes": len(artifact_bytes),
+                    "total_bytes": len(artifact_bytes),
+                },
+            },
+            headers=replacement_headers,
+        )
+        assert adopted_heartbeat.status_code == 200, adopted_heartbeat.text
         complete = env.client.post(
-            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}"
-            "/complete",
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}/complete",
             json={
                 "fencing_token": leased["fencing_token"],
                 "succeeded": True,
@@ -330,7 +461,7 @@ def test_worker_update_upload_claim_and_complete_is_ticket_safe(tmp_path) -> Non
                     "artifact_sha256": artifact_sha256,
                 },
             },
-            headers=env.worker_headers,
+            headers=replacement_headers,
         )
         assert complete.status_code == 200, complete.text
         assert complete.json()["state"] == "succeeded"
@@ -340,6 +471,155 @@ def test_worker_update_upload_claim_and_complete_is_ticket_safe(tmp_path) -> Non
         )
         assert listed.status_code == 200
         assert "authorization" not in listed.json()[0]
+    finally:
+        env.client.__exit__(None, None, None)
+
+
+def test_worker_update_rollback_can_complete_from_previous_runtime_session(tmp_path) -> None:
+    env = _environment(tmp_path)
+    try:
+        artifact = b"worker-update-that-rolls-back"
+        artifact_sha256 = hashlib.sha256(artifact).hexdigest()
+        spec = {
+            "kind": "worker_update",
+            "target_version": "0.1.2",
+            "artifact_sha256": artifact_sha256,
+            "artifact_size": len(artifact),
+            "apply": "on_idle",
+        }
+        created_response = _create_job(env, spec)
+        assert created_response.status_code == 200, created_response.text
+        created = created_response.json()
+        upload = env.client.put(
+            created["upload_ticket"]["url"],
+            content=artifact,
+            headers=created["upload_ticket"]["headers"],
+        )
+        assert upload.status_code == 204, upload.text
+        committed = env.client.post(
+            f"/api/v1/maintenance-jobs/{created['id']}/commit",
+            json={},
+            headers=env.owner_headers,
+        )
+        assert committed.status_code == 200, committed.text
+        claim = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/claim",
+            json={"ttl_seconds": 60},
+            headers=env.worker_headers,
+        )
+        assert claim.status_code == 200, claim.text
+        leased = claim.json()
+        heartbeat_path = (
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}/heartbeat"
+        )
+        complete_path = (
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}/complete"
+        )
+        target_headers = _worker_session(env.client, env.worker["id"], env.worker_keys)
+        rollback_result = {
+            "kind": "worker_update",
+            "status": "rolled_back",
+            "target_version": spec["target_version"],
+            "artifact_sha256": artifact_sha256,
+        }
+
+        before_restart = env.client.post(
+            complete_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": False,
+                "result": rollback_result,
+            },
+            headers=target_headers,
+        )
+        assert before_restart.status_code == 409
+
+        restarting = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "progress": {"stage": "staging", "completed_bytes": len(artifact)},
+            },
+            headers=env.worker_headers,
+        )
+        assert restarting.status_code == 200, restarting.text
+        adopted = env.client.post(
+            heartbeat_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "adopt_restart_session": True,
+                "progress": {"stage": "activating", "completed_bytes": len(artifact)},
+            },
+            headers=target_headers,
+        )
+        assert adopted.status_code == 200, adopted.text
+
+        ordinary_failure = env.client.post(
+            complete_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": False,
+                "result": {**rollback_result, "status": "failed"},
+            },
+            headers=env.worker_headers,
+        )
+        assert ordinary_failure.status_code == 409
+        wrong_fence = env.client.post(
+            complete_path,
+            json={
+                "fencing_token": leased["fencing_token"] + 1,
+                "succeeded": False,
+                "result": rollback_result,
+            },
+            headers=env.worker_headers,
+        )
+        assert wrong_fence.status_code == 409
+        invalid_result = env.client.post(
+            complete_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": False,
+                "result": {**rollback_result, "target_version": "0.1.3"},
+            },
+            headers=env.worker_headers,
+        )
+        assert invalid_result.status_code == 422
+
+        env.app.state.db.execute(
+            "UPDATE worker_maintenance_jobs SET lease_expires_at=0 WHERE id=?",
+            (created["id"],),
+        )
+        expired = env.client.post(
+            complete_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": False,
+                "result": rollback_result,
+            },
+            headers=env.worker_headers,
+        )
+        assert expired.status_code == 409
+        env.app.state.db.execute(
+            "UPDATE worker_maintenance_jobs SET lease_expires_at=? WHERE id=?",
+            (time.time() + 60, created["id"]),
+        )
+
+        rolled_back = env.client.post(
+            complete_path,
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": False,
+                "result": rollback_result,
+            },
+            headers=env.worker_headers,
+        )
+        assert rolled_back.status_code == 200, rolled_back.text
+        assert rolled_back.json()["state"] == "failed"
+        assert rolled_back.json()["result"]["status"] == "rolled_back"
     finally:
         env.client.__exit__(None, None, None)
 
@@ -678,6 +958,56 @@ def test_model_job_fencing_strict_result_and_inference_exclusion(tmp_path) -> No
         assert second_session["id"] == env.app.state.db.fetchone(
             "SELECT lease_session_id FROM worker_maintenance_jobs WHERE id=?", (job["id"],)
         )["lease_session_id"]
+
+        restarting_model_job = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{job['id']}/heartbeat",
+            json={
+                "fencing_token": 2,
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "progress": {"stage": "installing", "completed_bytes": 0},
+            },
+            headers=second_headers,
+        )
+        assert restarting_model_job.status_code == 200, restarting_model_job.text
+        third_token, _ = env.app.state.db.create_session(
+            principal_type="worker",
+            principal_id=env.worker["id"],
+            user_id=env.worker["owner_user_id"],
+            scopes=["worker:maintenance:report"],
+        )
+        rejected_model_adoption = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{job['id']}/heartbeat",
+            json={
+                "fencing_token": 2,
+                "ttl_seconds": 60,
+                "state": "restarting",
+                "adopt_restart_session": True,
+            },
+            headers={"Authorization": f"Bearer {third_token}"},
+        )
+        assert rejected_model_adoption.status_code == 409
+        assert rejected_model_adoption.json()["error"]["code"] == int(
+            ErrorCode.MAINTENANCE_LEASE_LOST
+        )
+        rejected_model_completion = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{job['id']}/complete",
+            json={
+                "fencing_token": 2,
+                "succeeded": False,
+                "result": {
+                    "kind": "model_install",
+                    "status": "failed",
+                    "installed_model_digests": [],
+                    "failed_model_digest": spec["model_digests"][0],
+                },
+            },
+            headers={"Authorization": f"Bearer {third_token}"},
+        )
+        assert rejected_model_completion.status_code == 409
+        assert rejected_model_completion.json()["error"]["code"] == int(
+            ErrorCode.MAINTENANCE_LEASE_LOST
+        )
 
         stale = env.client.post(
             f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{job['id']}/heartbeat",
