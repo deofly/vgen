@@ -52,7 +52,13 @@ def package_files(directory: Path) -> list[Path]:
         total += path.stat().st_size
         if len(files) > MAX_PACKAGE_FILES or total > MAX_UNCOMPRESSED_BYTES:
             raise RegistryError("workflow package exceeds the file or size limit")
-    return sorted(files)
+    # Path ordering is platform-specific: WindowsPath compares case-insensitively,
+    # while PosixPath compares case-sensitively.  The package digest is a wire
+    # identity, so order by the UTF-8 bytes that are actually hashed instead.
+    return sorted(
+        files,
+        key=lambda path: path.relative_to(directory).as_posix().encode("utf-8"),
+    )
 
 
 def file_digest(path: Path) -> str:

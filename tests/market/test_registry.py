@@ -25,10 +25,25 @@ from vgen.market.registry import (
     WorkflowRegistry,
     build_archive,
     package_digest,
+    package_files,
     sign_package,
     validate_package,
     write_checksums,
 )
+
+
+def test_package_file_order_is_cross_platform_digest_order(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    for name in ("workflow.json", "README.md", "mapping.json", "manifest.yaml"):
+        (package / name).write_text(name, encoding="utf-8")
+
+    assert [path.name for path in package_files(package)] == [
+        "README.md",
+        "manifest.yaml",
+        "mapping.json",
+        "workflow.json",
+    ]
 
 
 def make_package(path: Path, *, signed: bool) -> Path:
