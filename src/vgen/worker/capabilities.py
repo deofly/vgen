@@ -381,7 +381,7 @@ class WorkerCapabilityStore:
         try:
             facts = comfyui_capability_facts(installed.manifest, installed.path)
         except WorkflowCapabilityError as exc:
-            raise CapabilityInstallError("CAPABILITY_ARCHIVE_INVALID") from exc
+            raise CapabilityInstallError("CAPABILITY_GRAPH_INVALID") from exc
         if any(
             not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", item) for item in facts.node_classes
         ):

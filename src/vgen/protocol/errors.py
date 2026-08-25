@@ -137,6 +137,7 @@ class ErrorCode(IntEnum):
     CAPABILITY_EXECUTABLE_CONTENT = 340016
     CAPABILITY_RELEASE_INVALID = 340017
     CAPABILITY_COMPILE_INVALID = 340018
+    CAPABILITY_GRAPH_INVALID = 340019
 
     # 40xxxx: crypto / key envelope
     DECRYPTION_FAILED = 400001
@@ -688,6 +689,13 @@ _ERROR_SPECS = (
     _spec(
         ErrorCode.CAPABILITY_COMPILE_INVALID,
         "The workflow capability graph or parameter mapping cannot be compiled.",
+        422,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.CAPABILITY_GRAPH_INVALID,
+        "The workflow capability graph, mapping, or model binding is invalid.",
         422,
         ErrorOrigin.WORKER,
         responsibility=Responsibility.CONSUMER,

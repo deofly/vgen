@@ -245,6 +245,7 @@ def test_model_failures_use_dedicated_maintenance_codes(
         ),
         ("CAPABILITY_RELEASE_INVALID", ErrorCode.CAPABILITY_RELEASE_INVALID),
         ("CAPABILITY_COMPILE_INVALID", ErrorCode.CAPABILITY_COMPILE_INVALID),
+        ("CAPABILITY_GRAPH_INVALID", ErrorCode.CAPABILITY_GRAPH_INVALID),
         ("CAPABILITY_NODE_APPROVAL_MISMATCH", ErrorCode.MAINTENANCE_POLICY_DENIED),
     ],
 )

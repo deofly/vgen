@@ -1040,6 +1040,8 @@ def _capability_error_code(reason: str) -> int:
         return int(ErrorCode.CAPABILITY_RELEASE_INVALID)
     if "COMPILE_INVALID" in reason:
         return int(ErrorCode.CAPABILITY_COMPILE_INVALID)
+    if "GRAPH_INVALID" in reason:
+        return int(ErrorCode.CAPABILITY_GRAPH_INVALID)
     if "ARCHIVE_INVALID" in reason:
         return int(ErrorCode.CAPABILITY_ARCHIVE_INVALID)
     if any(
