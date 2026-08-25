@@ -211,3 +211,25 @@ def test_invalid_manifest_yaml_is_isolated_and_remote_reinstall_repairs_it(
         "vgen/ltx-2.5-distilled-t2v"
     ]
     assert store.active_errors == 0
+
+
+def test_executor_validation_failure_is_distinct_from_invalid_archive(
+    tmp_path: Path,
+) -> None:
+    workflow = _ltx_workflow()
+    archive = build_archive(workflow, tmp_path / "ltx.zip", allow_unsigned=True)
+    store = WorkerCapabilityStore(tmp_path / "capabilities")
+
+    def reject(_installed: object) -> None:
+        raise ValueError("bounded executor validation failure")
+
+    with pytest.raises(CapabilityInstallError, match="CAPABILITY_COMPILE_INVALID"):
+        store.activate(
+            archive,
+            workflow_ref="vgen/ltx-2.5-distilled-t2v@1.0.0",
+            workflow_digest="sha256:" + package_digest(workflow),
+            publisher_key=None,
+            allow_unsigned=True,
+            node_classes_digest=_node_digest(workflow),
+            validator=reject,
+        )

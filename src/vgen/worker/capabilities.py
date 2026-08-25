@@ -121,7 +121,12 @@ class WorkerCapabilityStore:
                 if facts.node_classes_digest != node_classes_digest:
                     raise CapabilityInstallError("CAPABILITY_NODE_APPROVAL_MISMATCH")
                 if validator is not None:
-                    validator(installed)
+                    try:
+                        validator(installed)
+                    except CapabilityInstallError:
+                        raise
+                    except Exception as exc:
+                        raise CapabilityInstallError("CAPABILITY_COMPILE_INVALID") from exc
                 return self._publish(installed, workflow_ref, workflow_digest)
         except CapabilityInstallError:
             raise

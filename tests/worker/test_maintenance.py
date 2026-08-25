@@ -244,6 +244,7 @@ def test_model_failures_use_dedicated_maintenance_codes(
             ErrorCode.CAPABILITY_EXECUTABLE_CONTENT,
         ),
         ("CAPABILITY_RELEASE_INVALID", ErrorCode.CAPABILITY_RELEASE_INVALID),
+        ("CAPABILITY_COMPILE_INVALID", ErrorCode.CAPABILITY_COMPILE_INVALID),
         ("CAPABILITY_NODE_APPROVAL_MISMATCH", ErrorCode.MAINTENANCE_POLICY_DENIED),
     ],
 )
