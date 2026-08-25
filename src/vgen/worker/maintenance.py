@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import os
 import re
 import shutil
@@ -35,7 +36,10 @@ from vgen.protocol import ErrorCode, VGenError
 from .capabilities import CapabilityInstallError, WorkerCapabilityStore
 from .credentials import WorkerCredentials
 from .model_installer import ModelInstaller, ModelInstallError
+from .support_assets import refresh_windows_support_assets, schedule_windows_launcher_restart
 from .updater import RuntimeUpdater, WorkerUpdateError
+
+logger = logging.getLogger(__name__)
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _WORKFLOW_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -99,6 +103,7 @@ class MaintenanceOutcome:
     succeeded: bool
     restart_required: bool = False
     rollback_required: bool = False
+    launcher_restart_required: bool = False
     job_id: str | None = None
     error_code: int | None = None
 
@@ -193,6 +198,8 @@ class WorkerMaintenanceController:
         updater: RuntimeUpdater | None = None,
         model_installer: ModelInstaller | None = None,
         capability_store: WorkerCapabilityStore | None = None,
+        support_refresher: Callable[[], Path | None] = refresh_windows_support_assets,
+        launcher_restarter: Callable[[Path], None] = schedule_windows_launcher_restart,
         ticket_resolver: TicketResolver = _default_ticket_resolver,
     ) -> None:
         self._credentials = credentials
@@ -205,6 +212,8 @@ class WorkerMaintenanceController:
         self._model_root = model_root
         self._model_installer = model_installer
         self._capability_store = capability_store
+        self._support_refresher = support_refresher
+        self._launcher_restarter = launcher_restarter
         self._ticket_resolver = ticket_resolver
         self._last_progress_at = 0.0
         self._gateway_lock = threading.Lock()
@@ -257,6 +266,7 @@ class WorkerMaintenanceController:
                 "maintenance_update_restart", True, restart_required=True, job_id=job_id
             )
 
+        refreshed_launcher: Path | None = None
         try:
             activation = self._gateway.heartbeat_maintenance(
                 job_id,
@@ -287,6 +297,7 @@ class WorkerMaintenanceController:
                 ) as keeper:
                     activation_probe()
                     keeper.check()
+            refreshed_launcher = self._support_refresher()
             self._gateway.complete_maintenance(
                 job_id,
                 fencing_token=fencing_token,
@@ -311,6 +322,21 @@ class WorkerMaintenanceController:
                 error_code=int(ErrorCode.UPDATE_ACTIVATION_FAILED),
             )
         self._updater.mark_activation_succeeded(pointer)
+        if refreshed_launcher is not None:
+            try:
+                self._launcher_restarter(refreshed_launcher)
+            except WorkerUpdateError:
+                # The new runtime is already healthy and committed. Keep it
+                # online if the optional outer launcher restart cannot be
+                # queued; a later update can safely retry the asset refresh.
+                logger.exception("Unable to schedule refreshed Windows Worker launcher")
+            else:
+                return MaintenanceOutcome(
+                    "maintenance_support_restart",
+                    True,
+                    launcher_restart_required=True,
+                    job_id=job_id,
+                )
         return MaintenanceOutcome("maintenance_update_activated", True, job_id=job_id)
 
     def run_one(self) -> MaintenanceOutcome | None:

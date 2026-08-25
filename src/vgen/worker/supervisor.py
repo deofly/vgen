@@ -15,6 +15,7 @@ from .updater import RuntimeUpdater, WorkerUpdateError
 
 EXIT_UPDATE_RESTART = 75
 EXIT_UPDATE_ROLLBACK = 76
+EXIT_LAUNCHER_RESTART = 77
 _CHILD_ENV = "VGEN_WORKER_SUPERVISED_CHILD"
 _ROLLBACK_ENV = "VGEN_WORKER_UPDATE_ROLLBACK"
 _MAX_ROLLBACK_ATTEMPTS = 3
@@ -101,6 +102,7 @@ def supervise_worker(
 
 
 __all__ = [
+    "EXIT_LAUNCHER_RESTART",
     "EXIT_UPDATE_RESTART",
     "EXIT_UPDATE_ROLLBACK",
     "is_supervised_child",

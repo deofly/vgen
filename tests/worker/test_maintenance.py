@@ -351,6 +351,48 @@ def test_new_target_process_completes_pending_update_activation(tmp_path: Path) 
     assert gateway.completions[-1]["result"]["status"] == "activated"
 
 
+def test_new_target_refreshes_launcher_and_requests_outer_restart(tmp_path: Path) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+    gateway = FakeGateway()
+    launcher = tmp_path / "start-worker.cmd"
+    launcher.write_text("reviewed", encoding="utf-8")
+    restarted: list[Path] = []
+
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+        support_refresher=lambda: launcher,
+        launcher_restarter=restarted.append,
+        ticket_resolver=lambda _host, _port: ("93.184.216.34",),
+    ).recover_pending_update()
+
+    assert outcome is not None and outcome.succeeded
+    assert outcome.launcher_restart_required
+    assert outcome.mode == "maintenance_support_restart"
+    assert restarted == [launcher]
+    assert updater.succeeded
+    assert gateway.completions[-1]["result"]["status"] == "activated"
+
+
 def test_target_activation_renews_restarting_lease_during_slow_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

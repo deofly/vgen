@@ -45,6 +45,7 @@ from .credentials import (
 from .gateway import GatewayV1Client
 from .maintenance import MaintenanceOutcome, WorkerMaintenanceController
 from .supervisor import (
+    EXIT_LAUNCHER_RESTART,
     EXIT_UPDATE_RESTART,
     EXIT_UPDATE_ROLLBACK,
     is_supervised_child,
@@ -726,6 +727,9 @@ def run(
                         if recovered.rollback_required:
                             _write_status(status, json_output=arguments.json)
                             return EXIT_UPDATE_ROLLBACK
+                        if recovered.launcher_restart_required:
+                            _write_status(status, json_output=arguments.json)
+                            return EXIT_LAUNCHER_RESTART
                         if recovered.restart_required:
                             _write_status(status, json_output=arguments.json)
                             return EXIT_UPDATE_RESTART
@@ -758,6 +762,9 @@ def run(
                             if maintenance_outcome.rollback_required:
                                 _write_status(status, json_output=arguments.json)
                                 return EXIT_UPDATE_ROLLBACK
+                            if maintenance_outcome.launcher_restart_required:
+                                _write_status(status, json_output=arguments.json)
+                                return EXIT_LAUNCHER_RESTART
                             if maintenance_outcome.restart_required:
                                 _write_status(status, json_output=arguments.json)
                                 return EXIT_UPDATE_RESTART

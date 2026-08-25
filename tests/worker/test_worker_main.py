@@ -10,6 +10,7 @@ from vgen.executors import ExecutorDescriptor, ExecutorHealth
 from vgen.worker import LeaseReference, WorkerCredentials, save_worker_credentials_file
 from vgen.worker.main import (
     EXIT_CONFIG,
+    EXIT_LAUNCHER_RESTART,
     EXIT_OK,
     EXIT_UNAVAILABLE,
     EXIT_UPDATE_RESTART,
@@ -514,6 +515,45 @@ def test_pending_update_requests_supervisor_restart_before_other_work(
     )
     assert events == ["recover_update"]
     assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_update_restart"
+
+
+def test_refreshed_support_assets_request_outer_launcher_restart(
+    tmp_path: Path, capsys: Any
+) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+    )
+
+    class FakeMaintenance:
+        def recover_pending_update(self, **_kwargs: Any) -> MaintenanceOutcome:
+            return MaintenanceOutcome(
+                "maintenance_support_restart",
+                True,
+                launcher_restart_required=True,
+                job_id="mtn_test",
+            )
+
+    assert (
+        run(
+            [
+                "serve",
+                "--once",
+                "--json",
+                "--gateway-url",
+                "https://gateway.example.test",
+                "--credentials-file",
+                str(credential_file),
+            ],
+            executor_factory=lambda _arguments: FakeExecutor(),
+            gateway_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
+            core_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
+            maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
+        )
+        == EXIT_LAUNCHER_RESTART
+    )
+    assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_support_restart"
 
 
 def test_failed_target_activation_requests_supervisor_rollback(
