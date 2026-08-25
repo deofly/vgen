@@ -32,6 +32,7 @@ from vgen.artifacts import (
 from vgen.crypto import verify_maintenance_intent
 from vgen.protocol import ErrorCode, VGenError
 
+from .capabilities import CapabilityInstallError, WorkerCapabilityStore
 from .credentials import WorkerCredentials
 from .model_installer import ModelInstaller, ModelInstallError
 from .updater import RuntimeUpdater, WorkerUpdateError
@@ -84,6 +85,10 @@ class MaintenanceExecutor(Protocol):
     def maintenance_workflows(self) -> tuple[tuple[str, str], ...]: ...
 
     def invalidate_model_digest_cache(self) -> None: ...
+
+    def workflow_model_pins(self, workflow_ref: str, workflow_digest: str) -> tuple[Any, ...]: ...
+
+    def reload_capabilities(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +180,7 @@ class WorkerMaintenanceController:
         session: requests.Session | None = None,
         updater: RuntimeUpdater | None = None,
         model_installer: ModelInstaller | None = None,
+        capability_store: WorkerCapabilityStore | None = None,
         ticket_resolver: TicketResolver = _default_ticket_resolver,
         clock: Any = time.time,
     ) -> None:
@@ -187,6 +193,7 @@ class WorkerMaintenanceController:
         self._updater = updater or RuntimeUpdater(self._work_root)
         self._model_root = model_root
         self._model_installer = model_installer
+        self._capability_store = capability_store
         self._ticket_resolver = ticket_resolver
         self._clock = clock
         self._last_progress_at = 0.0
@@ -303,6 +310,7 @@ class WorkerMaintenanceController:
             if worker_id != self._credentials.worker_id or kind not in {
                 "worker_update",
                 "model_install",
+                "capability_install",
             }:
                 raise _MaintenanceRejected("MAINTENANCE_JOB_INVALID")
             if spec.get("kind") != kind:
@@ -319,12 +327,16 @@ class WorkerMaintenanceController:
             self._heartbeat(job_id, fencing_token, "validating", 0, None)
             if kind == "model_install":
                 return self._install_models(job_id, fencing_token, spec)
+            if kind == "capability_install":
+                return self._install_capability(job, job_id, fencing_token, spec)
             return self._stage_update(job, job_id, fencing_token, spec)
         except VGenError:
             # Gateway availability errors are not finalized: the same leased
             # job and model partial can continue after connectivity returns.
             raise
         except ArtifactTransferError:
+            if job.get("kind") == "capability_install":
+                return self._complete_capability_failure(job, "CAPABILITY_DOWNLOAD_FAILED")
             return self._complete_update_failure(job, "WORKER_UPDATE_DOWNLOAD_FAILED")
         except _MaintenanceCancelled:
             return MaintenanceOutcome(
@@ -343,12 +355,18 @@ class WorkerMaintenanceController:
             )
         except ModelInstallError as exc:
             return self._complete_model_failure(job, exc.code)
+        except CapabilityInstallError as exc:
+            return self._complete_capability_failure(job, exc.code)
         except WorkerUpdateError as exc:
+            if job.get("kind") == "capability_install":
+                return self._complete_capability_failure(job, exc.code)
             return self._complete_update_failure(job, exc.code)
         except (OSError, ValueError, TypeError, KeyError):
             kind = job.get("kind")
             if kind == "model_install":
                 return self._complete_model_failure(job, "MAINTENANCE_INTERNAL_ERROR")
+            if kind == "capability_install":
+                return self._complete_capability_failure(job, "MAINTENANCE_INTERNAL_ERROR")
             return self._complete_update_failure(job, "MAINTENANCE_INTERNAL_ERROR")
 
     def _install_models(
@@ -374,12 +392,16 @@ class WorkerMaintenanceController:
             or not isinstance(acceptances, list)
         ):
             raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
-        pins: dict[str, Any] = {}
-        for pin in self._executor.maintenance_model_pins:
+        resolver = getattr(self._executor, "workflow_model_pins", None)
+        workflow_pins = (
+            tuple(resolver(workflow_ref, workflow_digest))
+            if callable(resolver)
+            else tuple(self._executor.maintenance_model_pins)
+        )
+        pins: dict[str, list[Any]] = {}
+        for pin in workflow_pins:
             digest = "sha256:" + str(pin.sha256).removeprefix("sha256:").lower()
-            if digest in pins:
-                raise _MaintenanceRejected("MAINTENANCE_POLICY_AMBIGUOUS")
-            pins[digest] = pin
+            pins.setdefault(digest, []).append(pin)
         accepted: dict[str, Mapping[str, Any]] = {}
         for item in acceptances:
             if not isinstance(item, Mapping):
@@ -396,68 +418,77 @@ class WorkerMaintenanceController:
                 raise ModelInstallError("MODEL_ROOT_UNAVAILABLE")
             self._model_installer = ModelInstaller(self._model_root, session=self._session)
 
-        requested: list[tuple[str, Any]] = []
+        requested: list[tuple[str, tuple[Any, ...]]] = []
         for raw_digest in digests:
             if not isinstance(raw_digest, str) or not _WORKFLOW_DIGEST.fullmatch(raw_digest):
                 raise _MaintenanceRejected("MAINTENANCE_MODEL_DIGEST_INVALID")
-            pin = pins.get(raw_digest)
-            if pin is None:
+            digest_pins = pins.get(raw_digest)
+            if not digest_pins:
                 raise _MaintenanceRejected("MAINTENANCE_MODEL_NOT_ALLOWED")
             acceptance = accepted[raw_digest]
             accepted_at = acceptance.get("accepted_at")
+            license_pairs = {(pin.license, pin.revision) for pin in digest_pins}
             if (
-                acceptance.get("license_id") != pin.license
-                or acceptance.get("revision") != pin.revision
+                len(license_pairs) != 1
+                or (acceptance.get("license_id"), acceptance.get("revision"))
+                != next(iter(license_pairs))
                 or not isinstance(accepted_at, int)
                 or isinstance(accepted_at, bool)
                 or accepted_at < 1
                 or accepted_at > int(self._clock()) + 300
             ):
                 raise _MaintenanceRejected("MAINTENANCE_LICENSE_INVALID")
-            requested.append((raw_digest, pin))
+            requested.append((raw_digest, tuple(digest_pins)))
 
         installed: list[str] = []
         all_preexisting = True
-        for raw_digest, pin in requested:
-            self._last_progress_at = 0.0
-            self._heartbeat(job_id, fencing_token, "downloading", 0, pin.size, ttl_seconds=300)
+        for raw_digest, placement_pins in requested:
+            placement_preexisting = True
+            for pin in placement_pins:
+                self._last_progress_at = 0.0
+                self._heartbeat(
+                    job_id, fencing_token, "downloading", 0, pin.size, ttl_seconds=300
+                )
 
-            def progress(completed: int, total: int, *, _job: str = job_id) -> None:
-                now = time.monotonic()
-                if completed == total or now - self._last_progress_at >= 10:
-                    self._heartbeat(
-                        _job,
+                def progress(completed: int, total: int, *, _job: str = job_id) -> None:
+                    now = time.monotonic()
+                    if completed == total or now - self._last_progress_at >= 10:
+                        self._heartbeat(
+                            _job,
+                            fencing_token,
+                            "downloading",
+                            completed,
+                            total,
+                            ttl_seconds=300,
+                        )
+                        self._last_progress_at = now
+
+                try:
+                    with _LeaseKeeper(
+                        self._gateway,
+                        job_id,
                         fencing_token,
-                        "downloading",
-                        completed,
-                        total,
-                        ttl_seconds=300,
-                    )
-                    self._last_progress_at = now
-
-            try:
-                with _LeaseKeeper(
-                    self._gateway,
-                    job_id,
-                    fencing_token,
-                    stage="downloading",
-                    gateway_lock=self._gateway_lock,
-                ) as keeper:
-                    result = self._model_installer.install(pin, progress=progress)
-                    keeper.check()
-            except ModelInstallError as exc:
-                self._executor.invalidate_model_digest_cache()
-                raise _ModelInstallJobError(
-                    exc.code,
-                    installed=tuple(installed),
-                    failed_digest=raw_digest,
-                ) from exc
-            except BaseException:
-                self._executor.invalidate_model_digest_cache()
-                raise
+                        stage="downloading",
+                        gateway_lock=self._gateway_lock,
+                    ) as keeper:
+                        result = self._model_installer.install(pin, progress=progress)
+                        keeper.check()
+                except ModelInstallError as exc:
+                    self._executor.invalidate_model_digest_cache()
+                    raise _ModelInstallJobError(
+                        exc.code,
+                        installed=tuple(installed),
+                        failed_digest=raw_digest,
+                    ) from exc
+                except BaseException:
+                    self._executor.invalidate_model_digest_cache()
+                    raise
+                placement_preexisting = (
+                    placement_preexisting and result.status == "already_installed"
+                )
+                self._heartbeat(job_id, fencing_token, "verifying", result.size, result.size)
             installed.append(result.digest)
-            all_preexisting = all_preexisting and result.status == "already_installed"
-            self._heartbeat(job_id, fencing_token, "verifying", result.size, result.size)
+            all_preexisting = all_preexisting and placement_preexisting
 
         self._executor.invalidate_model_digest_cache()
         status = "already_installed" if all_preexisting else "installed"
@@ -472,6 +503,129 @@ class WorkerMaintenanceController:
             },
         )
         return MaintenanceOutcome("maintenance_models_installed", True, job_id=job_id)
+
+    def _install_capability(
+        self,
+        job: Mapping[str, Any],
+        job_id: str,
+        fencing_token: int,
+        spec: Mapping[str, Any],
+    ) -> MaintenanceOutcome:
+        workflow_ref = _required_string(spec, "workflow_ref")
+        workflow_digest = _required_string(spec, "workflow_digest")
+        artifact_sha256 = _required_string(spec, "artifact_sha256").lower()
+        artifact_size = _required_positive_int(spec, "artifact_size")
+        node_classes_digest = _required_string(spec, "node_classes_digest").lower()
+        publisher_key = spec.get("publisher_key")
+        allow_unsigned = spec.get("allow_unsigned_workflow")
+        if (
+            spec.get("kind") != "capability_install"
+            or spec.get("apply") != "on_idle"
+            or not _WORKFLOW_DIGEST.fullmatch(workflow_digest)
+            or not _DIGEST.fullmatch(artifact_sha256)
+            or not _DIGEST.fullmatch(node_classes_digest)
+            or not isinstance(allow_unsigned, bool)
+            or (publisher_key is not None and not isinstance(publisher_key, str))
+            or allow_unsigned != (publisher_key is None)
+        ):
+            raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
+
+        ticket = self._gateway.maintenance_artifact_ticket(job)
+        self._validate_update_ticket(ticket, artifact_size, artifact_sha256)
+        download_root = self._work_root / "capability-downloads"
+        download_root.mkdir(parents=True, exist_ok=True)
+        archive = download_root / f"{artifact_sha256}.zip"
+        if not _matches_file(archive, artifact_size, artifact_sha256):
+            try:
+                free = shutil.disk_usage(download_root).free
+            except OSError as exc:
+                raise CapabilityInstallError("CAPABILITY_DISK_UNAVAILABLE") from exc
+            if free < artifact_size + 32 * 1024 * 1024:
+                raise CapabilityInstallError("CAPABILITY_DISK_FULL")
+            adapter = (
+                OssStsArtifactAdapter()
+                if ticket.url.startswith("oss://")
+                else HttpArtifactAdapter(self._session)
+            )
+
+            def progress(completed: int, total: int | None) -> None:
+                now = time.monotonic()
+                if completed == total or now - self._last_progress_at >= 10:
+                    self._heartbeat(
+                        job_id,
+                        fencing_token,
+                        "downloading",
+                        completed,
+                        total,
+                        ttl_seconds=300,
+                    )
+                    self._last_progress_at = now
+
+            self._last_progress_at = 0.0
+            self._heartbeat(
+                job_id, fencing_token, "downloading", 0, artifact_size, ttl_seconds=300
+            )
+            with _LeaseKeeper(
+                self._gateway,
+                job_id,
+                fencing_token,
+                stage="downloading",
+                gateway_lock=self._gateway_lock,
+            ) as keeper:
+                adapter.download(ticket, archive, progress)
+                keeper.check()
+        if not _matches_file(archive, artifact_size, artifact_sha256):
+            raise CapabilityInstallError("CAPABILITY_INTEGRITY_FAILED")
+
+        self._heartbeat(
+            job_id, fencing_token, "activating", artifact_size, artifact_size, ttl_seconds=300
+        )
+        if self._capability_store is None:
+            self._capability_store = WorkerCapabilityStore(
+                self._work_root / "capabilities"
+            )
+        validator = getattr(self._executor, "validate_capability_release", None)
+        activation = self._capability_store.activate(
+            archive,
+            workflow_ref=workflow_ref,
+            workflow_digest=workflow_digest,
+            publisher_key=publisher_key,
+            allow_unsigned=allow_unsigned,
+            node_classes_digest=node_classes_digest,
+            validator=validator if callable(validator) else None,
+        )
+        reload_capabilities = getattr(self._executor, "reload_capabilities", None)
+        if callable(reload_capabilities):
+            reload_capabilities()
+        ready = False
+        capability_probe = getattr(self._executor, "capabilities", None)
+        if callable(capability_probe):
+            try:
+                report = capability_probe()
+                readiness = report.get("workflow_readiness", [])
+                ready = any(
+                    isinstance(item, Mapping)
+                    and item.get("workflow_ref") == workflow_ref
+                    and item.get("workflow_digest") == workflow_digest
+                    and item.get("state") == "ready"
+                    for item in readiness
+                )
+            except Exception:
+                ready = False
+        self._gateway.complete_maintenance(
+            job_id,
+            fencing_token=fencing_token,
+            succeeded=True,
+            result={
+                "kind": "capability_install",
+                "status": activation.status,
+                "workflow_ref": workflow_ref,
+                "workflow_digest": workflow_digest,
+                "artifact_sha256": artifact_sha256,
+                "ready": ready,
+            },
+        )
+        return MaintenanceOutcome("maintenance_capability_activated", True, job_id=job_id)
 
     def _stage_update(
         self,
@@ -614,6 +768,8 @@ class WorkerMaintenanceController:
     def _complete_rejected(self, job: Mapping[str, Any], _safe_reason: str) -> MaintenanceOutcome:
         if job.get("kind") == "model_install":
             return self._complete_model_failure(job, "MAINTENANCE_REJECTED")
+        if job.get("kind") == "capability_install":
+            return self._complete_capability_failure(job, "MAINTENANCE_REJECTED")
         return self._complete_update_failure(job, "MAINTENANCE_REJECTED")
 
     def _complete_model_failure(
@@ -653,6 +809,33 @@ class WorkerMaintenanceController:
             result=result,
         )
         return MaintenanceOutcome("maintenance_model_failed", False, job_id=job_id, error_code=code)
+
+    def _complete_capability_failure(
+        self, job: Mapping[str, Any], reason: str
+    ) -> MaintenanceOutcome:
+        job_id = _required_string(job, "id")
+        fencing_token = _required_positive_int(job, "fencing_token")
+        spec = _required_mapping(job, "spec")
+        workflow_ref = _required_string(spec, "workflow_ref")
+        workflow_digest = _required_string(spec, "workflow_digest")
+        artifact_sha256 = _required_string(spec, "artifact_sha256")
+        code = _capability_error_code(reason)
+        self._gateway.complete_maintenance(
+            job_id,
+            fencing_token=fencing_token,
+            succeeded=False,
+            result={
+                "kind": "capability_install",
+                "status": "failed",
+                "workflow_ref": workflow_ref,
+                "workflow_digest": workflow_digest,
+                "artifact_sha256": artifact_sha256,
+                "error_code": code,
+            },
+        )
+        return MaintenanceOutcome(
+            "maintenance_capability_failed", False, job_id=job_id, error_code=code
+        )
 
     def _complete_update_failure(self, job: Mapping[str, Any], reason: str) -> MaintenanceOutcome:
         job_id = _required_string(job, "id")
@@ -830,18 +1013,52 @@ def _model_error_code(reason: str) -> int:
         return int(ErrorCode.DISK_SPACE_INSUFFICIENT)
     if any(
         item in reason
-        for item in ("PATH", "TARGET_CONFLICT", "PARTIAL_UNSAFE", "ROOT_UNSAFE")
+        for item in (
+            "PATH",
+            "TARGET_CONFLICT",
+            "PARTIAL_UNSAFE",
+            "ROOT_UNSAFE",
+            "ROOT_UNAVAILABLE",
+            "CACHE_UNAVAILABLE",
+        )
     ):
         return int(ErrorCode.PATH_CONFLICT)
-    if "INTEGRITY" in reason or "SIZE_MISMATCH" in reason:
+    if any(item in reason for item in ("INTEGRITY", "SIZE_MISMATCH", "CACHE_CONFLICT")):
         return int(ErrorCode.DIGEST_MISMATCH)
     if any(item in reason for item in ("SOURCE_UNAVAILABLE", "DOWNLOAD", "RANGE")):
         return int(ErrorCode.DOWNLOAD_INTERRUPTED)
-    if any(item in reason for item in ("MANUAL", "ROOT_UNAVAILABLE")):
+    if any(item in reason for item in ("MANUAL", "GATED_CREDENTIAL")):
         return int(ErrorCode.GATED_CREDENTIAL_UNAVAILABLE)
     if any(item in reason for item in ("NOT_ALLOWED", "POLICY", "REJECTED")):
         return int(ErrorCode.MAINTENANCE_POLICY_DENIED)
     if any(item in reason for item in ("INVALID", "AMBIGUOUS", "PIN")):
+        return int(ErrorCode.MANIFEST_UNTRUSTED)
+    return int(ErrorCode.INTERNAL_ERROR)
+
+
+def _capability_error_code(reason: str) -> int:
+    if "INTEGRITY" in reason or "DIGEST" in reason or "BINDING_MISMATCH" in reason:
+        return int(ErrorCode.DIGEST_MISMATCH)
+    if "DISK" in reason:
+        return int(ErrorCode.DISK_SPACE_INSUFFICIENT)
+    if "DOWNLOAD" in reason or "ARTIFACT_UNREADABLE" in reason:
+        return int(ErrorCode.DOWNLOAD_INTERRUPTED)
+    if any(item in reason for item in ("ROOT", "INDEX", "RELEASE_CONFLICT", "PATH")):
+        return int(ErrorCode.PATH_CONFLICT)
+    if any(item in reason for item in ("NODE_APPROVAL", "REJECTED", "INTENT", "TICKET")):
+        return int(ErrorCode.MAINTENANCE_POLICY_DENIED)
+    if any(
+        item in reason
+        for item in (
+            "ARCHIVE",
+            "MANIFEST",
+            "SPEC",
+            "EXECUTOR",
+            "EXECUTABLE",
+            "VERSION",
+            "RELEASE_INVALID",
+        )
+    ):
         return int(ErrorCode.MANIFEST_UNTRUSTED)
     return int(ErrorCode.INTERNAL_ERROR)
 

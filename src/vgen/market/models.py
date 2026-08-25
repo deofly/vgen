@@ -196,8 +196,8 @@ class WorkflowManifest(BaseModel):
     def load(cls, path: Path) -> WorkflowManifest:
         try:
             raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise ValueError(f"manifest not found: {path}") from exc
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise ValueError(f"manifest is unavailable or invalid: {path}") from exc
         if not isinstance(raw, dict):
             raise ValueError("manifest must contain a YAML object")
         return cls.model_validate(raw)

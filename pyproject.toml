@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vgen"
-version = "0.10.0"
+version = "0.11.0"
 description = "Open, encrypted GPU workflow gateway, broker and worker runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -81,6 +81,7 @@ packages = ["src/vgen"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "workflows/vgen/minimax-h3-8step/1.0.0" = "vgen/assets/workflows/vgen/minimax-h3-8step/1.0.0"
+"workflows/vgen/ltx-2.5-distilled-t2v/1.0.0" = "vgen/assets/workflows/vgen/ltx-2.5-distilled-t2v/1.0.0"
 "examples/windows-worker/enroll-worker.ps1" = "vgen/assets/worker/enroll-worker.ps1"
 "examples/windows-worker/setup-worker.ps1" = "vgen/assets/worker/setup-worker.ps1"
 "examples/windows-worker/start-worker.cmd" = "vgen/assets/worker/start-worker.cmd"

@@ -801,6 +801,147 @@
         "title": "BrokerHeartbeat",
         "type": "object"
       },
+      "CapabilityInstallMaintenanceResult": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Artifact Sha256",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maximum": 999999.0,
+                "minimum": 100000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "kind": {
+            "const": "capability_install",
+            "title": "Kind",
+            "type": "string"
+          },
+          "ready": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ready"
+          },
+          "status": {
+            "enum": [
+              "activated",
+              "already_active",
+              "repaired",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "workflow_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Workflow Digest",
+            "type": "string"
+          },
+          "workflow_ref": {
+            "maxLength": 512,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+            "title": "Workflow Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "status",
+          "workflow_ref",
+          "workflow_digest",
+          "artifact_sha256"
+        ],
+        "title": "CapabilityInstallMaintenanceResult",
+        "type": "object"
+      },
+      "CapabilityInstallSpec": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_unsigned_workflow": {
+            "title": "Allow Unsigned Workflow",
+            "type": "boolean"
+          },
+          "apply": {
+            "const": "on_idle",
+            "default": "on_idle",
+            "title": "Apply",
+            "type": "string"
+          },
+          "artifact_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Artifact Sha256",
+            "type": "string"
+          },
+          "artifact_size": {
+            "maximum": 1073741824.0,
+            "minimum": 1.0,
+            "title": "Artifact Size",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "capability_install",
+            "title": "Kind",
+            "type": "string"
+          },
+          "node_classes_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Node Classes Digest",
+            "type": "string"
+          },
+          "publisher_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publisher Key"
+          },
+          "workflow_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Workflow Digest",
+            "type": "string"
+          },
+          "workflow_ref": {
+            "maxLength": 512,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+            "title": "Workflow Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "workflow_ref",
+          "workflow_digest",
+          "artifact_sha256",
+          "artifact_size",
+          "node_classes_digest",
+          "publisher_key",
+          "allow_unsigned_workflow"
+        ],
+        "title": "CapabilityInstallSpec",
+        "type": "object"
+      },
       "ChallengeRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1307,7 +1448,8 @@
           "action": {
             "enum": [
               "worker_update",
-              "model_install"
+              "model_install",
+              "capability_install"
             ],
             "title": "Action",
             "type": "string"
@@ -3044,6 +3186,20 @@
       "WorkerMaintenanceClaim": {
         "additionalProperties": false,
         "properties": {
+          "supported_actions": {
+            "items": {
+              "enum": [
+                "worker_update",
+                "model_install",
+                "capability_install"
+              ],
+              "type": "string"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "title": "Supported Actions",
+            "type": "array"
+          },
           "ttl_seconds": {
             "default": 60,
             "maximum": 300.0,
@@ -3072,6 +3228,7 @@
           "result": {
             "discriminator": {
               "mapping": {
+                "capability_install": "#/components/schemas/CapabilityInstallMaintenanceResult",
                 "model_install": "#/components/schemas/ModelInstallMaintenanceResult",
                 "worker_update": "#/components/schemas/WorkerUpdateMaintenanceResult"
               },
@@ -3083,6 +3240,9 @@
               },
               {
                 "$ref": "#/components/schemas/ModelInstallMaintenanceResult"
+              },
+              {
+                "$ref": "#/components/schemas/CapabilityInstallMaintenanceResult"
               }
             ],
             "title": "Result"
@@ -3109,6 +3269,7 @@
           "spec": {
             "discriminator": {
               "mapping": {
+                "capability_install": "#/components/schemas/CapabilityInstallSpec",
                 "model_install": "#/components/schemas/ModelInstallSpec",
                 "worker_update": "#/components/schemas/WorkerUpdateSpec"
               },
@@ -3120,6 +3281,9 @@
               },
               {
                 "$ref": "#/components/schemas/ModelInstallSpec"
+              },
+              {
+                "$ref": "#/components/schemas/CapabilityInstallSpec"
               }
             ],
             "title": "Spec"

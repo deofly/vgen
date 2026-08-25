@@ -1,18 +1,167 @@
 from __future__ import annotations
 
+import base64
 import sqlite3
 
 import pytest
 from pydantic import ValidationError
 
-from vgen.gateway.database import GatewayDatabase
+from vgen.gateway.database import SCHEMA, GatewayDatabase
 from vgen.gateway.schemas import (
     ArtifactPrepare,
+    CapabilityInstallMaintenanceResult,
+    CapabilityInstallSpec,
     OutputArtifact,
     RateProposal,
     TaskPreflight,
     TaskPrepare,
 )
+
+
+def _capability_spec(**overrides):
+    value = {
+        "kind": "capability_install",
+        "workflow_ref": "vgen/ltx-2.5@1.0.0",
+        "workflow_digest": "sha256:" + "a" * 64,
+        "artifact_sha256": "b" * 64,
+        "artifact_size": 123,
+        "node_classes_digest": "c" * 64,
+        "publisher_key": base64.b64encode(b"p" * 32).decode("ascii"),
+        "allow_unsigned_workflow": False,
+        "apply": "on_idle",
+    }
+    value.update(overrides)
+    return value
+
+
+def test_capability_install_schema_enforces_signed_or_explicitly_unsigned() -> None:
+    signed = CapabilityInstallSpec(**_capability_spec())
+    assert signed.publisher_key is not None
+
+    unsigned = CapabilityInstallSpec(
+        **_capability_spec(publisher_key=None, allow_unsigned_workflow=True)
+    )
+    assert unsigned.publisher_key is None
+
+    for invalid in (
+        _capability_spec(publisher_key=None),
+        _capability_spec(allow_unsigned_workflow=True),
+        _capability_spec(publisher_key=base64.b64encode(b"short").decode("ascii")),
+        _capability_spec(node_classes_digest="sha256:" + "c" * 64),
+        _capability_spec(workflow_ref="VGen/LTX@1.0.0"),
+        _capability_spec(allow_unsigned_workflow="false"),
+    ):
+        with pytest.raises(ValidationError):
+            CapabilityInstallSpec(**invalid)
+
+
+def test_capability_install_result_allows_not_ready_but_separates_failure_fields() -> None:
+    identifiers = {
+        "kind": "capability_install",
+        "workflow_ref": "vgen/ltx-2.5@1.0.0",
+        "workflow_digest": "sha256:" + "a" * 64,
+        "artifact_sha256": "b" * 64,
+    }
+    result = CapabilityInstallMaintenanceResult(
+        **identifiers, status="activated", ready=False
+    )
+    assert result.ready is False
+    repaired = CapabilityInstallMaintenanceResult(
+        **identifiers, status="repaired", ready=True
+    )
+    assert repaired.ready is True
+    CapabilityInstallMaintenanceResult(
+        **identifiers, status="failed", error_code=330006
+    )
+
+    with pytest.raises(ValidationError):
+        CapabilityInstallMaintenanceResult(**identifiers, status="activated")
+    with pytest.raises(ValidationError):
+        CapabilityInstallMaintenanceResult(
+            **identifiers, status="failed", ready=False, error_code=330006
+        )
+    with pytest.raises(ValidationError):
+        CapabilityInstallMaintenanceResult(
+            **identifiers, status="activated", ready=False, error_code=None
+        )
+
+
+def test_v1_maintenance_tables_rebuild_to_v2_without_losing_rows(tmp_path) -> None:
+    path = tmp_path / "legacy-maintenance-v1.db"
+    legacy_schema = SCHEMA.replace(
+        "CHECK(kind IN ('worker_update','model_install','capability_install'))",
+        "CHECK(kind IN ('worker_update','model_install'))",
+    ).replace(
+        "CHECK(kind IN ('worker_update','capability_install'))",
+        "CHECK(kind='worker_update')",
+    )
+    legacy = sqlite3.connect(path)
+    legacy.executescript(legacy_schema)
+    legacy.executescript(
+        """
+        INSERT INTO schema_meta(version) VALUES (1);
+        INSERT INTO users
+            (id,display_name,root_signing_public_key,root_encryption_public_key,status,
+             is_operator,created_at,updated_at)
+            VALUES ('usr_owner','Owner','root-sign','root-encrypt','active',0,1,1);
+        INSERT INTO devices
+            (id,user_id,name,signing_public_key,encryption_public_key,status,created_at)
+            VALUES ('dev_owner','usr_owner','Device','device-sign','device-encrypt','active',1);
+        INSERT INTO brokers
+            (id,owner_user_id,name,status,created_at,updated_at)
+            VALUES ('brk_home','usr_owner','Home','active',1,1);
+        INSERT INTO workers
+            (id,owner_user_id,manager_broker_id,name,signing_public_key,
+             encryption_public_key,executor_type,status,created_at,updated_at)
+            VALUES ('wrk_gpu','usr_owner','brk_home','GPU','worker-sign','worker-encrypt',
+                    'comfyui','active',1,1);
+        INSERT INTO worker_maintenance_jobs
+            (id,worker_id,broker_id,issued_by_user_id,issued_by_device_id,kind,spec,
+             spec_digest,authorization,dedupe_key,state,expires_at,created_at,updated_at)
+            VALUES ('mtj_existing','wrk_gpu','brk_home','usr_owner','dev_owner',
+                    'worker_update','{}','sha256:old','{}','dedupe-old','awaiting_upload',
+                    100,1,1);
+        INSERT INTO maintenance_artifacts
+            (id,job_id,kind,store_type,object_ref,expected_size,expected_sha256,state,
+             created_at,updated_at)
+            VALUES ('art_existing','mtj_existing','worker_update','local','art_existing',
+                    10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'uploaded',1,1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = GatewayDatabase(str(path))
+    try:
+        assert database.fetchone("SELECT version FROM schema_meta")["version"] == 2
+        assert database.fetchone(
+            "SELECT kind,state FROM worker_maintenance_jobs WHERE id='mtj_existing'"
+        )["kind"] == "worker_update"
+        assert database.fetchone(
+            "SELECT state FROM maintenance_artifacts WHERE id='art_existing'"
+        )["state"] == "uploaded"
+        assert database.fetchall("PRAGMA foreign_key_check") == []
+        assert database.fetchone("PRAGMA foreign_keys")[0] == 1
+
+        database.execute(
+            """INSERT INTO worker_maintenance_jobs
+               (id,worker_id,broker_id,issued_by_user_id,issued_by_device_id,kind,spec,
+                spec_digest,authorization,dedupe_key,state,expires_at,created_at,updated_at)
+               VALUES ('mtj_capability','wrk_gpu','brk_home','usr_owner','dev_owner',
+                       'capability_install','{}','sha256:new','{}','dedupe-new',
+                       'awaiting_upload',100,2,2)"""
+        )
+        database.execute(
+            """INSERT INTO maintenance_artifacts
+               (id,job_id,kind,store_type,object_ref,expected_size,expected_sha256,state,
+                created_at,updated_at)
+               VALUES ('art_capability','mtj_capability','capability_install','local',
+                       'art_capability',10,?,'pending',2,2)""",
+            ("b" * 64,),
+        )
+    finally:
+        database.close()
 
 
 def test_existing_gateway_adds_broker_runtime_columns(tmp_path) -> None:

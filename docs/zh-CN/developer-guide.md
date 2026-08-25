@@ -332,9 +332,34 @@ Package manifest 描述公共参数 schema、Executor variant、payload format�
 首次远程安装还必须从独立渠道 pin publisher key。未签名包只能显式 `--allow-unsigned` 安装，
 并保持 unsigned provenance。工作流安装绝不静默安装可执行插件或模型权重。
 
+Broker 的 `workflow-install` 把普通 release ZIP 的文件 SHA-256/size、workflow ref/digest、
+publisher pin（或明确 unsigned 授权）以及审核过的 node-class digest 一并写入 Device 签名的
+maintenance intent。Worker 在私有 staging 中重新验证这些绑定，只允许 inert workflow 数据，
+编译 ComfyUI policy 后再原子更新 active index。同 digest 的已激活 release 如被损坏，远程重装
+会先隔离旧目录，再用重新验证的 staging 副本替换；验证期间其他工作流保持可用。执行时 Worker
+会用包内 mapping 和校验后的
+有效参数重建 graph，并要求 operation、拓扑、输入绑定及模型 loader 路径精确一致。一个 release
+验证失败不会移除旧 H3 policy 或其他已激活工作流。第三方 custom-node 代码仍是单独的机器管理员
+边界，当前不会远程自动安装。
+
 模型只在 manifest 中记录 source、immutable revision、SHA-256、size、license、`gated` 和
 `manual_download`。Broker 发起 `model-install` 时，Worker 仍以机器管理员本地 policy 为最终
-授权；remote spec 不能覆盖 source、目标路径或许可证。gated/manual model 不得自动下载。
+授权；remote spec 不能覆盖 source、目标路径或许可证。`manual_download` model 不得自动下载；
+gated model 只读取 Worker 本机 `HF_TOKEN`/`HF_TOKEN_PATH`，credential 不进入 Gateway spec。
+权重按 digest 存入共享 CAS，再用只读硬链接 materialize 到每个工作流 placement；同 digest
+只下载一次，但 readiness 仍逐工作流、逐 placement 验证。每次复用前重新核对 size/SHA-256，
+不允许一个被改写的共享 inode 静默扩散到新 placement。
+
+新版 ComfyUI heartbeat 使用 `capability_schema_version: 2` 和 `workflow_readiness` 报告精确
+ref/digest/state。Gateway 对 v2 Worker 只调度唯一且 `ready` 的精确 release；畸形、重复或未知
+schema fail closed。manifest 的显存和内存下限分别产生 `insufficient_vram`、`insufficient_ram`；
+在 Worker facts 可用时，Broker 会在模型传输前检查，Worker 执行前还会再次强制检查。未升级
+Worker 保留旧 requirement fallback，且它们不会领取
+`capability_install` maintenance job。
+
+滚动升级时，新 Worker 会先协商自己支持的 maintenance actions；若 0.9.x Gateway 因不认识该
+字段而拒绝，Worker 会退回更窄的旧 claim，并定期重新探测。因此在 Gateway 完成升级前，原有
+推理轮询不会被中断。
 
 Worker wheel 更新复用同一条签名 maintenance 链路。前台 Worker 入口是稳定的父监督进程，
 `serve` 运行在子解释器中；监督进程只接受 Worker 私有 `runtime-releases` 目录下的原子运行时
@@ -354,6 +379,8 @@ Gateway 和未签名的远程指令都不能指定任意可执行文件路径。
 仅把图片字段设为空不能移除 ComfyUI 导出的默认图；删除连接必须由 mapping 中精确的
 `optional_connection` 元数据证明。参考包位于
 [`workflows/vgen/minimax-h3-8step/1.0.0`](../../workflows/vgen/minimax-h3-8step/1.0.0)。
+原生 LTX-2.5 T2V 参考包位于
+[`workflows/vgen/ltx-2.5-distilled-t2v/1.0.0`](../../workflows/vgen/ltx-2.5-distilled-t2v/1.0.0)。
 
 ## 6. 开发环境
 

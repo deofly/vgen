@@ -38,6 +38,7 @@ REQUIRED_SDIST = {
     "tools/project_version.py",
     "tools/release.py",
     "tools/release.sh",
+    "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/manifest.yaml",
     "workflows/vgen/minimax-h3-8step/1.0.0/manifest.yaml",
 }
 REQUIRED_WHEEL = {
@@ -45,6 +46,9 @@ REQUIRED_WHEEL = {
     "vgen/assets/worker/enroll-worker.ps1",
     "vgen/assets/worker/setup-worker.ps1",
     "vgen/assets/worker/start-worker.cmd",
+    "vgen/assets/workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/manifest.yaml",
+    "vgen/assets/workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/mapping.json",
+    "vgen/assets/workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/workflow.json",
     "vgen/assets/workflows/vgen/minimax-h3-8step/1.0.0/manifest.yaml",
     "vgen/assets/workflows/vgen/minimax-h3-8step/1.0.0/mapping.json",
     "vgen/assets/workflows/vgen/minimax-h3-8step/1.0.0/workflow.json",
@@ -54,6 +58,8 @@ REQUIRED_WHEEL = {
     "vgen/cli/worker_enrollment.py",
     "vgen/crypto/maintenance.py",
     "vgen/gateway/openapi.py",
+    "vgen/market/capabilities.py",
+    "vgen/worker/capabilities.py",
     "vgen/worker/maintenance.py",
     "vgen/worker/model_installer.py",
     "vgen/worker/updater.py",

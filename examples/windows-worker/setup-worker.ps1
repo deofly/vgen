@@ -55,6 +55,9 @@ if ($CheckOnly) {
     $env:GIT_OPTIONAL_LOCKS = "0"
 }
 
+# This is the legacy first-install H3 bootstrap policy, not the complete Worker
+# capability catalog. New reviewed workflow releases are activated later under
+# the Worker's private capability store by signed Broker maintenance jobs.
 $PolicyName = "comfyui-minimax-h3-policy.yaml"
 $PolicySha256 = "5ae3a0f9fa16dadd2435496bd96584e9206720a613460e06c8ec6ff2f2c97f75"
 $MinimumExecutorVersion = "1.1.0"

@@ -12,7 +12,8 @@ and keep task content and media encrypted end to end.
 - Run workflows on remote GPU Workers while controlling them from a Broker.
 - Generate text-to-video, first-frame, and first/last-frame videos with ComfyUI.
 - Move task media securely between clients and Workers.
-- Install workflow models and manage Worker updates remotely.
+- Publish and activate reviewed workflow releases, reuse shared model content,
+  and manage model/runtime installs remotely.
 - Schedule work reliably with capacity-aware task execution.
 
 ## Requirements

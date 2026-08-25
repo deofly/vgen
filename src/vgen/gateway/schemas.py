@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from enum import StrEnum
@@ -13,6 +14,12 @@ from .public_metadata import (
     PublicMetadataError,
     validate_artifact_media_metadata,
     validate_public_requirements,
+)
+
+_WORKFLOW_RELEASE_REF_PATTERN = (
+    r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@"
+    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 
 
@@ -388,8 +395,48 @@ class ModelInstallSpec(WireModel):
         return self
 
 
+class CapabilityInstallSpec(WireModel):
+    kind: Literal["capability_install"]
+    workflow_ref: str = Field(
+        min_length=1,
+        max_length=512,
+        pattern=_WORKFLOW_RELEASE_REF_PATTERN,
+    )
+    workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_size: int = Field(ge=1, le=1024**3, strict=True)
+    node_classes_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    publisher_key: str | None
+    allow_unsigned_workflow: bool = Field(strict=True)
+    apply: Literal["on_idle"] = "on_idle"
+
+    @field_validator("publisher_key")
+    @classmethod
+    def publisher_key_is_canonical_ed25519_base64(
+        cls, value: str | None
+    ) -> str | None:
+        if value is None:
+            return None
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("publisher key must be valid base64") from exc
+        if len(decoded) != 32 or base64.b64encode(decoded).decode("ascii") != value:
+            raise ValueError("publisher key must be canonical base64 encoding 32 bytes")
+        return value
+
+    @model_validator(mode="after")
+    def publisher_pin_matches_unsigned_policy(self) -> CapabilityInstallSpec:
+        if self.allow_unsigned_workflow:
+            if self.publisher_key is not None:
+                raise ValueError("unsigned workflows must not include a publisher key")
+        elif self.publisher_key is None:
+            raise ValueError("signed workflows require a publisher key")
+        return self
+
+
 WorkerMaintenanceSpec = Annotated[
-    WorkerUpdateSpec | ModelInstallSpec,
+    WorkerUpdateSpec | ModelInstallSpec | CapabilityInstallSpec,
     Field(discriminator="kind"),
 ]
 
@@ -397,7 +444,7 @@ WorkerMaintenanceSpec = Annotated[
 class MaintenanceIntentPayload(WireModel):
     version: Literal[1]
     kind: Literal["vgen-worker-maintenance-intent"]
-    action: Literal["worker_update", "model_install"]
+    action: Literal["worker_update", "model_install", "capability_install"]
     worker_id: str = Field(min_length=1, max_length=120)
     broker_id: str = Field(min_length=1, max_length=120)
     device_id: str = Field(min_length=1, max_length=120)
@@ -449,6 +496,20 @@ class WorkerMaintenanceCancel(WireModel):
 
 class WorkerMaintenanceClaim(WireModel):
     ttl_seconds: int = Field(default=60, ge=15, le=300)
+    supported_actions: list[
+        Literal["worker_update", "model_install", "capability_install"]
+    ] = Field(
+        default_factory=lambda: ["worker_update", "model_install"],
+        min_length=1,
+        max_length=3,
+    )
+
+    @field_validator("supported_actions")
+    @classmethod
+    def supported_actions_are_unique(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("maintenance supported actions must be unique")
+        return value
 
 
 class WorkerMaintenanceProgress(WireModel):
@@ -509,8 +570,52 @@ class ModelInstallMaintenanceResult(WireModel):
         return value
 
 
+class CapabilityInstallMaintenanceResult(WireModel):
+    kind: Literal["capability_install"]
+    status: Literal["activated", "already_active", "repaired", "failed"]
+    workflow_ref: str = Field(
+        min_length=1,
+        max_length=512,
+        pattern=_WORKFLOW_RELEASE_REF_PATTERN,
+    )
+    workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ready: bool | None = Field(default=None, strict=True)
+    error_code: int | None = Field(default=None, ge=100000, le=999999, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def status_selects_an_exact_field_set(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        common = {
+            "kind",
+            "status",
+            "workflow_ref",
+            "workflow_digest",
+            "artifact_sha256",
+        }
+        expected = common | ({"error_code"} if value.get("status") == "failed" else {"ready"})
+        if set(value) != expected:
+            raise ValueError("capability install result fields do not match its status")
+        return value
+
+    @model_validator(mode="after")
+    def success_and_failure_fields_are_disjoint(
+        self,
+    ) -> CapabilityInstallMaintenanceResult:
+        if self.status == "failed":
+            if self.ready is not None or self.error_code is None:
+                raise ValueError("failed capability installs require only an error code")
+        elif self.ready is None or self.error_code is not None:
+            raise ValueError("successful capability installs require readiness without an error")
+        return self
+
+
 WorkerMaintenanceResult = Annotated[
-    WorkerUpdateMaintenanceResult | ModelInstallMaintenanceResult,
+    WorkerUpdateMaintenanceResult
+    | ModelInstallMaintenanceResult
+    | CapabilityInstallMaintenanceResult,
     Field(discriminator="kind"),
 ]
 

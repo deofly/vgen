@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import secrets
@@ -185,6 +186,20 @@ def _model_spec(*, suffix: str = "a") -> dict[str, Any]:
     }
 
 
+def _capability_spec(artifact: bytes, *, suffix: str = "c") -> dict[str, Any]:
+    return {
+        "kind": "capability_install",
+        "workflow_ref": "vgen/ltx-2.5@1.0.0",
+        "workflow_digest": "sha256:" + suffix * 64,
+        "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
+        "artifact_size": len(artifact),
+        "node_classes_digest": "9" * 64,
+        "publisher_key": base64.b64encode(b"p" * 32).decode("ascii"),
+        "allow_unsigned_workflow": False,
+        "apply": "on_idle",
+    }
+
+
 def test_worker_update_upload_claim_and_complete_is_ticket_safe(tmp_path) -> None:
     env = _environment(tmp_path)
     try:
@@ -325,6 +340,168 @@ def test_worker_update_upload_claim_and_complete_is_ticket_safe(tmp_path) -> Non
         )
         assert listed.status_code == 200
         assert "authorization" not in listed.json()[0]
+    finally:
+        env.client.__exit__(None, None, None)
+
+
+def test_capability_install_upload_download_and_bound_not_ready_result(tmp_path) -> None:
+    env = _environment(tmp_path)
+    try:
+        artifact = b"signed-ltx-2.5-capability-pack"
+        spec = _capability_spec(artifact)
+        created_response = _create_job(env, spec)
+        assert created_response.status_code == 200, created_response.text
+        created = created_response.json()
+        assert created["state"] == "awaiting_upload"
+        assert created["artifact"]["kind"] == "capability_install"
+        assert created["upload_ticket"]["expected_sha256"] == spec["artifact_sha256"]
+
+        upload = env.client.put(
+            created["upload_ticket"]["url"],
+            content=artifact,
+            headers=created["upload_ticket"]["headers"],
+        )
+        assert upload.status_code == 204, upload.text
+        committed = env.client.post(
+            f"/api/v1/maintenance-jobs/{created['id']}/commit",
+            json={},
+            headers=env.owner_headers,
+        )
+        assert committed.status_code == 200, committed.text
+        assert committed.json()["state"] == "queued"
+
+        claim = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/claim",
+            json={
+                "ttl_seconds": 60,
+                "supported_actions": [
+                    "worker_update",
+                    "model_install",
+                    "capability_install",
+                ],
+            },
+            headers=env.worker_headers,
+        )
+        assert claim.status_code == 200, claim.text
+        leased = claim.json()
+        download = env.client.get(
+            leased["artifact_download_ticket"]["url"],
+            headers=leased["artifact_download_ticket"]["headers"],
+        )
+        assert download.status_code == 200
+        assert download.content == artifact
+
+        identifiers = {
+            "kind": "capability_install",
+            "status": "repaired",
+            "workflow_ref": spec["workflow_ref"],
+            "workflow_digest": spec["workflow_digest"],
+            "artifact_sha256": spec["artifact_sha256"],
+            "ready": False,
+        }
+        mismatched = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}/complete",
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": True,
+                "result": {**identifiers, "workflow_digest": "sha256:" + "d" * 64},
+            },
+            headers=env.worker_headers,
+        )
+        assert mismatched.status_code == 422, mismatched.text
+
+        completed = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/{created['id']}/complete",
+            json={
+                "fencing_token": leased["fencing_token"],
+                "succeeded": True,
+                "result": identifiers,
+            },
+            headers=env.worker_headers,
+        )
+        assert completed.status_code == 200, completed.text
+        assert completed.json()["state"] == "succeeded"
+        assert completed.json()["result"] == identifiers
+        artifact_row = env.app.state.db.fetchone(
+            "SELECT state FROM maintenance_artifacts WHERE job_id=?", (created["id"],)
+        )
+        assert artifact_row["state"] == "available"
+    finally:
+        env.client.__exit__(None, None, None)
+
+
+def test_capability_install_wrong_digest_records_bound_failure(tmp_path) -> None:
+    env = _environment(tmp_path)
+    try:
+        expected = b"expected capability"
+        spec = _capability_spec(expected, suffix="e")
+        created = _create_job(env, spec)
+        assert created.status_code == 200, created.text
+        ticket = created.json()["upload_ticket"]
+        rejected = env.client.put(
+            ticket["url"], content=b"x" * len(expected), headers=ticket["headers"]
+        )
+        assert rejected.status_code == 422, rejected.text
+        shown = env.client.get(
+            f"/api/v1/maintenance-jobs/{created.json()['id']}",
+            headers=env.owner_headers,
+        )
+        assert shown.status_code == 200, shown.text
+        assert shown.json()["result"] == {
+            "kind": "capability_install",
+            "status": "failed",
+            "workflow_ref": spec["workflow_ref"],
+            "workflow_digest": spec["workflow_digest"],
+            "artifact_sha256": spec["artifact_sha256"],
+            "error_code": int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
+        }
+    finally:
+        env.client.__exit__(None, None, None)
+
+
+def test_legacy_worker_skips_capability_job_without_starving_supported_jobs(
+    tmp_path,
+) -> None:
+    env = _environment(tmp_path)
+    try:
+        artifact = b"capability for an upgraded worker"
+        capability = _create_job(env, _capability_spec(artifact))
+        assert capability.status_code == 200, capability.text
+        upload_ticket = capability.json()["upload_ticket"]
+        uploaded = env.client.put(
+            upload_ticket["url"],
+            content=artifact,
+            headers=upload_ticket["headers"],
+        )
+        assert uploaded.status_code == 204, uploaded.text
+        committed = env.client.post(
+            f"/api/v1/maintenance-jobs/{capability.json()['id']}/commit",
+            json={},
+            headers=env.owner_headers,
+        )
+        assert committed.status_code == 200, committed.text
+
+        model = _create_job(env, _model_spec(suffix="d"))
+        assert model.status_code == 200, model.text
+        assert model.json()["state"] == "queued"
+
+        # Missing supported_actions is the old Worker wire contract. It must
+        # never lease unknown capability code and must still reach the later
+        # model job instead of being blocked by queue order.
+        claim = env.client.post(
+            f"/api/v1/workers/{env.worker['id']}/maintenance-jobs/claim",
+            json={"ttl_seconds": 60},
+            headers=env.worker_headers,
+        )
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["id"] == model.json()["id"]
+        assert claim.json()["kind"] == "model_install"
+
+        capability_row = env.app.state.db.fetchone(
+            "SELECT state FROM worker_maintenance_jobs WHERE id=?",
+            (capability.json()["id"],),
+        )
+        assert capability_row["state"] == "queued"
     finally:
         env.client.__exit__(None, None, None)
 

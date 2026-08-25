@@ -191,6 +191,190 @@ def test_preflight_reports_safe_states_and_never_reserves_or_bills(tmp_path) -> 
         )
 
 
+def test_v2_workflow_readiness_is_exact_unique_and_fail_closed(tmp_path) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    with TestClient(app) as client:
+        client.headers.update({"Vgen-Protocol-Version": "1"})
+        boot, headers, owner_identity, _ = bootstrap_identity(client)
+        workspace = client.post(
+            "/api/v1/workspaces", json={"name": "Exact readiness"}, headers=headers
+        ).json()
+        pool = client.post(
+            f"/api/v1/workspaces/{workspace['id']}/pools",
+            json={"name": "GPU"},
+            headers=headers,
+        ).json()
+        payload = _payload(workspace["id"], pool["id"])
+        worker_keys = DeviceKeys.generate()
+        worker = app.state.repository.create_worker(
+            owner_user_id=boot["user"]["id"],
+            manager_broker_id=None,
+            name="gpu-v2",
+            signing_public_key=b64url_encode(worker_keys.signing_public_bytes()),
+            encryption_public_key=b64url_encode(worker_keys.encryption_public_bytes()),
+            certificate=worker_owner_certificate(owner_identity, worker_keys),
+            executor_type="comfyui",
+            executor_version="1.0.0",
+            capabilities={},
+            capacity=1,
+        )
+        stamp = now()
+        app.state.db.execute(
+            """INSERT INTO worker_allocations
+               (id,worker_id,workspace_id,pool_id,owner_consent_at,
+                workspace_approved_at,approved_by_user_id,allocation_proof,status,
+                created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,'{}','active',?,?)""",
+            (
+                new_id("alc"),
+                worker["id"],
+                workspace["id"],
+                pool["id"],
+                stamp,
+                stamp,
+                boot["user"]["id"],
+                stamp,
+                stamp,
+            ),
+        )
+        rate = app.state.repository.propose_rate(
+            worker_id=worker["id"],
+            workspace_id=workspace["id"],
+            user_id=boot["user"]["id"],
+            rate_microtokens_per_second=1,
+        )
+        app.state.repository.approve_rate(
+            rate_id=rate["id"], admin_user_id=boot["user"]["id"]
+        )
+
+        exact = {
+            "workflow_ref": payload["workflow_ref"],
+            "workflow_digest": payload["workflow_digest"],
+            "state": "ready",
+            "missing_model_digests": [],
+            "missing_node_classes": [],
+        }
+        base_nested = {
+            "runtime_version": "0.33.0",
+            "model_digests": [MODEL_DIGEST],
+            "vram_bytes": 24_000_000_000,
+            "ram_bytes": 32_000_000_000,
+        }
+
+        def set_capabilities(nested: dict[str, object]) -> None:
+            capabilities = {
+                "executors": [
+                    {
+                        "type": "comfyui",
+                        "version": "1.0.0",
+                        "payload_formats": ["comfyui-api-graph/v1"],
+                        "operations": ["i2v"],
+                        "max_concurrency": 1,
+                        "capabilities": nested,
+                    }
+                ]
+            }
+            app.state.db.execute(
+                """UPDATE workers SET status='active',last_seen_at=?,capabilities=?,updated_at=?
+                   WHERE id=?""",
+                (now(), json_text(capabilities), now(), worker["id"]),
+            )
+
+        def preflight_state(nested: dict[str, object]) -> str:
+            set_capabilities(nested)
+            response = client.post("/api/v1/tasks/preflight", json=payload, headers=headers)
+            assert response.status_code == 200, response.text
+            return response.json()["state"]
+
+        v2 = {
+            **base_nested,
+            "capability_schema_version": 2,
+            "workflow_readiness": [exact],
+        }
+        assert preflight_state(v2) == "ready"
+        assert preflight_state(
+            {
+                **v2,
+                "workflow_readiness": [{**exact, "workflow_ref": "vgen/other@1.0.0"}],
+            }
+        ) == "capability_mismatch"
+        assert preflight_state(
+            {
+                **v2,
+                "workflow_readiness": [
+                    {**exact, "workflow_digest": "sha256:" + "c" * 64}
+                ],
+            }
+        ) == "capability_mismatch"
+        assert preflight_state(
+            {**v2, "workflow_readiness": [{**exact, "state": "missing_models"}]}
+        ) == "capability_mismatch"
+        for state in ("insufficient_vram", "insufficient_ram"):
+            assert preflight_state(
+                {**v2, "workflow_readiness": [{**exact, "state": state}]}
+            ) == "capability_mismatch"
+        assert preflight_state(
+            {**v2, "workflow_readiness": [exact, dict(exact)]}
+        ) == "capability_mismatch"
+        assert preflight_state(
+            {**v2, "workflow_readiness": [exact, "malformed"]}
+        ) == "capability_mismatch"
+        assert preflight_state(
+            {
+                **v2,
+                "workflow_readiness": [
+                    {
+                        key: value
+                        for key, value in exact.items()
+                        if key != "missing_node_classes"
+                    }
+                ],
+            }
+        ) == "capability_mismatch"
+        assert preflight_state(
+            {
+                **v2,
+                "workflow_readiness": [
+                    {**exact, "missing_model_digests": [MODEL_DIGEST]}
+                ],
+            }
+        ) == "capability_mismatch"
+        assert preflight_state({**v2, "capability_schema_version": 3}) == (
+            "capability_mismatch"
+        )
+
+        # A pre-v2 Worker has no per-workflow readiness list. Preserve the
+        # model/resource matcher until that Worker upgrades its heartbeat.
+        assert preflight_state(dict(base_nested)) == "ready"
+
+        set_capabilities(
+            {
+                **v2,
+                "workflow_readiness": [{**exact, "workflow_ref": "vgen/other@1.0.0"}],
+            }
+        )
+        rejected = client.post(
+            "/api/v1/tasks/prepare",
+            json=payload,
+            headers={**headers, "Idempotency-Key": "wrong-workflow-readiness"},
+        )
+        assert rejected.status_code == 503, rejected.text
+
+        set_capabilities(v2)
+        prepared = client.post(
+            "/api/v1/tasks/prepare",
+            json=payload,
+            headers={**headers, "Idempotency-Key": "exact-workflow-readiness"},
+        )
+        assert prepared.status_code == 200, prepared.text
+        assert prepared.json()["worker"]["id"] == worker["id"]
+
+
 def test_preflight_service_requires_submit_scope_and_workspace_binding(tmp_path) -> None:
     app = create_app(
         database_path=str(tmp_path / "gateway.db"),

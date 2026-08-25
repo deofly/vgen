@@ -685,13 +685,15 @@ def create_app(
 
     def maintenance_create_view(job: dict[str, Any], request: Request) -> dict[str, Any]:
         value = dict(job)
-        if value.get("kind") == "worker_update" and value.get("state") == "awaiting_upload":
+        if value.get("state") == "awaiting_upload" and isinstance(
+            value.get("artifact"), dict
+        ):
             value["upload_ticket"] = maintenance_artifact_ticket(value, request, method="PUT")
         return value
 
     def maintenance_claim_view(job: dict[str, Any], request: Request) -> dict[str, Any]:
         value = dict(job)
-        if value.get("kind") == "worker_update":
+        if isinstance(value.get("artifact"), dict):
             value["artifact_download_ticket"] = maintenance_artifact_ticket(
                 value, request, method="GET"
             )
@@ -2778,6 +2780,7 @@ def create_app(
             worker_id=worker_id,
             session_id=principal.session_id,
             ttl_seconds=payload.ttl_seconds,
+            supported_actions=tuple(payload.supported_actions),
         )
         if job is None:
             return Response(status_code=204)
@@ -2817,11 +2820,14 @@ def create_app(
     ) -> dict[str, Any]:
         require_worker(principal, worker_id)
         require_scope(principal, "worker:maintenance:report")
+        data = payload.model_dump(mode="json")
+        if payload.result.kind == "capability_install":
+            data["result"] = payload.result.model_dump(mode="json", exclude_none=True)
         return repository.complete_worker_maintenance(
             job_id=job_id,
             worker_id=worker_id,
             session_id=principal.session_id,
-            **payload.model_dump(mode="json"),
+            **data,
         )
 
     @app.post("/api/v1/workers/{worker_id}/heartbeat", tags=["worker"])
@@ -2867,6 +2873,8 @@ def create_app(
             workspace_id=payload.workspace_id,
             pool_id=payload.pool_id,
             executor_type=payload.executor_type,
+            workflow_ref=payload.workflow_ref,
+            workflow_digest=payload.workflow_digest,
             public_requirements=payload.public_requirements,
         )
 

@@ -134,6 +134,12 @@ _MAINTENANCE_LEASE_STATES = frozenset({"leased", "running", "restarting"})
 _MAINTENANCE_TERMINAL_STATES = frozenset(
     {"succeeded", "failed", "cancelled", "expired"}
 )
+_MAINTENANCE_KINDS = frozenset(
+    {"worker_update", "model_install", "capability_install"}
+)
+_ARTIFACT_MAINTENANCE_KINDS = frozenset(
+    {"worker_update", "capability_install"}
+)
 _WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
 MAX_QUEUED_TASKS_PER_WORKER = 100
 TASK_LIST_SORTS: dict[str, tuple[str, str]] = {
@@ -175,7 +181,13 @@ class GatewayRepository:
             ) from exc
 
     @staticmethod
-    def _matches_requirements(worker: sqlite3.Row, requirements: dict[str, Any]) -> bool:
+    def _matches_requirements(
+        worker: sqlite3.Row,
+        requirements: dict[str, Any],
+        *,
+        workflow_ref: str,
+        workflow_digest: str,
+    ) -> bool:
         def identifier_set(value: object) -> set[str] | None:
             if value is None:
                 return set()
@@ -219,7 +231,12 @@ class GatewayRepository:
                 return direct
             return 0
 
-        capabilities = json.loads(worker["capabilities"] or "{}")
+        try:
+            capabilities = json.loads(worker["capabilities"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(capabilities, dict):
+            return False
         executors = capabilities.get("executors")
         if not isinstance(executors, list):
             return False
@@ -234,11 +251,15 @@ class GatewayRepository:
         if descriptor is None:
             return False
         operation = requirements.get("operation")
-        if operation and operation not in descriptor.get("operations", []):
-            return False
+        if operation:
+            operations = descriptor.get("operations")
+            if not isinstance(operations, list) or operation not in operations:
+                return False
         payload_format = requirements.get("payload_format")
-        if payload_format and payload_format not in descriptor.get("payload_formats", []):
-            return False
+        if payload_format:
+            payload_formats = descriptor.get("payload_formats")
+            if not isinstance(payload_formats, list) or payload_format not in payload_formats:
+                return False
         minimum_executor_version = requirements.get("executor_min_version")
         if minimum_executor_version is not None:
             actual_executor_version = descriptor.get("version")
@@ -256,6 +277,91 @@ class GatewayRepository:
             if isinstance(descriptor.get("capabilities"), dict)
             else {}
         )
+        capability_schema_version = nested.get("capability_schema_version")
+        if "capability_schema_version" in nested:
+            if type(capability_schema_version) is not int or capability_schema_version != 2:
+                return False
+            workflow_readiness = nested.get("workflow_readiness")
+            if not isinstance(workflow_readiness, list) or len(workflow_readiness) > 256:
+                return False
+            matching_readiness: list[dict[str, Any]] = []
+            seen_workflows: set[tuple[str, str]] = set()
+            for item in workflow_readiness:
+                if not isinstance(item, dict):
+                    return False
+                if set(item) != {
+                    "workflow_ref",
+                    "workflow_digest",
+                    "state",
+                    "missing_model_digests",
+                    "missing_node_classes",
+                }:
+                    return False
+                item_ref = item.get("workflow_ref")
+                item_digest = item.get("workflow_digest")
+                item_state = item.get("state")
+                missing_models = item.get("missing_model_digests")
+                missing_nodes = item.get("missing_node_classes")
+                if (
+                    not isinstance(item_ref, str)
+                    or not 1 <= len(item_ref) <= 512
+                    or not isinstance(item_digest, str)
+                    or len(item_digest) != 71
+                    or not item_digest.startswith("sha256:")
+                    or any(character not in "0123456789abcdef" for character in item_digest[7:])
+                    or not isinstance(item_state, str)
+                    or item_state
+                    not in {
+                        "ready",
+                        "missing_models",
+                        "missing_nodes",
+                        "node_probe_unavailable",
+                        "executor_incompatible",
+                        "runtime_incompatible",
+                        "insufficient_vram",
+                        "insufficient_ram",
+                    }
+                    or not isinstance(missing_models, list)
+                    or len(missing_models) > 1024
+                    or any(
+                        not isinstance(digest, str)
+                        or len(digest) != 71
+                        or not digest.startswith("sha256:")
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in digest[7:]
+                        )
+                        for digest in missing_models
+                    )
+                    or len(missing_models) != len(set(missing_models))
+                    or not isinstance(missing_nodes, list)
+                    or len(missing_nodes) > 512
+                    or any(
+                        not isinstance(node, str)
+                        or not 1 <= len(node) <= 128
+                        or any(
+                            not (character.isalnum() or character in "_.:-")
+                            for character in node
+                        )
+                        for node in missing_nodes
+                    )
+                    or len(missing_nodes) != len(set(missing_nodes))
+                    or (
+                        item_state == "ready"
+                        and (bool(missing_models) or bool(missing_nodes))
+                    )
+                    or (item_state == "missing_models" and not missing_models)
+                    or (item_state == "missing_nodes" and not missing_nodes)
+                ):
+                    return False
+                identity = (item_ref, item_digest)
+                if identity in seen_workflows:
+                    return False
+                seen_workflows.add(identity)
+                if item_ref == workflow_ref and item_digest == workflow_digest:
+                    matching_readiness.append(item)
+            if len(matching_readiness) != 1 or matching_readiness[0]["state"] != "ready":
+                return False
         minimum_runtime_version = requirements.get("runtime_min_version")
         if minimum_runtime_version is not None:
             actual_runtime_version = nested.get("runtime_version")
@@ -4307,7 +4413,7 @@ class GatewayRepository:
                 "This Broker is not the Worker's delegated manager.",
                 403,
             )
-        if kind not in {"worker_update", "model_install"}:
+        if kind not in _MAINTENANCE_KINDS:
             raise RepositoryError(
                 VALIDATION_FAILED,
                 "WORKER_MAINTENANCE_KIND_INVALID",
@@ -4342,7 +4448,7 @@ class GatewayRepository:
                 return value
 
             job_id = new_id("mtj")
-            state = "awaiting_upload" if kind == "worker_update" else "queued"
+            state = "awaiting_upload" if kind in _ARTIFACT_MAINTENANCE_KINDS else "queued"
             conn.execute(
                 """INSERT INTO worker_maintenance_jobs
                    (id,worker_id,broker_id,issued_by_user_id,issued_by_device_id,kind,spec,
@@ -4366,16 +4472,17 @@ class GatewayRepository:
                 ),
             )
             artifact_id: str | None = None
-            if kind == "worker_update":
+            if kind in _ARTIFACT_MAINTENANCE_KINDS:
                 artifact_id = new_id("art")
                 conn.execute(
                     """INSERT INTO maintenance_artifacts
                        (id,job_id,kind,store_type,object_ref,expected_size,expected_sha256,
                         state,created_at,updated_at)
-                       VALUES (?,?,'worker_update',?,?,?,?, 'pending',?,?)""",
+                       VALUES (?,?,?,?,?,?,?,'pending',?,?)""",
                     (
                         artifact_id,
                         job_id,
+                        kind,
                         artifact_store_type,
                         artifact_id,
                         int(spec["artifact_size"]),
@@ -4497,7 +4604,7 @@ class GatewayRepository:
                 raise RepositoryError(
                     VALIDATION_FAILED,
                     "MAINTENANCE_ARTIFACT_NOT_UPLOADED",
-                    "The Worker update artifact has not been uploaded and verified.",
+                    "The Worker maintenance artifact has not been uploaded and verified.",
                     409,
                 )
             conn.execute(
@@ -4611,7 +4718,20 @@ class GatewayRepository:
         worker_id: str,
         session_id: str,
         ttl_seconds: int,
+        supported_actions: tuple[str, ...] = ("worker_update", "model_install"),
     ) -> dict[str, Any] | None:
+        allowed_actions = tuple(
+            action
+            for action in supported_actions
+            if action in {"worker_update", "model_install", "capability_install"}
+        )
+        if not allowed_actions or len(allowed_actions) != len(set(allowed_actions)):
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "WORKER_MAINTENANCE_ACTIONS_INVALID",
+                "Worker maintenance actions are invalid.",
+                422,
+            )
         stamp = now()
         with self.db.transaction(immediate=True) as conn:
             self._expire_reservations(conn, stamp)
@@ -4641,6 +4761,8 @@ class GatewayRepository:
                 (worker_id, stamp),
             ).fetchone()
             if existing is not None:
+                if existing["kind"] not in allowed_actions:
+                    return None
                 if existing["lease_session_id"] != session_id:
                     return None
                 lease_expires_at = min(stamp + ttl_seconds, float(existing["expires_at"]))
@@ -4660,11 +4782,13 @@ class GatewayRepository:
             ).fetchone()
             if active_attempt is not None:
                 return None
+            placeholders = ",".join("?" for _ in allowed_actions)
             job = conn.execute(
-                """SELECT * FROM worker_maintenance_jobs
-                   WHERE worker_id=? AND state='queued' AND expires_at>?
-                   ORDER BY created_at LIMIT 1""",
-                (worker_id, stamp),
+                f"""SELECT * FROM worker_maintenance_jobs
+                    WHERE worker_id=? AND state='queued' AND expires_at>?
+                      AND kind IN ({placeholders})
+                    ORDER BY created_at LIMIT 1""",
+                (worker_id, stamp, *allowed_actions),
             ).fetchone()
             if job is None:
                 return None
@@ -4836,7 +4960,27 @@ class GatewayRepository:
                     and result.get("artifact_sha256") == spec.get("artifact_sha256")
                     and succeeded == (status == "activated")
                 )
-            else:
+            elif row["kind"] == "capability_install":
+                success_status = status in {"activated", "already_active", "repaired"}
+                valid = (
+                    result.get("workflow_ref") == spec.get("workflow_ref")
+                    and result.get("workflow_digest") == spec.get("workflow_digest")
+                    and result.get("artifact_sha256") == spec.get("artifact_sha256")
+                    and succeeded == success_status
+                    and (
+                        (
+                            success_status
+                            and type(result.get("ready")) is bool
+                            and result.get("error_code") is None
+                        )
+                        or (
+                            status == "failed"
+                            and result.get("ready") is None
+                            and type(result.get("error_code")) is int
+                        )
+                    )
+                )
+            else:  # model_install
                 requested = set(spec.get("model_digests", []))
                 installed = set(result.get("installed_model_digests", []))
                 failed_digest = result.get("failed_model_digest")
@@ -4860,7 +5004,7 @@ class GatewayRepository:
                    WHERE id=?""",
                 (final_state, json_text(result), stamp, stamp, job_id),
             )
-            if succeeded and row["kind"] == "worker_update":
+            if succeeded and row["kind"] in _ARTIFACT_MAINTENANCE_KINDS:
                 conn.execute(
                     """UPDATE maintenance_artifacts SET state='available',updated_at=?
                        WHERE job_id=? AND state='uploaded'""",
@@ -5115,6 +5259,23 @@ class GatewayRepository:
         if size != int(maintenance["expected_size"]) or not digest_matches:
             stamp = now()
             job_spec = json.loads(maintenance["job_spec"])
+            if maintenance["kind"] == "capability_install":
+                failure_result = {
+                    "kind": "capability_install",
+                    "status": "failed",
+                    "workflow_ref": job_spec["workflow_ref"],
+                    "workflow_digest": job_spec["workflow_digest"],
+                    "artifact_sha256": job_spec["artifact_sha256"],
+                    "error_code": int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
+                }
+            else:
+                failure_result = {
+                    "kind": "worker_update",
+                    "status": "failed",
+                    "target_version": job_spec["target_version"],
+                    "artifact_sha256": job_spec["artifact_sha256"],
+                    "error_code": int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
+                }
             with self.db.transaction(immediate=True) as conn:
                 conn.execute(
                     """UPDATE maintenance_artifacts
@@ -5127,15 +5288,7 @@ class GatewayRepository:
                        SET state='failed',result=?,completed_at=?,updated_at=?
                        WHERE id=? AND state='awaiting_upload'""",
                     (
-                        json_text(
-                            {
-                                "kind": "worker_update",
-                                "status": "failed",
-                                "target_version": job_spec["target_version"],
-                                "artifact_sha256": job_spec["artifact_sha256"],
-                                "error_code": int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
-                            }
-                        ),
+                        json_text(failure_result),
                         stamp,
                         stamp,
                         maintenance["job_id"],
@@ -5144,7 +5297,7 @@ class GatewayRepository:
             raise RepositoryError(
                 int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
                 "ARTIFACT_INTEGRITY_FAILED",
-                "Worker update artifact integrity verification failed.",
+                "Worker maintenance artifact integrity verification failed.",
                 422,
             )
         stamp = now()
@@ -5167,6 +5320,8 @@ class GatewayRepository:
         workspace_id: str,
         pool_id: str,
         executor_type: str,
+        workflow_ref: str,
+        workflow_digest: str,
         public_requirements: dict[str, Any],
     ) -> dict[str, Any]:
         """Report aggregate scheduling readiness without reserving any capacity."""
@@ -5227,7 +5382,16 @@ class GatewayRepository:
             stamp=stamp,
         )
         candidate = next(
-            (row for row in candidate_rows if self._matches_requirements(row, public_requirements)),
+            (
+                row
+                for row in candidate_rows
+                if self._matches_requirements(
+                    row,
+                    public_requirements,
+                    workflow_ref=workflow_ref,
+                    workflow_digest=workflow_digest,
+                )
+            ),
             None,
         )
         queueing = False
@@ -5242,7 +5406,12 @@ class GatewayRepository:
                 (
                     row
                     for row in queued_rows
-                    if self._matches_requirements(row, public_requirements)
+                    if self._matches_requirements(
+                        row,
+                        public_requirements,
+                        workflow_ref=workflow_ref,
+                        workflow_digest=workflow_digest,
+                    )
                 ),
                 None,
             )
@@ -5340,7 +5509,12 @@ class GatewayRepository:
                 (
                     row
                     for row in candidate_rows
-                    if self._matches_requirements(row, public_requirements)
+                    if self._matches_requirements(
+                        row,
+                        public_requirements,
+                        workflow_ref=workflow_ref,
+                        workflow_digest=workflow_digest,
+                    )
                 ),
                 None,
             )
@@ -5356,7 +5530,12 @@ class GatewayRepository:
                     (
                         row
                         for row in queue_rows
-                        if self._matches_requirements(row, public_requirements)
+                        if self._matches_requirements(
+                            row,
+                            public_requirements,
+                            workflow_ref=workflow_ref,
+                            workflow_digest=workflow_digest,
+                        )
                     ),
                     None,
                 )
@@ -6656,7 +6835,16 @@ class GatewayRepository:
                 ),
             ).fetchall()
             candidate = next(
-                (row for row in candidate_rows if self._matches_requirements(row, requirements)),
+                (
+                    row
+                    for row in candidate_rows
+                    if self._matches_requirements(
+                        row,
+                        requirements,
+                        workflow_ref=str(task["workflow_ref"]),
+                        workflow_digest=str(task["workflow_digest"]),
+                    )
+                ),
                 None,
             )
             if candidate is None:

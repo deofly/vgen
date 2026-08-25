@@ -244,6 +244,35 @@ install custom-node code, or execute setup scripts. Model acquisition is an
 explicit Broker maintenance job with license confirmation and revision, size,
 and SHA-256 checks.
 
+`workflow-install` binds the release ref/digest, archive SHA-256/size, publisher
+pin (or explicit unsigned authorization), and reviewed node-class digest into a
+Device-signed maintenance intent. The Worker revalidates the inert release in
+staging, compiles its ComfyUI policy, and atomically switches its active index.
+Reinstalling an already-active digest repairs a corrupt local release by moving
+the old directory aside and replacing it with the newly verified staged copy;
+other active workflows remain available throughout validation.
+At execution it rebuilds the graph from the package mapping and validated
+effective parameters, then requires an exact operation, topology, binding, and
+model-loader-path match. Third-party custom-node code remains a separate
+machine-administrator boundary.
+
+Models use a Worker-local digest-addressed content store. Shared T5, VAE, and
+other weights download once and are materialized as read-only hard links in
+each required ComfyUI placement. Every reuse rechecks size and SHA-256. Gated
+downloads read only Worker-local `HF_TOKEN`/`HF_TOKEN_PATH`; credentials never
+enter the Gateway spec. Readiness is still checked per exact workflow and
+placement. Capability-schema-v2 Workers are schedulable only when one exact
+ref/digest entry is `ready`; malformed or duplicate reports fail closed, while
+pre-v2 Workers retain the legacy requirements fallback. Manifest VRAM and RAM
+minimums produce `insufficient_vram`/`insufficient_ram`, are checked before
+model delivery when current Worker facts are available, and are enforced again
+locally before execution.
+
+During a rolling upgrade, a new Worker first negotiates its supported
+maintenance actions. If a 0.9.x Gateway rejects that new field, the Worker
+retries the narrower legacy claim and periodically probes again; inference
+polling therefore continues until the Gateway is upgraded.
+
 Worker wheel updates use the same signed maintenance path. The foreground
 Worker entry point is a stable parent supervisor; it launches `serve` in a child
 interpreter, follows only an atomic runtime pointer under the Worker's private

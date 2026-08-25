@@ -592,7 +592,60 @@ vgen broker maintenance-cancel <job_id>
 取消会阻止未开始的任务；正在下载的 Worker 会在下一次取消检查时停止。已校验并成功安装的
 文件不会因为随后取消而删除。
 
-### 6.2 更新 VGen Worker
+模型文件按 SHA-256 存入 Worker 本机共享内容缓存。两个工作流引用同一个 T5、VAE 或其他
+模型时只下载一次；如果 ComfyUI 要求它出现在不同目录，Worker 会从同一缓存创建硬链接，
+不会保存第二份权重。共享 inode 会设为只读，避免某个工作流原地改写后污染其他工作流；如需
+替换模型，应发布新的摘要 pin，而不是直接覆盖文件。就绪检查仍逐工作流、逐目标路径进行，
+因此不会把“别的目录里有同一模型”误判为当前工作流已就绪。
+
+### 6.2 远程安装 LTX-2.5 工作流
+
+先更新 Worker，使其心跳中出现 `capability_install`：
+
+```bash
+vgen worker upgrade --worker "Windows GPU Worker" --wait
+```
+
+在 Hugging Face 上阅读并接受 LTX-2.5 gate 和许可证，然后只在 Windows Worker 本机配置
+只读 token。推荐把 token 保存到仅当前 Windows 用户可读的文件，并把用户环境变量
+`HF_TOKEN_PATH` 指向该文件；修改环境变量后重新启动前台 Worker。不要把 token 放进 Mac
+命令、Gateway 配置或工作流清单。
+
+Mac CLI 已内置摘要固定的基础 T2V 包。下面的命令会依次上传工作流包、让 Worker 原子激活、
+安装五个缺失模型，并等待精确的工作流版本变为 `ready`：
+
+```bash
+vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
+  --worker "Windows GPU Worker" \
+  --approve-nodes \
+  --allow-unsigned \
+  --accept-license LicenseRef-LTX-2.x-Community \
+  --wait
+```
+
+该包使用 38 节点的 ComfyUI 原生 API 图，没有第三方 custom node；五个受限模型合计
+39,709,872,236 字节。`--approve-nodes` 批准命令显示的精确节点类摘要，`--allow-unsigned`
+只批准 CLI wheel 中摘要固定的当前未签名工作流包。正式市场发布应换成发布者签名包。
+
+官方基础图要求至少 32 GB 显存、32 GB 内存和足够的模型/缓存空间。24 GB RTX 3090 不会被
+此工作流调度；`workflow-install` 会在上传能力包和下载五个模型前直接拒绝。不要通过降低
+manifest 门槛掩盖实际 OOM 风险，应改用达到要求的 Worker，或另行发布并实机验证低显存量化
+工作流。
+
+安装完成后先预检，再提交：
+
+```bash
+vgen task preflight "电影感冰原上的北极光，风声与远处冰裂声" \
+  --workflow vgen/ltx-2.5-distilled-t2v@1.0.0 \
+  -p duration=5 -p width=1280 -p height=736 -p fps=24
+
+vgen task submit "电影感冰原上的北极光，风声与远处冰裂声" \
+  --workflow vgen/ltx-2.5-distilled-t2v@1.0.0 \
+  -p duration=5 -p width=1280 -p height=736 -p fps=24 \
+  --wait --output-dir ~/Downloads/VGen-output
+```
+
+### 6.3 更新 VGen Worker
 
 Windows 首次安装后，日常 VGen Worker 更新不需要重新下载或执行 PowerShell 安装脚本。在
 Workspace Owner 的 Mac 上运行：

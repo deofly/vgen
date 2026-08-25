@@ -43,6 +43,7 @@ from .models import (
 )
 
 _FINISH_SIGNATURE_CONTEXT = b"vgen-worker-finish-v1"
+_MAINTENANCE_ACTIONS_REPROBE_SECONDS = 60.0
 
 
 def _canonical_failure_responsibility(code: ErrorCode | int) -> str:
@@ -102,6 +103,8 @@ class GatewayV1Client:
         self._last_provider_token: str | None = None
         self._pending_lease_idempotency: str | None = None
         self._pending_maintenance_idempotency: str | None = None
+        self._pending_maintenance_claim_body: dict[str, Any] | None = None
+        self._maintenance_actions_retry_at = 0.0
         self._output_commits: dict[str, dict[str, _OutputCommit]] = {}
 
     @property
@@ -130,14 +133,55 @@ class GatewayV1Client:
             self._pending_maintenance_idempotency = (
                 "worker-maintenance-claim-" + secrets.token_urlsafe(24)
             )
-        value = self._request(
-            "POST",
-            f"/api/v1/workers/{self.worker_id}/maintenance-jobs/claim",
-            {"ttl_seconds": ttl_seconds},
-            idempotency_key=self._pending_maintenance_idempotency,
-            allow_empty=True,
-        )
+            supports_action_negotiation = (
+                time.monotonic() >= self._maintenance_actions_retry_at
+            )
+            self._pending_maintenance_claim_body = {"ttl_seconds": ttl_seconds}
+            if supports_action_negotiation:
+                self._pending_maintenance_claim_body["supported_actions"] = [
+                    "worker_update",
+                    "model_install",
+                    "capability_install",
+                ]
+        elif self._pending_maintenance_claim_body is None:
+            raise RuntimeError("pending maintenance claim has no bound request body")
+        path = f"/api/v1/workers/{self.worker_id}/maintenance-jobs/claim"
+        body = dict(self._pending_maintenance_claim_body)
+        supports_action_negotiation = "supported_actions" in body
+        try:
+            value = self._request(
+                "POST",
+                path,
+                body,
+                idempotency_key=self._pending_maintenance_idempotency,
+                allow_empty=True,
+            )
+        except GatewayRequestError as exc:
+            if not supports_action_negotiation or exc.code is not ErrorCode.VALIDATION_FAILED:
+                raise
+            # Gateway 0.9.x accepted only ttl_seconds. A definitive validation
+            # rejection cannot have leased work, so retry with a fresh key and
+            # the narrower legacy body. Re-probe periodically so a live Gateway
+            # upgrade enables capability_install without restarting the Worker.
+            self._maintenance_actions_retry_at = (
+                time.monotonic() + _MAINTENANCE_ACTIONS_REPROBE_SECONDS
+            )
+            self._pending_maintenance_idempotency = (
+                "worker-maintenance-claim-" + secrets.token_urlsafe(24)
+            )
+            self._pending_maintenance_claim_body = {"ttl_seconds": ttl_seconds}
+            value = self._request(
+                "POST",
+                path,
+                self._pending_maintenance_claim_body,
+                idempotency_key=self._pending_maintenance_idempotency,
+                allow_empty=True,
+            )
+        else:
+            if supports_action_negotiation:
+                self._maintenance_actions_retry_at = 0.0
         self._pending_maintenance_idempotency = None
+        self._pending_maintenance_claim_body = None
         if value is None:
             return None
         return _require_object(value, "maintenance claim response")

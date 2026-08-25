@@ -21,7 +21,7 @@ from typing import Any
 
 from vgen.protocol.ids import new_id as protocol_new_id
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 WORKER_ONLINE_WINDOW_SECONDS = 120.0
 TRANSFER_TICKET_REPLAY_RETENTION_SECONDS = 7_200.0
 
@@ -284,7 +284,7 @@ CREATE TABLE IF NOT EXISTS worker_maintenance_jobs (
     broker_id TEXT NOT NULL REFERENCES brokers(id),
     issued_by_user_id TEXT NOT NULL REFERENCES users(id),
     issued_by_device_id TEXT NOT NULL REFERENCES devices(id),
-    kind TEXT NOT NULL CHECK(kind IN ('worker_update','model_install')),
+    kind TEXT NOT NULL CHECK(kind IN ('worker_update','model_install','capability_install')),
     spec TEXT NOT NULL,
     spec_digest TEXT NOT NULL,
     authorization TEXT NOT NULL,
@@ -313,7 +313,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_maintenance_active_dedupe
 CREATE TABLE IF NOT EXISTS maintenance_artifacts (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL UNIQUE REFERENCES worker_maintenance_jobs(id),
-    kind TEXT NOT NULL CHECK(kind='worker_update'),
+    kind TEXT NOT NULL CHECK(kind IN ('worker_update','capability_install')),
     store_type TEXT NOT NULL,
     object_ref TEXT NOT NULL,
     expected_size INTEGER NOT NULL CHECK(expected_size > 0),
@@ -667,10 +667,112 @@ class GatewayDatabase:
             row = self._conn.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 self._conn.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
+            elif int(row["version"]) == 1:
+                self._migrate_schema_v1_to_v2()
             elif int(row["version"]) != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported gateway schema version {row['version']}; expected {SCHEMA_VERSION}"
                 )
+
+    def _migrate_schema_v1_to_v2(self) -> None:
+        """Rebuild maintenance tables whose v1 CHECK constraints are immutable."""
+
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("DROP INDEX IF EXISTS idx_maintenance_artifacts_job")
+            self._conn.execute("DROP INDEX IF EXISTS idx_worker_maintenance_poll")
+            self._conn.execute("DROP INDEX IF EXISTS idx_worker_maintenance_active_dedupe")
+            self._conn.execute(
+                "ALTER TABLE maintenance_artifacts RENAME TO _v1_maintenance_artifacts"
+            )
+            self._conn.execute(
+                "ALTER TABLE worker_maintenance_jobs RENAME TO _v1_worker_maintenance_jobs"
+            )
+            self._conn.execute(
+                """CREATE TABLE worker_maintenance_jobs (
+                    id TEXT PRIMARY KEY,
+                    worker_id TEXT NOT NULL REFERENCES workers(id),
+                    broker_id TEXT NOT NULL REFERENCES brokers(id),
+                    issued_by_user_id TEXT NOT NULL REFERENCES users(id),
+                    issued_by_device_id TEXT NOT NULL REFERENCES devices(id),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'worker_update','model_install','capability_install'
+                    )),
+                    spec TEXT NOT NULL,
+                    spec_digest TEXT NOT NULL,
+                    authorization TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'awaiting_upload','queued','leased','running','restarting',
+                        'succeeded','failed','cancelled','expired'
+                    )),
+                    progress TEXT NOT NULL DEFAULT '{}',
+                    result TEXT,
+                    fencing_token INTEGER NOT NULL DEFAULT 0,
+                    lease_session_id TEXT REFERENCES sessions(id),
+                    lease_expires_at REAL,
+                    heartbeat_at REAL,
+                    expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL
+                )"""
+            )
+            self._conn.execute(
+                """INSERT INTO worker_maintenance_jobs
+                   SELECT * FROM _v1_worker_maintenance_jobs"""
+            )
+            self._conn.execute(
+                """CREATE TABLE maintenance_artifacts (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL UNIQUE REFERENCES worker_maintenance_jobs(id),
+                    kind TEXT NOT NULL CHECK(kind IN ('worker_update','capability_install')),
+                    store_type TEXT NOT NULL,
+                    object_ref TEXT NOT NULL,
+                    expected_size INTEGER NOT NULL CHECK(expected_size > 0),
+                    expected_sha256 TEXT NOT NULL,
+                    observed_size INTEGER,
+                    observed_sha256 TEXT,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'pending','uploaded','available','failed','deleted'
+                    )),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                """INSERT INTO maintenance_artifacts
+                   SELECT * FROM _v1_maintenance_artifacts"""
+            )
+            self._conn.execute("DROP TABLE _v1_maintenance_artifacts")
+            self._conn.execute("DROP TABLE _v1_worker_maintenance_jobs")
+            self._conn.execute(
+                """CREATE INDEX idx_worker_maintenance_poll
+                   ON worker_maintenance_jobs(worker_id, state, created_at)"""
+            )
+            self._conn.execute(
+                """CREATE UNIQUE INDEX idx_worker_maintenance_active_dedupe
+                   ON worker_maintenance_jobs(worker_id, dedupe_key)
+                   WHERE state IN (
+                       'awaiting_upload','queued','leased','running','restarting'
+                   )"""
+            )
+            self._conn.execute(
+                """CREATE INDEX idx_maintenance_artifacts_job
+                   ON maintenance_artifacts(job_id, state)"""
+            )
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("gateway schema v1 to v2 migration violated foreign keys")
+            self._conn.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:

@@ -500,6 +500,58 @@ vgen broker maintenance-show <job_id>
 vgen broker maintenance-cancel <job_id>
 ```
 
+Model content is stored in a Worker-local SHA-256 cache. If two workflows use
+the same T5, VAE, or other model, the bytes are downloaded once and hard-linked
+to every required ComfyUI placement. The shared inode is read-only; publish a
+new digest pin instead of overwriting a model in place. Readiness remains
+placement-aware for each exact workflow release.
+
+### Install the bundled LTX-2.5 workflow remotely
+
+First upgrade the Worker so it advertises `capability_install`:
+
+```bash
+vgen worker upgrade --worker "Windows GPU Worker" --wait
+```
+
+Accept the LTX-2.5 gate and license on Hugging Face. Store a read-only token only
+on the Windows Worker, preferably in a user-protected file selected by
+`HF_TOKEN_PATH`, then restart the foreground Worker. Never put that token in a
+Mac command, Gateway configuration, or workflow manifest.
+
+```bash
+vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
+  --worker "Windows GPU Worker" \
+  --approve-nodes \
+  --allow-unsigned \
+  --accept-license LicenseRef-LTX-2.x-Community \
+  --wait
+```
+
+This uploads the digest-pinned workflow release, atomically activates it on the
+Worker, installs the five missing gated models, and waits for exact-release
+readiness. The 38-node graph uses ComfyUI core nodes only. Its five model files
+total 39,709,872,236 bytes. The bundled release is currently unsigned, so
+`--allow-unsigned` is an explicit trust decision; a market publication should
+use a publisher-signed package.
+
+The official base workflow requires at least 32 GB VRAM and 32 GB system RAM.
+A 24 GB RTX 3090 is intentionally not eligible: `workflow-install` rejects it
+before uploading the capability or downloading the five model files. Use a
+qualifying Worker or a separately published and hardware-validated low-VRAM
+workflow.
+
+```bash
+vgen task preflight "Aurora over an arctic ice field, cinematic wind and ice sounds" \
+  --workflow vgen/ltx-2.5-distilled-t2v@1.0.0 \
+  -p duration=5 -p width=1280 -p height=736 -p fps=24
+
+vgen task submit "Aurora over an arctic ice field, cinematic wind and ice sounds" \
+  --workflow vgen/ltx-2.5-distilled-t2v@1.0.0 \
+  -p duration=5 -p width=1280 -p height=736 -p fps=24 \
+  --wait --output-dir ~/Downloads/VGen-output
+```
+
 Upgrade a Worker from the pinned stable release without reinstalling Windows:
 
 ```bash

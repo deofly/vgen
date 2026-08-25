@@ -1,0 +1,104 @@
+schema_version: 1
+id: vgen/ltx-2.5-distilled-t2v
+version: 1.0.0
+title: LTX-2.5 distilled text-to-video
+summary: Native ComfyUI two-stage LTX-2.5 text-to-video generation with synchronized audio.
+license: MIT
+provenance: market
+publisher:
+  id: vgen
+  public_key: null
+homepage: https://huggingface.co/Lightricks/LTX-2.5
+source: https://github.com/Comfy-Org/workflow_templates/blob/2ded761bde3af3b4c8e905e162f45551cbec12ea/templates/video_ltx2_5_t2v.json
+parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - prompt
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+    seed:
+      type: integer
+      minimum: -1
+      default: -1
+    duration:
+      type: integer
+      minimum: 1
+      default: 5
+      description: Clip length in whole seconds. Frame count is duration * fps + 1.
+    width:
+      type: integer
+      minimum: 256
+      multipleOf: 32
+      default: 1280
+    height:
+      type: integer
+      minimum: 256
+      multipleOf: 32
+      default: 736
+    fps:
+      type: integer
+      minimum: 8
+      multipleOf: 8
+      default: 24
+variants:
+  - name: comfyui
+    executor_type: comfyui
+    payload_format: comfyui-api-graph/v1
+    payload: workflow.json
+    mapping: mapping.json
+    operations:
+      - t2v
+    executor_min_version: 1.2.0
+    runtime_min_version: 0.32.0
+    models:
+      - filename: ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors
+        folder: diffusion_models
+        source: https://huggingface.co/Lightricks/LTX-2.5/resolve/6c7e5e573ac1667efc83407806fe9b0b93730e60/diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors
+        revision: 6c7e5e573ac1667efc83407806fe9b0b93730e60
+        sha256: c4279eeff115cbeaca494bd2183e7d768c38fe85a184dc6afbb7159157c44334
+        size: 21504034224
+        license: LicenseRef-LTX-2.x-Community
+        gated: true
+        manual_download: false
+      - filename: gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors
+        folder: text_encoders
+        source: https://huggingface.co/Lightricks/LTX-2.5/resolve/6c7e5e573ac1667efc83407806fe9b0b93730e60/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors
+        revision: 6c7e5e573ac1667efc83407806fe9b0b93730e60
+        sha256: 6ce688a0aa98a5fa36a9f1e6c3f42152a498cc2b53ee8c15674c64244f91487f
+        size: 15372969374
+        license: LicenseRef-LTX-2.x-Community
+        gated: true
+        manual_download: false
+      - filename: ltx-2.5-video-vae-bf16.safetensors
+        folder: vae
+        source: https://huggingface.co/Lightricks/LTX-2.5/resolve/6c7e5e573ac1667efc83407806fe9b0b93730e60/vae/ltx-2.5-video-vae-bf16.safetensors
+        revision: 6c7e5e573ac1667efc83407806fe9b0b93730e60
+        sha256: 847e14ca7f3355debca0cea4eaa24ac0fbcdf0061da054ac89ca638a869ddba3
+        size: 1472223346
+        license: LicenseRef-LTX-2.x-Community
+        gated: true
+        manual_download: false
+      - filename: ltx-2.5-audio-vae-bf16.safetensors
+        folder: vae
+        source: https://huggingface.co/Lightricks/LTX-2.5/resolve/6c7e5e573ac1667efc83407806fe9b0b93730e60/vae/ltx-2.5-audio-vae-bf16.safetensors
+        revision: 6c7e5e573ac1667efc83407806fe9b0b93730e60
+        sha256: c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5
+        size: 364866540
+        license: LicenseRef-LTX-2.x-Community
+        gated: true
+        manual_download: false
+      - filename: ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
+        folder: latent_upscale_models
+        source: https://huggingface.co/Lightricks/LTX-2.5/resolve/6c7e5e573ac1667efc83407806fe9b0b93730e60/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
+        revision: 6c7e5e573ac1667efc83407806fe9b0b93730e60
+        sha256: eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8
+        size: 995778752
+        license: LicenseRef-LTX-2.x-Community
+        gated: true
+        manual_download: false
+    custom_nodes: []
+    min_vram_bytes: 32000000000
+    min_ram_bytes: 32000000000

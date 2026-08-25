@@ -155,13 +155,22 @@ def sign_package(directory: Path, private_key: Ed25519PrivateKey) -> str:
     return digest
 
 
-def build_archive(directory: Path, output: Path) -> Path:
+def build_archive(
+    directory: Path,
+    output: Path,
+    *,
+    allow_unsigned: bool = False,
+) -> Path:
     """Build a deterministic zip suitable for a static workflow registry."""
 
-    validate_package(directory, allow_unsigned=False)
+    validate_package(directory, allow_unsigned=allow_unsigned)
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+        for path in sorted(
+            item
+            for item in directory.rglob("*")
+            if item.is_file() and item.name != "workflow.lock"
+        ):
             relative = path.relative_to(directory).as_posix()
             info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -173,17 +182,24 @@ def build_archive(directory: Path, output: Path) -> Path:
 def validate_package(
     directory: Path, allow_unsigned: bool = False
 ) -> tuple[WorkflowManifest, str, bool]:
-    manifest = WorkflowManifest.load(directory / "manifest.yaml")
-    verify_checksums(directory)
-    for variant in manifest.variants:
-        for relative in (variant.payload, variant.mapping):
-            if relative and not (directory / relative).is_file():
-                raise RegistryError(f"workflow file is missing: {relative}")
-    digest = package_digest(directory)
-    signed = verify_signature(directory, manifest)
-    if not signed and not allow_unsigned:
-        raise RegistryError("workflow is unsigned; pass --allow-unsigned to trust it explicitly")
-    return manifest, digest, signed
+    try:
+        manifest = WorkflowManifest.load(directory / "manifest.yaml")
+        verify_checksums(directory)
+        for variant in manifest.variants:
+            for relative in (variant.payload, variant.mapping):
+                if relative and not (directory / relative).is_file():
+                    raise RegistryError(f"workflow file is missing: {relative}")
+        digest = package_digest(directory)
+        signed = verify_signature(directory, manifest)
+        if not signed and not allow_unsigned:
+            raise RegistryError(
+                "workflow is unsigned; pass --allow-unsigned to trust it explicitly"
+            )
+        return manifest, digest, signed
+    except RegistryError:
+        raise
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+        raise RegistryError("workflow package is invalid or unreadable") from exc
 
 
 class WorkflowRegistry:

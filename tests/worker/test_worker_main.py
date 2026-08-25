@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from vgen.crypto import DeviceKeys
+from vgen.crypto import DeviceKeys, b64url_encode
 from vgen.executors import ExecutorDescriptor, ExecutorHealth
 from vgen.worker import LeaseReference, WorkerCredentials, save_worker_credentials_file
 from vgen.worker.main import (
@@ -15,6 +15,7 @@ from vgen.worker.main import (
     EXIT_UPDATE_RESTART,
     EXIT_UPDATE_ROLLBACK,
     _build_gateway,
+    _executor_status,
     run,
     run_entrypoint,
 )
@@ -183,8 +184,10 @@ def test_serve_once_claims_and_executes_one_authenticated_lease(
     assert status["mode"] == "executed"
     assert status["attempt_id"] == "atm_test"
     assert status["succeeded"] is True
-    assert gateway.announced["executors"] == [{"type": "fake"}]
+    assert gateway.announced["executors"][0]["type"] == "fake"
+    assert gateway.announced["executors"][0]["capabilities"] == {"gpu_count": 1}
     assert gateway.announced["worker_runtime_version"]
+    assert gateway.announced["maintenance_actions"] == []
 
 
 def test_worker_refuses_credentials_pinned_to_another_gateway(
@@ -221,36 +224,130 @@ def test_worker_refuses_credentials_pinned_to_another_gateway(
     assert "bound to a different Gateway" in capsys.readouterr().err
 
 
-def test_authenticated_serve_rejects_policy_required_executor_without_local_policy(
+def test_authenticated_policyless_serve_starts_in_maintenance_only_mode(
     tmp_path: Path,
     capsys: Any,
 ) -> None:
     credential_file = tmp_path / "worker-credentials.json"
+    owner_root = DeviceKeys.generate()
     save_worker_credentials_file(
         credential_file,
-        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+        WorkerCredentials(
+            "wrk_test",
+            DeviceKeys.generate(),
+            "short-session",
+            owner_root_signing_public_key=b64url_encode(owner_root.signing_public_bytes()),
+        ),
     )
     executor = FakeExecutor()
     executor.requires_execution_policy = True
     executor.execution_policy_configured = False
+    executor.descriptor = lambda: ExecutorDescriptor(
+        "comfyui", "1.2.0", ("comfyui-api-graph/v1",), ("t2v",)
+    )
+    executor.capabilities = lambda: {
+        "capability_schema_version": 2,
+        "model_digests": [],
+        "ready_workflow_digests": [],
+        "workflow_readiness": [],
+    }
+    events: list[str] = []
+
+    class FakeGateway:
+        announced: dict[str, Any] | None = None
+
+        def announce(self, capabilities: dict[str, Any]) -> None:
+            events.append("announce")
+            self.announced = capabilities
+
+        def poll_lease(self) -> Any:
+            raise AssertionError("policyless Worker must not claim inference")
+
+    gateway = FakeGateway()
+
+    class FakeCore:
+        def capabilities(self) -> dict[str, Any]:
+            return {
+                "executors": [
+                    {
+                        "type": "comfyui",
+                        "capabilities": executor.capabilities(),
+                    }
+                ]
+            }
+
+        def resume_pending(self, _gateway: Any) -> None:
+            events.append("resume_upload")
+            return None
+
+    class FakeMaintenance:
+        enabled = True
+
+        def recover_pending_update(self, **_kwargs: Any) -> None:
+            events.append("recover_update")
+            return None
+
+        def run_one(self) -> None:
+            events.append("maintenance")
+            return None
 
     exit_code = run(
         [
             "serve",
             "--once",
+            "--json",
             "--gateway-url",
             "https://gateway.example.test",
             "--credentials-file",
             str(credential_file),
         ],
         executor_factory=lambda _arguments: executor,
-        gateway_factory=lambda *_arguments: (_ for _ in ()).throw(
-            AssertionError("Gateway must not be contacted without a local policy")
-        ),
+        gateway_factory=lambda *_arguments: gateway,  # type: ignore[arg-type,return-value]
+        core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
+        maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
     )
 
-    assert exit_code == EXIT_CONFIG
-    assert "requires --comfy-policy-file" in capsys.readouterr().err
+    assert exit_code == EXIT_OK
+    assert events == ["recover_update", "announce", "resume_upload", "maintenance"]
+    assert gateway.announced is not None
+    assert gateway.announced["maintenance_actions"] == [
+        "worker_update",
+        "model_install",
+        "capability_install",
+    ]
+    assert gateway.announced["executors"][0]["capabilities"] == {
+        "capability_schema_version": 2,
+        "model_digests": [],
+        "ready_workflow_digests": [],
+        "workflow_readiness": [],
+    }
+    assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_only"
+
+
+def test_comfyui_capability_probe_failure_keeps_v2_fail_closed() -> None:
+    executor = FakeExecutor()
+    executor.descriptor = lambda: ExecutorDescriptor(
+        "comfyui", "1.2.0", ("comfyui-api-graph/v1",), ("t2v",)
+    )
+    executor.capabilities = lambda: (_ for _ in ()).throw(RuntimeError("probe failed"))
+
+    status = _executor_status(executor)
+
+    assert status["ok"] is False
+    assert status["executor"]["health"] == "capability_probe_failed"
+    assert status["executor"]["capabilities"] == {
+        "capability_schema_version": 2,
+        "model_digests": [],
+        "ready_workflow_digests": [],
+        "workflow_readiness": [],
+    }
+
+    executor.capabilities = lambda: {}
+    invalid_status = _executor_status(executor)
+
+    assert invalid_status["ok"] is False
+    assert invalid_status["executor"]["health"] == "capability_probe_failed"
+    assert invalid_status["executor"]["capabilities"]["capability_schema_version"] == 2
 
 
 def test_serve_retries_spooled_upload_before_polling_new_lease(tmp_path: Path, capsys: Any) -> None:
@@ -301,16 +398,38 @@ def test_unhealthy_executor_still_announces_and_runs_maintenance(
     tmp_path: Path, capsys: Any
 ) -> None:
     credential_file = tmp_path / "worker-credentials.json"
+    owner_root = DeviceKeys.generate()
     save_worker_credentials_file(
         credential_file,
-        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+        WorkerCredentials(
+            "wrk_test",
+            DeviceKeys.generate(),
+            "short-session",
+            owner_root_signing_public_key=b64url_encode(owner_root.signing_public_bytes()),
+        ),
     )
     events: list[str] = []
+    executor = FakeExecutor(healthy=False)
+    executor.descriptor = lambda: ExecutorDescriptor(
+        "comfyui", "1.2.0", ("comfyui-api-graph/v1",), ("t2v",)
+    )
+    executor.requires_execution_policy = True
+    executor.execution_policy_configured = True
 
     class FakeGateway:
         def announce(self, capabilities: dict[str, Any]) -> None:
             events.append("announce")
-            assert capabilities["executors"][0]["capabilities"] == {}
+            assert capabilities["maintenance_actions"] == [
+                "worker_update",
+                "model_install",
+                "capability_install",
+            ]
+            assert capabilities["executors"][0]["capabilities"] == {
+                "capability_schema_version": 2,
+                "model_digests": [],
+                "ready_workflow_digests": [],
+                "workflow_readiness": [],
+            }
 
         def poll_lease(self) -> Any:
             raise AssertionError("inference must not be leased while the executor is unhealthy")
@@ -321,6 +440,8 @@ def test_unhealthy_executor_still_announces_and_runs_maintenance(
             return None
 
     class FakeMaintenance:
+        enabled = True
+
         def recover_pending_update(self, **_kwargs: Any) -> None:
             events.append("recover_update")
             return None
@@ -339,7 +460,7 @@ def test_unhealthy_executor_still_announces_and_runs_maintenance(
             "--credentials-file",
             str(credential_file),
         ],
-        executor_factory=lambda _arguments: FakeExecutor(healthy=False),
+        executor_factory=lambda _arguments: executor,
         gateway_factory=lambda *_arguments: FakeGateway(),  # type: ignore[arg-type,return-value]
         core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
         maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]

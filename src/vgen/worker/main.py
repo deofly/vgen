@@ -280,10 +280,21 @@ def _build_executor(arguments: argparse.Namespace) -> Executor:
             )
         except ComfyUIPolicyError as exc:
             raise WorkerConfigurationError(str(exc)) from exc
+        capability_source = None
+        if arguments.command == "serve":
+            from .capabilities import CapabilityInstallError, WorkerCapabilityStore
+
+            try:
+                capability_source = WorkerCapabilityStore(
+                    _worker_work_root(arguments) / "capabilities"
+                )
+            except CapabilityInstallError as exc:
+                raise WorkerConfigurationError(exc.code) from exc
         return ComfyUIExecutor(
             arguments.comfy_url,
             arguments.comfy_output_dir,
             policy=policy,
+            capability_source=capability_source,
             model_root=arguments.comfy_model_root,
             model_verification_progress=(
                 show_model_progress if getattr(arguments, "progress", False) else None
@@ -330,7 +341,10 @@ def _build_core(
 
 
 def _worker_work_root(arguments: argparse.Namespace) -> Path:
-    return (arguments.work_root or (Path(user_data_path("vgen")) / "worker")).expanduser()
+    return (
+        getattr(arguments, "work_root", None)
+        or (Path(user_data_path("vgen")) / "worker")
+    ).expanduser()
 
 
 def _build_maintenance(
@@ -361,16 +375,24 @@ def _executor_status(executor: Executor) -> dict[str, Any]:
     capabilities: Mapping[str, Any]
     if health.healthy:
         try:
-            capabilities = executor.capabilities()
+            probed = executor.capabilities()
+            if not isinstance(probed, Mapping):
+                raise TypeError("executor capabilities must be an object")
+            if descriptor.executor_type == "comfyui" and (
+                probed.get("capability_schema_version") != 2
+                or not isinstance(probed.get("workflow_readiness"), list)
+            ):
+                raise ValueError("ComfyUI capability schema is unavailable")
+            capabilities = probed
         except Exception as exc:
             health = type(health)(
                 False,
                 "capability_probe_failed",
                 details={"error_type": type(exc).__name__},
             )
-            capabilities = {}
+            capabilities = _fail_closed_executor_capabilities(descriptor.executor_type)
     else:
-        capabilities = {}
+        capabilities = _fail_closed_executor_capabilities(descriptor.executor_type)
     return {
         "ok": health.healthy,
         "executor": {
@@ -383,6 +405,19 @@ def _executor_status(executor: Executor) -> dict[str, Any]:
             "health_details": dict(health.details),
             "capabilities": dict(capabilities),
         },
+    }
+
+
+def _fail_closed_executor_capabilities(executor_type: str) -> dict[str, Any]:
+    """Keep modern workflow scheduling fail-closed when probing is unavailable."""
+
+    if executor_type != "comfyui":
+        return {}
+    return {
+        "capability_schema_version": 2,
+        "model_digests": [],
+        "ready_workflow_digests": [],
+        "workflow_readiness": [],
     }
 
 
@@ -489,19 +524,28 @@ def _write_status(status: Mapping[str, Any], *, json_output: bool) -> None:
     print(line, flush=True)
 
 
-def _announced_capabilities(status: Mapping[str, Any]) -> dict[str, Any]:
-    """Build a descriptor even when ComfyUI cannot currently execute.
+def _announced_capabilities(
+    status: Mapping[str, Any],
+    *,
+    maintenance_actions: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Build the single-executor descriptor from one coherent health probe.
 
     This keeps the Worker online for signed model/update maintenance without
-    advertising missing models or unavailable GPUs as executable capacity.
+    advertising missing models or unavailable GPUs as executable capacity, and
+    avoids a second capability probe producing a different scheduling view.
     """
 
     executor = status["executor"]
     if not isinstance(executor, Mapping):
         raise WorkerConfigurationError("Executor status must be an object.")
     capabilities = executor.get("capabilities")
+    nested = dict(capabilities) if isinstance(capabilities, Mapping) else {}
+    if executor.get("type") == "comfyui" and nested.get("capability_schema_version") != 2:
+        nested = _fail_closed_executor_capabilities("comfyui")
     return {
         "worker_runtime_version": __version__,
+        "maintenance_actions": list(maintenance_actions),
         "executors": [
             {
                 "type": executor["type"],
@@ -509,10 +553,29 @@ def _announced_capabilities(status: Mapping[str, Any]) -> dict[str, Any]:
                 "payload_formats": list(executor["payload_formats"]),
                 "operations": list(executor["operations"]),
                 "max_concurrency": executor["max_concurrency"],
-                "capabilities": dict(capabilities) if isinstance(capabilities, Mapping) else {},
+                "capabilities": nested,
             }
-        ]
+        ],
     }
+
+
+def _enabled_maintenance_actions(
+    controller: WorkerMaintenanceController | None,
+) -> tuple[str, ...]:
+    if controller is None or not bool(getattr(controller, "enabled", False)):
+        return ()
+    return ("worker_update", "model_install", "capability_install")
+
+
+def _can_poll_inference(executor: Executor, status: Mapping[str, Any]) -> bool:
+    if not bool(status.get("ok")):
+        return False
+    if not getattr(executor, "requires_execution_policy", False):
+        return True
+    try:
+        return bool(getattr(executor, "execution_policy_configured", False))
+    except Exception:
+        return False
 
 
 def _apply_maintenance_outcome(status: dict[str, Any], outcome: MaintenanceOutcome) -> None:
@@ -596,15 +659,6 @@ def run(
             raise WorkerConfigurationError(
                 "--announce requires a Worker identity and short-lived session."
             )
-        if (
-            gateway_url is not None
-            and credentials is not None
-            and getattr(executor, "requires_execution_policy", False)
-            and not getattr(executor, "execution_policy_configured", False)
-        ):
-            raise WorkerConfigurationError(
-                "Authenticated ComfyUI execution requires --comfy-policy-file."
-            )
         session = http_session or requests.Session()
         gateway = (
             gateway_factory(arguments, credentials, session)
@@ -639,7 +693,12 @@ def run(
                     raise WorkerConfigurationError(
                         "Worker update activation requires a Gateway connection."
                     )
-                gateway.announce(_announced_capabilities(activation_status))
+                gateway.announce(
+                    _announced_capabilities(
+                        activation_status,
+                        maintenance_actions=_enabled_maintenance_actions(maintenance),
+                    )
+                )
 
             if gateway is not None and core is not None and maintenance is not None:
                 try:
@@ -673,12 +732,10 @@ def run(
 
                     # Announce a generic descriptor even if ComfyUI is down or
                     # models are missing, so the Gateway can deliver maintenance.
-                    announced = dict(
-                        core.capabilities()
-                        if status["ok"]
-                        else _announced_capabilities(status)
+                    announced = _announced_capabilities(
+                        status,
+                        maintenance_actions=_enabled_maintenance_actions(maintenance),
                     )
-                    announced["worker_runtime_version"] = __version__
                     gateway.announce(announced)
                     resumed = core.resume_pending(gateway)
                     if resumed is not None:
@@ -704,7 +761,7 @@ def run(
                             if maintenance_outcome.restart_required:
                                 _write_status(status, json_output=arguments.json)
                                 return EXIT_UPDATE_RESTART
-                        elif not status["ok"]:
+                        elif not _can_poll_inference(executor, status):
                             status["mode"] = "maintenance_only"
                             status["gateway"] = {"ok": True, "status": "connected"}
                         else:

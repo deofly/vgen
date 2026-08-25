@@ -23,7 +23,12 @@ from urllib.parse import unquote, urlsplit
 import requests
 import websocket
 import yaml
+from jsonschema import Draft202012Validator
+from packaging.version import InvalidVersion, Version
 
+from vgen.market.builder import WorkflowBuildError, build_comfy_graph
+from vgen.market.capabilities import WorkflowCapabilityError, comfyui_capability_facts
+from vgen.market.registry import InstallResult
 from vgen.protocol import ErrorCode
 
 from .base import (
@@ -127,6 +132,31 @@ class ComfyUIModelPin:
     license_url: str | None = None
     gated: bool = False
     manual_download: bool = False
+
+
+@dataclass(frozen=True)
+class ComfyUIWorkflowCapability:
+    workflow_ref: str
+    workflow_digest: str
+    policy: ComfyUIExecutionPolicy
+    executor_min_version: str | None = None
+    runtime_min_version: str | None = None
+    operations: frozenset[str] = frozenset()
+    template_graph: dict[str, Any] | None = None
+    mapping: dict[str, Any] | None = None
+    parameter_schema: dict[str, Any] | None = None
+    min_vram_bytes: int | None = None
+    min_ram_bytes: int | None = None
+
+
+class CapabilitySource:
+    """Narrow structural contract implemented by WorkerCapabilityStore."""
+
+    def active(self) -> tuple[InstallResult, ...]:  # pragma: no cover - protocol shape only
+        raise NotImplementedError
+
+    def generation(self) -> object:  # pragma: no cover
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -605,6 +635,327 @@ def _policy_limit(value: Mapping[str, Any], field: str, default: int, maximum: i
     return result
 
 
+def _minimum_version_satisfied(actual: object, minimum: str | None) -> bool:
+    if minimum is None:
+        return True
+    if not isinstance(actual, str):
+        return False
+    try:
+        return Version(actual) >= Version(minimum)
+    except InvalidVersion:
+        return False
+
+
+def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
+    try:
+        facts = comfyui_capability_facts(installed.manifest, installed.path)
+    except WorkflowCapabilityError as exc:
+        raise ComfyUIPolicyError("An active workflow capability graph is invalid.") from exc
+    variant = facts.variant
+    graph = facts.graph
+    mapping = facts.mapping
+    node_classes = facts.node_classes
+    parameter_schema = installed.manifest.parameters
+    try:
+        Draft202012Validator.check_schema(parameter_schema)
+    except Exception as exc:
+        raise ComfyUIPolicyError(
+            "An active workflow capability parameter schema is invalid."
+        ) from exc
+    properties = parameter_schema.get("properties", {})
+    if not isinstance(properties, dict) or set(mapping) != set(properties):
+        raise ComfyUIPolicyError(
+            "An active workflow capability must map every declared parameter exactly once."
+        )
+    mapping_targets: dict[str, tuple[str, str]] = {}
+    for name, rule in mapping.items():
+        mapping_targets[name] = _capability_mapping_target(graph, rule, name=name)
+    if len(set(mapping_targets.values())) != len(mapping_targets):
+        raise ComfyUIPolicyError(
+            "An active workflow capability maps multiple parameters to one input."
+        )
+
+    declared_custom = {
+        node_type
+        for dependency in variant.custom_nodes
+        for node_type in dependency.node_types
+    }
+    custom = node_classes & declared_custom
+    builtin = node_classes - custom
+    seen_model_paths: set[str] = set()
+    model_metadata: dict[str, tuple[object, ...]] = {}
+    for model in variant.models:
+        model_path = f"{model.folder}/{model.filename}"
+        metadata = (
+            model.size,
+            model.source,
+            model.revision,
+            model.license,
+            model.gated,
+            model.manual_download,
+        )
+        if model.size < 1 or model_path in seen_model_paths:
+            raise ComfyUIPolicyError(
+                "An active workflow capability has duplicate or empty model pins."
+            )
+        previous = model_metadata.get(model.sha256)
+        if previous is not None and previous != metadata:
+            raise ComfyUIPolicyError(
+                "An active workflow capability has conflicting shared model metadata."
+            )
+        seen_model_paths.add(model_path)
+        model_metadata[model.sha256] = metadata
+    models = tuple(
+        ComfyUIModelPin(
+            path=f"{model.folder}/{model.filename}",
+            sha256=model.sha256,
+            size=model.size,
+            source=model.source,
+            revision=model.revision,
+            license=model.license,
+            gated=model.gated,
+            manual_download=model.manual_download,
+        )
+        for model in variant.models
+    )
+    expected_model_references = {
+        model.filename.replace("\\", "/") for model in variant.models
+    }
+    actual_model_references = _model_references(graph)
+    if actual_model_references != expected_model_references:
+        raise ComfyUIPolicyError(
+            "An active workflow capability must bind every model pin to its exact graph path."
+        )
+    for node_id, field in mapping_targets.values():
+        original = graph[node_id]["inputs"][field]
+        if isinstance(original, str) and original.replace("\\", "/") in actual_model_references:
+            raise ComfyUIPolicyError(
+                "An active workflow capability cannot expose a pinned model loader as a parameter."
+            )
+    workflow_ref = f"{installed.manifest.id}@{installed.manifest.version}"
+    workflow_digest = f"sha256:{installed.digest}"
+    edge_count = sum(
+        1
+        for node in graph.values()
+        if isinstance(node, dict)
+        for value in (node.get("inputs") or {}).values()
+        if _looks_like_connection(value)
+    )
+    policy = ComfyUIExecutionPolicy(
+        allowed_node_classes=frozenset(builtin),
+        allowed_custom_node_classes=frozenset(custom),
+        allowed_workflow_digests=frozenset({workflow_digest}),
+        maintenance_workflows=((workflow_ref, workflow_digest),),
+        model_files=models,
+        max_payload_bytes=min(_HARD_MAX_PAYLOAD_BYTES, max(1024 * 1024, len(json.dumps(graph)) * 2)),
+        max_nodes=min(_HARD_MAX_NODES, max(64, len(graph))),
+        max_edges=min(_HARD_MAX_EDGES, max(256, edge_count * 2)),
+        max_graph_depth=32,
+        max_value_depth=12,
+        max_input_fields_per_node=64,
+    )
+    capability = ComfyUIWorkflowCapability(
+        workflow_ref=workflow_ref,
+        workflow_digest=workflow_digest,
+        policy=policy,
+        executor_min_version=variant.executor_min_version,
+        runtime_min_version=variant.runtime_min_version,
+        operations=frozenset(variant.operations),
+        template_graph=graph,
+        mapping=mapping,
+        parameter_schema=parameter_schema,
+        min_vram_bytes=variant.min_vram_bytes,
+        min_ram_bytes=variant.min_ram_bytes,
+    )
+    # Compile every declared topology through the same package binding used at
+    # execution time. Optional image nodes are therefore removed (or retained)
+    # exactly as the reviewed mapping declares before the release is activated.
+    for operation in capability.operations:
+        sample_parameters = _sample_operation_parameters(operation, mapping)
+        try:
+            sample_graph, effective, derived_operation = build_comfy_graph(
+                graph, mapping, sample_parameters
+            )
+        except WorkflowBuildError as exc:
+            raise ComfyUIPolicyError(
+                "An active workflow capability mapping cannot build its declared operations."
+            ) from exc
+        if operation in {"t2v", "i2v", "flf"} and derived_operation != operation:
+            raise ComfyUIPolicyError(
+                "An active workflow capability operation does not match its mapping."
+            )
+        bindings = _capability_expected_bindings(sample_graph, mapping, effective)
+        policy.authorize_graph(sample_graph, bindings)
+    return capability
+
+
+def _capability_mapping_target(
+    graph: Mapping[str, Any],
+    rule: Any,
+    *,
+    name: str,
+    allow_connection: bool = False,
+) -> tuple[str, str]:
+    if not isinstance(rule, dict) or set(rule) - {
+        "node",
+        "title",
+        "input",
+        "optional_connection",
+    }:
+        raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} is invalid.")
+    node_selector = rule.get("node")
+    title_selector = rule.get("title")
+    if (node_selector is None) == (title_selector is None):
+        raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} is ambiguous.")
+    if node_selector is not None:
+        if isinstance(node_selector, bool) or not isinstance(node_selector, (str, int)):
+            raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} is invalid.")
+        node_id = str(node_selector)
+        if node_id not in graph:
+            raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} has no node.")
+    else:
+        if (
+            not isinstance(title_selector, str)
+            or not title_selector
+            or len(title_selector) > 256
+            or "\x00" in title_selector
+        ):
+            raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} is invalid.")
+        matches = [
+            candidate_id
+            for candidate_id, node in graph.items()
+            if isinstance(node, dict)
+            and (node.get("_meta") or {}).get("title") == title_selector
+        ]
+        if len(matches) != 1:
+            raise ComfyUIPolicyError(
+                f"Workflow parameter mapping {name!r} must select one node."
+            )
+        node_id = matches[0]
+    node = graph.get(node_id)
+    inputs = node.get("inputs") if isinstance(node, dict) else None
+    candidates = rule.get("input")
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    if (
+        not isinstance(candidates, list)
+        or not candidates
+        or len(candidates) > 16
+        or any(
+            not isinstance(candidate, str)
+            or not _SAFE_IDENTIFIER.fullmatch(candidate)
+            for candidate in candidates
+        )
+        or len(candidates) != len(set(candidates))
+        or not isinstance(inputs, dict)
+    ):
+        raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} has no safe input.")
+    fields = [candidate for candidate in candidates if candidate in inputs]
+    if not fields:
+        raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} has no input.")
+    field = fields[0]
+    if _looks_like_connection(inputs[field]) and not allow_connection:
+        raise ComfyUIPolicyError(
+            f"Workflow parameter mapping {name!r} targets a connected input."
+        )
+    optional = rule.get("optional_connection")
+    if optional is not None:
+        if name not in {"image", "last_image"} or not isinstance(optional, dict):
+            raise ComfyUIPolicyError(
+                f"Workflow parameter mapping {name!r} has an invalid optional connection."
+            )
+        if set(optional) - {"target_node", "target_title", "input", "output"}:
+            raise ComfyUIPolicyError(
+                f"Workflow parameter mapping {name!r} has an invalid optional connection."
+            )
+        target_rule = {
+            "node": optional.get("target_node"),
+            "title": optional.get("target_title"),
+            "input": optional.get("input"),
+        }
+        target_id, target_field = _capability_mapping_target(
+            graph,
+            target_rule,
+            name=f"{name}.optional_connection",
+            allow_connection=True,
+        )
+        output = optional.get("output", 0)
+        if not isinstance(output, int) or isinstance(output, bool) or output < 0:
+            raise ComfyUIPolicyError(
+                f"Workflow parameter mapping {name!r} has an invalid optional output."
+            )
+        if graph[target_id]["inputs"].get(target_field) != [node_id, output]:
+            raise ComfyUIPolicyError(
+                f"Workflow parameter mapping {name!r} does not match its connection."
+            )
+    return node_id, field
+
+
+def _model_references(value: Any) -> set[str]:
+    if isinstance(value, str):
+        normalized = value.replace("\\", "/")
+        return {normalized} if normalized.casefold().endswith(MODEL_EXTENSIONS) else set()
+    if isinstance(value, list):
+        return set().union(*(_model_references(item) for item in value), set())
+    if isinstance(value, dict):
+        return set().union(*(_model_references(item) for item in value.values()), set())
+    return set()
+
+
+def _sample_operation_parameters(
+    operation: str, mapping: Mapping[str, Any]
+) -> dict[str, Any]:
+    parameters: dict[str, Any] = {}
+    if operation in {"i2v", "i2i", "flf"} and "image" in mapping:
+        parameters["image"] = "vgen-input.png"
+    if operation == "flf" and "last_image" in mapping:
+        parameters["last_image"] = "vgen-last-input.png"
+    return parameters
+
+
+def _capability_expected_bindings(
+    graph: Mapping[str, Any],
+    mapping: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    for name in ("image", "last_image"):
+        if not parameters.get(name):
+            continue
+        rule = mapping.get(name)
+        node_id, field = _capability_mapping_target(graph, rule, name=name)
+        bindings.append({"input": name, "node_id": node_id, "field": field})
+    return bindings
+
+
+def _normalized_bindings(
+    graph: Mapping[str, Any], bindings: list[dict[str, Any]]
+) -> tuple[tuple[str, str, str], ...]:
+    normalized: list[tuple[str, str, str]] = []
+    for binding in bindings:
+        input_name = binding.get("input")
+        node_id = binding.get("node_id")
+        node_title = binding.get("node_title")
+        field = binding.get("field", "image")
+        matches = [
+            candidate_id
+            for candidate_id, node in graph.items()
+            if (node_id is None or candidate_id == str(node_id))
+            and (
+                node_title is None
+                or (isinstance(node, dict) and (node.get("_meta") or {}).get("title") == node_title)
+            )
+        ]
+        if (
+            not isinstance(input_name, str)
+            or not isinstance(field, str)
+            or len(matches) != 1
+        ):
+            raise _policy_denied("workflow_bindings_mismatch")
+        normalized.append((input_name, matches[0], field))
+    return tuple(sorted(normalized))
+
+
 def _policy_denied(reason: str) -> ExecutorFailure:
     return ExecutorFailure(
         ErrorCode.UNSUPPORTED_PAYLOAD,
@@ -752,6 +1103,23 @@ class ComfyUIClient:
             return result
         except (requests.RequestException, ValueError, KeyError):
             return {}
+
+    def node_classes(self) -> set[str] | None:
+        """Return the currently loaded ComfyUI node classes without node metadata."""
+
+        try:
+            response = self._session.get(f"{self._base}/object_info", timeout=120)
+            response.raise_for_status()
+            value = response.json()
+            if not isinstance(value, dict):
+                return None
+            return {
+                str(name)
+                for name, metadata in value.items()
+                if isinstance(name, str) and isinstance(metadata, dict)
+            }
+        except (requests.RequestException, ValueError):
+            return None
 
     def models_catalog(self) -> set[str] | None:
         try:
@@ -984,12 +1352,16 @@ class ComfyUIExecutor:
         *,
         client: ComfyUIClient | None = None,
         policy: ComfyUIExecutionPolicy | None = None,
+        capability_source: CapabilitySource | None = None,
         model_root: Path | None = None,
         model_verification_progress: Callable[[ModelVerificationProgress], None] | None = None,
     ) -> None:
         self._client = client or ComfyUIClient(base_url)
         self._output_dir = output_dir.expanduser().resolve()
         self._policy = policy
+        self._capability_source = capability_source
+        self._capability_generation: object = object()
+        self._dynamic_capabilities: dict[str, ComfyUIWorkflowCapability] = {}
         self._model_root = (
             model_root.expanduser().resolve()
             if model_root is not None
@@ -1000,7 +1372,8 @@ class ComfyUIExecutor:
 
     @property
     def execution_policy_configured(self) -> bool:
-        return self._policy is not None
+        self._reload_capabilities()
+        return self._policy is not None or bool(self._dynamic_capabilities)
 
     @property
     def maintenance_model_pins(self) -> tuple[ComfyUIModelPin, ...]:
@@ -1010,13 +1383,34 @@ class ComfyUIExecutor:
         or widen the source, destination, license, or integrity policy.
         """
 
-        return self._policy.model_files if self._policy is not None else ()
+        capabilities = self._workflow_capabilities()
+        pins: dict[tuple[str, str], ComfyUIModelPin] = {}
+        if self._policy is not None:
+            for pin in self._policy.model_files:
+                pins[(pin.path, pin.sha256)] = pin
+        for capability in capabilities.values():
+            for pin in capability.policy.model_files:
+                pins[(pin.path, pin.sha256)] = pin
+        return tuple(pins[key] for key in sorted(pins))
 
     @property
     def maintenance_workflows(self) -> tuple[tuple[str, str], ...]:
         """Exact package-ref to digest bindings allowed to request models."""
 
-        return self._policy.maintenance_workflows if self._policy is not None else ()
+        return tuple(
+            sorted(
+                (capability.workflow_ref, capability.workflow_digest)
+                for capability in self._workflow_capabilities().values()
+            )
+        )
+
+    def workflow_model_pins(
+        self, workflow_ref: str, workflow_digest: str
+    ) -> tuple[ComfyUIModelPin, ...]:
+        capability = self._workflow_capabilities().get(workflow_digest)
+        if capability is None or capability.workflow_ref != workflow_ref:
+            return ()
+        return capability.policy.model_files
 
     @property
     def maintenance_model_root(self) -> Path:
@@ -1029,10 +1423,22 @@ class ComfyUIExecutor:
 
         self._model_digest_cache.clear()
 
+    def reload_capabilities(self) -> None:
+        """Force an already-running Worker to observe an atomically activated release."""
+
+        self._capability_generation = object()
+        self._reload_capabilities()
+
+    @staticmethod
+    def validate_capability_release(installed: InstallResult) -> None:
+        """Compile one staged release before its active index is changed."""
+
+        _workflow_capability(installed)
+
     def descriptor(self) -> ExecutorDescriptor:
         return ExecutorDescriptor(
             executor_type="comfyui",
-            version="1.1.0",
+            version="1.2.0",
             payload_formats=(COMFYUI_PAYLOAD_FORMAT,),
             operations=("t2v", "i2v", "flf", "t2i", "i2i"),
             max_concurrency=1,
@@ -1046,10 +1452,101 @@ class ComfyUIExecutor:
             return ExecutorHealth(False, "unavailable", details={"error_type": type(exc).__name__})
 
     def capabilities(self) -> Mapping[str, Any]:
-        model_digests, model_failures = self._verified_model_digests()
+        capabilities = self._workflow_capabilities()
+        all_pins = self.maintenance_model_pins
+        model_digests, model_failures = self._verified_model_digests(all_pins)
+        gpus, system, vram_bytes, ram_bytes = self._resource_snapshot()
+        node_probe = getattr(self._client, "node_classes", None)
+        node_classes = node_probe() if callable(node_probe) else None
+        runtime_version = system.get("runtime_version")
+        workflow_readiness: list[dict[str, Any]] = []
+        for capability in sorted(capabilities.values(), key=lambda item: item.workflow_ref):
+            # Readiness is placement-aware even though installation and the
+            # public aggregate are digest-deduplicated. If the same content is
+            # required at two paths, one valid path cannot hide the missing
+            # second placement.
+            missing_models = sorted(
+                {
+                    f"sha256:{pin.sha256}"
+                    for pin in capability.policy.model_files
+                    if f"sha256:{pin.sha256}"
+                    not in self._verified_model_digests((pin,))[0]
+                }
+            )
+            required_nodes = (
+                capability.policy.allowed_node_classes
+                | capability.policy.allowed_custom_node_classes
+            )
+            missing_nodes = (
+                sorted(required_nodes - node_classes)
+                if isinstance(node_classes, set)
+                else sorted(required_nodes)
+            )
+            runtime_compatible = _minimum_version_satisfied(
+                runtime_version, capability.runtime_min_version
+            )
+            executor_compatible = _minimum_version_satisfied(
+                self.descriptor().version, capability.executor_min_version
+            )
+            if not executor_compatible:
+                state = "executor_incompatible"
+            elif not runtime_compatible:
+                state = "runtime_incompatible"
+            elif (
+                capability.min_vram_bytes is not None
+                and vram_bytes < capability.min_vram_bytes
+            ):
+                state = "insufficient_vram"
+            elif (
+                capability.min_ram_bytes is not None
+                and ram_bytes < capability.min_ram_bytes
+            ):
+                state = "insufficient_ram"
+            elif missing_nodes:
+                state = "missing_nodes" if node_classes is not None else "node_probe_unavailable"
+            elif missing_models:
+                state = "missing_models"
+            else:
+                state = "ready"
+            workflow_readiness.append(
+                {
+                    "workflow_ref": capability.workflow_ref,
+                    "workflow_digest": capability.workflow_digest,
+                    "state": state,
+                    "missing_model_digests": missing_models,
+                    "missing_node_classes": missing_nodes,
+                }
+            )
+        return {
+            "executor_type": "comfyui",
+            "payload_formats": [COMFYUI_PAYLOAD_FORMAT],
+            "model_digests": model_digests,
+            "capability_schema_version": 2,
+            "ready_workflow_digests": [
+                item["workflow_digest"]
+                for item in workflow_readiness
+                if item["state"] == "ready"
+            ],
+            "workflow_readiness": workflow_readiness,
+            "gpus": gpus,
+            "vram_bytes": vram_bytes,
+            "ram_bytes": ram_bytes,
+            "runtime_version": system.get("runtime_version"),
+            "system": system,
+            "execution_policy": {
+                "configured": self.execution_policy_configured,
+                "model_pins": len(all_pins),
+                "models_verified": len(model_digests),
+                "models_failed": model_failures,
+            },
+        }
+
+    def _resource_snapshot(self) -> tuple[list[dict[str, Any]], dict[str, Any], int, int]:
         gpus = self._client.gpu_info()
         system_info = getattr(self._client, "system_info", None)
         system = system_info() if callable(system_info) else {}
+        if not isinstance(system, dict):
+            system = {}
         vram_bytes = max(
             (
                 int(gpu.get("vram_total_mb", 0) * 1024 * 1024)
@@ -1060,25 +1557,17 @@ class ComfyUIExecutor:
             ),
             default=0,
         )
-        return {
-            "executor_type": "comfyui",
-            "payload_formats": [COMFYUI_PAYLOAD_FORMAT],
-            "model_digests": model_digests,
-            "gpus": gpus,
-            "vram_bytes": vram_bytes,
-            "ram_bytes": int(system.get("ram_bytes", 0)),
-            "runtime_version": system.get("runtime_version"),
-            "system": system,
-            "execution_policy": {
-                "configured": self.execution_policy_configured,
-                "model_pins": len(self._policy.model_files) if self._policy is not None else 0,
-                "models_verified": len(model_digests),
-                "models_failed": model_failures,
-            },
-        }
+        raw_ram_bytes = system.get("ram_bytes")
+        ram_bytes = (
+            raw_ram_bytes
+            if isinstance(raw_ram_bytes, int) and not isinstance(raw_ram_bytes, bool)
+            else 0
+        )
+        return gpus, system, vram_bytes, max(0, ram_bytes)
 
-    def _verified_model_digests(self) -> tuple[list[str], int]:
-        pins = self._policy.model_files if self._policy is not None else ()
+    def _verified_model_digests(
+        self, pins: tuple[ComfyUIModelPin, ...]
+    ) -> tuple[list[str], int]:
         verified: list[str] = []
         failures = 0
         total_size = sum(pin.size for pin in pins)
@@ -1176,7 +1665,114 @@ class ComfyUIExecutor:
                 failures += 1
                 continue
             verified.append(f"sha256:{digest}")
-        return sorted(verified), failures
+        return sorted(set(verified)), failures
+
+    def _reload_capabilities(self) -> None:
+        if self._capability_source is None:
+            return
+        try:
+            generation = self._capability_source.generation()
+        except Exception as exc:
+            logger.error(
+                "Ignoring unavailable dynamic workflow capability index: %s",
+                type(exc).__name__,
+            )
+            self._dynamic_capabilities = {}
+            self._capability_generation = object()
+            return
+        if generation == self._capability_generation:
+            return
+        loaded: dict[str, ComfyUIWorkflowCapability] = {}
+        invalid_digests: set[str] = set()
+        had_errors = False
+        try:
+            active = self._capability_source.active()
+        except Exception as exc:
+            logger.error(
+                "Ignoring unavailable dynamic workflow capability releases: %s",
+                type(exc).__name__,
+            )
+            self._dynamic_capabilities = {}
+            self._capability_generation = object()
+            return
+        for installed in active:
+            try:
+                capability = _workflow_capability(installed)
+            except Exception as exc:
+                had_errors = True
+                logger.error(
+                    "Ignoring invalid dynamic workflow capability release: %s",
+                    type(exc).__name__,
+                )
+                continue
+            if capability.workflow_digest in invalid_digests:
+                continue
+            previous = loaded.get(capability.workflow_digest)
+            if previous is not None and previous.workflow_ref != capability.workflow_ref:
+                had_errors = True
+                loaded.pop(capability.workflow_digest, None)
+                invalid_digests.add(capability.workflow_digest)
+                logger.error(
+                    "Ignoring conflicting dynamic workflow capability digest."
+                )
+                continue
+            loaded[capability.workflow_digest] = capability
+        had_errors = had_errors or bool(
+            getattr(self._capability_source, "active_errors", 0)
+        )
+        self._dynamic_capabilities = loaded
+        # Keep retrying a partially invalid generation so an administrator can
+        # repair one release without rewriting active.json. Healthy releases
+        # remain available throughout the repair.
+        self._capability_generation = object() if had_errors else generation
+
+    def _workflow_capabilities(self) -> dict[str, ComfyUIWorkflowCapability]:
+        self._reload_capabilities()
+        values: dict[str, ComfyUIWorkflowCapability] = {}
+        if self._policy is not None:
+            for workflow_ref, workflow_digest in self._policy.maintenance_workflows:
+                values[workflow_digest] = ComfyUIWorkflowCapability(
+                    workflow_ref,
+                    workflow_digest,
+                    self._policy,
+                )
+        for digest, capability in self._dynamic_capabilities.items():
+            existing = values.get(digest)
+            # A legacy machine-admin policy remains authoritative for the same
+            # exact release (notably H3, whose market manifest intentionally
+            # marks model downloads as manual metadata). The activated package
+            # still contributes its exact operation/graph/parameter binding.
+            if existing is None:
+                values[digest] = capability
+            elif existing.workflow_ref == capability.workflow_ref:
+                values[digest] = ComfyUIWorkflowCapability(
+                    workflow_ref=capability.workflow_ref,
+                    workflow_digest=capability.workflow_digest,
+                    policy=existing.policy,
+                    executor_min_version=capability.executor_min_version,
+                    runtime_min_version=capability.runtime_min_version,
+                    operations=capability.operations,
+                    template_graph=capability.template_graph,
+                    mapping=capability.mapping,
+                    parameter_schema=capability.parameter_schema,
+                    min_vram_bytes=capability.min_vram_bytes,
+                    min_ram_bytes=capability.min_ram_bytes,
+                )
+        return values
+
+    def _capability_for_digest(
+        self, workflow_digest: str
+    ) -> ComfyUIWorkflowCapability | None:
+        capability = self._workflow_capabilities().get(workflow_digest)
+        if capability is not None:
+            return capability
+        if self._policy is None:
+            return None
+        try:
+            self._policy.authorize_digest(workflow_digest)
+        except ExecutorFailure:
+            return None
+        return ComfyUIWorkflowCapability("", workflow_digest, self._policy)
 
     def execute(self, request: ExecutionRequest, context: ExecutionContext) -> ExecutionResult:
         descriptor = self.descriptor()
@@ -1194,9 +1790,44 @@ class ComfyUIExecutor:
                 "The ComfyUI executor does not support this operation.",
                 details={"operation": request.operation},
             )
-        if self._policy is not None and self._policy.model_files:
-            verified_models, model_failures = self._verified_model_digests()
-            if model_failures or len(verified_models) != len(self._policy.model_files):
+        capability = self._capability_for_digest(request.workflow_digest)
+        policy = capability.policy if capability is not None else None
+        if (
+            capability is not None
+            and capability.template_graph is not None
+            and request.operation not in capability.operations
+        ):
+            raise _policy_denied("operation_not_allowed_by_workflow")
+        if capability is not None and (
+            capability.min_vram_bytes is not None or capability.min_ram_bytes is not None
+        ):
+            _gpus, _system, vram_bytes, ram_bytes = self._resource_snapshot()
+            if (
+                capability.min_vram_bytes is not None
+                and vram_bytes < capability.min_vram_bytes
+            ):
+                raise ExecutorFailure(
+                    ErrorCode.GPU_OUT_OF_MEMORY,
+                    "GPU_OUT_OF_MEMORY",
+                    "This Worker does not meet the workflow GPU-memory requirement.",
+                    retry_action=RetryAction.ANOTHER_WORKER,
+                    details={"reason": "insufficient_vram"},
+                )
+            if (
+                capability.min_ram_bytes is not None
+                and ram_bytes < capability.min_ram_bytes
+            ):
+                raise ExecutorFailure(
+                    ErrorCode.DEPENDENCY_MISSING,
+                    "DEPENDENCY_MISSING",
+                    "This Worker does not meet the workflow system-memory requirement.",
+                    retry_action=RetryAction.ANOTHER_WORKER,
+                    details={"reason": "insufficient_ram"},
+                )
+        if policy is not None and policy.model_files:
+            verified_models, model_failures = self._verified_model_digests(policy.model_files)
+            required_model_digests = {pin.sha256 for pin in policy.model_files}
+            if model_failures or len(verified_models) != len(required_model_digests):
                 raise ExecutorFailure(
                     ErrorCode.DEPENDENCY_MISSING,
                     "DEPENDENCY_MISSING",
@@ -1204,13 +1835,21 @@ class ComfyUIExecutor:
                     details={"reason": "model_integrity_unavailable"},
                 )
 
-        if self._policy is None:
+        if policy is None:
             raise _policy_denied("policy_required")
-        self._policy.authorize_digest(request.workflow_digest)
-        if len(request.payload) > self._policy.max_payload_bytes:
+        policy.authorize_digest(request.workflow_digest)
+        if len(request.payload) > policy.max_payload_bytes:
             raise _policy_denied("payload_size_limit")
-        workflow, bindings = self._decode_payload(request.payload)
-        self._policy.authorize_graph(workflow, bindings)
+        workflow, bindings, parameters = self._decode_payload(request.payload)
+        policy.authorize_graph(workflow, bindings)
+        if capability is not None and capability.template_graph is not None:
+            self._authorize_capability_payload(
+                capability,
+                request.operation,
+                workflow,
+                bindings,
+                parameters,
+            )
         context.raise_if_cancelled()
         for binding in bindings:
             self._bind_input(workflow, request, binding)
@@ -1284,11 +1923,20 @@ class ComfyUIExecutor:
         self._client.interrupt()
 
     @staticmethod
-    def _decode_payload(payload: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    def _decode_payload(
+        payload: bytes,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
         try:
             body = json.loads(payload.decode("utf-8"))
+            if not isinstance(body, dict) or set(body) - {
+                "workflow",
+                "input_bindings",
+                "effective_parameters",
+            }:
+                raise TypeError
             workflow = body["workflow"]
             bindings = body.get("input_bindings") or []
+            parameters = body.get("effective_parameters")
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ExecutorFailure(
                 ErrorCode.UNSUPPORTED_PAYLOAD,
@@ -1310,7 +1958,49 @@ class ComfyUIExecutor:
                 "UNSUPPORTED_PAYLOAD",
                 "ComfyUI input bindings must be a list.",
             )
-        return workflow, bindings
+        if parameters is not None and not isinstance(parameters, dict):
+            raise ExecutorFailure(
+                ErrorCode.UNSUPPORTED_PAYLOAD,
+                "UNSUPPORTED_PAYLOAD",
+                "ComfyUI effective parameters must be an object.",
+            )
+        return workflow, bindings, parameters
+
+    @staticmethod
+    def _authorize_capability_payload(
+        capability: ComfyUIWorkflowCapability,
+        operation: str,
+        workflow: dict[str, Any],
+        bindings: list[dict[str, Any]],
+        parameters: dict[str, Any] | None,
+    ) -> None:
+        template = capability.template_graph
+        mapping = capability.mapping
+        schema = capability.parameter_schema
+        if template is None or mapping is None or schema is None or parameters is None:
+            raise _policy_denied("workflow_parameters_required")
+        validator = Draft202012Validator(schema)
+        if next(validator.iter_errors(parameters), None) is not None:
+            raise _policy_denied("workflow_parameters_invalid")
+        try:
+            expected_graph, effective, derived_operation = build_comfy_graph(
+                template, mapping, parameters
+            )
+        except WorkflowBuildError as exc:
+            raise _policy_denied("workflow_mapping_invalid") from exc
+        if effective != parameters:
+            raise _policy_denied("workflow_parameters_not_canonical")
+        if derived_operation != operation:
+            raise _policy_denied("workflow_operation_mismatch")
+        if expected_graph != workflow:
+            raise _policy_denied("workflow_graph_mismatch")
+        expected_bindings = _capability_expected_bindings(
+            expected_graph, mapping, effective
+        )
+        if _normalized_bindings(workflow, bindings) != _normalized_bindings(
+            expected_graph, expected_bindings
+        ):
+            raise _policy_denied("workflow_bindings_mismatch")
 
     def _bind_input(
         self,

@@ -597,6 +597,97 @@ def test_gateway_maintenance_claim_heartbeat_complete_and_relative_ticket() -> N
     )
 
 
+def test_maintenance_claim_falls_back_for_legacy_gateway_and_reprobes() -> None:
+    class LegacyThenUpgradedSession:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, dict[str, Any]]] = []
+            self.upgraded = False
+
+        def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+            self.requests.append((method, url, kwargs))
+            body = json.loads(kwargs["data"])
+            if "supported_actions" in body and not self.upgraded:
+                return response(
+                    422,
+                    {"error": {"code": int(ErrorCode.VALIDATION_FAILED)}},
+                )
+            return response(204)
+
+    session = LegacyThenUpgradedSession()
+    client = GatewayV1Client(
+        "https://gateway.example.test",
+        WorkerCredentials("wrk_contract", DeviceKeys.generate(), "short-session"),
+        session=session,  # type: ignore[arg-type]
+    )
+
+    assert client.claim_maintenance(ttl_seconds=60) is None
+    assert [json.loads(item[2]["data"]) for item in session.requests] == [
+        {
+            "supported_actions": [
+                "worker_update",
+                "model_install",
+                "capability_install",
+            ],
+            "ttl_seconds": 60,
+        },
+        {"ttl_seconds": 60},
+    ]
+    assert (
+        session.requests[0][2]["headers"]["Idempotency-Key"]
+        != session.requests[1][2]["headers"]["Idempotency-Key"]
+    )
+
+    assert client.claim_maintenance(ttl_seconds=60) is None
+    assert json.loads(session.requests[-1][2]["data"]) == {"ttl_seconds": 60}
+
+    session.upgraded = True
+    client._maintenance_actions_retry_at = 0.0
+    assert client.claim_maintenance(ttl_seconds=60) is None
+    assert "supported_actions" in json.loads(session.requests[-1][2]["data"])
+
+
+def test_legacy_claim_ambiguous_response_keeps_key_and_body_bound() -> None:
+    class AmbiguousLegacySession:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, dict[str, Any]]] = []
+
+        def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+            self.requests.append((method, url, kwargs))
+            body = json.loads(kwargs["data"])
+            if len(self.requests) == 1:
+                assert "supported_actions" in body
+                return response(
+                    422,
+                    {"error": {"code": int(ErrorCode.VALIDATION_FAILED)}},
+                )
+            if len(self.requests) == 2:
+                assert body == {"ttl_seconds": 60}
+                raise requests.ConnectionError("response lost after cached claim")
+            return response(204)
+
+    session = AmbiguousLegacySession()
+    client = GatewayV1Client(
+        "https://gateway.example.test",
+        WorkerCredentials("wrk_contract", DeviceKeys.generate(), "short-session"),
+        session=session,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(GatewayUnavailableError):
+        client.claim_maintenance(ttl_seconds=60)
+    legacy_key = session.requests[1][2]["headers"]["Idempotency-Key"]
+
+    # Even if the negotiation re-probe deadline passes, an ambiguous request
+    # must first be replayed with its exact canonical body and key.
+    client._maintenance_actions_retry_at = 0.0
+    assert client.claim_maintenance(ttl_seconds=60) is None
+    assert json.loads(session.requests[2][2]["data"]) == {"ttl_seconds": 60}
+    assert session.requests[2][2]["headers"]["Idempotency-Key"] == legacy_key
+
+    assert client.claim_maintenance(ttl_seconds=60) is None
+    assert "supported_actions" in json.loads(session.requests[3][2]["data"])
+    assert session.requests[3][2]["headers"]["Idempotency-Key"] != legacy_key
+
+
 def test_local_maintenance_ticket_must_share_gateway_origin() -> None:
     client = GatewayV1Client(
         "https://gateway.example.test",

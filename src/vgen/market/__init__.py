@@ -1,6 +1,14 @@
 """Signed workflow registry and local workflow installation."""
 
+from .capabilities import ComfyUICapabilityFacts, comfyui_capability_facts
 from .models import WorkflowManifest, WorkflowVariant
 from .registry import InstallResult, WorkflowRegistry
 
-__all__ = ["InstallResult", "WorkflowManifest", "WorkflowRegistry", "WorkflowVariant"]
+__all__ = [
+    "ComfyUICapabilityFacts",
+    "InstallResult",
+    "WorkflowManifest",
+    "WorkflowRegistry",
+    "WorkflowVariant",
+    "comfyui_capability_facts",
+]

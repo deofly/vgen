@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from vgen.crypto import (
     DeviceKeys,
     build_maintenance_intent_payload,
@@ -87,6 +89,50 @@ def test_maintenance_intent_binds_owner_device_target_kind_and_spec() -> None:
         expected_broker_id="brk_home",
         expected_kind="worker_update",
         expected_spec=changed_spec,
+        now=300,
+    )
+
+
+def test_capability_install_is_an_explicit_signed_maintenance_action() -> None:
+    owner = derive_identity_keys(b"capability-owner" * 4)
+    device = DeviceKeys.generate()
+    certificate = issue_device_certificate(
+        owner,
+        device,
+        device_id="dev_capability_owner",
+        issued_at=100,
+        expires_at=1_000,
+    )
+    spec = {
+        "kind": "capability_install",
+        "workflow_ref": "vgen/ltx-2.5@1.0.0",
+        "workflow_digest": "sha256:" + "b" * 64,
+        "artifact_sha256": "c" * 64,
+        "artifact_size": 123,
+        "node_classes_digest": "d" * 64,
+        "publisher_key": base64.b64encode(b"p" * 32).decode("ascii"),
+        "allow_unsigned_workflow": False,
+        "apply": "on_idle",
+    }
+    payload = build_maintenance_intent_payload(
+        worker_id="wrk_target",
+        broker_id="brk_home",
+        kind="capability_install",
+        spec=spec,
+        device_id="dev_capability_owner",
+        issued_at=200,
+        expires_at=800,
+        nonce="nonce_0123456789abcdef",
+    )
+    intent = sign_maintenance_intent(device, certificate, payload)
+
+    assert verify_maintenance_intent(
+        intent,
+        owner.signing_public_key,
+        expected_worker_id="wrk_target",
+        expected_broker_id="brk_home",
+        expected_kind="capability_install",
+        expected_spec=spec,
         now=300,
     )
 

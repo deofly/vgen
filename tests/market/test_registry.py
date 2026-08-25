@@ -11,6 +11,8 @@ import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from vgen.crypto import canonical_json
+from vgen.executors.comfyui import ComfyUIExecutionPolicy
 from vgen.market.builder import WorkflowBuildError, build_comfy_graph
 from vgen.market.models import (
     CustomNodeRequirement,
@@ -222,6 +224,104 @@ def test_minimax_reference_declares_all_weight_and_code_dependencies() -> None:
     assert all(dependency.manual_install for dependency in variant.custom_nodes)
 
 
+def test_ltx_2_5_reference_is_canonical_native_and_buildable() -> None:
+    root = Path(__file__).parents[2]
+    package = root / "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0"
+    manifest, _, signed = validate_package(package, allow_unsigned=True)
+    variant = manifest.variants[0]
+
+    assert signed is False
+    assert manifest.id == "vgen/ltx-2.5-distilled-t2v"
+    assert variant.operations == ["t2v"]
+    assert variant.executor_min_version == "1.2.0"
+    assert variant.runtime_min_version == "0.32.0"
+    assert variant.custom_nodes == []
+    assert len(variant.models) == 5
+    assert sum(model.size for model in variant.models) == 39_709_872_236
+    assert all(model.gated and not model.manual_download for model in variant.models)
+    assert {model.revision for model in variant.models} == {
+        "6c7e5e573ac1667efc83407806fe9b0b93730e60"
+    }
+    pins = {
+        (model.folder, model.filename): (model.size, model.sha256)
+        for model in variant.models
+    }
+    assert pins == {
+        (
+            "diffusion_models",
+            "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+        ): (
+            21_504_034_224,
+            "c4279eeff115cbeaca494bd2183e7d768c38fe85a184dc6afbb7159157c44334",
+        ),
+        (
+            "text_encoders",
+            "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+        ): (
+            15_372_969_374,
+            "6ce688a0aa98a5fa36a9f1e6c3f42152a498cc2b53ee8c15674c64244f91487f",
+        ),
+        ("vae", "ltx-2.5-video-vae-bf16.safetensors"): (
+            1_472_223_346,
+            "847e14ca7f3355debca0cea4eaa24ac0fbcdf0061da054ac89ca638a869ddba3",
+        ),
+        ("vae", "ltx-2.5-audio-vae-bf16.safetensors"): (
+            364_866_540,
+            "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5",
+        ),
+        (
+            "latent_upscale_models",
+            "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+        ): (
+            995_778_752,
+            "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8",
+        ),
+    }
+    assert all(
+        model.source
+        == (
+            "https://huggingface.co/Lightricks/LTX-2.5/resolve/"
+            f"{model.revision}/{model.folder}/{model.filename}"
+        )
+        for model in variant.models
+    )
+
+    workflow_path = package / variant.payload
+    graph = json.loads(workflow_path.read_bytes())
+    mapping = json.loads((package / variant.mapping).read_bytes())
+    assert workflow_path.read_bytes() == canonical_json(graph)
+    assert len(graph) == 38
+    assert "ResolutionSelector" not in {node["class_type"] for node in graph.values()}
+    assert "TextGenerateLTX2Prompt" not in {
+        node["class_type"] for node in graph.values()
+    }
+
+    built, effective, operation = build_comfy_graph(
+        graph,
+        mapping,
+        {
+            "prompt": "A lighthouse in a winter storm",
+            "seed": 123,
+            "duration": 3,
+            "width": 1024,
+            "height": 576,
+            "fps": 24,
+        },
+    )
+    assert operation == "t2v"
+    assert effective["duration"] == 3
+    assert built["405:376"]["inputs"]["value"] == "A lighthouse in a winter storm"
+    assert built["405:339"]["inputs"]["noise_seed"] == 123
+    assert built["405:362"]["inputs"]["value"] == 3
+    assert built["405:372"]["inputs"]["value"] == 1024
+    assert built["405:360"]["inputs"]["value"] == 576
+    assert built["405:361"]["inputs"]["value"] == 24
+
+    node_classes = frozenset(node["class_type"] for node in built.values())
+    assert len(node_classes) == 23
+    ComfyUIExecutionPolicy(allowed_node_classes=node_classes).authorize_graph(built, [])
+
+
 def test_archive_rejects_symbolic_links_and_windows_paths(tmp_path: Path) -> None:
     for name, member_name, mode in (
         ("symlink.zip", "workflow-link", stat.S_IFLNK | 0o777),
@@ -247,6 +347,14 @@ def test_unsigned_package_requires_explicit_opt_in(tmp_path: Path) -> None:
     manifest, _, signed = validate_package(package, allow_unsigned=True)
     assert isinstance(manifest, WorkflowManifest)
     assert signed is False
+
+
+def test_invalid_manifest_yaml_is_normalized_as_registry_error(tmp_path: Path) -> None:
+    package = make_package(tmp_path / "package", signed=False)
+    (package / "manifest.yaml").write_text("publisher: [unterminated\n", encoding="utf-8")
+
+    with pytest.raises(RegistryError, match="invalid or unreadable"):
+        validate_package(package, allow_unsigned=True)
 
 
 def test_package_can_be_signed_and_archived(tmp_path: Path) -> None:
