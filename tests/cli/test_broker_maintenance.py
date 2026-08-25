@@ -469,7 +469,9 @@ def test_worker_upgrade_is_idempotent_when_worker_already_reports_stable(
     assert client.created == []
 
 
+@pytest.mark.parametrize("readiness_state", ["missing_models", "missing_nodes"])
 def test_model_install_only_sends_missing_digests(
+    readiness_state: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identity = _identity()
@@ -493,7 +495,7 @@ def test_model_install_only_sends_missing_digests(
                         {
                             "workflow_ref": f"{manifest.id}@{manifest.version}",
                             "workflow_digest": f"sha256:{'a' * 64}",
-                            "state": "missing_models",
+                            "state": readiness_state,
                             "missing_model_digests": [f"sha256:{missing.sha256}"],
                             "missing_node_classes": [],
                         }

@@ -2169,15 +2169,15 @@ def _apply_model_install(
         raw_missing = readiness.get("missing_model_digests")
         if state == "ready":
             missing_digests: set[str] = set()
-        elif state == "missing_models" and isinstance(raw_missing, list) and all(
+        elif state in {"missing_models", "missing_nodes", "node_probe_unavailable"} and isinstance(
+            raw_missing, list
+        ) and all(
             isinstance(item, str) for item in raw_missing
         ):
             missing_digests = set(raw_missing)
         elif state in {
             "executor_incompatible",
             "runtime_incompatible",
-            "missing_nodes",
-            "node_probe_unavailable",
             "insufficient_vram",
             "insufficient_ram",
         }:

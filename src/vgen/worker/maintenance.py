@@ -122,6 +122,7 @@ class _LeaseKeeper:
         self._stage = stage
         self._gateway_lock = gateway_lock
         self._state = state
+        self._progress: tuple[int, int | None] = (0, None)
         self._stop = threading.Event()
         self._error: BaseException | None = None
         self._thread = threading.Thread(
@@ -146,6 +147,11 @@ class _LeaseKeeper:
         if self._error is not None:
             raise self._error
 
+    def update_progress(self, completed: int, total: int | None) -> None:
+        # Tuple replacement is atomic under CPython and keeps the lease thread
+        # from overwriting a real transfer position with its initial 0/unknown.
+        self._progress = (completed, total)
+
     def _run(self) -> None:
         # The caller sends the first heartbeat before entering.  Renew every
         # twenty seconds and request a five-minute lease for slow Windows disk
@@ -154,6 +160,7 @@ class _LeaseKeeper:
         while not self._stop.wait(_LEASE_RENEW_INTERVAL_SECONDS):
             try:
                 with self._gateway_lock:
+                    completed, total = self._progress
                     response = self._gateway.heartbeat_maintenance(
                         self._job_id,
                         fencing_token=self._fencing_token,
@@ -161,8 +168,8 @@ class _LeaseKeeper:
                         state=self._state,
                         progress={
                             "stage": self._stage,
-                            "completed_bytes": 0,
-                            "total_bytes": None,
+                            "completed_bytes": completed,
+                            "total_bytes": total,
                         },
                     )
                     if response.get("cancelled") is True:
@@ -438,6 +445,7 @@ class WorkerMaintenanceController:
                 )
 
                 def progress(completed: int, total: int, *, _job: str = job_id) -> None:
+                    keeper.update_progress(completed, total)
                     now = time.monotonic()
                     if completed == total or now - self._last_progress_at >= 10:
                         self._heartbeat(
@@ -536,6 +544,7 @@ class WorkerMaintenanceController:
             )
 
             def progress(completed: int, total: int | None) -> None:
+                keeper.update_progress(completed, total)
                 now = time.monotonic()
                 if completed == total or now - self._last_progress_at >= 10:
                     self._heartbeat(
@@ -649,6 +658,7 @@ class WorkerMaintenanceController:
             )
 
             def progress(completed: int, total: int | None) -> None:
+                keeper.update_progress(completed, total)
                 now = time.monotonic()
                 if completed == total or now - self._last_progress_at >= 10:
                     self._heartbeat(
