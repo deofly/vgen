@@ -652,8 +652,42 @@ def test_windows_worker_generates_only_a_controlled_model_path_map() -> None:
     )[0]
     assert '"vgen_verified_models:"' in writer
     assert '"  base_path: $quotedRoot"' in writer
-    for category in ("diffusion_models", "text_encoders", "loras", "vae"):
-        assert f'"  {category}: {category}"' in writer
+    configured_categories = {
+        "audio_encoders",
+        "background_removal",
+        "checkpoints",
+        "classifiers",
+        "clip_vision",
+        "controlnet",
+        "detection",
+        "diffusers",
+        "diffusion_models",
+        "embeddings",
+        "frame_interpolation",
+        "geometry_estimation",
+        "gligen",
+        "hypernetworks",
+        "latent_upscale_models",
+        "loras",
+        "model_patches",
+        "optical_flow",
+        "photomaker",
+        "style_models",
+        "text_encoders",
+        "upscale_models",
+        "vae",
+        "vae_approx",
+    }
+    for category in configured_categories:
+        assert f'"{category}"' in writer
+    published_model_categories = {
+        model["folder"]
+        for manifest_path in (ROOT / "workflows").glob("**/manifest.yaml")
+        for variant in yaml.safe_load(manifest_path.read_text(encoding="utf-8"))["variants"]
+        for model in variant.get("models", [])
+    }
+    assert published_model_categories <= configured_categories
+    assert '$contentLines.Add("  ${category}: $category")' in writer
     assert "custom_nodes" not in writer
     assert "is_default" not in writer
     assert "ConvertTo-YamlSingleQuotedScalar" in writer

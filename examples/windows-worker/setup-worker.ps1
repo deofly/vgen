@@ -1327,15 +1327,44 @@ function Write-VGenModelPathsConfig {
     }
 
     $quotedRoot = ConvertTo-YamlSingleQuotedScalar $ModelsRoot
-    $content = @(
+    # Keep every reviewed ComfyUI model category on the same selected root.
+    # Marketplace workflows may introduce a new category without requiring a
+    # second copy of a shared model or another installer code change.
+    $modelCategories = @(
+        "audio_encoders",
+        "background_removal",
+        "checkpoints",
+        "classifiers",
+        "clip_vision",
+        "controlnet",
+        "detection",
+        "diffusers",
+        "diffusion_models",
+        "embeddings",
+        "frame_interpolation",
+        "geometry_estimation",
+        "gligen",
+        "hypernetworks",
+        "latent_upscale_models",
+        "loras",
+        "model_patches",
+        "optical_flow",
+        "photomaker",
+        "style_models",
+        "text_encoders",
+        "upscale_models",
+        "vae",
+        "vae_approx"
+    )
+    $contentLines = [System.Collections.Generic.List[string]]::new()
+    @(
         "vgen_verified_models:",
-        "  base_path: $quotedRoot",
-        "  diffusion_models: diffusion_models",
-        "  text_encoders: text_encoders",
-        "  loras: loras",
-        "  vae: vae"
-    ) -join "`r`n"
-    $content += "`r`n"
+        "  base_path: $quotedRoot"
+    ) | ForEach-Object { $contentLines.Add($_) }
+    foreach ($category in $modelCategories) {
+        $contentLines.Add("  ${category}: $category")
+    }
+    $content = ($contentLines -join "`r`n") + "`r`n"
 
     if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
         try {
