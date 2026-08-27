@@ -486,14 +486,21 @@ Worker has no manager Broker, first run:
 vgen worker manager-set "Windows GPU Worker"
 ```
 
-Install pinned workflow models:
+Verify H3 models already provisioned by the reviewed Windows installer:
 
 ```bash
 vgen broker model-install vgen/minimax-h3-8step \
   --worker "Windows GPU Worker" --wait
 ```
 
-The CLI creates the install job directly; there is no license prompt or
+This H3 command only verifies and reuses the five model files already placed by
+the reviewed Windows installer. The H3 `1.0.0` pins are explicitly
+`manual_download`; on a local cache miss the job returns
+`MODEL_MANUAL_ACTION_REQUIRED` and does not download them. Repair H3 by rerunning
+the reviewed one-click installer, not by treating `model-install` as a bootstrap.
+
+For workflows whose manifests explicitly permit remote downloads, the CLI
+creates the install job directly; there is no license prompt or
 `--accept-license` option. License fields in workflow manifests are read-only
 publication metadata and are not part of remote authorization. Downloads resume
 safely and install only after source revision, path, size, and SHA-256 all match.
@@ -519,26 +526,39 @@ First upgrade the Worker so it advertises `capability_install`:
 vgen worker upgrade --worker "Windows GPU Worker" --wait
 ```
 
-Accept the LTX-2.5 gate and license on Hugging Face. Store a read-only token only
-on the Windows Worker, preferably in a user-protected file selected by
-`HF_TOKEN_PATH`, then stop and start the `VGen Worker Supervisor` scheduled task.
-Never put that token in a
-Mac command, Gateway configuration, or workflow manifest.
+The bundled base workflow uses gated upstream models. Only when the Worker CAS
+does not already contain those bytes, obtain access from the upstream Hugging
+Face account and store a read-only token on the Windows Worker, preferably in a
+user-protected file selected by `HF_TOKEN_PATH`. Then stop and start the
+`VGen Worker Supervisor` scheduled task. This is an upstream download
+credential, not a VGen license-acceptance mechanism; VGen stores no license
+acceptance state. Never put that token in a Mac command, Gateway configuration,
+or workflow manifest.
 
 ```bash
 vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
   --worker "Windows GPU Worker" \
-  --approve-nodes \
-  --allow-unsigned \
   --wait
 ```
 
 This uploads the digest-pinned workflow release, atomically activates it on the
 Worker, installs the five missing gated models, and waits for exact-release
 readiness. The 38-node graph uses ComfyUI core nodes only. Its five model files
-total 39,709,872,236 bytes. The bundled release is currently unsigned, so
-`--allow-unsigned` is an explicit trust decision; a market publication should
-use a publisher-signed package.
+total 39,709,872,236 bytes. The CLI auto-approves the node set and unsigned state
+only for the exact official package digest bundled in the current wheel; changing
+any package byte removes that exception. Custom and local development packages
+still require explicit review, while a marketplace publication should use an
+independent publication trust chain.
+
+The existing `ltx-2.5-gguf-q4-t2v@1.0.0` through `1.0.2` directories are
+immutable historical capability packages. Their README references to a
+ComfyUI-GGUF bootstrap do not mean that the current public one-click installer
+installs that node by default. Starting with 0.13.11, the GGUF node and Python
+dependencies are provisioned only when the Windows host explicitly enables
+`-InstallLtxGguf`; the public one-click path leaves it disabled. Without that
+reviewed host dependency these workflows must remain `missing_nodes`. Correct
+the package documentation or dependency contract only in a new workflow
+SemVer, never by rewriting the old package bytes.
 
 The official base workflow requires at least 32 GB VRAM and 32 GB system RAM.
 A 24 GB RTX 3090 is intentionally not eligible: `workflow-install` rejects it

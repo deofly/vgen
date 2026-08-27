@@ -575,14 +575,20 @@ CLI 明确报告没有 manager Broker，先运行：
 vgen worker manager-set "Windows GPU Worker"
 ```
 
-### 6.1 安装缺失模型
+### 6.1 核对模型与安装可远程下载的模型
 
 ```bash
 vgen broker model-install vgen/minimax-h3-8step \
   --worker "Windows GPU Worker" --wait
 ```
 
-CLI 会显示缺失模型总量并直接创建安装任务，不再要求输入许可证标识，也没有
+这条 H3 命令只会核对并复用已由受审核 Windows 安装器放置的五个模型。H3 `1.0.0` 的 pin
+明确标记为 `manual_download`；本机缓存缺失时，维护任务会返回
+`MODEL_MANUAL_ACTION_REQUIRED`，不会从远端补下载。H3 修复必须重新运行受审核的一键安装器，
+不能把 `model-install` 当作 bootstrap 替代品。
+
+对于 manifest 明确允许远程下载的工作流，CLI 会显示缺失模型总量并创建安装任务，不再要求
+输入许可证标识，也没有
 `--accept-license` 参数。工作流清单中的许可证字段只作为发布来源的说明和审计信息，不参与
 远程授权。下载支持断点续传，只有路径、固定来源/revision、大小和 SHA-256 全部通过后才原子
 安装；已有冲突文件不会被覆盖。
@@ -612,11 +618,12 @@ vgen broker maintenance-cancel <job_id>
 vgen worker upgrade --worker "Windows GPU Worker" --wait
 ```
 
-在 Hugging Face 上阅读并接受 LTX-2.5 gate 和许可证，然后只在 Windows Worker 本机配置
-只读 token。推荐把 token 保存到仅当前 Windows 用户可读的文件，并把用户环境变量
+内置基础版使用的是 Hugging Face 上游的 gated 模型：只有尚未取得这些模型访问权限、且
+Worker 本地缓存也未命中时，才需要先在上游账号完成访问授权，并只在 Windows Worker 本机
+配置只读 token。推荐把 token 保存到仅当前 Windows 用户可读的文件，并把用户环境变量
 `HF_TOKEN_PATH` 指向该文件；修改环境变量后停止并重新启动任务计划程序中的
-`VGen Worker Supervisor`。不要把 token 放进 Mac
-命令、Gateway 配置或工作流清单。
+`VGen Worker Supervisor`。这是上游下载凭据，不是 VGen 的 license 接受逻辑；VGen 不保存
+许可证接受状态。不要把 token 放进 Mac 命令、Gateway 配置或工作流清单。
 
 Mac CLI 已内置摘要固定的基础 T2V 包。下面的命令会依次上传工作流包、让 Worker 原子激活、
 安装五个缺失模型，并等待精确的工作流版本变为 `ready`：
@@ -624,14 +631,20 @@ Mac CLI 已内置摘要固定的基础 T2V 包。下面的命令会依次上传�
 ```bash
 vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
   --worker "Windows GPU Worker" \
-  --approve-nodes \
-  --allow-unsigned \
   --wait
 ```
 
 该包使用 38 节点的 ComfyUI 原生 API 图，没有第三方 custom node；五个受限模型合计
-39,709,872,236 字节。`--approve-nodes` 批准命令显示的精确节点类摘要，`--allow-unsigned`
-只批准 CLI wheel 中摘要固定的当前未签名工作流包。正式市场发布应换成发布者签名包。
+39,709,872,236 字节。CLI 只对当前 wheel 内置且摘要精确匹配的官方包自动批准节点清单和
+未签名状态；只要文件发生变化，这个例外就失效。自定义或本地开发包仍必须经过显式审核，
+正式市场发布则应使用独立的发布信任链。
+
+仓库中的 `ltx-2.5-gguf-q4-t2v@1.0.0` 至 `1.0.2` 是不可变的历史能力包。
+其中 README 所称的 ComfyUI-GGUF bootstrap 不代表当前公开一键安装器会默认安装该节点。
+从 0.13.11 起，GGUF 节点和 Python 依赖只在 Windows host 明确启用
+`-InstallLtxGguf` 时安装；公开一键路径不启用这个开关。没有已审核的 ComfyUI-GGUF host
+依赖时，这些 GGUF 工作流必须保持 `missing_nodes`，不能当作远程一键安装成功。旧包字节不会
+原地修改；未来修正文档或依赖契约必须发布新的工作流 SemVer。
 
 官方基础图要求至少 32 GB 显存、32 GB 内存和足够的模型/缓存空间。24 GB RTX 3090 不会被
 此工作流调度；`workflow-install` 会在上传能力包和下载五个模型前直接拒绝。不要通过降低

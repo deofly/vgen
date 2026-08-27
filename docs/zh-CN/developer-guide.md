@@ -336,7 +336,12 @@ Broker 的 `workflow-install` 把普通 release ZIP 的文件 SHA-256/size、wor
 publisher pin（或明确 unsigned 授权）以及审核过的 node-class digest 一并写入 Device 签名的
 maintenance intent。Worker 在私有 staging 中重新验证这些绑定，只允许 inert workflow 数据，
 编译 ComfyUI policy 后再原子更新 active index。同 digest 的已激活 release 如被损坏，远程重装
-会先隔离旧目录，再用重新验证的 staging 副本替换；验证期间其他工作流保持可用。执行时 Worker
+会先隔离旧目录，再用重新验证的 staging 副本替换；不同签名 intent 的 capability/model 任务
+不会共用同一个维护任务或授权来源，因此一个调用失败时不能取消或回滚另一个调用。同一 intent
+的重试仍保持幂等。创建响应通过 `creation_disposition` 和 `intent_owns_job` 明确所有权，CLI 只在
+后者为 true 时把任务 ID 用于自动回滚。Worker 更新不产生工作流/模型授权，仍可按不可变包摘要
+安全去重。
+验证期间其他工作流保持可用。执行时 Worker
 会用包内 mapping 和校验后的
 有效参数重建 graph，并要求 operation、拓扑、输入绑定及模型 loader 路径精确一致。一个 release
 验证失败不会移除旧 H3 policy 或其他已激活工作流。第三方 custom-node 代码仍是单独的机器管理员
@@ -382,6 +387,12 @@ Gateway 和未签名的远程指令都不能指定任意可执行文件路径。
 [`workflows/vgen/minimax-h3-8step/1.0.0`](../../workflows/vgen/minimax-h3-8step/1.0.0)。
 原生 LTX-2.5 T2V 参考包位于
 [`workflows/vgen/ltx-2.5-distilled-t2v/1.0.0`](../../workflows/vgen/ltx-2.5-distilled-t2v/1.0.0)。
+
+已发布工作流目录按内容摘要视为不可变。H3 `1.0.0` manifest 中的
+`github.com/vgen-project/vgen` 是保留的历史计划地址，当前源码和支持仓库是
+`github.com/deofly/vgen`。修正该 provenance 必须发布新的工作流版本并同步更新 bootstrap
+授权摘要，不能改写 `1.0.0`。LTX GGUF `1.0.0` 至 `1.0.2` README 中的自动 bootstrap
+描述同样属于历史包字节；0.13.11 的公开安装器不会默认启用 `-InstallLtxGguf`。
 
 ## 6. 开发环境
 
@@ -702,6 +713,18 @@ python tools/build_gateway_bundle.py
 python tools/build_windows_worker_bundle.py \
   --gateway https://gateway.example.com
 ```
+
+Windows 构建器会根据 `requirements/` 下三份带 SHA-256 的锁文件生成 CPython 3.11
+`win_amd64` wheelhouse，并直接装进安装包。需要单独审核中间产物时，先运行
+`python tools/windows_worker_wheelhouse.py --output <空目录>`，再通过
+`--wheelhouse` 交给 Windows 包构建器。目标 Windows 只会用
+`--no-index --require-hashes` 从包内安装，不会现场升级 pip，也不会从 PyPI 动态解析 Worker
+依赖。构建器会检查 wheel 的 METADATA、平台 tag、`Requires-Python`、Python 3.11 全部补丁版本
+marker，以及从 `vgen[worker-comfyui]` 出发的完整依赖图；缺包和无关 wheel 都会失败关闭。
+安装包还会记录三份已提交锁文件经过明确边界编码后的 SHA-256；安装包构建器会拒绝与锁定
+wheel 集合不一致的预构建 wheelhouse，公开发布校验器也会拒绝与当前检出版本不一致的锁摘要。
+修改锁文件或确定性源码构建规则后，必须通过 CI 的 Linux 3.11/3.14 重建、严格 umask 对比、
+Windows 3.11 原生安装和锁定运行时漏洞审计。
 
 Mac 构建器会把本手册对应版本的用户手册复制为包内离线 `README.md`；Gateway 构建器从用户
 手册的 Gateway 标记区生成 `INSTALL.txt`。这些是生成的离线安装卡，不是第三套维护源。

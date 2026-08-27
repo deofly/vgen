@@ -248,6 +248,13 @@ and SHA-256 checks.
 pin (or explicit unsigned authorization), and reviewed node-class digest into a
 Device-signed maintenance intent. The Worker revalidates the inert release in
 staging, compiles its ComfyUI policy, and atomically switches its active index.
+Capability and model jobs are never deduplicated across distinct signed intents:
+each caller receives an independent job and authorization source, so one failed
+caller cannot cancel or roll back another caller's install. Replays of the same
+intent remain idempotent. The create response reports `creation_disposition`
+and `intent_owns_job`; automatic rollback uses a job ID only when the latter is
+true. Worker-update jobs may still deduplicate by immutable artifact digest
+because they do not mint workflow/model grants.
 Reinstalling an already-active digest repairs a corrupt local release by moving
 the old directory aside and replacing it with the newly verified staged copy;
 other active workflows remain available throughout validation.
@@ -255,6 +262,15 @@ At execution it rebuilds the graph from the package mapping and validated
 effective parameters, then requires an exact operation, topology, binding, and
 model-loader-path match. Third-party custom-node code remains a separate
 machine-administrator boundary.
+
+Published workflow directories are content-addressed and immutable. The H3
+`1.0.0` manifest retains the historical planned
+`github.com/vgen-project/vgen` provenance URL, while the current source and
+support repository is `github.com/deofly/vgen`. Correct it only in a new
+workflow SemVer together with the matching bootstrap-authorization digest;
+never rewrite `1.0.0`. The LTX GGUF `1.0.0` through `1.0.2` README bootstrap
+wording is likewise historical package content. The 0.13.11 public installer
+does not enable `-InstallLtxGguf` by default.
 
 Models use a Worker-local digest-addressed content store. Shared T5, VAE, and
 other weights download once and are materialized as read-only hard links in
@@ -432,6 +448,22 @@ python tools/build_public_release.py \
   --release-origin https://downloads.example.com \
   --published-at 2026-08-22T12:34:56Z
 ```
+
+The Windows builder creates a CPython 3.11 `win_amd64` wheelhouse from the
+three SHA-256 locks under `requirements/` and embeds it in the installer. To
+review that intermediate artifact separately, run
+`python tools/windows_worker_wheelhouse.py --output <empty-directory>`, then
+pass the result with `--wheelhouse`. The target machine installs only from this
+bundle with `--no-index --require-hashes`; it does not upgrade pip or resolve
+Worker dependencies from PyPI. The builder validates wheel metadata, tags,
+`Requires-Python`, all Python 3.11 patch-level markers, and the dependency graph
+rooted at `vgen[worker-comfyui]`; missing and unrelated wheels fail the build.
+The bundle records a framed SHA-256 digest of all three committed lock files,
+and both the bundle builder and public-release validator reject a prebuilt
+wheelhouse or lock-set binding that differs from that checkout.
+Changes to any lock or deterministic source-build recipe must pass the Linux
+3.11/3.14 rebuilds, restrictive-umask comparison, native Windows 3.11 install,
+and pinned-runtime vulnerability audit in CI.
 
 The Mac README and Gateway `INSTALL.txt` are generated from the User Guide.
 Universal Windows packages contain no credentials. Release manifests pin size
