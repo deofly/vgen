@@ -21,13 +21,17 @@ class HostControl:
         yield
 
 
-def _archive(tmp_path: Path) -> tuple[Path, str]:
+def _archive(
+    tmp_path: Path,
+    *,
+    wheel_name: str = "gguf-0.17.1-py3-none-any.whl",
+) -> tuple[Path, str]:
     source = tmp_path / "source"
     source.mkdir()
     (source / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
     wheels = tmp_path / "wheels"
     wheels.mkdir()
-    (wheels / "gguf-0.17.1-py3-none-any.whl").write_bytes(b"wheel")
+    (wheels / wheel_name).write_bytes(b"wheel")
     archive = tmp_path / "pack.zip"
     build_node_pack_archive(
         source,
@@ -67,6 +71,7 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
         python,
         host,  # type: ignore[arg-type]
         lambda: set(loaded),
+        pure_python_only=True,
         wheel_installer=install_wheels,
     )
     result = installer.install(
@@ -173,4 +178,45 @@ def test_rejects_wrong_artifact_digest_before_pause(tmp_path: Path) -> None:
             expected_node_pack_ref="vgen/comfyui-gguf@1.0.0",
             expected_node_classes=("UnetLoaderGGUF",),
         )
+    assert host.pauses == 0
+
+
+def test_fallback_runtime_rejects_native_wheel_before_install_or_pause(
+    tmp_path: Path,
+) -> None:
+    archive, digest = _archive(
+        tmp_path,
+        wheel_name="gguf-0.17.1-cp311-cp311-win_amd64.whl",
+    )
+    custom_nodes = tmp_path / "custom_nodes"
+    custom_nodes.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    host = HostControl()
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"python")
+    wheel_calls = 0
+
+    def install_wheels(_python: Path, _wheels: tuple[Path, ...], _target: Path) -> None:
+        nonlocal wheel_calls
+        wheel_calls += 1
+
+    installer = NodePackInstaller(
+        work,
+        custom_nodes,
+        python,
+        host,  # type: ignore[arg-type]
+        lambda: set(),
+        pure_python_only=True,
+        wheel_installer=install_wheels,
+    )
+
+    with pytest.raises(NodePackInstallError, match="NODE_PACK_RUNTIME_INCOMPATIBLE"):
+        installer.install(
+            archive,
+            expected_sha256=digest,
+            expected_node_pack_ref="vgen/comfyui-gguf@1.0.0",
+            expected_node_classes=("UnetLoaderGGUF",),
+        )
+    assert wheel_calls == 0
     assert host.pauses == 0

@@ -117,6 +117,7 @@ class NodePackInstaller:
         host_control: ComfyUIHostControl,
         node_probe: NodeProbe,
         *,
+        pure_python_only: bool = False,
         wheel_installer: WheelInstaller = _default_wheel_installer,
         sleeper: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -138,6 +139,7 @@ class NodePackInstaller:
         self.python_executable = resolved_python
         self.host_control = host_control
         self.node_probe = node_probe
+        self.pure_python_only = pure_python_only
         self.wheel_installer = wheel_installer
         self.sleeper = sleeper
         self.monotonic = monotonic
@@ -183,6 +185,10 @@ class NodePackInstaller:
             wheels = tuple(
                 wheel_root / item.filename for item in manifest.wheels
             )
+            if self.pure_python_only and any(
+                not wheel.name.endswith("-py3-none-any.whl") for wheel in wheels
+            ):
+                raise NodePackInstallError("NODE_PACK_RUNTIME_INCOMPATIBLE")
             self.wheel_installer(
                 self.python_executable,
                 wheels,

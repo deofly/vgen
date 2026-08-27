@@ -1436,7 +1436,7 @@ def _update_error_code(reason: str) -> int:
 def _node_pack_error_code(reason: str) -> int:
     if "ROLLBACK" in reason:
         return int(ErrorCode.NODE_PACK_ROLLBACK_FAILED)
-    if "DEPENDENCY_INSTALL" in reason:
+    if any(item in reason for item in ("DEPENDENCY_INSTALL", "RUNTIME_INCOMPATIBLE")):
         return int(ErrorCode.NODE_PACK_DEPENDENCY_INSTALL_FAILED)
     if any(item in reason for item in ("ACTIVATION", "NODE_VALIDATION", "HOST_")):
         return int(ErrorCode.NODE_PACK_ACTIVATION_FAILED)

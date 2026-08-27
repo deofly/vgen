@@ -397,17 +397,16 @@ def _build_maintenance(
     )
     node_probe = getattr(executor, "maintenance_node_classes", None)
     node_pack_installer = None
-    if (
-        custom_nodes_root is not None
-        and arguments.comfy_python_executable is not None
-        and callable(node_probe)
-    ):
+    if custom_nodes_root is not None and callable(node_probe):
+        configured_python = arguments.comfy_python_executable
+        installer_python = configured_python or Path(sys.executable).resolve(strict=True)
         node_pack_installer = NodePackInstaller(
             work_root,
             custom_nodes_root,
-            arguments.comfy_python_executable,
+            installer_python,
             ComfyUIHostControl(work_root),
             node_probe,
+            pure_python_only=configured_python is None,
         )
     return WorkerMaintenanceController(
         credentials,

@@ -61,6 +61,55 @@ def test_worker_gateway_enables_attempt_progress_reporting() -> None:
     assert gateway._report_progress is True
 
 
+def test_maintenance_uses_worker_python_for_pure_node_packs_without_host_pin(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    custom_nodes = tmp_path / "custom_nodes"
+    custom_nodes.mkdir()
+    captured: dict[str, Any] = {}
+
+    class FakeNodePackInstaller:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured["installer_args"] = args
+            captured["installer_kwargs"] = kwargs
+
+    class FakeMaintenanceController:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured["controller_args"] = args
+            captured["controller_kwargs"] = kwargs
+
+    executor = FakeExecutor()
+    executor.maintenance_node_classes = lambda: set()
+    monkeypatch.setattr(worker_main_module, "NodePackInstaller", FakeNodePackInstaller)
+    monkeypatch.setattr(
+        worker_main_module,
+        "WorkerMaintenanceController",
+        FakeMaintenanceController,
+    )
+
+    worker_main_module._build_maintenance(
+        SimpleNamespace(
+            work_root=tmp_path / "work",
+            comfy_custom_nodes_root=custom_nodes,
+            comfy_python_executable=None,
+            comfy_model_root=None,
+        ),
+        SimpleNamespace(),  # type: ignore[arg-type]
+        SimpleNamespace(),  # type: ignore[arg-type]
+        executor,
+        SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    assert captured["installer_args"][2] == Path(
+        worker_main_module.sys.executable
+    ).resolve(strict=True)
+    assert captured["installer_kwargs"]["pure_python_only"] is True
+    assert captured["controller_kwargs"]["node_pack_installer"].__class__ is (
+        FakeNodePackInstaller
+    )
+
+
 def test_doctor_outputs_machine_readable_executor_status(capsys: Any) -> None:
     exit_code = run(["doctor", "--json"], executor_factory=lambda _arguments: FakeExecutor())
     assert exit_code == EXIT_OK
