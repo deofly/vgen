@@ -90,6 +90,21 @@ Assert-Condition ($launcherHashes[0] -cne $basePythonHash) `
     "The native test did not distinguish the venv launcher from base python.exe."
 Assert-Condition (Test-LockedWorkerRuntime $first $requirements $BootstrapPython) `
     "Fresh runtime did not match the lock."
+$invalidRequirements = Join-Path $env:RUNNER_TEMP `
+    "vgen-invalid-requirements-$([Guid]::NewGuid().ToString('N')).txt"
+try {
+    [IO.File]::WriteAllBytes($invalidRequirements, [byte[]]@(0xff))
+    Assert-Condition (-not (Test-LockedWorkerRuntime `
+        $first $invalidRequirements $BootstrapPython)) `
+        "A verifier traceback escaped the fail-closed boolean contract."
+    Assert-Condition ($ErrorActionPreference -ceq "Stop") `
+        "Runtime verification changed the caller's error policy."
+}
+finally {
+    if (Test-Path -LiteralPath $invalidRequirements -PathType Leaf) {
+        Remove-Item -LiteralPath $invalidRequirements -Force
+    }
+}
 $firstCount = Get-RuntimeDirectoryCount
 
 $second = [string](Ensure-WorkerRuntime `

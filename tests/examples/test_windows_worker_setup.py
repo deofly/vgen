@@ -117,11 +117,19 @@ def test_windows_worker_native_installer_output_never_becomes_a_return_value() -
     assert 'getattr(path.lstat(), "st_file_attributes", 0)' in text
     assert "attributes & 0x400" in text
     assert "target in distribution_paths or target in tracked" in text
-    assert "& $TrustedPython -I -B -S -c $verificationCode $Python $Requirements" in text
     assert 'getattr(path.lstat(), "st_file_attributes", 0)' in enrollment
     assert "$runtimeLockSetSha256 -notmatch '^[0-9a-f]{64}$'" in enrollment
     assert "target in distribution_paths or target in tracked" in enrollment
     for installer in (text, enrollment):
+        verifier = installer.split("$verificationCode = @'\n", 1)[1].split("\n'@", 1)[0]
+        assert verifier.isascii()
+        compile(verifier, "<locked-worker-runtime-verifier>", "exec")
+        assert "$verificationCode |" in installer
+        assert "& $TrustedPython -I -B -S - $Python $Requirements" in installer
+        assert "-c $verificationCode" not in installer
+        assert "$verificationCommandSucceeded = $?" in installer
+        assert "$verificationExitCode = $LASTEXITCODE" in installer
+        assert '$ErrorActionPreference = "Continue"' not in installer
         assert "function Remove-WorkerRuntimeActivationScripts" in installer
         assert installer.count("Remove-WorkerRuntimeActivationScripts ") == 2
         removal = installer.split("function Remove-WorkerRuntimeActivationScripts", 1)[1].split(
@@ -152,6 +160,16 @@ def test_windows_worker_native_installer_output_never_becomes_a_return_value() -
         assert '"$RuntimeRoot-invalid-$([Guid]' not in installer
         assert '"$RuntimeRoot-staging-$([Guid]' not in installer
         assert "function Remove-ClosedWorkerRuntimeTree" in installer
+    setup_verifier = text.split("$verificationCode = @'\n", 1)[1].split("\n'@", 1)[0]
+    enrollment_verifier = enrollment.split("$verificationCode = @'\n", 1)[1].split("\n'@", 1)[0]
+    assert setup_verifier == enrollment_verifier
+    setup_verification_function = text.split("function Test-LockedWorkerRuntime", 1)[1].split(
+        "function Install-LockedWorkerPythonPackages", 1
+    )[0]
+    enrollment_verification_function = enrollment.split(
+        "function Test-LockedWorkerRuntime", 1
+    )[1].split("function Install-LockedWorkerPythonPackages", 1)[0]
+    assert setup_verification_function == enrollment_verification_function
     assert runtime.index("Remove-WorkerRuntimeActivationScripts $stagingRoot") < runtime.index(
         "Install-LockedWorkerPythonPackages `"
     )

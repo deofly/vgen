@@ -2862,8 +2862,25 @@ for directory, directory_names, file_names in os.walk(runtime_root, followlinks=
         if resolved_file not in tracked and resolved_file not in baseline_files:
             raise SystemExit(1)
 '@
-    & $TrustedPython -I -B -S -c $verificationCode $Python $Requirements 2>$null | Out-Null
-    return $LASTEXITCODE -eq 0
+    $verificationCommandSucceeded = $false
+    $verificationExitCode = $null
+    try {
+        # Windows PowerShell 5.1 cannot reliably quote a multiline native
+        # argument. Send the ASCII verifier over stdin so Python receives the
+        # reviewed source verbatim; verification failures remain a boolean.
+        $verificationCode |
+            & $TrustedPython -I -B -S - $Python $Requirements 1>$null 2>$null
+        $verificationCommandSucceeded = $?
+        $verificationExitCode = $LASTEXITCODE
+    }
+    catch {
+        return $false
+    }
+    return (
+        $verificationCommandSucceeded -and
+        $null -ne $verificationExitCode -and
+        $verificationExitCode -eq 0
+    )
 }
 
 function Install-LockedWorkerPythonPackages {
