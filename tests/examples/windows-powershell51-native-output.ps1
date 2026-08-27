@@ -53,12 +53,27 @@ public static class VGenFakeNative
         }
 
         Console.WriteLine("python-native-noise-must-not-be-returned");
-        int venvIndex = Array.IndexOf(args, "venv");
+        int venvIndex = -1;
+        for (int index = 0; index + 1 < args.Length; index++)
+        {
+            if (args[index] == "-m" && args[index + 1] == "venv")
+            {
+                venvIndex = index + 1;
+                break;
+            }
+        }
         if (venvIndex >= 0 && args.Length > venvIndex + 1)
         {
             string scripts = Path.Combine(args[args.Length - 1], "Scripts");
             Directory.CreateDirectory(scripts);
             File.Copy(executable, Path.Combine(scripts, "python.exe"), true);
+            File.Copy(executable, Path.Combine(scripts, "pythonw.exe"), true);
+            foreach (string activationName in new string[] {
+                    "activate", "activate.bat", "Activate.ps1", "deactivate.bat"
+                })
+            {
+                File.WriteAllText(Path.Combine(scripts, activationName), "test activation script");
+            }
             return 0;
         }
         for (int index = 0; index < args.Length; index++)
