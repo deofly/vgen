@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import sys
 import time
@@ -267,7 +268,7 @@ def test_stages_separate_runtime_and_writes_pending_activation_pointer(
     wheel = tmp_path / "vgen.whl"
     size, digest = build_wheel(wheel, "0.2.0")
     source = tmp_path / "source-runtime"
-    python = source / "bin/python"
+    python = source / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"fake python")
 

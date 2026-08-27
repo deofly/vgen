@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -254,8 +255,22 @@ def test_completion_install_all_writes_bash_and_zsh_activation(tmp_path: Path) -
     zshrc = home / ".zshrc"
     assert "vgen.bash" in bashrc.read_text(encoding="utf-8")
     assert "vgen.zsh" in zshrc.read_text(encoding="utf-8")
-    subprocess.run(["/bin/bash", "-n", str(bashrc)], check=True)
-    subprocess.run(["/bin/zsh", "-n", str(zshrc)], check=True)
+
+
+@pytest.mark.parametrize("shell", ("bash", "zsh"))
+def test_completion_install_writes_valid_shell_activation(
+    tmp_path: Path, shell: str
+) -> None:
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    installed = install_shell_completion(shell, home=home)["shells"][0]
+
+    for path_key in ("script", "rc_file"):
+        subprocess.run([executable, "-n", installed[path_key]], check=True)
 
 
 def test_completion_install_auto_uses_login_shell(tmp_path: Path) -> None:
