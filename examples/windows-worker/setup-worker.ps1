@@ -25,6 +25,10 @@ param(
 
     [string]$BundleConfig,
 
+    # Optional compatibility bootstrap for the published LTX GGUF workflow.
+    # Base H3 setup must not fail because an unrelated workflow node is absent.
+    [switch]$InstallLtxGguf,
+
     [switch]$CheckOnly
 )
 
@@ -59,7 +63,7 @@ if ($CheckOnly) {
 # capability catalog. New reviewed workflow releases are activated later under
 # the Worker's private capability store by signed Broker maintenance jobs.
 $PolicyName = "comfyui-minimax-h3-policy.yaml"
-$PolicySha256 = "5ae3a0f9fa16dadd2435496bd96584e9206720a613460e06c8ec6ff2f2c97f75"
+$PolicySha256 = "c0352f39ca9e18dafa9372b35d3f88b7de2f1351a3b0db12e86cb7a70450fbaf"
 $MinimumExecutorVersion = "1.1.0"
 $MinimumRuntimeVersion = "0.30.0"
 $MinimumVramBytes = [Int64]16000000000
@@ -1042,7 +1046,7 @@ function Resolve-WorkerBundleSettings {
             throw "BundleConfig is not valid JSON."
         }
         if ((Get-RequiredJsonProperty $config "format" "BundleConfig") -ne "vgen-windows-worker-bundle" -or
-            (Get-RequiredJsonProperty $config "version" "BundleConfig") -ne 1) {
+            (Get-RequiredJsonProperty $config "version" "BundleConfig") -ne 2) {
             throw "BundleConfig has an unsupported format or version."
         }
     }
@@ -1104,12 +1108,13 @@ function Resolve-WorkerBundleSettings {
     $resolvedPolicySha256 = $PolicySha256
     $wheel = Get-RequiredJsonProperty $config "wheel" "BundleConfig"
     $policy = Get-RequiredJsonProperty $config "policy" "BundleConfig"
+    $pythonRuntime = Get-RequiredJsonProperty $config "python_runtime" "BundleConfig"
     $wheelVersionValue = Get-RequiredJsonProperty $wheel "version" "BundleConfig wheel"
     if ($wheelVersionValue -isnot [string]) {
         throw "BundleConfig wheel version must be a string."
     }
     $resolvedVGenVersion = [string]$wheelVersionValue
-    if ($resolvedVGenVersion -notmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$') {
+    if ($resolvedVGenVersion -notmatch '^(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})$') {
         throw "BundleConfig wheel version is not a supported VGen release version."
     }
     $resolvedWheelName = [string](Get-RequiredJsonProperty $wheel "name" "BundleConfig wheel")
@@ -1130,6 +1135,52 @@ function Resolve-WorkerBundleSettings {
     if ($resolvedWheelSha256 -notmatch "^[0-9a-f]{64}$" -or $resolvedPolicySha256 -notmatch "^[0-9a-f]{64}$") {
         throw "BundleConfig file hashes must be lowercase SHA-256 values."
     }
+    if ((Get-RequiredJsonProperty $pythonRuntime "implementation" "BundleConfig python_runtime") -cne "cp" -or
+        (Get-RequiredJsonProperty $pythonRuntime "python_version" "BundleConfig python_runtime") -cne "3.11" -or
+        (Get-RequiredJsonProperty $pythonRuntime "platform" "BundleConfig python_runtime") -cne "win_amd64") {
+        throw "BundleConfig Python runtime target is invalid."
+    }
+    $runtimeRequirements = Get-RequiredJsonProperty `
+        $pythonRuntime "requirements" "BundleConfig python_runtime"
+    $bootstrapPip = Get-RequiredJsonProperty `
+        $pythonRuntime "bootstrap_pip" "BundleConfig python_runtime"
+    $runtimeRequirementsName = [string](Get-RequiredJsonProperty `
+        $runtimeRequirements "name" "BundleConfig python_runtime requirements")
+    $runtimeRequirementsSha256 = [string](Get-RequiredJsonProperty `
+        $runtimeRequirements "sha256" "BundleConfig python_runtime requirements")
+    $runtimeLockSetSha256 = [string](Get-RequiredJsonProperty `
+        $pythonRuntime "lock_set_sha256" "BundleConfig python_runtime")
+    $bootstrapPipName = [string](Get-RequiredJsonProperty `
+        $bootstrapPip "name" "BundleConfig python_runtime bootstrap_pip")
+    $bootstrapPipSha256 = [string](Get-RequiredJsonProperty `
+        $bootstrapPip "sha256" "BundleConfig python_runtime bootstrap_pip")
+    if ($runtimeRequirementsName -cne "vgen-worker-requirements.txt" -or
+        $runtimeRequirementsSha256 -notmatch '^[0-9a-f]{64}$' -or
+        $runtimeLockSetSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [IO.Path]::GetFileName($bootstrapPipName) -cne $bootstrapPipName -or
+        $bootstrapPipName -notmatch '^pip-[0-9]+\.[0-9]+(?:\.[0-9]+)?-py3-none-any\.whl$' -or
+        $bootstrapPipSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "BundleConfig Python runtime lock is invalid."
+    }
+    $runtimeWheelRecords = @(
+        Get-RequiredJsonProperty $pythonRuntime "wheels" "BundleConfig python_runtime"
+    )
+    $vgenRuntimeRecords = @(
+        $runtimeWheelRecords | Where-Object {
+            [string]$_.name -ceq $resolvedWheelName -and
+            [string]$_.sha256 -ceq $resolvedWheelSha256
+        }
+    )
+    $pipRuntimeRecords = @(
+        $runtimeWheelRecords | Where-Object {
+            [string]$_.name -ceq $bootstrapPipName -and
+            [string]$_.sha256 -ceq $bootstrapPipSha256
+        }
+    )
+    if ($runtimeWheelRecords.Count -lt 2 -or $runtimeWheelRecords.Count -gt 128 -or
+        $vgenRuntimeRecords.Count -ne 1 -or $pipRuntimeRecords.Count -ne 1) {
+        throw "BundleConfig Python runtime wheel list is invalid."
+    }
 
     return [PSCustomObject]@{
         GatewayUrl = $resolvedGateway
@@ -1139,6 +1190,11 @@ function Resolve-WorkerBundleSettings {
         VGenVersion = $resolvedVGenVersion
         WheelName = $resolvedWheelName
         WheelSha256 = $resolvedWheelSha256
+        RuntimeRequirementsName = $runtimeRequirementsName
+        RuntimeRequirementsSha256 = $runtimeRequirementsSha256
+        RuntimeLockSetSha256 = $runtimeLockSetSha256
+        BootstrapPipName = $bootstrapPipName
+        BootstrapPipSha256 = $bootstrapPipSha256
         PolicyName = $resolvedPolicyName
         PolicySha256 = $resolvedPolicySha256
         HasBundleConfig = ($null -ne $config)
@@ -2479,56 +2535,502 @@ function Write-ManualModelList {
     }
 }
 
+function Remove-WorkerRuntimeActivationScripts {
+    param([string]$StagingRoot)
+
+    $scriptsRoot = Join-Path $StagingRoot "Scripts"
+    if (-not (Test-Path -LiteralPath $scriptsRoot -PathType Container)) {
+        throw "The new Worker Python runtime has no Scripts directory."
+    }
+    $scriptsItem = Get-Item -LiteralPath $scriptsRoot -Force
+    if (($scriptsItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The new Worker Python Scripts directory is unsafe."
+    }
+    foreach ($activationName in @(
+            "activate",
+            "activate.bat",
+            "Activate.ps1",
+            "deactivate.bat"
+        )) {
+        $activationPath = Join-Path $scriptsRoot $activationName
+        if (-not (Test-Path -LiteralPath $activationPath -PathType Leaf)) {
+            throw "The new Worker Python runtime has an unexpected activation-script layout."
+        }
+        $activationItem = Get-Item -LiteralPath $activationPath -Force
+        if ($activationItem.PSIsContainer -or
+            ($activationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The new Worker Python runtime contains an unsafe activation script."
+        }
+        [System.IO.File]::Delete($activationItem.FullName)
+    }
+
+    $requiredLaunchers = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $null = $requiredLaunchers.Add("python.exe")
+    $null = $requiredLaunchers.Add("pythonw.exe")
+    foreach ($remaining in @(Get-ChildItem -LiteralPath $scriptsRoot -Force)) {
+        if ($remaining.PSIsContainer -or
+            ($remaining.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not $requiredLaunchers.Remove($remaining.Name)) {
+            throw "The new Worker Python Scripts directory is not closed before package installation."
+        }
+    }
+    if ($requiredLaunchers.Count -ne 0) {
+        throw "The new Worker Python runtime is missing a required CPython launcher."
+    }
+}
+
+function Test-LockedWorkerRuntime {
+    param(
+        [string]$Python,
+        [string]$Requirements,
+        [string]$TrustedPython
+    )
+    if ([string]::IsNullOrWhiteSpace($TrustedPython) -or
+        -not (Test-Path -LiteralPath $Python -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $Requirements -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $TrustedPython -PathType Leaf)) {
+        return $false
+    }
+    foreach ($verificationInput in @($Python, $Requirements, $TrustedPython)) {
+        try {
+            $verificationItem = Get-Item -LiteralPath $verificationInput -Force
+            if ($verificationItem.PSIsContainer -or
+                ($verificationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+        }
+        catch {
+            return $false
+        }
+    }
+    $verificationCode = @'
+import base64
+import csv
+import hashlib
+import io
+import os
+import platform
+import re
+import sys
+import sysconfig
+from importlib import metadata
+from pathlib import Path
+
+def is_reparse(path):
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        raise SystemExit(1)
+    return path.is_symlink() or bool(attributes & 0x400)
+
+def canonicalize_name(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+def same_path(left, right):
+    return os.path.normcase(str(left.resolve(strict=True))) == os.path.normcase(
+        str(right.resolve(strict=True))
+    )
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
+
+if sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 11):
+    raise SystemExit(1)
+trusted_python = Path(sys.executable)
+target_python = Path(sys.argv[1])
+requirements_path = Path(sys.argv[2])
+if target_python.name != "python.exe" or target_python.parent.name != "Scripts":
+    raise SystemExit(1)
+runtime_path = target_python.parent.parent
+runtime_root = runtime_path.resolve(strict=True)
+if is_reparse(runtime_path) or same_path(trusted_python, target_python):
+    raise SystemExit(1)
+if not same_path(target_python, runtime_path / "Scripts" / "python.exe"):
+    raise SystemExit(1)
+
+root_entries = {entry.name: entry for entry in runtime_path.iterdir()}
+if set(root_entries) != {"Include", "Lib", "Scripts", "pyvenv.cfg"}:
+    raise SystemExit(1)
+for directory_name in ("Include", "Lib", "Scripts"):
+    directory = root_entries[directory_name]
+    if is_reparse(directory) or not directory.is_dir():
+        raise SystemExit(1)
+if set(entry.name for entry in (runtime_path / "Lib").iterdir()) != {"site-packages"}:
+    raise SystemExit(1)
+
+site_path = runtime_path / "Lib" / "site-packages"
+site_root = site_path.resolve(strict=True)
+try:
+    site_root.relative_to(runtime_root)
+except ValueError:
+    raise SystemExit(1)
+if is_reparse(site_path) or not site_root.is_dir():
+    raise SystemExit(1)
+
+target_pythonw = runtime_path / "Scripts" / "pythonw.exe"
+for executable in (target_python, target_pythonw, trusted_python):
+    if is_reparse(executable) or not executable.is_file():
+        raise SystemExit(1)
+if (
+    trusted_python.name.casefold() != "python.exe"
+    or bool(sysconfig.get_config_var("Py_DEBUG"))
+    or sysconfig.is_python_build()
+):
+    raise SystemExit(1)
+
+trusted_stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+launcher_root = trusted_stdlib / "venv" / "scripts" / "nt"
+if is_reparse(trusted_stdlib) or is_reparse(launcher_root) or not launcher_root.is_dir():
+    raise SystemExit(1)
+
+def locate_launcher(installed_name, packaged_name, fallback_name):
+    candidates = (
+        launcher_root / installed_name,
+        launcher_root / packaged_name,
+        trusted_python.parent / fallback_name,
+    )
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve(strict=True)
+        try:
+            if candidate.parent == launcher_root:
+                resolved.relative_to(trusted_stdlib)
+            else:
+                resolved.relative_to(trusted_python.parent.resolve(strict=True))
+        except ValueError:
+            raise SystemExit(1)
+        if is_reparse(candidate) or not candidate.is_file():
+            raise SystemExit(1)
+        return candidate
+    raise SystemExit(1)
+
+console_launcher = locate_launcher("python.exe", "venvlauncher.exe", "venvlauncher.exe")
+windowed_launcher = locate_launcher("pythonw.exe", "venvwlauncher.exe", "venvwlauncher.exe")
+if sha256_file(target_python) != sha256_file(console_launcher):
+    raise SystemExit(1)
+if sha256_file(target_pythonw) != sha256_file(windowed_launcher):
+    raise SystemExit(1)
+
+configuration_path = runtime_path / "pyvenv.cfg"
+if is_reparse(configuration_path) or not configuration_path.is_file():
+    raise SystemExit(1)
+try:
+    configuration_value = configuration_path.read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if not 1 <= len(configuration_value) <= 16384 or "\x00" in configuration_value:
+    raise SystemExit(1)
+configuration = {}
+for raw_line in configuration_value.splitlines():
+    key, separator, value = raw_line.partition(" = ")
+    if not separator or not key or key in configuration or not value:
+        raise SystemExit(1)
+    configuration[key] = value
+if set(configuration) != {
+    "home",
+    "include-system-site-packages",
+    "version",
+    "executable",
+    "command",
+}:
+    raise SystemExit(1)
+try:
+    home_matches = same_path(Path(configuration["home"]), trusted_python.parent)
+    executable_matches = same_path(Path(configuration["executable"]), trusted_python)
+except OSError:
+    raise SystemExit(1)
+command = configuration["command"]
+if (
+    not home_matches
+    or not executable_matches
+    or configuration["include-system-site-packages"].casefold() != "false"
+    or configuration["version"] != platform.python_version()
+    or " -m venv --without-pip " not in command
+    or os.path.normcase(str(runtime_path)) not in os.path.normcase(command)
+):
+    raise SystemExit(1)
+
+expected = {}
+for raw in requirements_path.read_text(encoding="ascii").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    match = re.fullmatch(
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)(\[worker-comfyui\])?"
+        r"==([A-Za-z0-9][A-Za-z0-9.!+_-]*) --hash=sha256:[0-9a-f]{64}",
+        line,
+    )
+    if match is None:
+        raise SystemExit(1)
+    name = canonicalize_name(match.group(1))
+    extra = match.group(2)
+    if (name == "vgen" and extra != "[worker-comfyui]") or (name != "vgen" and extra):
+        raise SystemExit(1)
+    if name in expected:
+        raise SystemExit(1)
+    expected[name] = match.group(3)
+
+installed = {}
+distributions = list(metadata.distributions(path=[str(site_root)]))
+for distribution in distributions:
+    name = canonicalize_name(distribution.metadata.get("Name", ""))
+    if not name or name in installed:
+        raise SystemExit(1)
+    installed[name] = distribution.version
+if installed != expected:
+    raise SystemExit(1)
+
+tracked = set()
+for distribution in distributions:
+    record = distribution.read_text("RECORD")
+    if record is None:
+        raise SystemExit(1)
+    distribution_paths = set()
+    for relative, encoded_hash, raw_size in csv.reader(io.StringIO(record)):
+        try:
+            raw_target = Path(distribution.locate_file(relative))
+            target = raw_target.resolve()
+            target.relative_to(runtime_root)
+        except (OSError, ValueError):
+            raise SystemExit(1)
+        if is_reparse(raw_target) or target in distribution_paths or target in tracked:
+            raise SystemExit(1)
+        if not encoded_hash:
+            if not relative.endswith(".dist-info/RECORD") or raw_size:
+                raise SystemExit(1)
+            distribution_paths.add(target)
+            tracked.add(target)
+            continue
+        try:
+            algorithm, encoded = encoded_hash.split("=", 1)
+            value = target.read_bytes()
+        except (OSError, ValueError):
+            raise SystemExit(1)
+        if algorithm != "sha256" or not raw_size.isdecimal() or len(value) != int(raw_size):
+            raise SystemExit(1)
+        actual = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).rstrip(b"=").decode()
+        if actual != encoded:
+            raise SystemExit(1)
+        distribution_paths.add(target)
+        tracked.add(target)
+
+baseline_files = {
+    configuration_path.resolve(strict=True),
+    target_python.resolve(strict=True),
+    target_pythonw.resolve(strict=True),
+}
+for forbidden_activation_name in (
+    "activate",
+    "activate.bat",
+    "activate.fish",
+    "Activate.ps1",
+    "deactivate.bat",
+):
+    if (runtime_path / "Scripts" / forbidden_activation_name).exists():
+        raise SystemExit(1)
+
+allowed_directories = {
+    runtime_root,
+    (runtime_path / "Include").resolve(strict=True),
+    (runtime_path / "Lib").resolve(strict=True),
+    site_root,
+    (runtime_path / "Scripts").resolve(strict=True),
+}
+for target in tracked:
+    parent = target.parent
+    while parent != runtime_root:
+        allowed_directories.add(parent)
+        parent = parent.parent
+
+for directory, directory_names, file_names in os.walk(runtime_root, followlinks=False):
+    parent = Path(directory)
+    for entry in (*directory_names, *file_names):
+        if is_reparse(parent / entry):
+            raise SystemExit(1)
+    for directory_name in directory_names:
+        if (parent / directory_name).resolve(strict=True) not in allowed_directories:
+            raise SystemExit(1)
+    for file_name in file_names:
+        resolved_file = (parent / file_name).resolve(strict=True)
+        if resolved_file not in tracked and resolved_file not in baseline_files:
+            raise SystemExit(1)
+'@
+    & $TrustedPython -I -B -S -c $verificationCode $Python $Requirements 2>$null | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Install-LockedWorkerPythonPackages {
+    param(
+        [string]$Python,
+        [string]$BundleRoot,
+        [string]$BootstrapPip,
+        [string]$Requirements,
+        [string]$TrustedPython
+    )
+    $bootstrapCode = "import sys; sys.path.insert(0, sys.argv.pop(1)); from pip._internal.cli.main import main; raise SystemExit(main())"
+    & $Python -I -B -c $bootstrapCode $BootstrapPip install `
+        --disable-pip-version-check `
+        --no-index `
+        --find-links $BundleRoot `
+        --require-hashes `
+        --only-binary=:all: `
+        --no-compile `
+        -r $Requirements | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "The reviewed offline Worker Python dependencies could not be installed."
+    }
+    & $Python -I -B -m pip check | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "The reviewed Worker Python dependency set is inconsistent."
+    }
+    if (-not (Test-LockedWorkerRuntime $Python $Requirements $TrustedPython)) {
+        throw "The installed Worker Python files do not match the reviewed dependency lock."
+    }
+}
+
+function Remove-ClosedWorkerRuntimeTree {
+    param(
+        [string]$RuntimeRoot,
+        [string]$CandidateRoot
+    )
+    $runtimeFull = [System.IO.Path]::GetFullPath($RuntimeRoot).TrimEnd("\")
+    $candidateFull = [System.IO.Path]::GetFullPath($CandidateRoot).TrimEnd("\")
+    $allowed = @(
+        "$runtimeFull-invalid",
+        "$runtimeFull-staging"
+    )
+    if ($candidateFull -cnotin $allowed -or
+        -not [System.IO.Path]::GetDirectoryName($candidateFull).Equals(
+            [System.IO.Path]::GetDirectoryName($runtimeFull),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Worker runtime cleanup refused an unexpected path."
+    }
+    if (-not (Test-Path -LiteralPath $candidateFull)) {
+        return
+    }
+
+    $removeEntry = $null
+    $removeEntry = {
+        param([string]$Path)
+        $item = Get-Item -LiteralPath $Path -Force
+        $isReparse = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($item.PSIsContainer -and -not $isReparse) {
+            foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) {
+                & $removeEntry $child.FullName
+            }
+            $item.Attributes = [System.IO.FileAttributes]::Directory
+            [System.IO.Directory]::Delete($item.FullName, $false)
+            return
+        }
+        if ($item.PSIsContainer) {
+            [System.IO.Directory]::Delete($item.FullName, $false)
+            return
+        }
+        $item.Attributes = [System.IO.FileAttributes]::Normal
+        [System.IO.File]::Delete($item.FullName)
+    }
+    & $removeEntry $candidateFull
+}
+
+function Complete-LockedWorkerRuntime {
+    param(
+        [string]$StagingRoot,
+        [string]$RuntimeRoot
+    )
+    $quarantine = "$RuntimeRoot-invalid"
+    $movedExisting = $false
+    if (Test-Path -LiteralPath $quarantine) {
+        Remove-ClosedWorkerRuntimeTree $RuntimeRoot $quarantine
+    }
+    if (Test-Path -LiteralPath $RuntimeRoot) {
+        $existing = Get-Item -LiteralPath $RuntimeRoot -Force
+        if (-not $existing.PSIsContainer -or
+            ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The existing Worker Python runtime is not a safe local directory."
+        }
+        [System.IO.Directory]::Move($RuntimeRoot, $quarantine)
+        $movedExisting = $true
+    }
+    try {
+        [System.IO.Directory]::Move($StagingRoot, $RuntimeRoot)
+    }
+    catch {
+        if ($movedExisting -and -not (Test-Path -LiteralPath $RuntimeRoot) -and
+            (Test-Path -LiteralPath $quarantine -PathType Container)) {
+            [System.IO.Directory]::Move($quarantine, $RuntimeRoot)
+        }
+        throw
+    }
+    if ($movedExisting -and (Test-Path -LiteralPath $quarantine)) {
+        try {
+            Remove-ClosedWorkerRuntimeTree $RuntimeRoot $quarantine
+        }
+        catch {
+            Write-Warning "The replaced Worker runtime remains in its bounded quarantine path: $quarantine"
+        }
+    }
+}
+
 function Ensure-WorkerRuntime {
     param(
         [string]$RuntimeRoot,
-        [string]$WheelPath,
         [string]$BootstrapPython,
-        [string]$ExpectedVersion
+        [string]$ExpectedVersion,
+        [string]$BundleRoot,
+        [string]$BootstrapPip,
+        [string]$Requirements
     )
     $python = Join-Path $RuntimeRoot "Scripts\python.exe"
     if ($CheckOnly) {
-        if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-            Add-Finding "The dedicated VGen Worker virtual environment is not installed."
-            return $null
-        }
-        try {
-            $version = (& $python -B -c "import vgen; print(vgen.__version__)" 2>$null | Select-Object -Last 1).Trim()
-        }
-        catch {
-            Add-Finding "The VGen package cannot be imported from the Worker virtual environment."
-            return $null
-        }
-        if ($LASTEXITCODE -ne 0 -or $version -cne $ExpectedVersion) {
-            Add-Finding "The Worker virtual environment does not contain VGen $ExpectedVersion."
+        if (-not (Test-LockedWorkerRuntime $python $Requirements $BootstrapPython)) {
+            Add-Finding "The dedicated VGen Worker environment does not match its dependency lock."
             return $null
         }
         return $python
     }
 
-    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-        if ([string]::IsNullOrWhiteSpace($BootstrapPython)) {
-            throw "Python 3.11 is required to create the isolated Worker environment."
-        }
+    if (Test-LockedWorkerRuntime $python $Requirements $BootstrapPython) {
+        return $python
+    }
+    if (Test-Path -LiteralPath $RuntimeRoot) {
+        Write-Step "Preparing a clean replacement for the inconsistent Worker environment"
+    }
+    if ([string]::IsNullOrWhiteSpace($BootstrapPython)) {
+        throw "Python 3.11 is required to create the isolated Worker environment."
+    }
+    $stagingRoot = "$RuntimeRoot-staging"
+    $stagingPython = Join-Path $stagingRoot "Scripts\python.exe"
+    if (Test-Path -LiteralPath $stagingRoot) {
+        Remove-ClosedWorkerRuntimeTree $RuntimeRoot $stagingRoot
+    }
+    try {
         Write-Step "Creating dedicated Python 3.11 Worker environment"
-        & $BootstrapPython -m venv $RuntimeRoot | Out-Host
+        & $BootstrapPython -I -B -m venv --without-pip $stagingRoot | Out-Host
         $venvExitCode = $LASTEXITCODE
         if ($venvExitCode -ne 0) {
             throw "Python could not create the Worker virtual environment."
         }
+        Remove-WorkerRuntimeActivationScripts $stagingRoot
+        Write-Step "Installing the reviewed offline Worker Python dependency set"
+        Install-LockedWorkerPythonPackages `
+            $stagingPython $BundleRoot $BootstrapPip $Requirements $BootstrapPython
+        Complete-LockedWorkerRuntime $stagingRoot $RuntimeRoot
     }
-    Write-Step "Installing the reviewed VGen Worker wheel"
-    & $python -m pip install --disable-pip-version-check --upgrade pip | Out-Host
-    $pipBootstrapExitCode = $LASTEXITCODE
-    if ($pipBootstrapExitCode -ne 0) {
-        throw "pip could not initialize the Worker virtual environment."
+    finally {
+        if (Test-Path -LiteralPath $stagingRoot) {
+            try { Remove-ClosedWorkerRuntimeTree $RuntimeRoot $stagingRoot }
+            catch { Write-Warning "The bounded Worker runtime staging path could not be removed." }
+        }
     }
-    $wheelRequirement = "$WheelPath`[worker-comfyui`]"
-    & $python -m pip install --disable-pip-version-check --upgrade $wheelRequirement | Out-Host
-    $pipInstallExitCode = $LASTEXITCODE
-    if ($pipInstallExitCode -ne 0) {
-        throw "pip could not install the reviewed VGen Worker wheel."
-    }
+    $python = Join-Path $RuntimeRoot "Scripts\python.exe"
     try {
         $installedVersion = (& $python -B -c "import vgen; print(vgen.__version__)" 2>$null | Select-Object -Last 1).Trim()
     }
@@ -2638,11 +3140,48 @@ function Assert-DoctorResult {
     }
 }
 
+function Test-WorkerPathAncestryWithoutReparse {
+    param(
+        [string]$Candidate,
+        [string]$Boundary
+    )
+    try {
+        $resolvedBoundary = [System.IO.Path]::GetFullPath($Boundary).TrimEnd("\")
+        $boundaryPrefix = $resolvedBoundary + "\"
+        $current = [System.IO.Path]::GetFullPath($Candidate)
+        while ($true) {
+            if (-not $current.Equals($resolvedBoundary, [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $current.StartsWith($boundaryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+            if (Test-Path -LiteralPath $current) {
+                $item = Get-Item -LiteralPath $current -Force
+                if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    return $false
+                }
+            }
+            if ($current.Equals($resolvedBoundary, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+            $parent = [System.IO.Path]::GetDirectoryName($current)
+            if ([string]::IsNullOrWhiteSpace($parent) -or
+                $parent.Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+            $current = [System.IO.Path]::GetFullPath($parent)
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
 function Test-AllowedWorkerPythonPath {
     param(
         [string]$Candidate,
         [string]$InitialPython,
-        [string]$WorkRoot
+        [string]$WorkRoot,
+        [switch]$AllowMissing
     )
     if ([string]::IsNullOrWhiteSpace($Candidate)) {
         return $false
@@ -2654,8 +3193,15 @@ function Test-AllowedWorkerPythonPath {
         $releasePrefix = $releaseRoot.TrimEnd("\") + "\"
         $allowed = $resolvedCandidate.Equals($resolvedInitial, [System.StringComparison]::OrdinalIgnoreCase) -or
             $resolvedCandidate.StartsWith($releasePrefix, [System.StringComparison]::OrdinalIgnoreCase)
-        if (-not $allowed -or -not (Test-Path -LiteralPath $resolvedCandidate -PathType Leaf)) {
+        if (-not $allowed) {
             return $false
+        }
+        if (-not $resolvedCandidate.Equals($resolvedInitial, [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not (Test-WorkerPathAncestryWithoutReparse $resolvedCandidate $WorkRoot)) {
+            return $false
+        }
+        if (-not (Test-Path -LiteralPath $resolvedCandidate -PathType Leaf)) {
+            return [bool]$AllowMissing
         }
         $item = Get-Item -LiteralPath $resolvedCandidate
         return ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
@@ -2665,10 +3211,45 @@ function Test-AllowedWorkerPythonPath {
     }
 }
 
+function Compare-WorkerReleaseVersion {
+    param(
+        [object]$Left,
+        [object]$Right
+    )
+    if ($Left -isnot [string] -or $Right -isnot [string]) {
+        throw "The VGen Worker runtime version is invalid."
+    }
+    $pattern = '^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+    $leftMatch = [regex]::Match([string]$Left, $pattern)
+    $rightMatch = [regex]::Match([string]$Right, $pattern)
+    if (-not $leftMatch.Success -or -not $rightMatch.Success) {
+        throw "The VGen Worker runtime version is invalid."
+    }
+    foreach ($index in 1..3) {
+        $leftPart = $leftMatch.Groups[$index].Value
+        $rightPart = $rightMatch.Groups[$index].Value
+        if ($leftPart.Length -lt $rightPart.Length) {
+            return -1
+        }
+        if ($leftPart.Length -gt $rightPart.Length) {
+            return 1
+        }
+        $comparison = [string]::CompareOrdinal($leftPart, $rightPart)
+        if ($comparison -lt 0) {
+            return -1
+        }
+        if ($comparison -gt 0) {
+            return 1
+        }
+    }
+    return 0
+}
+
 function Get-WorkerRuntimeState {
     param(
         [string]$WorkRoot,
-        [string]$InitialPython
+        [string]$InitialPython,
+        [string]$InitialVersion
     )
     $pointerPath = Join-Path $WorkRoot "runtime-active.json"
     if (-not (Test-Path -LiteralPath $pointerPath)) {
@@ -2676,6 +3257,9 @@ function Get-WorkerRuntimeState {
             ActivePython = $InitialPython
             PreviousPython = $null
             Pending = $false
+            ActiveAvailable = $true
+            ActivationVerified = $false
+            SupersededPending = $false
         }
     }
     $item = Get-Item -LiteralPath $pointerPath
@@ -2689,35 +3273,204 @@ function Get-WorkerRuntimeState {
     catch {
         throw "The VGen Worker runtime pointer is invalid."
     }
-    if ($pointer.format -ne "vgen-worker-runtime-pointer" -or $pointer.version -ne 1) {
+    if ($pointer.format -cne "vgen-worker-runtime-pointer" -or
+        ($pointer.version -isnot [int] -and $pointer.version -isnot [long]) -or
+        [long]$pointer.version -ne 1) {
         throw "The VGen Worker runtime pointer is invalid."
     }
-    $pending = $null -ne $pointer.PSObject.Properties["pending_job_id"] -and
-        -not [string]::IsNullOrWhiteSpace([string]$pointer.pending_job_id)
-    $rolledBack = $null -ne $pointer.PSObject.Properties["rolled_back_job_id"] -and
-        -not [string]::IsNullOrWhiteSpace([string]$pointer.rolled_back_job_id)
-    if ($rolledBack -and -not $pending) {
+    $pendingFieldsPresent = $false
+    foreach ($fieldName in @(
+            "pending_job_id",
+            "pending_fencing_token",
+            "previous_python",
+            "previous_version",
+            "activation_verified_at"
+        )) {
+        if ($null -ne $pointer.PSObject.Properties[$fieldName]) {
+            $pendingFieldsPresent = $true
+        }
+    }
+    if ($pendingFieldsPresent) {
+        if ($null -eq $pointer.PSObject.Properties["pending_job_id"] -or
+            $pointer.pending_job_id -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$pointer.pending_job_id) -or
+            ([string]$pointer.pending_job_id).Length -gt 256 -or
+            ([string]$pointer.pending_job_id).IndexOfAny(@([char]0, [char]10, [char]13)) -ge 0 -or
+            $null -eq $pointer.PSObject.Properties["pending_fencing_token"] -or
+            ($pointer.pending_fencing_token -isnot [int] -and
+                $pointer.pending_fencing_token -isnot [long]) -or
+            [long]$pointer.pending_fencing_token -lt 1 -or
+            $null -eq $pointer.PSObject.Properties["previous_python"] -or
+            $pointer.previous_python -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$pointer.previous_python) -or
+            $null -eq $pointer.PSObject.Properties["previous_version"] -or
+            $pointer.previous_version -isnot [string] -or
+            $null -eq $pointer.PSObject.Properties["artifact_sha256"] -or
+            $pointer.artifact_sha256 -isnot [string] -or
+            ([string]$pointer.artifact_sha256) -cnotmatch '^[0-9a-f]{64}$') {
+            throw "The VGen Worker runtime pointer is invalid."
+        }
+    }
+    $pending = $pendingFieldsPresent
+    if ($null -ne $pointer.PSObject.Properties["artifact_sha256"] -and
+        ($pointer.artifact_sha256 -isnot [string] -or
+            ([string]$pointer.artifact_sha256) -cnotmatch '^[0-9a-f]{64}$')) {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    if ($null -ne $pointer.PSObject.Properties["switched_at"] -and
+        (($pointer.switched_at -isnot [int] -and $pointer.switched_at -isnot [long]) -or
+            [long]$pointer.switched_at -lt 1)) {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    $activationVerified = $false
+    if ($pending -and $null -ne $pointer.PSObject.Properties["activation_verified_at"]) {
+        $verifiedAt = $pointer.activation_verified_at
+        if (($verifiedAt -isnot [int] -and $verifiedAt -isnot [long]) -or
+            [long]$verifiedAt -lt 1) {
+            throw "The VGen Worker runtime pointer is invalid."
+        }
+        $activationVerified = $true
+    }
+    $rolledBackFieldsPresent =
+        $null -ne $pointer.PSObject.Properties["rolled_back_job_id"] -or
+        $null -ne $pointer.PSObject.Properties["rolled_back_at"]
+    if ($rolledBackFieldsPresent -and
+        ($null -eq $pointer.PSObject.Properties["rolled_back_job_id"] -or
+            $pointer.rolled_back_job_id -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$pointer.rolled_back_job_id) -or
+            ([string]$pointer.rolled_back_job_id).Length -gt 256 -or
+            $null -eq $pointer.PSObject.Properties["rolled_back_at"] -or
+            ($pointer.rolled_back_at -isnot [int] -and
+                $pointer.rolled_back_at -isnot [long]) -or
+            [long]$pointer.rolled_back_at -lt 1)) {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    $rolledBack = $rolledBackFieldsPresent
+    if ($pending -and $rolledBack) {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    # Compare every pointer, including a pending activation. A target older
+    # than this reviewed installer predates the current takeover protocol and
+    # must be resolved by launching the current base as its rollback runtime.
+    if ($null -eq $pointer.PSObject.Properties["active_version"] -or
+        $pointer.active_version -isnot [string]) {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    try {
+        $versionComparison = Compare-WorkerReleaseVersion ([string]$pointer.active_version) $InitialVersion
+    }
+    catch {
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    if ($rolledBack -and -not $pending -and $versionComparison -le 0) {
         return [PSCustomObject]@{
             ActivePython = $InitialPython
             PreviousPython = $null
             Pending = $false
+            ActiveAvailable = $true
+            ActivationVerified = $false
+            SupersededPending = $false
         }
     }
-    if (-not (Test-AllowedWorkerPythonPath ([string]$pointer.active_python) $InitialPython $WorkRoot)) {
+    if (-not (Test-AllowedWorkerPythonPath `
+            ([string]$pointer.active_python) `
+            $InitialPython `
+            $WorkRoot `
+            -AllowMissing)) {
         throw "The VGen Worker runtime pointer is invalid."
+    }
+    $activeAvailable = Test-AllowedWorkerPythonPath `
+        ([string]$pointer.active_python) `
+        $InitialPython `
+        $WorkRoot
+    if (-not $pending -and -not $activeAvailable) {
+        if ($versionComparison -le 0) {
+            return [PSCustomObject]@{
+                ActivePython = $InitialPython
+                PreviousPython = $null
+                Pending = $false
+                ActiveAvailable = $true
+                ActivationVerified = $false
+                SupersededPending = $false
+            }
+        }
+        throw "The VGen Worker runtime pointer is invalid."
+    }
+    if (-not $pending -and $versionComparison -lt 0) {
+        return [PSCustomObject]@{
+            ActivePython = $InitialPython
+            PreviousPython = $null
+            Pending = $false
+            ActiveAvailable = $true
+            ActivationVerified = $false
+            SupersededPending = $false
+        }
     }
     $previousPython = $null
     if ($pending) {
         if ($null -eq $pointer.PSObject.Properties["previous_python"] -or
-            -not (Test-AllowedWorkerPythonPath ([string]$pointer.previous_python) $InitialPython $WorkRoot)) {
+            $null -eq $pointer.PSObject.Properties["previous_version"] -or
+            $pointer.previous_version -isnot [string]) {
             throw "The VGen Worker rollback runtime pointer is invalid."
         }
-        $previousPython = [string]$pointer.previous_python
+        try {
+            $previousComparison = Compare-WorkerReleaseVersion `
+                ([string]$pointer.previous_version) `
+                $InitialVersion
+        }
+        catch {
+            throw "The VGen Worker rollback runtime pointer is invalid."
+        }
+        if ($previousComparison -le 0) {
+            $previousPython = $InitialPython
+        }
+        elseif (Test-AllowedWorkerPythonPath `
+                ([string]$pointer.previous_python) `
+                $InitialPython `
+                $WorkRoot) {
+            $previousPython = [string]$pointer.previous_python
+        }
+        else {
+            throw "The VGen Worker rollback runtime pointer is invalid."
+        }
     }
     return [PSCustomObject]@{
         ActivePython = [string]$pointer.active_python
         PreviousPython = $previousPython
         Pending = $pending
+        ActiveAvailable = $activeAvailable
+        ActivationVerified = $activationVerified
+        SupersededPending = $pending -and $versionComparison -lt 0
+    }
+}
+
+function Select-InitialWorkerRuntime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$RuntimeState
+    )
+
+    if ($RuntimeState.Pending -and -not $RuntimeState.SupersededPending -and
+        $RuntimeState.ActivationVerified -and
+        -not $RuntimeState.ActiveAvailable) {
+        throw "The verified VGen Worker update runtime is unavailable."
+    }
+    $rollback = $RuntimeState.Pending -and
+        ($RuntimeState.SupersededPending -or
+            (-not $RuntimeState.ActivationVerified -and
+                -not $RuntimeState.ActiveAvailable))
+    $python = if ($rollback) {
+        $RuntimeState.PreviousPython
+    }
+    else {
+        $RuntimeState.ActivePython
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$python)) {
+        throw "The selected VGen Worker runtime is unavailable."
+    }
+    return [PSCustomObject]@{
+        Python = [string]$python
+        Rollback = [bool]$rollback
     }
 }
 
@@ -2726,12 +3479,32 @@ function Replace-FileAtomically {
 
     $parent = Split-Path -Parent $Destination
     $backup = Join-Path $parent ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    $replacementCommitted = $false
     try {
         # Windows PowerShell 5.1 requires a real backup path here.
         [IO.File]::Replace($Source, $Destination, $backup)
+        $replacementCommitted = $true
+    }
+    catch {
+        $replacementFailure = $_
+        if ((Test-Path -LiteralPath $backup -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $Destination)) {
+            try {
+                [IO.File]::Move($backup, $Destination)
+            }
+            catch {
+                throw "Atomic file replacement failed and the original file could not be restored; its backup remains at $backup"
+            }
+        }
+        if (Test-Path -LiteralPath $backup) {
+            throw "Atomic file replacement failed; the original file backup remains at $backup"
+        }
+        throw $replacementFailure
     }
     finally {
-        if (Test-Path -LiteralPath $backup) {
+        # ReplaceFile can fail after moving the old destination to Backup. Only
+        # discard that recovery copy after the replacement definitely committed.
+        if ($replacementCommitted -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
             try { [IO.File]::Delete($backup) }
             catch { Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }
         }
@@ -2901,8 +3674,22 @@ try {
         (Join-Path $PSScriptRoot $bundleSettings.PolicyName),
         (Join-Path (Join-Path $PSScriptRoot "..") $PolicyName)
     )
+    $runtimeRequirementsPath = Resolve-BundledFile "Worker Python requirements lock" @(
+        (Join-Path $PSScriptRoot $bundleSettings.RuntimeRequirementsName)
+    )
+    $bootstrapPipPath = Resolve-BundledFile "Worker bootstrap pip wheel" @(
+        (Join-Path $PSScriptRoot $bundleSettings.BootstrapPipName)
+    )
     Assert-FileHash $wheelPath $bundleSettings.WheelSha256 "VGen Worker wheel"
     Assert-FileHash $policyPath $bundleSettings.PolicySha256 "ComfyUI execution policy"
+    Assert-FileHash `
+        $runtimeRequirementsPath `
+        $bundleSettings.RuntimeRequirementsSha256 `
+        "Worker Python requirements lock"
+    Assert-FileHash `
+        $bootstrapPipPath `
+        $bundleSettings.BootstrapPipSha256 `
+        "Worker bootstrap pip wheel"
 
     Write-Step "Checking Gateway health"
     $gatewayBase = $GatewayUrl.AbsoluteUri.TrimEnd("/")
@@ -2932,12 +3719,23 @@ try {
     $bootstrapPythonResults = @(Ensure-Python311)
     $bootstrapPython = Resolve-SingleExecutableResult `
         $bootstrapPythonResults "Python 3.11 discovery" ([bool]$CheckOnly)
-    $runtimeRoot = Join-Path $env:LOCALAPPDATA "VGen\worker-runtime-$($bundleSettings.VGenVersion)"
+    $runtimeLockId = $bundleSettings.RuntimeRequirementsSha256.Substring(0, 16)
+    $runtimeRoot = Join-Path $env:LOCALAPPDATA `
+        "VGen\worker-runtime-$($bundleSettings.VGenVersion)-$runtimeLockId"
     $runtimePythonResults = @(
-        Ensure-WorkerRuntime $runtimeRoot $wheelPath $bootstrapPython $bundleSettings.VGenVersion
+        Ensure-WorkerRuntime `
+            $runtimeRoot `
+            $bootstrapPython `
+            $bundleSettings.VGenVersion `
+            $PSScriptRoot `
+            $bootstrapPipPath `
+            $runtimeRequirementsPath
     )
     $runtimePython = Resolve-SingleExecutableResult `
         $runtimePythonResults "VGen Worker runtime preparation" ([bool]$CheckOnly)
+    if ($null -ne $runtimePython) {
+        $runtimeRoot = Split-Path -Parent (Split-Path -Parent $runtimePython)
+    }
     $comfyPython = Resolve-ComfyPython $resolvedComfyRoot $resolvedComfyDataRoot $comfyLayout.DesktopRecord
     if ($null -eq $comfyPython) {
         if ($CheckOnly) {
@@ -2968,8 +3766,10 @@ try {
         foreach ($pin in $CustomNodePins) {
             $null = Install-PinnedCustomNode $pin $customNodesRoot $comfyWasRunning $vgenComfyRoot
         }
-        foreach ($pin in $BootstrapCustomNodePins) {
-            $null = Install-PinnedCustomNode $pin $customNodesRoot $comfyWasRunning $vgenComfyRoot
+        if ($InstallLtxGguf) {
+            foreach ($pin in $BootstrapCustomNodePins) {
+                $null = Install-PinnedCustomNode $pin $customNodesRoot $comfyWasRunning $vgenComfyRoot
+            }
         }
     }
 
@@ -2978,7 +3778,7 @@ try {
             $message = "The selected ComfyUI Python runtime cannot import the required Torch, audio, or Video Helper modules."
             Add-Finding $message
         }
-        if (-not (Test-ComfyGgufPythonRequirements $comfyPython)) {
+        if ($InstallLtxGguf -and -not (Test-ComfyGgufPythonRequirements $comfyPython)) {
             Add-Finding "The selected ComfyUI Python runtime does not contain the reviewed ComfyUI-GGUF dependency versions."
         }
     }
@@ -2995,13 +3795,15 @@ try {
         if (-not (Test-ComfyPythonRequirements $comfyPython)) {
             throw "The selected ComfyUI Python runtime cannot import the required Torch, audio, or Video Helper modules."
         }
-        Write-Step "Installing reviewed ComfyUI-GGUF Python requirements into the ComfyUI runtime"
-        & $comfyPython -m pip install --disable-pip-version-check @ComfyGgufPythonRequirements
-        if ($LASTEXITCODE -ne 0) {
-            throw "ComfyUI could not install the reviewed ComfyUI-GGUF requirements."
-        }
-        if (-not (Test-ComfyGgufPythonRequirements $comfyPython)) {
-            throw "The selected ComfyUI Python runtime does not contain the reviewed ComfyUI-GGUF dependency versions."
+        if ($InstallLtxGguf) {
+            Write-Step "Installing reviewed ComfyUI-GGUF Python requirements into the ComfyUI runtime"
+            & $comfyPython -m pip install --disable-pip-version-check @ComfyGgufPythonRequirements
+            if ($LASTEXITCODE -ne 0) {
+                throw "ComfyUI could not install the reviewed ComfyUI-GGUF requirements."
+            }
+            if (-not (Test-ComfyGgufPythonRequirements $comfyPython)) {
+                throw "The selected ComfyUI Python runtime does not contain the reviewed ComfyUI-GGUF dependency versions."
+            }
         }
     }
 
@@ -3135,7 +3937,7 @@ try {
     }
 
     Write-Step "Running fail-closed Worker doctor"
-    $doctorOutput = & $workerExecutable doctor --comfy-url $ComfyUrl --comfy-output-dir $outputRoot --comfy-model-root $modelsRoot --comfy-policy-file $policyPath --progress --json
+    $doctorOutput = & $workerExecutable doctor --comfy-url $ComfyUrl --comfy-output-dir $outputRoot --comfy-model-root $modelsRoot --comfy-custom-nodes-root $customNodesRoot --comfy-policy-file $policyPath --progress --json
     $doctorExit = $LASTEXITCODE
     try {
         $doctor = (($doctorOutput | ForEach-Object { [string]$_ }) -join "`n") | ConvertFrom-Json
@@ -3170,6 +3972,7 @@ try {
         "--comfy-url", $ComfyUrl,
         "--comfy-output-dir", $outputRoot,
         "--comfy-model-root", $modelsRoot,
+        "--comfy-custom-nodes-root", $customNodesRoot,
         "--comfy-policy-file", $policyPath,
         "--work-root", $workRoot,
         "--interval", "2",
@@ -3196,7 +3999,7 @@ try {
         Write-WorkerLaunchConfig `
             $launchConfigPath `
             $runtimePython `
-            (@("-I", "-m", "vgen.worker.main") + $workerArguments) `
+            (@("-I", "-B", "-m", "vgen.worker.main") + $workerArguments) `
             $workRoot `
             $comfyPython `
             $comfyArguments `
@@ -3242,9 +4045,17 @@ try {
     # outer loop so a pre-supervisor Worker can still complete its first remote
     # upgrade without reinstalling the Windows package.
     $workerExitCode = 1
-    $activeWorkerPython = (Get-WorkerRuntimeState $workRoot $runtimePython).ActivePython
+    $runtimeState = Get-WorkerRuntimeState `
+        $workRoot $runtimePython $bundleSettings.VGenVersion
     $restartAttempts = 0
-    $launchingRollback = $false
+    $runtimeSelection = Select-InitialWorkerRuntime $runtimeState
+    $launchingRollback = $runtimeSelection.Rollback
+    $activeWorkerPython = $runtimeSelection.Python
+    # This PowerShell loop is already the stable supervisor. Prevent a nested
+    # Python supervisor. New targets also receive the reviewed base version so
+    # equal/newer protocol generations can yield after activation when needed.
+    $env:VGEN_WORKER_SUPERVISED_CHILD = "1"
+    $env:VGEN_WORKER_SUPERVISOR_BASE_VERSION = $bundleSettings.VGenVersion
     try {
         while ($true) {
             if ($launchingRollback) {
@@ -3253,12 +4064,30 @@ try {
             else {
                 [Environment]::SetEnvironmentVariable("VGEN_WORKER_UPDATE_ROLLBACK", $null, "Process")
             }
-            & $activeWorkerPython -m vgen.worker.main @workerArguments
+            & $activeWorkerPython -I -B -m vgen.worker.main @workerArguments
             $workerExitCode = $LASTEXITCODE
             [Environment]::SetEnvironmentVariable("VGEN_WORKER_UPDATE_ROLLBACK", $null, "Process")
 
-            $runtimeState = Get-WorkerRuntimeState $workRoot $runtimePython
+            $runtimeState = Get-WorkerRuntimeState `
+                $workRoot $runtimePython $bundleSettings.VGenVersion
             if ($workerExitCode -eq 75) {
+                if ($runtimeState.Pending -and $runtimeState.SupersededPending) {
+                    $restartAttempts = 1
+                    Write-Warning "The pending Worker update is older than the reviewed installer; resolving it with the base runtime."
+                    $activeWorkerPython = $runtimeState.PreviousPython
+                    $launchingRollback = $true
+                    continue
+                }
+                if ($runtimeState.Pending -and -not $runtimeState.ActiveAvailable) {
+                    if ($runtimeState.ActivationVerified) {
+                        throw "The verified VGen Worker update runtime is unavailable."
+                    }
+                    $restartAttempts = 1
+                    Write-Warning "The updated Worker runtime is unavailable; starting the reviewed rollback runtime."
+                    $activeWorkerPython = $runtimeState.PreviousPython
+                    $launchingRollback = $true
+                    continue
+                }
                 if ($runtimeState.ActivePython.Equals($activeWorkerPython, [System.StringComparison]::OrdinalIgnoreCase)) {
                     throw "The VGen Worker update restart pointer did not advance safely."
                 }
@@ -3271,14 +4100,40 @@ try {
                 continue
             }
 
-            # If the target interpreter could not reach its activation
-            # heartbeat, restart the previous runtime once.  That old process
-            # reports a signed rolled_back result and clears the pending pointer.
-            if ($workerExitCode -ne 0 -and $runtimeState.Pending -and
+            # Exit 76 is an explicit decision by the target after a definitive
+            # activation failure, so it remains authorized to start rollback.
+            if ($workerExitCode -eq 76 -and $runtimeState.Pending -and
                 $runtimeState.ActivePython.Equals($activeWorkerPython, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $restartAttempts++
                 if ($restartAttempts -gt 3) {
                     throw "The VGen Worker update failed and exceeded the safe rollback limit."
+                }
+                Write-Warning "The updated Worker requested rollback; restarting the previous reviewed runtime."
+                $activeWorkerPython = $runtimeState.PreviousPython
+                $launchingRollback = $true
+                continue
+            }
+
+            # An unexpected target failure is ambiguous after activation was
+            # verified. Retry that target so completion remains idempotent; only
+            # an unverified target may fall back to the previous runtime.
+            if ($workerExitCode -ne 0 -and $runtimeState.Pending -and
+                $runtimeState.ActivePython.Equals($activeWorkerPython, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $restartAttempts++
+                if ($restartAttempts -gt 3) {
+                    throw "The VGen Worker update failed and exceeded the safe restart limit."
+                }
+                if ($runtimeState.ActivationVerified) {
+                    if (-not $runtimeState.ActiveAvailable) {
+                        throw "The verified VGen Worker update runtime is unavailable."
+                    }
+                    # The Gateway success response may have raced a child crash.
+                    # Restart only the verified target so it can retry idempotent
+                    # remote completion and local pointer cleanup.
+                    Write-Warning "The verified Worker update did not finish cleanup; restarting the target runtime."
+                    $activeWorkerPython = $runtimeState.ActivePython
+                    $launchingRollback = $false
+                    continue
                 }
                 Write-Warning "The updated Worker did not activate; restarting the previous reviewed runtime."
                 $activeWorkerPython = $runtimeState.PreviousPython
@@ -3289,6 +4144,12 @@ try {
         }
     }
     finally {
+        [Environment]::SetEnvironmentVariable("VGEN_WORKER_SUPERVISED_CHILD", $null, "Process")
+        [Environment]::SetEnvironmentVariable(
+            "VGEN_WORKER_SUPERVISOR_BASE_VERSION",
+            $null,
+            "Process"
+        )
         Stop-VGenManagedComfyUI
     }
     exit $workerExitCode

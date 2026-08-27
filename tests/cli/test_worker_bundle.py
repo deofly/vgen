@@ -20,9 +20,16 @@ from vgen.cli.worker_bundle import (
 )
 
 WHEEL_NAME = f"vgen-{__version__}-py3-none-any.whl"
+TEST_RUNTIME_LOCK_SET_SHA256 = "0" * 64
 
 
-def _write_test_wheel(directory: Path, *, version: str = __version__) -> Path:
+def _write_test_wheel(
+    directory: Path,
+    *,
+    version: str = __version__,
+    requirements: tuple[str, ...] = (),
+    requires_python: str | None = None,
+) -> Path:
     target = directory / f"vgen-{version}-py3-none-any.whl"
     dist_info = f"vgen-{version}.dist-info"
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -31,15 +38,48 @@ def _write_test_wheel(directory: Path, *, version: str = __version__) -> Path:
         archive.writestr("vgen/cli/worker_enrollment.py", "# test enrollment\n")
         archive.writestr("vgen/assets/worker/enroll-worker.ps1", "# test enrollment script\n")
         archive.writestr("vgen/assets/worker/supervise-worker.ps1", "# test supervisor script\n")
-        archive.writestr(
-            f"{dist_info}/METADATA",
-            f"Metadata-Version: 2.4\nName: vgen\nVersion: {version}\n",
-        )
+        metadata = f"Metadata-Version: 2.4\nName: vgen\nVersion: {version}\n"
+        metadata += "".join(f"Requires-Dist: {item}\n" for item in requirements)
+        if requires_python is not None:
+            metadata += f"Requires-Python: {requires_python}\n"
+        archive.writestr(f"{dist_info}/METADATA", metadata)
         archive.writestr(
             f"{dist_info}/WHEEL",
             "Wheel-Version: 1.0\nGenerator: vgen-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
     return target
+
+
+def _write_dependency_wheel(
+    directory: Path,
+    *,
+    distribution: str,
+    version: str,
+    requirements: tuple[str, ...] = (),
+    requires_python: str | None = None,
+) -> Path:
+    filename_distribution = distribution.replace("-", "_")
+    target = directory / f"{filename_distribution}-{version}-py3-none-any.whl"
+    dist_info = f"{filename_distribution}-{version}.dist-info"
+    metadata = f"Metadata-Version: 2.4\nName: {distribution}\nVersion: {version}\n"
+    metadata += "".join(f"Requires-Dist: {item}\n" for item in requirements)
+    if requires_python is not None:
+        metadata += f"Requires-Python: {requires_python}\n"
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{filename_distribution}/__init__.py", "")
+        archive.writestr(f"{dist_info}/METADATA", metadata)
+        archive.writestr(
+            f"{dist_info}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: vgen-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    return target
+
+
+def _write_test_wheelhouse(directory: Path) -> Path:
+    wheelhouse = directory / "wheelhouse"
+    wheelhouse.mkdir()
+    _write_dependency_wheel(wheelhouse, distribution="pip", version="26.2")
+    return wheelhouse
 
 
 def test_parser_exposes_single_interactive_worker_add_command() -> None:
@@ -63,9 +103,12 @@ def test_parser_exposes_single_interactive_worker_add_command() -> None:
 def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Path) -> None:
     target = tmp_path / "public-worker-installer.zip"
     wheel_path = _write_test_wheel(tmp_path)
+    wheelhouse = _write_test_wheelhouse(tmp_path)
 
     result = create_public_windows_worker_installer_bundle(
         gateway_url="https://gateway.example",
+        wheelhouse_path=wheelhouse,
+        runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
         output=target,
         wheel_path=wheel_path,
     )
@@ -82,6 +125,8 @@ def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Pat
             "supervise-worker.ps1",
             "vgen-worker-bundle.json",
             "comfyui-minimax-h3-policy.yaml",
+            "pip-26.2-py3-none-any.whl",
+            "vgen-worker-requirements.txt",
             WHEEL_NAME,
             "SHA256SUMS",
         }
@@ -89,6 +134,16 @@ def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Pat
         config = json.loads(archive.read("vgen-worker-bundle.json"))
         assert config["gateway_url"] == "https://gateway.example"
         assert config["enrollment"]["identity"] == "generated_on_worker"
+        assert config["version"] == 2
+        assert config["python_runtime"]["bootstrap_pip"]["name"] == (
+            "pip-26.2-py3-none-any.whl"
+        )
+        assert config["python_runtime"]["lock_set_sha256"] == (
+            TEST_RUNTIME_LOCK_SET_SHA256
+        )
+        requirements = archive.read("vgen-worker-requirements.txt").decode("ascii")
+        assert f"vgen[worker-comfyui]=={__version__} --hash=sha256:" in requirements
+        assert "pip==26.2 --hash=sha256:" in requirements
         assert "worker_id" not in config
         assert "session_token" not in config
         enrollment_script = archive.read("enroll-worker.ps1").decode("utf-8")
@@ -102,6 +157,17 @@ def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Pat
         install = archive.read("INSTALL.txt").decode("utf-8")
         assert "verification code" in install
         assert "vgen worker add" in install
+
+
+def test_public_installer_rejects_an_unbound_runtime_lock_set(tmp_path: Path) -> None:
+    with pytest.raises(WorkerBundleError, match="lock-set digest"):
+        create_public_windows_worker_installer_bundle(
+            gateway_url="https://gateway.example",
+            wheelhouse_path=_write_test_wheelhouse(tmp_path),
+            runtime_lock_set_sha256="not-a-sha256",
+            output=tmp_path / "worker.zip",
+            wheel_path=_write_test_wheel(tmp_path),
+        )
 
 
 def test_public_installer_refuses_a_stale_wheel_without_local_enrollment(tmp_path: Path) -> None:
@@ -121,6 +187,8 @@ def test_public_installer_refuses_a_stale_wheel_without_local_enrollment(tmp_pat
     with pytest.raises(WorkerBundleError, match="predates credential-free enrollment"):
         create_public_windows_worker_installer_bundle(
             gateway_url="https://gateway.example",
+            wheelhouse_path=_write_test_wheelhouse(tmp_path),
+            runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
             output=tmp_path / "worker.zip",
             wheel_path=wheel_path,
         )
@@ -142,8 +210,74 @@ def test_public_installer_rejects_non_origin_or_insecure_gateway(
     with pytest.raises(WorkerBundleError, match="Gateway URL"):
         create_public_windows_worker_installer_bundle(
             gateway_url=gateway,
+            wheelhouse_path=_write_test_wheelhouse(tmp_path),
+            runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
             output=tmp_path / "worker.zip",
             wheel_path=wheel_path,
+        )
+
+
+def test_public_installer_rejects_unrelated_wheelhouse_distribution(tmp_path: Path) -> None:
+    wheel = _write_test_wheel(tmp_path)
+    wheelhouse = _write_test_wheelhouse(tmp_path)
+    _write_dependency_wheel(wheelhouse, distribution="unrelated", version="1.0.0")
+
+    with pytest.raises(WorkerBundleError, match="unrelated distributions: unrelated"):
+        create_public_windows_worker_installer_bundle(
+            gateway_url="https://gateway.example",
+            wheelhouse_path=wheelhouse,
+            runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
+            output=tmp_path / "worker.zip",
+            wheel_path=wheel,
+        )
+
+
+def test_public_installer_checks_dependency_markers_at_every_python_311_patch(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_test_wheel(
+        tmp_path,
+        requirements=("patch-only==1.0.0; python_full_version == '3.11.50'",),
+    )
+
+    with pytest.raises(WorkerBundleError, match="does not satisfy.*patch-only"):
+        create_public_windows_worker_installer_bundle(
+            gateway_url="https://gateway.example",
+            wheelhouse_path=_write_test_wheelhouse(tmp_path),
+            runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
+            output=tmp_path / "worker.zip",
+            wheel_path=wheel,
+        )
+
+
+def test_public_installer_rejects_requires_python_middle_patch_exclusion(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_test_wheel(tmp_path, requires_python="!=3.11.50")
+
+    with pytest.raises(WorkerBundleError, match="complete Python 3.11 target"):
+        create_public_windows_worker_installer_bundle(
+            gateway_url="https://gateway.example",
+            wheelhouse_path=_write_test_wheelhouse(tmp_path),
+            runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
+            output=tmp_path / "worker.zip",
+            wheel_path=wheel,
+        )
+
+
+def test_public_installer_rejects_unknown_dependency_marker(tmp_path: Path) -> None:
+    wheel = _write_test_wheel(
+        tmp_path,
+        requirements=("dependency==1.0.0; unknown_runtime == 'anything'",),
+    )
+
+    with pytest.raises(WorkerBundleError, match="invalid dependency"):
+        create_public_windows_worker_installer_bundle(
+            gateway_url="https://gateway.example",
+            wheelhouse_path=_write_test_wheelhouse(tmp_path),
+            runtime_lock_set_sha256=TEST_RUNTIME_LOCK_SET_SHA256,
+            output=tmp_path / "worker.zip",
+            wheel_path=wheel,
         )
 
 
@@ -182,6 +316,13 @@ def test_worker_update_wheel_can_target_a_newer_reviewed_release(tmp_path: Path)
 
 def test_worker_update_wheel_requires_three_part_release_version(tmp_path: Path) -> None:
     wheel = _write_test_wheel(tmp_path, version="0.2")
+
+    with pytest.raises(WorkerBundleError, match="MAJOR.MINOR.PATCH"):
+        inspect_worker_update_wheel(wheel)
+
+
+def test_worker_update_wheel_rejects_unbounded_version_components(tmp_path: Path) -> None:
+    wheel = _write_test_wheel(tmp_path, version="1000000000.2.0")
 
     with pytest.raises(WorkerBundleError, match="MAJOR.MINOR.PATCH"):
         inspect_worker_update_wheel(wheel)

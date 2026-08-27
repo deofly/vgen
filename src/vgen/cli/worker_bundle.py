@@ -9,25 +9,38 @@ import io
 import json
 import os
 import re
+import stat
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from email.parser import Parser
 from importlib import metadata, resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from packaging.markers import UndefinedComparison, UndefinedEnvironmentName, default_environment
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.tags import Tag, compatible_tags, cpython_tags, parse_tag
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
+from packaging.version import Version
 
 from vgen import __version__
 
 _BUNDLE_FORMAT = "vgen-windows-worker-bundle"
-_BUNDLE_VERSION = 1
+_BUNDLE_VERSION = 2
 _EXECUTOR_VERSION = "1.1.0"
 _POLICY_NAME = "comfyui-minimax-h3-policy.yaml"
 _SCRIPT_NAME = "setup-worker.ps1"
 _LAUNCHER_NAME = "start-worker.cmd"
 _ENROLLMENT_SCRIPT_NAME = "enroll-worker.ps1"
 _SUPERVISOR_SCRIPT_NAME = "supervise-worker.ps1"
-_WORKER_UPDATE_VERSION = re.compile(r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$")
+_RUNTIME_REQUIREMENTS_NAME = "vgen-worker-requirements.txt"
+_MAX_WHEELHOUSE_FILES = 128
+_MAX_WHEELHOUSE_BYTES = 512 * 1024 * 1024
+_WORKER_UPDATE_VERSION = re.compile(r"^(?:0|[1-9]\d{0,8})\.(?:0|[1-9]\d{0,8})\.(?:0|[1-9]\d{0,8})$")
+_RUNTIME_PYTHON_PATCHES = tuple(Version(f"3.11.{patch}") for patch in range(100))
 
 
 class WorkerBundleError(ValueError):
@@ -56,6 +69,17 @@ class WorkerUpdateArtifact:
     version: str
     size_bytes: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeWheel:
+    name: str
+    distribution: str
+    version: Version
+    sha256: str
+    value: bytes
+    requirements: tuple[str, ...]
+    requires_python: str | None
 
 
 def _sha256(value: bytes) -> str:
@@ -128,6 +152,259 @@ def _validate_public_installer_wheel(value: bytes) -> None:
         raise WorkerBundleError(
             "The Worker wheel predates credential-free enrollment; build the current release first."
         )
+
+
+def _runtime_target_tags() -> frozenset[Tag]:
+    tags = set(
+        cpython_tags(
+            python_version=(3, 11),
+            abis=("cp311", "abi3", "none"),
+            platforms=("win_amd64",),
+        )
+    )
+    tags.update(
+        compatible_tags(
+            python_version=(3, 11),
+            interpreter="cp311",
+            platforms=("win_amd64",),
+        )
+    )
+    return frozenset(tags)
+
+
+_RUNTIME_TARGET_TAGS = _runtime_target_tags()
+
+
+def _inspect_runtime_wheel(name: str, value: bytes) -> _RuntimeWheel:
+    if (
+        Path(name).name != name
+        or not name.endswith(".whl")
+        or not 1 <= len(value) <= _MAX_WHEELHOUSE_BYTES
+    ):
+        raise WorkerBundleError("The Worker wheelhouse contains an invalid wheel file.")
+    try:
+        filename_distribution, filename_version, _build, filename_tags = parse_wheel_filename(name)
+    except InvalidWheelFilename as exc:
+        raise WorkerBundleError(f"The Worker wheelhouse filename is invalid: {name}") from exc
+    if not filename_tags.intersection(_RUNTIME_TARGET_TAGS):
+        raise WorkerBundleError(f"The Worker wheel is not compatible with CPython 3.11: {name}")
+    try:
+        with zipfile.ZipFile(io.BytesIO(value)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > 8192:
+                raise WorkerBundleError(f"The Worker wheel has an invalid entry count: {name}")
+            seen: set[str] = set()
+            folded: set[str] = set()
+            total = 0
+            for info in infos:
+                path = info.filename
+                normalized = path.replace("\\", "/")
+                parts = PurePosixPath(normalized.rstrip("/")).parts
+                key = normalized.casefold()
+                if (
+                    path != normalized
+                    or path.startswith("/")
+                    or "\x00" in path
+                    or not parts
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or normalized in seen
+                    or key in folded
+                    or stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK
+                    or info.flag_bits & 0x1
+                    or info.file_size < 0
+                ):
+                    raise WorkerBundleError(f"The Worker wheel contains an unsafe entry: {name}")
+                seen.add(normalized)
+                folded.add(key)
+                total += info.file_size
+                if total > _MAX_WHEELHOUSE_BYTES:
+                    raise WorkerBundleError(f"The Worker wheel expands beyond its limit: {name}")
+            metadata_names = [item for item in seen if item.endswith(".dist-info/METADATA")]
+            wheel_names = [item for item in seen if item.endswith(".dist-info/WHEEL")]
+            if len(metadata_names) != 1 or len(wheel_names) != 1:
+                raise WorkerBundleError(f"The Worker wheel metadata is incomplete: {name}")
+            package_metadata = Parser().parsestr(archive.read(metadata_names[0]).decode("utf-8"))
+            wheel_metadata = Parser().parsestr(archive.read(wheel_names[0]).decode("utf-8"))
+            if archive.testzip() is not None:
+                raise WorkerBundleError(f"The Worker wheel contains corrupt data: {name}")
+    except WorkerBundleError:
+        raise
+    except (KeyError, OSError, UnicodeDecodeError, zipfile.BadZipFile) as exc:
+        raise WorkerBundleError(f"The Worker wheel is unreadable: {name}") from exc
+    distribution = canonicalize_name(package_metadata.get("Name", ""))
+    try:
+        version = Version(package_metadata.get("Version", ""))
+    except ValueError as exc:
+        raise WorkerBundleError(f"The Worker wheel version is invalid: {name}") from exc
+    declared_tags: set[Tag] = set()
+    for raw_tag in wheel_metadata.get_all("Tag", []):
+        try:
+            declared_tags.update(parse_tag(raw_tag))
+        except ValueError as exc:
+            raise WorkerBundleError(f"The Worker wheel tag metadata is invalid: {name}") from exc
+    if (
+        distribution != canonicalize_name(filename_distribution)
+        or version != filename_version
+        or not declared_tags
+        or declared_tags != filename_tags
+    ):
+        raise WorkerBundleError(f"The Worker wheel identity does not match its filename: {name}")
+    requires_python = package_metadata.get("Requires-Python")
+    if requires_python:
+        try:
+            python_specifier = SpecifierSet(requires_python)
+        except InvalidSpecifier as exc:
+            raise WorkerBundleError(f"The Worker wheel Requires-Python is invalid: {name}") from exc
+        if not all(
+            python_specifier.contains(candidate, prereleases=True)
+            for candidate in _RUNTIME_PYTHON_PATCHES
+        ):
+            raise WorkerBundleError(
+                f"The Worker wheel does not support the complete Python 3.11 target: {name}"
+            )
+    return _RuntimeWheel(
+        name=name,
+        distribution=distribution,
+        version=version,
+        sha256=_sha256(value),
+        value=value,
+        requirements=tuple(package_metadata.get_all("Requires-Dist", [])),
+        requires_python=requires_python,
+    )
+
+
+def validate_windows_worker_runtime_wheelhouse(
+    root: Path,
+    *,
+    vgen_name: str,
+    vgen_value: bytes,
+) -> tuple[list[_RuntimeWheel], bytes, _RuntimeWheel]:
+    expanded = root.expanduser()
+    try:
+        if expanded.is_symlink():
+            raise WorkerBundleError("The Worker wheelhouse must not be a symbolic link.")
+        candidate = expanded.resolve(strict=True)
+    except WorkerBundleError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise WorkerBundleError(
+            "The Worker wheelhouse must be a regular local directory."
+        ) from exc
+    if not candidate.is_dir():
+        raise WorkerBundleError("The Worker wheelhouse must be a regular local directory.")
+    paths = sorted(candidate.iterdir(), key=lambda item: item.name.encode("utf-8"))
+    if not paths or len(paths) >= _MAX_WHEELHOUSE_FILES:
+        raise WorkerBundleError("The Worker wheelhouse has an invalid file count.")
+    total = len(vgen_value)
+    wheels = [_inspect_runtime_wheel(vgen_name, vgen_value)]
+    names = {vgen_name.casefold()}
+    for path in paths:
+        if path.is_symlink() or not path.is_file() or path.name != path.name.strip():
+            raise WorkerBundleError("The Worker wheelhouse may contain only regular wheel files.")
+        if path.name.casefold() in names:
+            raise WorkerBundleError(f"The Worker wheelhouse has a duplicate filename: {path.name}")
+        try:
+            value = path.read_bytes()
+        except OSError as exc:
+            raise WorkerBundleError(
+                f"The Worker wheelhouse file cannot be read: {path.name}"
+            ) from exc
+        total += len(value)
+        if total > _MAX_WHEELHOUSE_BYTES:
+            raise WorkerBundleError("The Worker wheelhouse exceeds its size limit.")
+        wheels.append(_inspect_runtime_wheel(path.name, value))
+        names.add(path.name.casefold())
+
+    by_distribution: dict[str, _RuntimeWheel] = {}
+    for wheel in wheels:
+        if wheel.distribution in by_distribution:
+            raise WorkerBundleError(
+                f"The Worker wheelhouse contains more than one {wheel.distribution} wheel."
+            )
+        by_distribution[wheel.distribution] = wheel
+    pip_wheel = by_distribution.get("pip")
+    if pip_wheel is None:
+        raise WorkerBundleError("The Worker wheelhouse has no reviewed bootstrap pip wheel.")
+
+    environment_base = default_environment()
+    environment_base.update(
+        {
+            "implementation_name": "cpython",
+            "os_name": "nt",
+            "platform_machine": "AMD64",
+            "platform_python_implementation": "CPython",
+            "platform_system": "Windows",
+            "python_version": "3.11",
+            "sys_platform": "win32",
+        }
+    )
+    if "vgen" not in by_distribution:
+        raise WorkerBundleError("The Worker wheelhouse has no VGen wheel.")
+    reachable: set[str] = set()
+    for python_version in _RUNTIME_PYTHON_PATCHES:
+        python_full_version = str(python_version)
+        environment = {**environment_base, "python_full_version": python_full_version}
+        environment_reachable = {"vgen"}
+        requested_extras: dict[str, set[str]] = {"vgen": {"worker-comfyui"}}
+        changed = True
+        while changed:
+            changed = False
+            for distribution in tuple(sorted(environment_reachable)):
+                wheel = by_distribution[distribution]
+                contexts = {"", *requested_extras.get(distribution, set())}
+                for raw in wheel.requirements:
+                    try:
+                        requirement = Requirement(raw)
+                    except InvalidRequirement as exc:
+                        raise WorkerBundleError(
+                            f"The Worker wheel has an invalid dependency: {wheel.name}"
+                        ) from exc
+                    try:
+                        active = requirement.marker is None or any(
+                            requirement.marker.evaluate({**environment, "extra": extra})
+                            for extra in contexts
+                        )
+                    except (UndefinedComparison, UndefinedEnvironmentName) as exc:
+                        raise WorkerBundleError(
+                            f"The Worker wheel dependency marker cannot be evaluated: {wheel.name}"
+                        ) from exc
+                    if not active:
+                        continue
+                    dependency = by_distribution.get(canonicalize_name(requirement.name))
+                    if dependency is None or (
+                        requirement.specifier
+                        and not requirement.specifier.contains(dependency.version, prereleases=True)
+                    ):
+                        raise WorkerBundleError(
+                            f"The Worker wheelhouse does not satisfy {raw!r} from {wheel.name}."
+                        )
+                    if requirement.url is not None:
+                        raise WorkerBundleError(
+                            f"The Worker wheel uses an unreviewed direct dependency URL: {wheel.name}"
+                        )
+                    if dependency.distribution not in environment_reachable:
+                        environment_reachable.add(dependency.distribution)
+                        requested_extras[dependency.distribution] = set()
+                        changed = True
+                    before = len(requested_extras[dependency.distribution])
+                    requested_extras[dependency.distribution].update(requirement.extras)
+                    changed = changed or len(requested_extras[dependency.distribution]) != before
+        reachable.update(environment_reachable)
+
+    orphans = set(by_distribution) - reachable - {"pip"}
+    if orphans:
+        raise WorkerBundleError(
+            "The Worker wheelhouse contains unrelated distributions: " + ", ".join(sorted(orphans))
+        )
+
+    lines = ["# Generated from the reviewed Windows Worker wheelhouse; do not edit."]
+    for wheel in sorted(wheels, key=lambda item: item.distribution):
+        requirement_name = wheel.distribution
+        if wheel.distribution == "vgen":
+            requirement_name += "[worker-comfyui]"
+        lines.append(f"{requirement_name}=={wheel.version} --hash=sha256:{wheel.sha256}")
+    requirements = ("\n".join(lines) + "\n").encode("ascii")
+    return wheels, requirements, pip_wheel
 
 
 def inspect_worker_update_wheel(path: Path) -> WorkerUpdateArtifact:
@@ -364,6 +641,8 @@ def _write_public_installer_bundle(
 def create_public_windows_worker_installer_bundle(
     *,
     gateway_url: str,
+    wheelhouse_path: Path,
+    runtime_lock_set_sha256: str,
     output: Path | None = None,
     wheel_path: Path | None = None,
     overwrite: bool = False,
@@ -377,6 +656,8 @@ def create_public_windows_worker_installer_bundle(
     """
 
     endpoint = _validated_gateway_origin(gateway_url)
+    if re.fullmatch(r"[0-9a-f]{64}", runtime_lock_set_sha256) is None:
+        raise WorkerBundleError("Worker runtime lock-set digest must be lowercase SHA-256.")
     target = _safe_installer_output_path(output)
     if target.exists() and not overwrite:
         raise WorkerBundleError(f"Refusing to overwrite existing bundle: {target}")
@@ -387,6 +668,13 @@ def create_public_windows_worker_installer_bundle(
     policy = _asset_bytes(_POLICY_NAME)
     wheel_name, wheel = load_worker_wheel(wheel_path)
     _validate_public_installer_wheel(wheel)
+    runtime_wheels, runtime_requirements, bootstrap_pip = (
+        validate_windows_worker_runtime_wheelhouse(
+            wheelhouse_path,
+            vgen_name=wheel_name,
+            vgen_value=wheel,
+        )
+    )
     config = {
         "format": _BUNDLE_FORMAT,
         "version": _BUNDLE_VERSION,
@@ -398,6 +686,29 @@ def create_public_windows_worker_installer_bundle(
             "name": wheel_name,
             "version": __version__,
             "sha256": _sha256(wheel),
+        },
+        "python_runtime": {
+            "implementation": "cp",
+            "python_version": "3.11",
+            "platform": "win_amd64",
+            "lock_set_sha256": runtime_lock_set_sha256,
+            "requirements": {
+                "name": _RUNTIME_REQUIREMENTS_NAME,
+                "sha256": _sha256(runtime_requirements),
+            },
+            "bootstrap_pip": {
+                "name": bootstrap_pip.name,
+                "sha256": bootstrap_pip.sha256,
+            },
+            "wheels": [
+                {
+                    "name": item.name,
+                    "distribution": item.distribution,
+                    "version": str(item.version),
+                    "sha256": item.sha256,
+                }
+                for item in sorted(runtime_wheels, key=lambda item: item.name.encode("utf-8"))
+            ],
         },
         "policy": {"name": _POLICY_NAME, "sha256": _sha256(policy)},
         "enrollment": {
@@ -429,7 +740,11 @@ def create_public_windows_worker_installer_bundle(
             (_SUPERVISOR_SCRIPT_NAME, supervisor_script, 0o644),
             ("vgen-worker-bundle.json", config_bytes, 0o644),
             (_POLICY_NAME, policy, 0o644),
-            (wheel_name, wheel, 0o644),
+            (_RUNTIME_REQUIREMENTS_NAME, runtime_requirements, 0o644),
+            *[
+                (item.name, item.value, 0o644)
+                for item in sorted(runtime_wheels, key=lambda item: item.name.encode("utf-8"))
+            ],
         ],
     )
     return WorkerInstallerBundleResult(target, endpoint)

@@ -31,6 +31,15 @@ SSH_TARGET_PATTERN = re.compile(
     r"^(?:[A-Za-z0-9._-]+@)?(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$"
 )
 REMOTE_DIRECTORY_PATTERN = re.compile(r"^/tmp/vgen-release\.[A-Za-z0-9.-]+$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+PUBLIC_METADATA_LIMIT = 1024 * 1024
+PUBLIC_BOOTSTRAP_LIMIT = 2 * 1024 * 1024
+PUBLIC_ARTIFACT_LIMIT = 4 * 1024**3
+PUBLIC_READ_CHUNK = 1024 * 1024
+MUTABLE_CACHE_DIRECTIVES = frozenset({"public", "max-age=0", "must-revalidate"})
+IMMUTABLE_CACHE_DIRECTIVES = frozenset(
+    {"public", "max-age=31536000", "immutable"}
+)
 
 
 class ReleaseError(RuntimeError):
@@ -600,46 +609,286 @@ def _ssh_commands(target: str, port: int) -> tuple[list[str], list[str]]:
     return ["ssh", "-p", str(port), target], ["scp", "-P", str(port)]
 
 
-def _verify_public_release(release_origin: str, version: str) -> None:
-    release, _ = _validated_origin(release_origin)
+def _header_values(response: object, name: str) -> list[str]:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return []
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        values = get_all(name, [])
+        return [str(value) for value in values]
+    value = headers.get(name)
+    return [] if value is None else [str(value)]
 
-    def read(url: str, limit: int) -> bytes:
-        request = urllib.request.Request(url, headers={"User-Agent": "vgen-release/1"})
-        # Every URL is derived from the validated HTTPS origin.
-        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
-            value = response.read(limit + 1)
-        if len(value) > limit:
-            raise ReleaseError(f"public verification response exceeded its limit: {url}")
-        return value
 
-    stable = json.loads(
-        read(f"{release}/releases/channels/stable.json", 1024 * 1024)
-    )
+def _verify_public_headers(
+    response: object,
+    *,
+    url: str,
+    content_type: str,
+    cache_directives: frozenset[str],
+) -> None:
+    status = getattr(response, "status", None)
+    if status is None:
+        getcode = getattr(response, "getcode", None)
+        status = getcode() if callable(getcode) else None
+    if status != 200:
+        raise ReleaseError(f"public verification expected HTTP 200 for {url}")
+    geturl = getattr(response, "geturl", None)
+    final_url = geturl() if callable(geturl) else url
+    if final_url != url:
+        raise ReleaseError(f"public verification endpoint redirected unexpectedly: {url}")
+
+    content_types = _header_values(response, "Content-Type")
     if (
-        not isinstance(stable, dict)
-        or set(stable) != {"schema_version", "channel", "version", "manifest_sha256"}
-        or stable.get("version") != version
+        len(content_types) != 1
+        or content_types[0].split(";", 1)[0].strip().lower() != content_type
     ):
-        raise ReleaseError("public stable pointer did not switch to the requested version")
-    read(f"{release}/releases/install-macos.sh", 2 * 1024 * 1024)
-    read(f"{release}/releases/install-windows-worker.ps1", 2 * 1024 * 1024)
-    manifest = json.loads(
-        read(f"{release}/releases/{version}/manifest.json", 1024 * 1024)
+        raise ReleaseError(f"public verification Content-Type mismatch for {url}")
+    cache_values = _header_values(response, "Cache-Control")
+    actual_cache = {
+        directive.strip().lower()
+        for value in cache_values
+        for directive in value.split(",")
+        if directive.strip()
+    }
+    if not cache_directives.issubset(actual_cache):
+        raise ReleaseError(f"public verification Cache-Control mismatch for {url}")
+    encodings = {
+        item.strip().lower()
+        for value in _header_values(response, "Content-Encoding")
+        for item in value.split(",")
+        if item.strip()
+    }
+    if encodings - {"identity"}:
+        raise ReleaseError(f"public verification Content-Encoding mismatch for {url}")
+
+
+def _download_public_file(
+    url: str,
+    *,
+    limit: int,
+    content_type: str,
+    cache_directives: frozenset[str],
+    capture: bool,
+) -> tuple[bytes | None, int, str]:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept-Encoding": "identity", "User-Agent": "vgen-release/1"},
     )
+    body = bytearray() if capture else None
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        # Every URL is derived from the validated credential-free HTTPS origin.
+        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
+            _verify_public_headers(
+                response,
+                url=url,
+                content_type=content_type,
+                cache_directives=cache_directives,
+            )
+            lengths = _header_values(response, "Content-Length")
+            if len(lengths) > 1 or (
+                lengths and re.fullmatch(r"[0-9]+", lengths[0].strip()) is None
+            ):
+                raise ReleaseError(f"public verification Content-Length is invalid for {url}")
+            declared_length = int(lengths[0]) if lengths else None
+            if declared_length is not None and declared_length > limit:
+                raise ReleaseError(f"public verification response exceeded its limit: {url}")
+            while True:
+                block = response.read(PUBLIC_READ_CHUNK)
+                if not block:
+                    break
+                size += len(block)
+                if size > limit:
+                    raise ReleaseError(
+                        f"public verification response exceeded its limit: {url}"
+                    )
+                digest.update(block)
+                if body is not None:
+                    body.extend(block)
+            if declared_length is not None and size != declared_length:
+                raise ReleaseError(
+                    f"public verification Content-Length does not match the body: {url}"
+                )
+    except ReleaseError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise ReleaseError(
+            f"public verification request failed with HTTP {exc.code}: {url}"
+        ) from None
+    except OSError as exc:
+        raise ReleaseError(
+            f"public verification request failed ({type(exc).__name__}): {url}"
+        ) from None
+    return (bytes(body) if body is not None else None), size, digest.hexdigest()
+
+
+def _local_public_bytes(path: Path, *, limit: int, label: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseError(f"local public {label} must be a regular file: {path}")
+    size = path.stat().st_size
+    if size <= 0 or size > limit:
+        raise ReleaseError(f"local public {label} has an invalid size: {path}")
+    return path.read_bytes()
+
+
+def _json_object(value: bytes, *, label: str) -> dict[str, object]:
+    try:
+        payload = json.loads(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ReleaseError(f"{label} is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ReleaseError(f"{label} is not a JSON object")
+    return payload
+
+
+def _verify_public_release(
+    release_origin: str,
+    version: str,
+    *,
+    public_root: Path | None = None,
+) -> None:
+    if VERSION_PATTERN.fullmatch(version) is None:
+        raise ReleaseError("public verification version must use MAJOR.MINOR.PATCH")
+    release, _ = _validated_origin(release_origin)
+    root = public_root or REPOSITORY / "dist" / "public-releases"
+    local_manifest = _local_public_bytes(
+        root / version / "manifest.json",
+        limit=PUBLIC_METADATA_LIMIT,
+        label="manifest",
+    )
+    local_stable = _json_object(
+        _local_public_bytes(
+            root / "channels" / "stable.json",
+            limit=PUBLIC_METADATA_LIMIT,
+            label="stable pointer",
+        ),
+        label="local public stable pointer",
+    )
+    manifest_digest = hashlib.sha256(local_manifest).hexdigest()
+    expected_stable = {
+        "schema_version": 1,
+        "channel": "stable",
+        "version": version,
+        "manifest_sha256": manifest_digest,
+    }
+    if local_stable != expected_stable:
+        raise ReleaseError("local public stable pointer is not bound to the manifest")
+
+    stable_url = f"{release}/releases/channels/stable.json"
+    stable_bytes, _, _ = _download_public_file(
+        stable_url,
+        limit=PUBLIC_METADATA_LIMIT,
+        content_type="application/json",
+        cache_directives=MUTABLE_CACHE_DIRECTIVES,
+        capture=True,
+    )
+    if stable_bytes is None:
+        raise ReleaseError("public stable pointer was not captured for verification")
+    stable = _json_object(stable_bytes, label="public stable pointer")
+    if stable != expected_stable:
+        raise ReleaseError("public stable pointer did not switch to the requested release")
+
+    for filename, expected_type in (
+        ("install-macos.sh", "text/x-shellscript"),
+        ("install-windows-worker.ps1", "text/plain"),
+    ):
+        expected = _local_public_bytes(
+            root / filename,
+            limit=PUBLIC_BOOTSTRAP_LIMIT,
+            label=filename,
+        )
+        actual, size, digest = _download_public_file(
+            f"{release}/releases/{filename}",
+            limit=PUBLIC_BOOTSTRAP_LIMIT,
+            content_type=expected_type,
+            cache_directives=MUTABLE_CACHE_DIRECTIVES,
+            capture=True,
+        )
+        if (
+            actual != expected
+            or size != len(expected)
+            or digest != hashlib.sha256(expected).hexdigest()
+        ):
+            raise ReleaseError(f"public bootstrap bytes do not match the build: {filename}")
+
+    manifest_url = f"{release}/releases/{version}/manifest.json"
+    manifest_bytes, _, public_manifest_digest = _download_public_file(
+        manifest_url,
+        limit=PUBLIC_METADATA_LIMIT,
+        content_type="application/json",
+        cache_directives=IMMUTABLE_CACHE_DIRECTIVES,
+        capture=True,
+    )
+    if manifest_bytes is None:
+        raise ReleaseError("public manifest was not captured for verification")
+    if public_manifest_digest != stable["manifest_sha256"]:
+        raise ReleaseError("public manifest SHA-256 does not match the stable pointer")
+    if manifest_bytes != local_manifest:
+        raise ReleaseError("public manifest bytes do not match the local release build")
+    manifest = _json_object(manifest_bytes, label="public manifest")
+    if (
+        set(manifest)
+        != {"schema_version", "audience", "version", "published_at", "artifacts"}
+        or manifest.get("schema_version") != 1
+        or manifest.get("audience") != "public"
+        or manifest.get("version") != version
+    ):
+        raise ReleaseError("public manifest metadata is invalid")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) != 2:
         raise ReleaseError("public manifest does not contain the two expected installers")
+    expected_artifacts = {
+        f"VGen-macOS-{version}.zip": ("macos-cli", "cli-installer", "macos"),
+        f"vgen-windows-worker-installer-{version}.zip": (
+            "windows-worker-installer",
+            "worker-installer",
+            "windows",
+        ),
+    }
+    seen: set[str] = set()
     for artifact in artifacts:
-        if not isinstance(artifact, dict) or not isinstance(artifact.get("filename"), str):
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "name",
+            "kind",
+            "platform",
+            "filename",
+            "size",
+            "sha256",
+            "content_type",
+        }:
             raise ReleaseError("public manifest contains invalid artifact metadata")
-        url = f"{release}/releases/{version}/{artifact['filename']}"
-        request = urllib.request.Request(
-            url,
-            headers={"Range": "bytes=0-0", "User-Agent": "vgen-release/1"},
+        filename = artifact.get("filename")
+        identity = expected_artifacts.get(filename) if isinstance(filename, str) else None
+        size = artifact.get("size")
+        sha256 = artifact.get("sha256")
+        if (
+            identity is None
+            or filename in seen
+            or tuple(artifact.get(field) for field in ("name", "kind", "platform"))
+            != identity
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or not 0 < size <= PUBLIC_ARTIFACT_LIMIT
+            or not isinstance(sha256, str)
+            or SHA256_PATTERN.fullmatch(sha256) is None
+            or artifact.get("content_type") != "application/zip"
+        ):
+            raise ReleaseError("public manifest contains invalid artifact metadata")
+        seen.add(filename)
+        _, downloaded_size, downloaded_sha256 = _download_public_file(
+            f"{release}/releases/{version}/{filename}",
+            limit=size,
+            content_type="application/zip",
+            cache_directives=IMMUTABLE_CACHE_DIRECTIVES,
+            capture=False,
         )
-        # URL is derived from the validated HTTPS origin.
-        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
-            response.read(1)
+        if downloaded_size != size or downloaded_sha256 != sha256:
+            raise ReleaseError(f"public artifact size or SHA-256 mismatch: {filename}")
+    if seen != set(expected_artifacts):
+        raise ReleaseError("public manifest does not contain both expected installers")
 
 
 def _validate_gateway_publish_options(
@@ -812,7 +1061,11 @@ def publish_release(
         f"--domain {shlex.quote(release_domain)} --confirm-stable"
     )
     _run([*ssh, remote_command])
-    _verify_public_release(release, result.version)
+    _verify_public_release(
+        release,
+        result.version,
+        public_root=result.deployment_archive.parent / "public-releases",
+    )
     cleanup = f"rm -rf -- {shlex.quote(remote_dir)}"
     _run([*ssh, cleanup])
 

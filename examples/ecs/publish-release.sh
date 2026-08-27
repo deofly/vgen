@@ -372,34 +372,76 @@ mv -f "${STABLE_STAGE}" "${RELEASE_ROOT}/channels/stable.json"
 log "stable pointer switched to ${VERSION}"
 
 if [[ "${TESTING}" != "1" || "${VGEN_SKIP_PUBLIC_CHECK:-0}" != "1" ]]; then
-  STABLE_RESPONSE="$(mktemp "/tmp/vgen-stable-response.${VERSION}.XXXXXXXX")"
-  curl --fail --silent --show-error --max-time 20 \
-    "https://${DOMAIN}/releases/channels/stable.json" >"${STABLE_RESPONSE}"
-  VGEN_STABLE_RESPONSE="${STABLE_RESPONSE}" VGEN_RELEASE_VERSION="${VERSION}" \
-    python3 -I -B <<'PY'
-import json
+  verify_public_file() {
+    local relative="$1"
+    local expected_type="$2"
+    local cache_mode="$3"
+    local headers
+    headers="$(mktemp "${UNPACK_DIR}/public-headers.XXXXXXXX")"
+    curl --disable --fail --silent --show-error --proto '=https' \
+      --connect-timeout 20 --max-time 600 \
+      --header 'Accept-Encoding: identity' --dump-header "${headers}" \
+      "https://${DOMAIN}/releases/${relative}" | \
+      cmp -s - "${UNPACK_DIR}/${relative}"
+    VGEN_PUBLIC_HEADERS="${headers}" \
+    VGEN_EXPECTED_CONTENT_TYPE="${expected_type}" \
+    VGEN_EXPECTED_CACHE_MODE="${cache_mode}" \
+      python3 -I -B <<'PY'
 import os
+import re
 from pathlib import Path
 
-payload = json.loads(Path(os.environ["VGEN_STABLE_RESPONSE"]).read_bytes())
+raw = Path(os.environ["VGEN_PUBLIC_HEADERS"]).read_bytes().decode("iso-8859-1")
+blocks = [block for block in re.split(r"\r?\n\r?\n", raw) if block.strip()]
+responses = [block.splitlines() for block in blocks if block.startswith("HTTP/")]
+if not responses or re.fullmatch(r"HTTP/\S+\s+200(?:\s+.*)?", responses[-1][0]) is None:
+    raise SystemExit("public release endpoint did not return HTTP 200")
+headers = {}
+for line in responses[-1][1:]:
+    if not line or line[:1].isspace() or ":" not in line:
+        raise SystemExit("public release endpoint returned malformed headers")
+    name, value = line.split(":", 1)
+    headers.setdefault(name.strip().lower(), []).append(value.strip())
+content_types = headers.get("content-type", [])
+expected_type = os.environ["VGEN_EXPECTED_CONTENT_TYPE"]
 if (
-    not isinstance(payload, dict)
-    or set(payload) != {"schema_version", "channel", "version", "manifest_sha256"}
-    or payload.get("version") != os.environ["VGEN_RELEASE_VERSION"]
+    len(content_types) != 1
+    or content_types[0].split(";", 1)[0].strip().lower() != expected_type
 ):
-    raise SystemExit("public stable pointer did not switch to the requested version")
+    raise SystemExit("public release endpoint returned the wrong Content-Type")
+cache = {
+    directive.strip().lower()
+    for value in headers.get("cache-control", [])
+    for directive in value.split(",")
+    if directive.strip()
+}
+required = (
+    {"public", "max-age=0", "must-revalidate"}
+    if os.environ["VGEN_EXPECTED_CACHE_MODE"] == "mutable"
+    else {"public", "max-age=31536000", "immutable"}
+)
+if not required.issubset(cache):
+    raise SystemExit("public release endpoint returned the wrong Cache-Control")
+encodings = {
+    item.strip().lower()
+    for value in headers.get("content-encoding", [])
+    for item in value.split(",")
+    if item.strip()
+}
+if encodings - {"identity"}:
+    raise SystemExit("public release endpoint returned encoded bytes")
 PY
-  rm -f -- "${STABLE_RESPONSE}"
-  curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
-    "https://${DOMAIN}/releases/install-macos.sh"
-  curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
-    "https://${DOMAIN}/releases/install-windows-worker.ps1"
-  curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
-    "https://${DOMAIN}/releases/${VERSION}/manifest.json"
-  curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
-    "https://${DOMAIN}/releases/${VERSION}/VGen-macOS-${VERSION}.zip"
-  curl --fail --silent --show-error --max-time 20 --range 0-0 --output /dev/null \
-    "https://${DOMAIN}/releases/${VERSION}/vgen-windows-worker-installer-${VERSION}.zip"
+    rm -f -- "${headers}"
+  }
+
+  verify_public_file "channels/stable.json" "application/json" "mutable"
+  verify_public_file "install-macos.sh" "text/x-shellscript" "mutable"
+  verify_public_file "install-windows-worker.ps1" "text/plain" "mutable"
+  verify_public_file "${VERSION}/manifest.json" "application/json" "immutable"
+  verify_public_file "${VERSION}/VGen-macOS-${VERSION}.zip" \
+    "application/zip" "immutable"
+  verify_public_file "${VERSION}/vgen-windows-worker-installer-${VERSION}.zip" \
+    "application/zip" "immutable"
 fi
 
 trap - ERR INT TERM

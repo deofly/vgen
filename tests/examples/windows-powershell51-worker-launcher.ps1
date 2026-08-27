@@ -41,6 +41,7 @@ $requiredFunctions = @(
     "Get-Sha256",
     "Resolve-SafeVGenDirectory",
     "Replace-VGenFileAtomically",
+    "Remove-SafeVGenTree",
     "Install-VGenWorkerLauncher",
     "Install-VGenWorkerDesktopShortcut"
 )
@@ -71,6 +72,7 @@ $desktop = Join-Path $testRoot "Desktop"
 $vgenRoot = Join-Path $testRoot "VGen"
 $installerRoot = Join-Path $vgenRoot "installer"
 $junction = $null
+$cleanupJunction = $null
 
 function New-TestInstaller {
     param(
@@ -121,6 +123,41 @@ try {
     }
     [IO.Directory]::CreateDirectory($desktop) | Out-Null
     [IO.Directory]::CreateDirectory($installerRoot) | Out-Null
+
+    $safeCleanup = Join-Path $installerRoot "safe-cleanup"
+    [IO.Directory]::CreateDirectory((Join-Path $safeCleanup "nested")) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $safeCleanup "nested\owned.txt"), "owned")
+    Remove-SafeVGenTree $safeCleanup $installerRoot "Safe cleanup fixture"
+    if (Test-Path -LiteralPath $safeCleanup) {
+        throw "The safe installer cleanup did not remove an owned regular tree."
+    }
+
+    $cleanupOutside = Join-Path $testRoot "cleanup-outside"
+    $cleanupMarker = Join-Path $cleanupOutside "must-survive.txt"
+    $unsafeCleanup = Join-Path $installerRoot "unsafe-cleanup"
+    [IO.Directory]::CreateDirectory($cleanupOutside) | Out-Null
+    [IO.Directory]::CreateDirectory($unsafeCleanup) | Out-Null
+    [IO.File]::WriteAllText($cleanupMarker, "must survive")
+    $cleanupJunction = Join-Path $unsafeCleanup "junction"
+    $cleanupJunctionResult = & cmd.exe /d /c mklink /J $cleanupJunction $cleanupOutside 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create cleanup safety junction: $cleanupJunctionResult"
+    }
+    $unsafeCleanupRejected = $false
+    try {
+        Remove-SafeVGenTree $unsafeCleanup $installerRoot "Unsafe cleanup fixture"
+    }
+    catch {
+        $unsafeCleanupRejected = $true
+    }
+    if (-not $unsafeCleanupRejected -or
+        -not (Test-Path -LiteralPath $unsafeCleanup) -or
+        -not (Test-Path -LiteralPath $cleanupMarker -PathType Leaf)) {
+        throw "The safe installer cleanup traversed or removed an unsafe junction tree."
+    }
+    & $env:ComSpec /d /c "rmdir `"$cleanupJunction`"" | Out-Null
+    $cleanupJunction = $null
+    [IO.Directory]::Delete($unsafeCleanup, $false)
 
     $firstRoot = New-TestInstaller "0.9.1" "1" 23
     $stableLauncher = Install-VGenWorkerLauncher $firstRoot
@@ -252,6 +289,9 @@ finally {
     $env:LOCALAPPDATA = $previousLocalAppData
     if ($null -ne $junction -and (Test-Path -LiteralPath $junction)) {
         & $env:ComSpec /d /c "rmdir `"$junction`"" | Out-Null
+    }
+    if ($null -ne $cleanupJunction -and (Test-Path -LiteralPath $cleanupJunction)) {
+        & $env:ComSpec /d /c "rmdir `"$cleanupJunction`"" | Out-Null
     }
     if (Test-Path -LiteralPath $testRoot) {
         Remove-Item -LiteralPath $testRoot -Recurse -Force

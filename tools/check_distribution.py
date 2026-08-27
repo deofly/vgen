@@ -10,6 +10,16 @@ import zipfile
 from pathlib import Path
 
 LEGACY_ROOTS = ("cli/", "server/", "worker/", "deploy/")
+FORBIDDEN_SDIST_PARTS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "target",
+    }
+)
+FORBIDDEN_SDIST_SUFFIXES = (".class", ".jar", ".pyc", ".pyo")
 REQUIRED_SDIST = {
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
@@ -17,6 +27,9 @@ REQUIRED_SDIST = {
     "docs/user-guide.md",
     "LICENSE",
     "NOTICE",
+    "requirements/windows-worker-binary.lock",
+    "requirements/windows-worker-build.lock",
+    "requirements/windows-worker-source.lock",
     "README.md",
     "SECURITY.md",
     "schemas/openapi-v1.json",
@@ -29,8 +42,12 @@ REQUIRED_SDIST = {
     "examples/windows-worker/setup-worker.ps1",
     "examples/windows-worker/supervise-worker.ps1",
     "examples/windows-worker/start-worker.cmd",
+    "src/vgen/gateway/bootstrap_capabilities.py",
     "src/vgen/gateway/openapi.py",
     "src/vgen/cli/upgrade.py",
+    "src/vgen/market/paths.py",
+    "src/vgen/protocol/diagnostics.py",
+    "src/vgen/protocol/media.py",
     "tools/build_public_release.py",
     "tools/build_windows_worker_bundle.py",
     "tools/check_distribution.py",
@@ -39,6 +56,7 @@ REQUIRED_SDIST = {
     "tools/project_version.py",
     "tools/release.py",
     "tools/release.sh",
+    "tools/windows_worker_wheelhouse.py",
     "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/manifest.yaml",
     "workflows/vgen/minimax-h3-8step/1.0.0/manifest.yaml",
 }
@@ -59,8 +77,12 @@ REQUIRED_WHEEL = {
     "vgen/cli/worker_bundle.py",
     "vgen/cli/worker_enrollment.py",
     "vgen/crypto/maintenance.py",
+    "vgen/gateway/bootstrap_capabilities.py",
     "vgen/gateway/openapi.py",
     "vgen/market/capabilities.py",
+    "vgen/market/paths.py",
+    "vgen/protocol/diagnostics.py",
+    "vgen/protocol/media.py",
     "vgen/worker/capabilities.py",
     "vgen/worker/maintenance.py",
     "vgen/worker/model_installer.py",
@@ -93,6 +115,14 @@ def _check_sdist(path: Path, version: str) -> None:
     leaked = sorted(name for name in relative if name.startswith(LEGACY_ROOTS))
     if leaked:
         raise RuntimeError(f"sdist contains legacy v0 paths: {leaked[:10]}")
+    generated = sorted(
+        name
+        for name in relative
+        if FORBIDDEN_SDIST_PARTS.intersection(Path(name).parts)
+        or name.lower().endswith(FORBIDDEN_SDIST_SUFFIXES)
+    )
+    if generated:
+        raise RuntimeError(f"sdist contains generated build artifacts: {generated[:10]}")
     missing = sorted(REQUIRED_SDIST - relative)
     if missing:
         raise RuntimeError(f"sdist is missing public v1 contracts: {missing}")

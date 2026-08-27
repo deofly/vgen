@@ -26,6 +26,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$env:PYTHONDONTWRITEBYTECODE = "1"
 
 $TaskName = "VGen Worker Supervisor"
 $SupervisorFormat = "vgen-windows-worker-supervisor"
@@ -329,12 +330,32 @@ function Replace-FileAtomically {
 
     $directory = Split-Path -Parent $Destination
     $backup = Join-Path $directory ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    $replacementCommitted = $false
     try {
         # Windows PowerShell 5.1 requires a real backup path here.
         [IO.File]::Replace($Source, $Destination, $backup)
+        $replacementCommitted = $true
+    }
+    catch {
+        $replacementFailure = $_
+        if ((Test-Path -LiteralPath $backup -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $Destination)) {
+            try {
+                [IO.File]::Move($backup, $Destination)
+            }
+            catch {
+                throw "Atomic file replacement failed and the original file could not be restored; its backup remains at $backup"
+            }
+        }
+        if (Test-Path -LiteralPath $backup) {
+            throw "Atomic file replacement failed; the original file backup remains at $backup"
+        }
+        throw $replacementFailure
     }
     finally {
-        if (Test-Path -LiteralPath $backup) {
+        # ReplaceFile can fail after moving the old destination to Backup. Only
+        # discard that recovery copy after the replacement definitely committed.
+        if ($replacementCommitted -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
             try { [IO.File]::Delete($backup) }
             catch { Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }
         }

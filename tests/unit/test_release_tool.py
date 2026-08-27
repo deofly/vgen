@@ -106,6 +106,105 @@ def _public_release(tmp_path: Path, *, version: str = "0.3.1") -> Path:
     return root
 
 
+class _FakeHeaders:
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = {name.lower(): [value] for name, value in values.items()}
+
+    def get_all(self, name: str, default: list[str]) -> list[str]:
+        return self._values.get(name.lower(), default)
+
+    def get(self, name: str) -> str | None:
+        values = self._values.get(name.lower())
+        return values[0] if values else None
+
+
+class _FakePublicResponse:
+    def __init__(
+        self,
+        *,
+        url: str,
+        value: bytes,
+        headers: dict[str, str],
+        reads: list[int],
+    ) -> None:
+        self.status = 200
+        self.headers = _FakeHeaders(headers)
+        self._url = url
+        self._value = value
+        self._offset = 0
+        self._reads = reads
+
+    def __enter__(self) -> _FakePublicResponse:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, size: int) -> bytes:
+        self._reads.append(size)
+        start = self._offset
+        self._offset = min(len(self._value), self._offset + size)
+        return self._value[start : self._offset]
+
+
+def _install_public_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    public_root: Path,
+    *,
+    body_overrides: dict[str, bytes] | None = None,
+    header_overrides: dict[str, dict[str, str | None]] | None = None,
+) -> tuple[list[str], list[int]]:
+    origin = "https://vgen.example.com/releases/"
+    requests: list[str] = []
+    reads: list[int] = []
+    bodies = body_overrides or {}
+    headers = header_overrides or {}
+
+    def urlopen(request: object, *, timeout: int) -> _FakePublicResponse:
+        assert timeout == 20
+        url = request.full_url
+        assert url.startswith(origin)
+        assert request.get_header("Accept-encoding") == "identity"
+        relative = url.removeprefix(origin)
+        requests.append(relative)
+        value = bodies.get(relative, (public_root / relative).read_bytes())
+        immutable = relative.split("/", 1)[0][0].isdigit()
+        if relative.endswith(".json"):
+            content_type = "application/json"
+        elif relative.endswith(".zip"):
+            content_type = "application/zip"
+        elif relative.endswith(".ps1"):
+            content_type = "text/plain"
+        else:
+            content_type = "text/x-shellscript"
+        response_headers = {
+            "Content-Type": content_type,
+            "Cache-Control": (
+                "public, max-age=31536000, immutable"
+                if immutable
+                else "public, max-age=0, must-revalidate"
+            ),
+            "Content-Length": str(len(value)),
+        }
+        for name, replacement in headers.get(relative, {}).items():
+            if replacement is None:
+                response_headers.pop(name, None)
+            else:
+                response_headers[name] = replacement
+        return _FakePublicResponse(
+            url=url,
+            value=value,
+            headers=response_headers,
+            reads=reads,
+        )
+
+    monkeypatch.setattr(TOOL.urllib.request, "urlopen", urlopen)
+    return requests, reads
+
+
 def test_release_preflight_requires_clean_tagged_source(tmp_path) -> None:
     repository = _repository(tmp_path)
     with pytest.raises(TOOL.ReleaseError, match="required release tag"):
@@ -213,6 +312,87 @@ def test_release_deployment_archive_is_closed_and_reproducible(tmp_path) -> None
             "0.3.1/vgen-windows-worker-installer-0.3.1.zip",
         }
         assert all(member.isfile() for member in archive.getmembers())
+
+
+def test_public_release_verifier_streams_and_binds_every_published_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    version = "0.3.1"
+    public_root = _public_release(tmp_path, version=version)
+    requests, reads = _install_public_responses(monkeypatch, public_root)
+
+    TOOL._verify_public_release(
+        "https://vgen.example.com",
+        version,
+        public_root=public_root,
+    )
+
+    assert requests == [
+        "channels/stable.json",
+        "install-macos.sh",
+        "install-windows-worker.ps1",
+        f"{version}/manifest.json",
+        f"{version}/VGen-macOS-{version}.zip",
+        f"{version}/vgen-windows-worker-installer-{version}.zip",
+    ]
+    assert reads
+    assert all(size == TOOL.PUBLIC_READ_CHUNK for size in reads)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("manifest", "manifest SHA-256"),
+        ("artifact", "artifact size or SHA-256"),
+        ("bootstrap", "bootstrap bytes"),
+        ("content-type", "Content-Type mismatch"),
+        ("cache-control", "Cache-Control mismatch"),
+        ("oversize", "exceeded its limit"),
+    ],
+)
+def test_public_release_verifier_rejects_stale_or_transformed_responses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    version = "0.3.1"
+    public_root = _public_release(tmp_path, version=version)
+    body_overrides: dict[str, bytes] = {}
+    header_overrides: dict[str, dict[str, str | None]] = {}
+    if mutation == "manifest":
+        relative = f"{version}/manifest.json"
+        body_overrides[relative] = (public_root / relative).read_bytes() + b" "
+    elif mutation == "artifact":
+        relative = f"{version}/VGen-macOS-{version}.zip"
+        original = (public_root / relative).read_bytes()
+        body_overrides[relative] = bytes([original[0] ^ 1]) + original[1:]
+    elif mutation == "bootstrap":
+        body_overrides["install-macos.sh"] = b"#!/bin/sh\nexit 1\n"
+    elif mutation == "content-type":
+        header_overrides["channels/stable.json"] = {"Content-Type": "text/plain"}
+    elif mutation == "cache-control":
+        header_overrides[f"{version}/manifest.json"] = {
+            "Cache-Control": "public, max-age=0, must-revalidate"
+        }
+    else:
+        body_overrides["channels/stable.json"] = b"x" * (
+            TOOL.PUBLIC_METADATA_LIMIT + 1
+        )
+        header_overrides["channels/stable.json"] = {"Content-Length": None}
+    _install_public_responses(
+        monkeypatch,
+        public_root,
+        body_overrides=body_overrides,
+        header_overrides=header_overrides,
+    )
+
+    with pytest.raises(TOOL.ReleaseError, match=expected_error):
+        TOOL._verify_public_release(
+            "https://vgen.example.com",
+            version,
+            public_root=public_root,
+        )
 
 
 def test_release_cleanup_replaces_only_current_local_staging(tmp_path, monkeypatch) -> None:
@@ -407,7 +587,7 @@ def test_publish_can_reset_and_initialize_gateway_with_oss_role(
         lambda *args, **kwargs: "/tmp/vgen-release.0.7.0.ABCDEFGH",
     )
     monkeypatch.setattr(TOOL, "_run", fake_run)
-    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args: None)
+    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args, **kwargs: None)
 
     TOOL.publish_release(
         result,
@@ -501,7 +681,7 @@ def test_publish_can_resume_partial_gateway_without_repeating_cloud_options(
         TOOL, "_capture", lambda *args, **kwargs: "/tmp/vgen-release.0.7.1.ABCDEFGH"
     )
     monkeypatch.setattr(TOOL, "_run", lambda command, **kwargs: commands.append(command))
-    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args: None)
+    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args, **kwargs: None)
     TOOL.publish_release(
         result,
         gateway_origin="https://vgen-gw.example.com",
@@ -541,7 +721,7 @@ def test_publish_generates_cloud_kit_before_resetting_test_gateway(
         "_run",
         lambda command, **kwargs: commands.append(command),
     )
-    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args: None)
+    monkeypatch.setattr(TOOL, "_verify_public_release", lambda *args, **kwargs: None)
     TOOL.publish_release(
         result,
         gateway_origin="https://vgen-gw.example.com",
@@ -647,6 +827,123 @@ def test_ecs_publisher_is_idempotent_and_rejects_immutable_changes(tmp_path) -> 
     rejected = publish()
     assert rejected.returncode != 0
     assert "already exists with different bytes" in rejected.stderr
+
+
+def test_ecs_publisher_streams_public_files_and_validates_headers(tmp_path) -> None:
+    version = "0.3.1"
+    public_root = _public_release(tmp_path, version=version)
+    archive = TOOL.build_deployment_archive(
+        version=version,
+        public_root=public_root,
+        output=tmp_path / f"vgen-public-release-{version}.tar.gz",
+    )
+    release_root = tmp_path / "served"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    flock = fake_bin / "flock"
+    flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    flock.chmod(0o755)
+    curl = fake_bin / "curl"
+    curl.write_text(
+        """#!/bin/bash
+set -Eeuo pipefail
+headers=""
+url=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --dump-header)
+      headers="$2"
+      shift 2
+      ;;
+    --header|--connect-timeout|--max-time|--proto)
+      shift 2
+      ;;
+    --disable|--fail|--silent|--show-error)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+prefix="https://vgen.example.com/releases/"
+[[ -n "${headers}" && "${url}" == "${prefix}"* ]] || exit 2
+relative="${url#${prefix}}"
+source_file="${VGEN_FAKE_RELEASE_ROOT}/${relative}"
+[[ -f "${source_file}" ]] || exit 22
+case "${relative}" in
+  *.json) content_type="application/json" ;;
+  *.zip) content_type="application/zip" ;;
+  *.ps1) content_type="text/plain" ;;
+  *) content_type="text/x-shellscript" ;;
+esac
+case "${relative}" in
+  channels/*|install-*) cache="public, max-age=0, must-revalidate" ;;
+  *) cache="public, max-age=31536000, immutable" ;;
+esac
+if [[ "${relative}" == "${VGEN_FAKE_BAD_CACHE_PATH:-}" ]]; then
+  cache="no-store"
+fi
+printf 'HTTP/1.1 200 OK\r\nContent-Type: %s\r\nCache-Control: %s\r\n\r\n' \
+  "${content_type}" "${cache}" >"${headers}"
+printf '%s\n' "${relative}" >>"${VGEN_FAKE_CURL_LOG}"
+/bin/cat "${source_file}"
+""",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    request_log = tmp_path / "curl.log"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "VGEN_PUBLISH_TESTING": "1",
+        "VGEN_RELEASE_ROOT_OVERRIDE": str(release_root),
+        "VGEN_BACKUP_ROOT_OVERRIDE": str(tmp_path / "backups"),
+        "VGEN_LOCK_PATH_OVERRIDE": str(tmp_path / "publisher.lock"),
+        "VGEN_FAKE_RELEASE_ROOT": str(release_root),
+        "VGEN_FAKE_CURL_LOG": str(request_log),
+    }
+    command = [
+        "bash",
+        str(PUBLISHER_PATH),
+        "--archive",
+        str(archive),
+        "--version",
+        version,
+        "--domain",
+        "vgen.example.com",
+        "--confirm-stable",
+    ]
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert request_log.read_text(encoding="utf-8").splitlines() == [
+        "channels/stable.json",
+        "install-macos.sh",
+        "install-windows-worker.ps1",
+        f"{version}/manifest.json",
+        f"{version}/VGen-macOS-{version}.zip",
+        f"{version}/vgen-windows-worker-installer-{version}.zip",
+    ]
+
+    environment["VGEN_FAKE_BAD_CACHE_PATH"] = f"{version}/manifest.json"
+    rejected = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert rejected.returncode != 0
+    assert "wrong Cache-Control" in rejected.stderr
 
 
 def test_ecs_publisher_restores_channel_when_public_check_fails(tmp_path) -> None:

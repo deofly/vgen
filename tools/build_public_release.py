@@ -27,8 +27,30 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
+from packaging.version import InvalidVersion, Version
+
+from vgen.cli.worker_bundle import (
+    WorkerBundleError,
+    validate_windows_worker_runtime_wheelhouse,
+)
+
+try:
+    from windows_worker_wheelhouse import (
+        WheelhouseBuildError,
+        committed_worker_lock_set_sha256,
+        expected_committed_runtime_hashes,
+    )
+except ModuleNotFoundError:  # Imported by path from the repository test suite.
+    from tools.windows_worker_wheelhouse import (
+        WheelhouseBuildError,
+        committed_worker_lock_set_sha256,
+        expected_committed_runtime_hashes,
+    )
+
 REPOSITORY = Path(__file__).resolve().parents[1]
-_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
+_VERSION = re.compile(r"^(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})$")
 _PUBLISHED_AT = re.compile(
     r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
     r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
@@ -92,7 +114,9 @@ def _sha256_file(path: Path) -> str:
 
 
 def _json_bytes(value: dict[str, Any]) -> bytes:
-    return (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return (
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
 
 
 def _absolute(path: Path) -> Path:
@@ -136,7 +160,8 @@ def _validated_gateway_origin(value: str) -> str:
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
-        or port is None and parsed.netloc.endswith(":")
+        or port is None
+        and parsed.netloc.endswith(":")
     ):
         raise PublicReleaseBuildError(
             "origin must be HTTPS without credentials, path, query, or fragment"
@@ -307,6 +332,13 @@ def _validate_windows_bundle(path: Path, *, version: str, gateway_origin: str) -
     if path.name != expected_name:
         raise PublicReleaseBuildError(f"Windows Worker bundle must be named {expected_name}")
     try:
+        expected_lock_set_sha256 = committed_worker_lock_set_sha256()
+        expected_runtime_hashes = expected_committed_runtime_hashes()
+    except WheelhouseBuildError as exc:
+        raise PublicReleaseBuildError(
+            f"committed Windows Worker runtime locks are invalid: {exc}"
+        ) from exc
+    try:
         with zipfile.ZipFile(path) as archive:
             entries = _safe_zip_entries(archive, label="Windows Worker bundle")
             if any("/" in name for name in entries):
@@ -318,6 +350,176 @@ def _validate_windows_bundle(path: Path, *, version: str, gateway_origin: str) -
             }
             if forbidden.intersection(entries):
                 raise PublicReleaseBuildError("public Windows Worker bundle contains credentials")
+            try:
+                config = json.loads(archive.read("vgen-worker-bundle.json"))
+            except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise PublicReleaseBuildError(
+                    "Windows Worker bundle configuration is invalid"
+                ) from exc
+            python_runtime = config.get("python_runtime") if isinstance(config, dict) else None
+            requirements = (
+                python_runtime.get("requirements") if isinstance(python_runtime, dict) else None
+            )
+            bootstrap_pip = (
+                python_runtime.get("bootstrap_pip") if isinstance(python_runtime, dict) else None
+            )
+            runtime_wheels = (
+                python_runtime.get("wheels") if isinstance(python_runtime, dict) else None
+            )
+            if (
+                not isinstance(requirements, dict)
+                or requirements.get("name") != "vgen-worker-requirements.txt"
+                or not isinstance(requirements.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", requirements["sha256"]) is None
+                or not isinstance(bootstrap_pip, dict)
+                or not isinstance(bootstrap_pip.get("name"), str)
+                or re.fullmatch(
+                    r"pip-[0-9]+\.[0-9]+(?:\.[0-9]+)?-py3-none-any\.whl",
+                    bootstrap_pip["name"],
+                )
+                is None
+                or not isinstance(bootstrap_pip.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", bootstrap_pip["sha256"]) is None
+                or not isinstance(runtime_wheels, list)
+                or not 2 <= len(runtime_wheels) <= 128
+                or python_runtime.get("lock_set_sha256") != expected_lock_set_sha256
+            ):
+                raise PublicReleaseBuildError("Windows Worker Python runtime lock is invalid")
+            runtime_names: set[str] = set()
+            folded_runtime_names: set[str] = set()
+            runtime_digests: dict[str, str] = {}
+            runtime_distributions: dict[str, tuple[Version, str]] = {}
+            for record in runtime_wheels:
+                if not isinstance(record, dict) or set(record) != {
+                    "name",
+                    "distribution",
+                    "version",
+                    "sha256",
+                }:
+                    raise PublicReleaseBuildError(
+                        "Windows Worker Python runtime wheel identity is invalid"
+                    )
+                name = record.get("name")
+                digest = record.get("sha256")
+                distribution = record.get("distribution")
+                version_value = record.get("version")
+                try:
+                    filename_distribution, filename_version, _build, _tags = (
+                        parse_wheel_filename(name) if isinstance(name, str) else (None,) * 4
+                    )
+                    configured_version = Version(version_value)
+                except (InvalidVersion, InvalidWheelFilename, TypeError):
+                    raise PublicReleaseBuildError(
+                        "Windows Worker Python runtime wheel identity is invalid"
+                    ) from None
+                normalized_distribution = (
+                    canonicalize_name(distribution) if isinstance(distribution, str) else ""
+                )
+                if (
+                    not isinstance(name, str)
+                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.whl", name) is None
+                    or name.casefold() in folded_runtime_names
+                    or not normalized_distribution
+                    or normalized_distribution != canonicalize_name(filename_distribution)
+                    or configured_version != filename_version
+                    or normalized_distribution in runtime_distributions
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    or name not in entries
+                    or entries[name].is_dir()
+                    or hashlib.sha256(archive.read(entries[name])).hexdigest() != digest
+                ):
+                    raise PublicReleaseBuildError(
+                        "Windows Worker Python runtime wheel list is invalid"
+                    )
+                runtime_names.add(name)
+                folded_runtime_names.add(name.casefold())
+                runtime_digests[name] = digest
+                runtime_distributions[normalized_distribution] = (configured_version, digest)
+            if (
+                bootstrap_pip["name"] not in runtime_names
+                or runtime_digests.get(bootstrap_pip["name"]) != bootstrap_pip["sha256"]
+                or "vgen-worker-requirements.txt" not in entries
+                or entries["vgen-worker-requirements.txt"].is_dir()
+                or hashlib.sha256(archive.read(entries["vgen-worker-requirements.txt"])).hexdigest()
+                != requirements["sha256"]
+            ):
+                raise PublicReleaseBuildError(
+                    "Windows Worker Python runtime lock does not match its files"
+                )
+            try:
+                requirements_value = archive.read(entries["vgen-worker-requirements.txt"])
+                requirements_text = requirements_value.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise PublicReleaseBuildError(
+                    "Windows Worker Python requirements lock is invalid"
+                ) from exc
+            locked_requirements: dict[str, tuple[Version, str]] = {}
+            for raw in requirements_text.splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                match = re.fullmatch(r"(.+?) --hash=sha256:([0-9a-f]{64})", line)
+                try:
+                    requirement = Requirement(match.group(1) if match is not None else "")
+                    pins = list(requirement.specifier)
+                    pinned_version = Version(pins[0].version)
+                except (InvalidRequirement, InvalidVersion, IndexError):
+                    raise PublicReleaseBuildError(
+                        "Windows Worker Python requirements lock is invalid"
+                    ) from None
+                normalized = canonicalize_name(requirement.name)
+                if (
+                    match is None
+                    or requirement.url is not None
+                    or requirement.marker is not None
+                    or len(pins) != 1
+                    or pins[0].operator != "=="
+                    or normalized in locked_requirements
+                    or (normalized == "vgen" and requirement.extras != {"worker-comfyui"})
+                    or (normalized != "vgen" and requirement.extras)
+                ):
+                    raise PublicReleaseBuildError(
+                        "Windows Worker Python requirements lock is invalid"
+                    )
+                locked_requirements[normalized] = (pinned_version, match.group(2))
+            if locked_requirements != runtime_distributions or not {"pip", "vgen"}.issubset(
+                locked_requirements
+            ):
+                raise PublicReleaseBuildError(
+                    "Windows Worker Python requirements do not match the runtime wheels"
+                )
+            vgen_runtime_name = f"vgen-{version}-py3-none-any.whl"
+            if vgen_runtime_name not in runtime_names:
+                raise PublicReleaseBuildError("Windows Worker Python runtime has no VGen wheel")
+            actual_runtime_hashes = {
+                digest
+                for distribution, (_runtime_version, digest) in runtime_distributions.items()
+                if distribution != "vgen"
+            }
+            if (
+                len(actual_runtime_hashes) != len(runtime_distributions) - 1
+                or actual_runtime_hashes != expected_runtime_hashes
+            ):
+                raise PublicReleaseBuildError(
+                    "Windows Worker Python wheels differ from the committed runtime locks"
+                )
+            try:
+                with tempfile.TemporaryDirectory(prefix="vgen-release-wheelhouse-") as temporary:
+                    wheelhouse = Path(temporary)
+                    for runtime_name in runtime_names - {vgen_runtime_name}:
+                        (wheelhouse / runtime_name).write_bytes(archive.read(entries[runtime_name]))
+                    _reviewed_wheels, _reviewed_requirements, _reviewed_pip = (
+                        validate_windows_worker_runtime_wheelhouse(
+                            wheelhouse,
+                            vgen_name=vgen_runtime_name,
+                            vgen_value=archive.read(entries[vgen_runtime_name]),
+                        )
+                    )
+            except (OSError, WorkerBundleError) as exc:
+                raise PublicReleaseBuildError(
+                    f"Windows Worker Python wheelhouse is invalid: {exc}"
+                ) from exc
             required = {
                 "INSTALL.txt",
                 "enroll-worker.ps1",
@@ -326,15 +528,15 @@ def _validate_windows_bundle(path: Path, *, version: str, gateway_origin: str) -
                 "supervise-worker.ps1",
                 "vgen-worker-bundle.json",
                 "comfyui-minimax-h3-policy.yaml",
+                "vgen-worker-requirements.txt",
                 "SHA256SUMS",
-                f"vgen-{version}-py3-none-any.whl",
+                *runtime_names,
             }
             if set(entries) != required:
                 raise PublicReleaseBuildError(
                     "Windows Worker bundle files do not match the closed public allowlist"
                 )
             _verify_checksums(archive, entries, prefix="", label="Windows Worker bundle")
-            config = json.loads(archive.read("vgen-worker-bundle.json"))
             wheel_sha256 = _validated_embedded_wheel(
                 archive,
                 entries[f"vgen-{version}-py3-none-any.whl"],
@@ -348,6 +550,7 @@ def _validate_windows_bundle(path: Path, *, version: str, gateway_origin: str) -
     if (
         not isinstance(config, dict)
         or config.get("format") != "vgen-windows-worker-bundle"
+        or config.get("version") != 2
         or config.get("gateway_url") != gateway_origin
         or not isinstance(enrollment, dict)
         or enrollment.get("kind") != "worker"
@@ -357,6 +560,10 @@ def _validate_windows_bundle(path: Path, *, version: str, gateway_origin: str) -
         or wheel.get("name") != f"vgen-{version}-py3-none-any.whl"
         or wheel.get("version") != version
         or wheel.get("sha256") != wheel_sha256
+        or python_runtime.get("implementation") != "cp"
+        or python_runtime.get("python_version") != "3.11"
+        or python_runtime.get("platform") != "win_amd64"
+        or f"vgen-{version}-py3-none-any.whl" not in runtime_names
         or any(key in config for key in ("worker_id", "session_token", "invite_uri"))
     ):
         raise PublicReleaseBuildError(
@@ -441,7 +648,7 @@ def _macos_bootstrap(
     release = shlex.quote(release_origin)
     expected_version = shlex.quote(version)
     expected_manifest = shlex.quote(manifest_sha256)
-    script = f'''#!/bin/sh
+    script = f"""#!/bin/sh
 set -eu
 umask 077
 
@@ -762,7 +969,7 @@ if "$VGEN_BIN" profile show >/dev/null 2>&1; then
 else
   printf '\nNext: "%s" join --gateway %s\n' "$VGEN_BIN" "$GATEWAY_ORIGIN"
 fi
-'''
+"""
     return script.encode("utf-8")
 
 
@@ -779,7 +986,7 @@ def _windows_worker_bootstrap(
     release = json.dumps(release_origin)
     expected_version = json.dumps(version)
     expected_manifest = json.dumps(manifest_sha256)
-    script = rf'''$ErrorActionPreference = "Stop"
+    script = rf"""$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Net.Http
@@ -790,6 +997,7 @@ $ExpectedManifestSha256 = {expected_manifest}
 $ExpectedArtifact = "vgen-windows-worker-installer-$ExpectedVersion.zip"
 
 function Get-VGenBytes([string]$Url, [int64]$Limit) {{
+    if ($Limit -lt 1) {{ throw "Release file size limit is invalid." }}
     $uri = [Uri]$Url
     $origin = [Uri]$ReleaseOrigin
     if ($uri.Scheme -ne $origin.Scheme -or $uri.Host -ne $origin.Host -or $uri.Port -ne $origin.Port) {{
@@ -798,18 +1006,41 @@ function Get-VGenBytes([string]$Url, [int64]$Limit) {{
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
+    $request = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Get,
+        $uri
+    )
     $response = $null
+    $downloadStream = $null
+    $downloadMemory = $null
     try {{
-        $response = $client.GetAsync($uri).GetAwaiter().GetResult()
+        $response = $client.SendAsync(
+            $request,
+            [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+        ).GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {{
             throw "Release download returned HTTP $([int]$response.StatusCode)."
         }}
-        $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-        if ($bytes.LongLength -gt $Limit) {{ throw "Release file exceeded its size limit." }}
-        return $bytes
+        $declaredLength = $response.Content.Headers.ContentLength
+        if ($null -ne $declaredLength -and [int64]$declaredLength -gt $Limit) {{
+            throw "Release file exceeded its size limit."
+        }}
+        $downloadStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $downloadMemory = [IO.MemoryStream]::new()
+        $buffer = [byte[]]::new(65536)
+        $total = [int64]0
+        while (($read = $downloadStream.Read($buffer, 0, $buffer.Length)) -gt 0) {{
+            $total += [int64]$read
+            if ($total -gt $Limit) {{ throw "Release file exceeded its size limit." }}
+            $downloadMemory.Write($buffer, 0, $read)
+        }}
+        return ,$downloadMemory.ToArray()
     }}
     finally {{
+        if ($null -ne $downloadMemory) {{ $downloadMemory.Dispose() }}
+        if ($null -ne $downloadStream) {{ $downloadStream.Dispose() }}
         if ($null -ne $response) {{ $response.Dispose() }}
+        $request.Dispose()
         $client.Dispose()
         $handler.Dispose()
     }}
@@ -837,18 +1068,70 @@ function Resolve-SafeVGenDirectory([string]$Path, [string]$Description) {{
 function Replace-VGenFileAtomically([string]$Source, [string]$Destination) {{
     $destinationParent = Split-Path -Parent $Destination
     $backup = Join-Path $destinationParent ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    $replacementCommitted = $false
     try {{
         # Windows PowerShell 5.1 rejects a null backup path for File.Replace.
         # Keep the backup beside the destination so the replacement remains
         # same-volume and atomic, then remove it after the switch succeeds.
         [IO.File]::Replace($Source, $Destination, $backup)
+        $replacementCommitted = $true
+    }}
+    catch {{
+        $replacementFailure = $_
+        if ((Test-Path -LiteralPath $backup -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $Destination)) {{
+            try {{
+                [IO.File]::Move($backup, $Destination)
+            }}
+            catch {{
+                throw "Atomic file replacement failed and the original file could not be restored; its backup remains at $backup"
+            }}
+        }}
+        if (Test-Path -LiteralPath $backup) {{
+            throw "Atomic file replacement failed; the original file backup remains at $backup"
+        }}
+        throw $replacementFailure
     }}
     finally {{
-        if (Test-Path -LiteralPath $backup) {{
+        # ReplaceFile can fail after moving the old destination to Backup. Only
+        # discard that recovery copy after the replacement definitely committed.
+        if ($replacementCommitted -and (Test-Path -LiteralPath $backup -PathType Leaf)) {{
             try {{ [IO.File]::Delete($backup) }}
             catch {{ Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }}
         }}
     }}
+}}
+
+function Remove-SafeVGenTree([string]$Path, [string]$ExpectedParent, [string]$Description) {{
+    if (-not (Test-Path -LiteralPath $Path)) {{ return }}
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd("\")
+    $fullParent = [IO.Path]::GetFullPath($ExpectedParent).TrimEnd("\")
+    $actualParent = [IO.Path]::GetDirectoryName($fullPath)
+    if ([string]::IsNullOrWhiteSpace($actualParent) -or
+        -not $actualParent.Equals($fullParent, [StringComparison]::OrdinalIgnoreCase)) {{
+        throw "$Description is outside the reviewed installer directory."
+    }}
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($fullPath)
+    while ($pending.Count -gt 0) {{
+        $current = $pending.Pop()
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+            throw "$Description contains an unsafe reparse point."
+        }}
+        if ($item.PSIsContainer) {{
+            foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {{
+                if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+                    throw "$Description contains an unsafe reparse point."
+                }}
+                if ($child.PSIsContainer) {{ $pending.Push($child.FullName) }}
+            }}
+        }}
+        elseif ($current.Equals($fullPath, [StringComparison]::OrdinalIgnoreCase)) {{
+            throw "$Description is not a directory."
+        }}
+    }}
+    [IO.Directory]::Delete($fullPath, $true)
 }}
 
 function Install-VGenWorkerLauncher([string]$InstallRoot) {{
@@ -1032,6 +1315,7 @@ if (-not (Test-Path -LiteralPath $parent)) {{
 $parent = Resolve-SafeVGenDirectory $parent "The VGen installer directory"
 $installRoot = Join-Path $parent "$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"
 $staging = "$installRoot.staging-$([Guid]::NewGuid().ToString('N'))"
+$backup = $null
 [IO.Directory]::CreateDirectory($staging) | Out-Null
 $archivePath = Join-Path $staging $ExpectedArtifact
 [IO.File]::WriteAllBytes($archivePath, $archiveBytes)
@@ -1073,12 +1357,49 @@ try {{
             ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
             throw "Existing VGen installer directory is unsafe."
         }}
-        Remove-Item -LiteralPath $installRoot -Recurse -Force
+        $backup = "$installRoot.backup-$([Guid]::NewGuid().ToString('N'))"
+        [IO.Directory]::Move($installRoot, $backup)
     }}
-    Move-Item -LiteralPath $staging -Destination $installRoot
+    # Directory.Move is a same-volume, fail-if-destination-exists rename.
+    # Move-Item would instead nest staging inside a directory created by a
+    # concurrent installer and falsely report a successful publication.
+    [IO.Directory]::Move($staging, $installRoot)
+    if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {{
+        try {{
+            Remove-SafeVGenTree $backup $parent "The previous installer backup"
+            $backup = $null
+        }} catch {{
+            Write-Warning "The previous installer directory could not be cleaned up: $backup"
+        }}
+    }}
 }} catch {{
-    if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force }}
-    throw
+    $replacementFailure = $_
+    $restoreFailure = $null
+    # Restore before best-effort staging cleanup. A locked staging file must
+    # never strand the previous complete installer under a random backup name.
+    if ($null -ne $backup -and (Test-Path -LiteralPath $backup) -and
+        -not (Test-Path -LiteralPath $installRoot)) {{
+        try {{
+            [IO.Directory]::Move($backup, $installRoot)
+            $backup = $null
+        }} catch {{
+            $restoreFailure = $_
+        }}
+    }}
+    if (Test-Path -LiteralPath $staging) {{
+        try {{
+            Remove-SafeVGenTree $staging $parent "The failed installer staging directory"
+        }} catch {{
+            Write-Warning "The failed VGen installer staging directory could not be cleaned up: $staging"
+        }}
+    }}
+    if ($null -ne $restoreFailure) {{
+        throw "VGen installer replacement and automatic restore failed; the previous verified installer remains at $backup"
+    }}
+    if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {{
+        Write-Warning "A concurrent installer destination appeared; the previous verified installer remains at $backup"
+    }}
+    throw $replacementFailure
 }}
 
 $stableLauncher = Install-VGenWorkerLauncher $installRoot
@@ -1086,7 +1407,7 @@ Install-VGenWorkerDesktopShortcut $stableLauncher
 Write-Host "[vgen] Verified. Starting the universal Worker installer..."
 & $stableLauncher -Repair
 if ($LASTEXITCODE -ne 0) {{ throw "Windows Worker setup stopped with exit code $LASTEXITCODE." }}
-'''
+"""
     return script.encode("utf-8")
 
 
@@ -1106,9 +1427,7 @@ def build_public_release(
     gateway_origin = _validated_gateway_origin(gateway_origin)
     release_origin = _validated_gateway_origin(release_origin)
     macos_bundle = _regular_source(macos_bundle, label="macOS CLI bundle")
-    windows_worker_bundle = _regular_source(
-        windows_worker_bundle, label="Windows Worker bundle"
-    )
+    windows_worker_bundle = _regular_source(windows_worker_bundle, label="Windows Worker bundle")
     if macos_bundle == windows_worker_bundle:
         raise PublicReleaseBuildError("public artifacts must be distinct files")
     macos_wheel_sha256 = _validate_macos_bundle(
@@ -1251,9 +1570,7 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = _parser().parse_args()
     version = arguments.version
-    macos_bundle = arguments.mac_bundle or (
-        REPOSITORY / "dist" / f"VGen-macOS-{version}.zip"
-    )
+    macos_bundle = arguments.mac_bundle or (REPOSITORY / "dist" / f"VGen-macOS-{version}.zip")
     windows_bundle = arguments.windows_worker_bundle or (
         REPOSITORY / "dist" / f"vgen-windows-worker-installer-{version}.zip"
     )

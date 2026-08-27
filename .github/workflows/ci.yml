@@ -30,6 +30,17 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[gateway,broker,worker-comfyui,oss,dev]'
       - run: python -m pip install -e 'sdks/python[dev]'
+      - name: Rebuild the deterministic Windows Worker wheelhouse
+        if: matrix.python-version == '3.11' || matrix.python-version == '3.14'
+        run: python tools/windows_worker_wheelhouse.py --output "$RUNNER_TEMP/windows-worker-wheelhouse"
+      - name: Rebuild the wheelhouse under a restrictive umask
+        if: matrix.python-version == '3.11'
+        run: |
+          umask 077
+          python tools/windows_worker_wheelhouse.py --output "$RUNNER_TEMP/windows-worker-wheelhouse-umask077"
+          (cd "$RUNNER_TEMP/windows-worker-wheelhouse" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/wheelhouse-default.sha256"
+          (cd "$RUNNER_TEMP/windows-worker-wheelhouse-umask077" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/wheelhouse-umask077.sha256"
+          diff -u "$RUNNER_TEMP/wheelhouse-default.sha256" "$RUNNER_TEMP/wheelhouse-umask077.sha256"
       - run: ruff check src tests tools sdks/python/src sdks/python/tests
       - run: python -m pytest
       - run: python -m pytest
@@ -66,6 +77,11 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[gateway,broker,worker-comfyui,oss,dev]'
       - run: python -m pip_audit . --progress-spinner off
+      - name: Audit the pinned Windows Worker runtime
+        run: |
+          python -m pip_audit --progress-spinner off --no-deps --disable-pip -r requirements/windows-worker-binary.lock
+          python -m pip_audit --progress-spinner off --no-deps --disable-pip -r requirements/windows-worker-source.lock
+          python -m pip_audit --progress-spinner off --no-deps --disable-pip -r requirements/windows-worker-build.lock
       - run: bandit -c pyproject.toml -r src tools sdks/python/src
 
   windows-powershell-51:
@@ -76,6 +92,36 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
+      - name: Install Windows Worker test dependencies
+        run: python -m pip install -e '.[worker-comfyui]' pytest
+      - name: Rebuild the reviewed offline Worker wheelhouse on Windows
+        run: python tools/windows_worker_wheelhouse.py --output "$env:RUNNER_TEMP\windows-worker-wheelhouse"
+      - name: Build the reviewed Windows Worker installer fixture
+        shell: powershell
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP "worker-dist"
+          New-Item -ItemType Directory -Path $dist | Out-Null
+          python -m pip wheel --no-deps --wheel-dir $dist .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $wheels = @(Get-ChildItem -LiteralPath $dist -Filter "vgen-*.whl")
+          if ($wheels.Count -ne 1) { throw "Expected exactly one VGen wheel." }
+          $version = (& python -c "import vgen; print(vgen.__version__)").Trim()
+          $bundle = Join-Path $env:RUNNER_TEMP "vgen-windows-worker-installer-$version.zip"
+          python tools/build_windows_worker_bundle.py `
+            --gateway "https://gateway.example" `
+            --wheel $wheels[0].FullName `
+            --wheelhouse "$env:RUNNER_TEMP\windows-worker-wheelhouse" `
+            --output $bundle
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive -LiteralPath $bundle -DestinationPath "$env:RUNNER_TEMP\worker-bundle"
+      - name: Exercise Python runtime locking on Windows
+        run: >-
+          python -m pytest -q
+          tests/cli/test_worker_bundle.py
+          tests/examples/test_windows_worker_setup.py
+          tests/worker/test_updater.py
+          tests/worker/test_supervisor.py
+          tests/worker/test_model_installer.py
       - name: Parse the Worker installers with Windows PowerShell 5.1
         shell: powershell
         run: |
@@ -128,6 +174,19 @@ jobs:
         run: |
           .\tests\examples\windows-powershell51-worker-supervisor.ps1 `
             -RepositoryRoot "$PWD"
+      - name: Verify Worker runtime pointer precedence
+        shell: powershell
+        run: |
+          .\tests\examples\windows-powershell51-runtime-pointer.ps1 `
+            -RepositoryRoot "$PWD"
+      - name: Verify the offline locked Worker runtime
+        shell: powershell
+        run: |
+          $bootstrapPython = (Get-Command python).Source
+          .\tests\examples\windows-powershell51-locked-runtime.ps1 `
+            -RepositoryRoot "$PWD" `
+            -BundleRoot "$env:RUNNER_TEMP\worker-bundle" `
+            -BootstrapPython $bootstrapPython
       - name: Verify repeated atomic model-path replacement
         shell: powershell
         run: .\tests\examples\windows-powershell51-model-paths.ps1

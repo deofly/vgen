@@ -23,6 +23,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$env:PYTHONDONTWRITEBYTECODE = "1"
 $managedSupervisorForRecovery = $null
 $powerShellForRecovery = $null
 $supervisorStoppedForRepair = $false
@@ -74,12 +75,32 @@ function Replace-FileAtomically {
 
     $parent = Split-Path -Parent $Destination
     $backup = Join-Path $parent ".$([IO.Path]::GetFileName($Destination)).$([Guid]::NewGuid().ToString('N')).bak"
+    $replacementCommitted = $false
     try {
         # Windows PowerShell 5.1 requires a real backup path here.
         [IO.File]::Replace($Source, $Destination, $backup)
+        $replacementCommitted = $true
+    }
+    catch {
+        $replacementFailure = $_
+        if ((Test-Path -LiteralPath $backup -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $Destination)) {
+            try {
+                [IO.File]::Move($backup, $Destination)
+            }
+            catch {
+                throw "Atomic file replacement failed and the original file could not be restored; its backup remains at $backup"
+            }
+        }
+        if (Test-Path -LiteralPath $backup) {
+            throw "Atomic file replacement failed; the original file backup remains at $backup"
+        }
+        throw $replacementFailure
     }
     finally {
-        if (Test-Path -LiteralPath $backup) {
+        # ReplaceFile can fail after moving the old destination to Backup. Only
+        # discard that recovery copy after the replacement definitely committed.
+        if ($replacementCommitted -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
             try { [IO.File]::Delete($backup) }
             catch { Write-Warning "A temporary VGen replacement backup could not be removed: $backup" }
         }
@@ -200,6 +221,7 @@ function Assert-ClosedBundleDirectory {
         "supervise-worker.ps1",
         "vgen-worker-bundle.json",
         "comfyui-minimax-h3-policy.yaml",
+        "vgen-worker-requirements.txt",
         "SHA256SUMS"
     )
     $wheelCount = 0
@@ -211,14 +233,14 @@ function Assert-ClosedBundleDirectory {
         if ($allowedNames -ccontains $item.Name) {
             continue
         }
-        if ($item.Name -cmatch '^vgen-[0-9]+\.[0-9]+\.[0-9]+-py3-none-any\.whl$') {
+        if ($item.Name -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.whl$') {
             $wheelCount += 1
             continue
         }
         throw "The Worker installer folder contains an unexpected entry: $($item.Name)"
     }
-    if ($wheelCount -ne 1) {
-        throw "The Worker installer folder must contain exactly one reviewed VGen wheel."
+    if ($wheelCount -lt 2 -or $wheelCount -gt 128) {
+        throw "The Worker installer folder has an invalid reviewed wheel count."
     }
 }
 
@@ -285,6 +307,450 @@ function Ensure-Python311 {
     return $python
 }
 
+function Remove-WorkerRuntimeActivationScripts {
+    param([string]$StagingRoot)
+
+    $scriptsRoot = Join-Path $StagingRoot "Scripts"
+    if (-not (Test-Path -LiteralPath $scriptsRoot -PathType Container)) {
+        throw "The new Worker Python runtime has no Scripts directory."
+    }
+    $scriptsItem = Get-Item -LiteralPath $scriptsRoot -Force
+    if (($scriptsItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The new Worker Python Scripts directory is unsafe."
+    }
+    foreach ($activationName in @(
+            "activate",
+            "activate.bat",
+            "Activate.ps1",
+            "deactivate.bat"
+        )) {
+        $activationPath = Join-Path $scriptsRoot $activationName
+        if (-not (Test-Path -LiteralPath $activationPath -PathType Leaf)) {
+            throw "The new Worker Python runtime has an unexpected activation-script layout."
+        }
+        $activationItem = Get-Item -LiteralPath $activationPath -Force
+        if ($activationItem.PSIsContainer -or
+            ($activationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The new Worker Python runtime contains an unsafe activation script."
+        }
+        [System.IO.File]::Delete($activationItem.FullName)
+    }
+
+    $requiredLaunchers = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $null = $requiredLaunchers.Add("python.exe")
+    $null = $requiredLaunchers.Add("pythonw.exe")
+    foreach ($remaining in @(Get-ChildItem -LiteralPath $scriptsRoot -Force)) {
+        if ($remaining.PSIsContainer -or
+            ($remaining.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not $requiredLaunchers.Remove($remaining.Name)) {
+            throw "The new Worker Python Scripts directory is not closed before package installation."
+        }
+    }
+    if ($requiredLaunchers.Count -ne 0) {
+        throw "The new Worker Python runtime is missing a required CPython launcher."
+    }
+}
+
+function Test-LockedWorkerRuntime {
+    param(
+        [string]$Python,
+        [string]$Requirements,
+        [string]$TrustedPython
+    )
+    if ([string]::IsNullOrWhiteSpace($TrustedPython) -or
+        -not (Test-Path -LiteralPath $Python -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $Requirements -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $TrustedPython -PathType Leaf)) {
+        return $false
+    }
+    foreach ($verificationInput in @($Python, $Requirements, $TrustedPython)) {
+        try {
+            $verificationItem = Get-Item -LiteralPath $verificationInput -Force
+            if ($verificationItem.PSIsContainer -or
+                ($verificationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+        }
+        catch {
+            return $false
+        }
+    }
+    $verificationCode = @'
+import base64
+import csv
+import hashlib
+import io
+import os
+import platform
+import re
+import sys
+import sysconfig
+from importlib import metadata
+from pathlib import Path
+
+def is_reparse(path):
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        raise SystemExit(1)
+    return path.is_symlink() or bool(attributes & 0x400)
+
+def canonicalize_name(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+def same_path(left, right):
+    return os.path.normcase(str(left.resolve(strict=True))) == os.path.normcase(
+        str(right.resolve(strict=True))
+    )
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
+
+if sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 11):
+    raise SystemExit(1)
+trusted_python = Path(sys.executable)
+target_python = Path(sys.argv[1])
+requirements_path = Path(sys.argv[2])
+if target_python.name != "python.exe" or target_python.parent.name != "Scripts":
+    raise SystemExit(1)
+runtime_path = target_python.parent.parent
+runtime_root = runtime_path.resolve(strict=True)
+if is_reparse(runtime_path) or same_path(trusted_python, target_python):
+    raise SystemExit(1)
+if not same_path(target_python, runtime_path / "Scripts" / "python.exe"):
+    raise SystemExit(1)
+
+root_entries = {entry.name: entry for entry in runtime_path.iterdir()}
+if set(root_entries) != {"Include", "Lib", "Scripts", "pyvenv.cfg"}:
+    raise SystemExit(1)
+for directory_name in ("Include", "Lib", "Scripts"):
+    directory = root_entries[directory_name]
+    if is_reparse(directory) or not directory.is_dir():
+        raise SystemExit(1)
+if set(entry.name for entry in (runtime_path / "Lib").iterdir()) != {"site-packages"}:
+    raise SystemExit(1)
+
+site_path = runtime_path / "Lib" / "site-packages"
+site_root = site_path.resolve(strict=True)
+try:
+    site_root.relative_to(runtime_root)
+except ValueError:
+    raise SystemExit(1)
+if is_reparse(site_path) or not site_root.is_dir():
+    raise SystemExit(1)
+
+target_pythonw = runtime_path / "Scripts" / "pythonw.exe"
+for executable in (target_python, target_pythonw, trusted_python):
+    if is_reparse(executable) or not executable.is_file():
+        raise SystemExit(1)
+if (
+    trusted_python.name.casefold() != "python.exe"
+    or bool(sysconfig.get_config_var("Py_DEBUG"))
+    or sysconfig.is_python_build()
+):
+    raise SystemExit(1)
+
+trusted_stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+launcher_root = trusted_stdlib / "venv" / "scripts" / "nt"
+if is_reparse(trusted_stdlib) or is_reparse(launcher_root) or not launcher_root.is_dir():
+    raise SystemExit(1)
+
+def locate_launcher(installed_name, packaged_name, fallback_name):
+    candidates = (
+        launcher_root / installed_name,
+        launcher_root / packaged_name,
+        trusted_python.parent / fallback_name,
+    )
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve(strict=True)
+        try:
+            if candidate.parent == launcher_root:
+                resolved.relative_to(trusted_stdlib)
+            else:
+                resolved.relative_to(trusted_python.parent.resolve(strict=True))
+        except ValueError:
+            raise SystemExit(1)
+        if is_reparse(candidate) or not candidate.is_file():
+            raise SystemExit(1)
+        return candidate
+    raise SystemExit(1)
+
+console_launcher = locate_launcher("python.exe", "venvlauncher.exe", "venvlauncher.exe")
+windowed_launcher = locate_launcher("pythonw.exe", "venvwlauncher.exe", "venvwlauncher.exe")
+if sha256_file(target_python) != sha256_file(console_launcher):
+    raise SystemExit(1)
+if sha256_file(target_pythonw) != sha256_file(windowed_launcher):
+    raise SystemExit(1)
+
+configuration_path = runtime_path / "pyvenv.cfg"
+if is_reparse(configuration_path) or not configuration_path.is_file():
+    raise SystemExit(1)
+try:
+    configuration_value = configuration_path.read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if not 1 <= len(configuration_value) <= 16384 or "\x00" in configuration_value:
+    raise SystemExit(1)
+configuration = {}
+for raw_line in configuration_value.splitlines():
+    key, separator, value = raw_line.partition(" = ")
+    if not separator or not key or key in configuration or not value:
+        raise SystemExit(1)
+    configuration[key] = value
+if set(configuration) != {
+    "home",
+    "include-system-site-packages",
+    "version",
+    "executable",
+    "command",
+}:
+    raise SystemExit(1)
+try:
+    home_matches = same_path(Path(configuration["home"]), trusted_python.parent)
+    executable_matches = same_path(Path(configuration["executable"]), trusted_python)
+except OSError:
+    raise SystemExit(1)
+command = configuration["command"]
+if (
+    not home_matches
+    or not executable_matches
+    or configuration["include-system-site-packages"].casefold() != "false"
+    or configuration["version"] != platform.python_version()
+    or " -m venv --without-pip " not in command
+    or os.path.normcase(str(runtime_path)) not in os.path.normcase(command)
+):
+    raise SystemExit(1)
+
+expected = {}
+for raw in requirements_path.read_text(encoding="ascii").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    match = re.fullmatch(
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)(\[worker-comfyui\])?"
+        r"==([A-Za-z0-9][A-Za-z0-9.!+_-]*) --hash=sha256:[0-9a-f]{64}",
+        line,
+    )
+    if match is None:
+        raise SystemExit(1)
+    name = canonicalize_name(match.group(1))
+    extra = match.group(2)
+    if (name == "vgen" and extra != "[worker-comfyui]") or (name != "vgen" and extra):
+        raise SystemExit(1)
+    if name in expected:
+        raise SystemExit(1)
+    expected[name] = match.group(3)
+
+installed = {}
+distributions = list(metadata.distributions(path=[str(site_root)]))
+for distribution in distributions:
+    name = canonicalize_name(distribution.metadata.get("Name", ""))
+    if not name or name in installed:
+        raise SystemExit(1)
+    installed[name] = distribution.version
+if installed != expected:
+    raise SystemExit(1)
+
+tracked = set()
+for distribution in distributions:
+    record = distribution.read_text("RECORD")
+    if record is None:
+        raise SystemExit(1)
+    distribution_paths = set()
+    for relative, encoded_hash, raw_size in csv.reader(io.StringIO(record)):
+        try:
+            raw_target = Path(distribution.locate_file(relative))
+            target = raw_target.resolve()
+            target.relative_to(runtime_root)
+        except (OSError, ValueError):
+            raise SystemExit(1)
+        if is_reparse(raw_target) or target in distribution_paths or target in tracked:
+            raise SystemExit(1)
+        if not encoded_hash:
+            if not relative.endswith(".dist-info/RECORD") or raw_size:
+                raise SystemExit(1)
+            distribution_paths.add(target)
+            tracked.add(target)
+            continue
+        try:
+            algorithm, encoded = encoded_hash.split("=", 1)
+            value = target.read_bytes()
+        except (OSError, ValueError):
+            raise SystemExit(1)
+        if algorithm != "sha256" or not raw_size.isdecimal() or len(value) != int(raw_size):
+            raise SystemExit(1)
+        actual = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).rstrip(b"=").decode()
+        if actual != encoded:
+            raise SystemExit(1)
+        distribution_paths.add(target)
+        tracked.add(target)
+
+baseline_files = {
+    configuration_path.resolve(strict=True),
+    target_python.resolve(strict=True),
+    target_pythonw.resolve(strict=True),
+}
+for forbidden_activation_name in (
+    "activate",
+    "activate.bat",
+    "activate.fish",
+    "Activate.ps1",
+    "deactivate.bat",
+):
+    if (runtime_path / "Scripts" / forbidden_activation_name).exists():
+        raise SystemExit(1)
+
+allowed_directories = {
+    runtime_root,
+    (runtime_path / "Include").resolve(strict=True),
+    (runtime_path / "Lib").resolve(strict=True),
+    site_root,
+    (runtime_path / "Scripts").resolve(strict=True),
+}
+for target in tracked:
+    parent = target.parent
+    while parent != runtime_root:
+        allowed_directories.add(parent)
+        parent = parent.parent
+
+for directory, directory_names, file_names in os.walk(runtime_root, followlinks=False):
+    parent = Path(directory)
+    for entry in (*directory_names, *file_names):
+        if is_reparse(parent / entry):
+            raise SystemExit(1)
+    for directory_name in directory_names:
+        if (parent / directory_name).resolve(strict=True) not in allowed_directories:
+            raise SystemExit(1)
+    for file_name in file_names:
+        resolved_file = (parent / file_name).resolve(strict=True)
+        if resolved_file not in tracked and resolved_file not in baseline_files:
+            raise SystemExit(1)
+'@
+    & $TrustedPython -I -B -S -c $verificationCode $Python $Requirements 2>$null | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Install-LockedWorkerPythonPackages {
+    param(
+        [string]$Python,
+        [string]$BundleRoot,
+        [string]$BootstrapPip,
+        [string]$Requirements,
+        [string]$TrustedPython
+    )
+    $bootstrapCode = "import sys; sys.path.insert(0, sys.argv.pop(1)); from pip._internal.cli.main import main; raise SystemExit(main())"
+    & $Python -I -B -c $bootstrapCode $BootstrapPip install `
+        --disable-pip-version-check `
+        --no-index `
+        --find-links $BundleRoot `
+        --require-hashes `
+        --only-binary=:all: `
+        --no-compile `
+        -r $Requirements | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "The reviewed offline Worker Python dependencies could not be installed."
+    }
+    & $Python -I -B -m pip check | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "The reviewed Worker Python dependency set is inconsistent."
+    }
+    if (-not (Test-LockedWorkerRuntime $Python $Requirements $TrustedPython)) {
+        throw "The installed Worker Python files do not match the reviewed dependency lock."
+    }
+}
+
+function Remove-ClosedWorkerRuntimeTree {
+    param(
+        [string]$RuntimeRoot,
+        [string]$CandidateRoot
+    )
+    $runtimeFull = [System.IO.Path]::GetFullPath($RuntimeRoot).TrimEnd("\")
+    $candidateFull = [System.IO.Path]::GetFullPath($CandidateRoot).TrimEnd("\")
+    $allowed = @(
+        "$runtimeFull-invalid",
+        "$runtimeFull-staging"
+    )
+    if ($candidateFull -cnotin $allowed -or
+        -not [System.IO.Path]::GetDirectoryName($candidateFull).Equals(
+            [System.IO.Path]::GetDirectoryName($runtimeFull),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Worker runtime cleanup refused an unexpected path."
+    }
+    if (-not (Test-Path -LiteralPath $candidateFull)) {
+        return
+    }
+
+    $removeEntry = $null
+    $removeEntry = {
+        param([string]$Path)
+        $item = Get-Item -LiteralPath $Path -Force
+        $isReparse = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($item.PSIsContainer -and -not $isReparse) {
+            foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) {
+                & $removeEntry $child.FullName
+            }
+            $item.Attributes = [System.IO.FileAttributes]::Directory
+            [System.IO.Directory]::Delete($item.FullName, $false)
+            return
+        }
+        if ($item.PSIsContainer) {
+            [System.IO.Directory]::Delete($item.FullName, $false)
+            return
+        }
+        $item.Attributes = [System.IO.FileAttributes]::Normal
+        [System.IO.File]::Delete($item.FullName)
+    }
+    & $removeEntry $candidateFull
+}
+
+function Complete-LockedWorkerRuntime {
+    param(
+        [string]$StagingRoot,
+        [string]$RuntimeRoot
+    )
+    $quarantine = "$RuntimeRoot-invalid"
+    $movedExisting = $false
+    if (Test-Path -LiteralPath $quarantine) {
+        Remove-ClosedWorkerRuntimeTree $RuntimeRoot $quarantine
+    }
+    if (Test-Path -LiteralPath $RuntimeRoot) {
+        $existing = Get-Item -LiteralPath $RuntimeRoot -Force
+        if (-not $existing.PSIsContainer -or
+            ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The existing Worker Python runtime is not a safe local directory."
+        }
+        [System.IO.Directory]::Move($RuntimeRoot, $quarantine)
+        $movedExisting = $true
+    }
+    try {
+        [System.IO.Directory]::Move($StagingRoot, $RuntimeRoot)
+    }
+    catch {
+        if ($movedExisting -and -not (Test-Path -LiteralPath $RuntimeRoot) -and
+            (Test-Path -LiteralPath $quarantine -PathType Container)) {
+            [System.IO.Directory]::Move($quarantine, $RuntimeRoot)
+        }
+        throw
+    }
+    if ($movedExisting -and (Test-Path -LiteralPath $quarantine)) {
+        try {
+            Remove-ClosedWorkerRuntimeTree $RuntimeRoot $quarantine
+        }
+        catch {
+            Write-Warning "The replaced Worker runtime remains in its bounded quarantine path: $quarantine"
+        }
+    }
+}
+
 try {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         throw "LOCALAPPDATA is required for VGen's private Worker enrollment state."
@@ -300,7 +766,7 @@ try {
     catch {
         throw "Worker bundle configuration is invalid."
     }
-    if ($config.format -cne "vgen-windows-worker-bundle" -or $config.version -ne 1) {
+    if ($config.format -cne "vgen-windows-worker-bundle" -or $config.version -ne 2) {
         throw "Worker bundle configuration has an unsupported format."
     }
     try {
@@ -324,7 +790,23 @@ try {
         if ($line -notmatch '^([0-9a-f]{64})  ([A-Za-z0-9._-]+)$') {
             throw "Worker bundle checksum list is invalid."
         }
+        if ($checksumRecords.ContainsKey($Matches[2])) {
+            throw "Worker bundle checksum list contains duplicate names."
+        }
         $checksumRecords[$Matches[2]] = $Matches[1]
+    }
+    $actualBundleNames = @(
+        Get-ChildItem -LiteralPath $PSScriptRoot -Force |
+            Where-Object { -not $_.PSIsContainer -and $_.Name -cne "SHA256SUMS" } |
+            ForEach-Object { $_.Name }
+    )
+    if ($actualBundleNames.Count -ne $checksumRecords.Count) {
+        throw "Worker bundle checksum list does not cover exactly its files."
+    }
+    foreach ($actualName in $actualBundleNames) {
+        if (-not $checksumRecords.ContainsKey($actualName)) {
+            throw "Worker bundle checksum list does not cover exactly its files."
+        }
     }
     foreach ($entry in $checksumRecords.GetEnumerator()) {
         $path = Assert-RegularLocalFile (Join-Path $PSScriptRoot $entry.Key) $entry.Key
@@ -339,6 +821,63 @@ try {
         $wheelName -notmatch '^vgen-[0-9]+\.[0-9]+\.[0-9]+-py3-none-any\.whl$') {
         throw "Worker bundle wheel name is invalid."
     }
+    $pythonRuntime = $config.python_runtime
+    if ($null -eq $pythonRuntime -or
+        $pythonRuntime.implementation -cne "cp" -or
+        $pythonRuntime.python_version -cne "3.11" -or
+        $pythonRuntime.platform -cne "win_amd64") {
+        throw "Worker bundle Python runtime target is invalid."
+    }
+    $requirementsName = [string]$pythonRuntime.requirements.name
+    $requirementsSha256 = [string]$pythonRuntime.requirements.sha256
+    $runtimeLockSetSha256 = [string]$pythonRuntime.lock_set_sha256
+    $bootstrapPipName = [string]$pythonRuntime.bootstrap_pip.name
+    $bootstrapPipSha256 = [string]$pythonRuntime.bootstrap_pip.sha256
+    if ($requirementsName -cne "vgen-worker-requirements.txt" -or
+        $requirementsSha256 -notmatch '^[0-9a-f]{64}$' -or
+        $runtimeLockSetSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [IO.Path]::GetFileName($bootstrapPipName) -cne $bootstrapPipName -or
+        $bootstrapPipName -notmatch '^pip-[0-9]+\.[0-9]+(?:\.[0-9]+)?-py3-none-any\.whl$' -or
+        $bootstrapPipSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "Worker bundle Python runtime lock is invalid."
+    }
+    $runtimeWheelNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $runtimeWheelRecords = @($pythonRuntime.wheels)
+    if ($runtimeWheelRecords.Count -lt 2 -or $runtimeWheelRecords.Count -gt 128) {
+        throw "Worker bundle Python runtime wheel list is invalid."
+    }
+    foreach ($runtimeWheel in $runtimeWheelRecords) {
+        $runtimeWheelName = [string]$runtimeWheel.name
+        $runtimeWheelSha256 = [string]$runtimeWheel.sha256
+        if ([IO.Path]::GetFileName($runtimeWheelName) -cne $runtimeWheelName -or
+            $runtimeWheelName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.whl$' -or
+            $runtimeWheelSha256 -notmatch '^[0-9a-f]{64}$' -or
+            -not $runtimeWheelNames.Add($runtimeWheelName) -or
+            -not $checksumRecords.ContainsKey($runtimeWheelName) -or
+            $checksumRecords[$runtimeWheelName] -cne $runtimeWheelSha256) {
+            throw "Worker bundle Python runtime wheel list is invalid."
+        }
+    }
+    if (-not $runtimeWheelNames.Contains($wheelName) -or
+        -not $runtimeWheelNames.Contains($bootstrapPipName) -or
+        $checksumRecords[$requirementsName] -cne $requirementsSha256 -or
+        $checksumRecords[$bootstrapPipName] -cne $bootstrapPipSha256 -or
+        $checksumRecords[$wheelName] -cne [string]$config.wheel.sha256) {
+        throw "Worker bundle Python runtime lock does not match its reviewed files."
+    }
+    $actualWheelNames = @(
+        Get-ChildItem -LiteralPath $PSScriptRoot -Force -Filter "*.whl" |
+            Where-Object { -not $_.PSIsContainer } |
+            ForEach-Object { $_.Name }
+    )
+    if ($actualWheelNames.Count -ne $runtimeWheelNames.Count) {
+        throw "Worker bundle Python runtime wheel list does not cover exactly its wheels."
+    }
+    foreach ($actualWheelName in $actualWheelNames) {
+        if (-not $runtimeWheelNames.Contains($actualWheelName)) {
+            throw "Worker bundle Python runtime wheel list does not cover exactly its wheels."
+        }
+    }
     $requiredChecksumNames = @(
         "INSTALL.txt",
         "enroll-worker.ps1",
@@ -347,8 +886,10 @@ try {
         "supervise-worker.ps1",
         "vgen-worker-bundle.json",
         "comfyui-minimax-h3-policy.yaml",
+        $requirementsName,
         $wheelName
     )
+    $requiredChecksumNames += @($runtimeWheelNames | ForEach-Object { $_ })
     foreach ($requiredName in $requiredChecksumNames) {
         if (-not $checksumRecords.ContainsKey($requiredName)) {
             throw "Worker bundle checksum list is incomplete."
@@ -446,6 +987,10 @@ try {
         }
     }
     $wheelPath = Assert-RegularLocalFile (Join-Path $PSScriptRoot $wheelName) "VGen wheel"
+    $requirementsPath = Assert-RegularLocalFile `
+        (Join-Path $PSScriptRoot $requirementsName) "Worker Python requirements lock"
+    $bootstrapPipPath = Assert-RegularLocalFile `
+        (Join-Path $PSScriptRoot $bootstrapPipName) "Worker bootstrap pip wheel"
     $setupPath = Assert-RegularLocalFile `
         (Join-Path $PSScriptRoot "setup-worker.ps1") "Worker setup script"
     $credentialRoot = Join-Path $env:LOCALAPPDATA "VGen\credentials"
@@ -458,19 +1003,38 @@ try {
     }
 
     $python = Ensure-Python311
-    $bootstrapRoot = Join-Path $env:LOCALAPPDATA "VGen\enrollment\$([string]$config.wheel.version)"
+    $runtimeLockId = $requirementsSha256.Substring(0, 16)
+    $bootstrapRoot = Join-Path $env:LOCALAPPDATA `
+        "VGen\enrollment\$([string]$config.wheel.version)-$runtimeLockId"
     $bootstrapPython = Join-Path $bootstrapRoot "Scripts\python.exe"
-    if (-not (Test-Path -LiteralPath $bootstrapPython -PathType Leaf)) {
-        Write-Step "Creating the local Worker enrollment runtime"
-        & $python -I -B -m venv $bootstrapRoot | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            throw "Python could not create the Worker enrollment runtime."
+    if (-not (Test-LockedWorkerRuntime $bootstrapPython $requirementsPath $python)) {
+        if (Test-Path -LiteralPath $bootstrapRoot) {
+            Write-Step "Preparing a clean replacement for the inconsistent enrollment environment"
         }
-    }
-    Write-Step "Installing the reviewed local VGen wheel"
-    & $bootstrapPython -I -B -m pip install --disable-pip-version-check --upgrade $wheelPath | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "The reviewed VGen wheel could not be installed."
+        $bootstrapStaging = "$bootstrapRoot-staging"
+        $stagingPython = Join-Path $bootstrapStaging "Scripts\python.exe"
+        if (Test-Path -LiteralPath $bootstrapStaging) {
+            Remove-ClosedWorkerRuntimeTree $bootstrapRoot $bootstrapStaging
+        }
+        try {
+            Write-Step "Creating the local Worker enrollment runtime"
+            & $python -I -B -m venv --without-pip $bootstrapStaging | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw "Python could not create the Worker enrollment runtime."
+            }
+            Remove-WorkerRuntimeActivationScripts $bootstrapStaging
+            Write-Step "Installing the reviewed offline Worker Python dependency set"
+            Install-LockedWorkerPythonPackages `
+                $stagingPython $PSScriptRoot $bootstrapPipPath $requirementsPath $python
+            Complete-LockedWorkerRuntime $bootstrapStaging $bootstrapRoot
+        }
+        finally {
+            if (Test-Path -LiteralPath $bootstrapStaging) {
+                try { Remove-ClosedWorkerRuntimeTree $bootstrapRoot $bootstrapStaging }
+                catch { Write-Warning "The bounded enrollment runtime staging path could not be removed." }
+            }
+        }
+        $bootstrapPython = Join-Path $bootstrapRoot "Scripts\python.exe"
     }
 
     $replaceExistingCredential = $false

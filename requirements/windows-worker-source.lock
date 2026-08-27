@@ -1,0 +1,3 @@
+# Pure-Python runtime wheels built from these exact source archives.
+crcmod==1.7 --hash=sha256:dc7051a0db5f2bd48665a990d3ec1cc305a466a77358ca4492826f41f283601e
+oss2==2.19.1 --hash=sha256:a8ab9ee7eb99e88a7e1382edc6ea641d219d585a7e074e3776e9dec9473e59c1

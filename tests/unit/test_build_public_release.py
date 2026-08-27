@@ -32,6 +32,16 @@ VERSION = "0.3.0"
 PUBLISHED_AT = "2026-08-22T12:34:56Z"
 
 
+def test_public_release_rejects_unbounded_version_components(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "vgen"\nversion = "1000000000.2.0"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="MAJOR.MINOR.PATCH"):
+        MODULE._project_version(tmp_path)
+
+
 def _zip_entry(name: str, value: bytes, *, mode: int = 0o644) -> tuple[zipfile.ZipInfo, bytes]:
     info = zipfile.ZipInfo(name, (2020, 2, 2, 0, 0, 0))
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -41,8 +51,7 @@ def _zip_entry(name: str, value: bytes, *, mode: int = 0o644) -> tuple[zipfile.Z
 
 def _checksums(files: dict[str, bytes]) -> bytes:
     return b"".join(
-        f"{hashlib.sha256(value).hexdigest()}  {name}\n".encode()
-        for name, value in files.items()
+        f"{hashlib.sha256(value).hexdigest()}  {name}\n".encode() for name, value in files.items()
     )
 
 
@@ -52,6 +61,7 @@ def _wheel_bytes(
     version: str = VERSION,
     tag: str = "py3-none-any",
     marker: bytes = b"same reviewed source",
+    requirements: tuple[str, ...] = (),
 ) -> bytes:
     buffer = io.BytesIO()
     dist_info = f"vgen-{version}.dist-info"
@@ -59,16 +69,25 @@ def _wheel_bytes(
         "vgen/__init__.py": marker,
         f"{dist_info}/METADATA": (
             f"Metadata-Version: 2.4\nName: {distribution}\nVersion: {version}\n"
+            + "".join(f"Requires-Dist: {requirement}\n" for requirement in requirements)
         ).encode(),
-        f"{dist_info}/WHEEL": (
-            f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
-        ).encode(),
+        f"{dist_info}/WHEEL": (f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n").encode(),
     }
     with zipfile.ZipFile(buffer, "w") as archive:
         for name, value in files.items():
             info, content = _zip_entry(name, value)
             archive.writestr(info, content)
     return buffer.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def _bind_public_release_tests_to_their_synthetic_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    pip_value = _wheel_bytes(distribution="pip", version="26.2", marker=b"reviewed pip")
+    monkeypatch.setattr(
+        MODULE,
+        "expected_committed_runtime_hashes",
+        lambda: frozenset({hashlib.sha256(pip_value).hexdigest()}),
+    )
 
 
 def _mac_bundle(
@@ -86,10 +105,10 @@ def _mac_bundle(
         install += (
             f"printf '%s' \"$1\" > {shlex.quote(str(marker))}\n"
             'mkdir -p "$HOME/.local/bin"\n'
-            'cat > "$HOME/.local/bin/vgen" <<\'SH\'\n'
+            "cat > \"$HOME/.local/bin/vgen\" <<'SH'\n"
             "#!/bin/sh\n"
-            f"if [ \"$1\" = \"--version\" ]; then echo 'vgen {VERSION}'; exit 0; fi\n"
-            "if [ \"$1 $2\" = \"profile show\" ]; then exit 1; fi\n"
+            f'if [ "$1" = "--version" ]; then echo \'vgen {VERSION}\'; exit 0; fi\n'
+            'if [ "$1 $2" = "profile show" ]; then exit 1; fi\n'
             "exit 0\n"
             "SH\n"
             'chmod 755 "$HOME/.local/bin/vgen"\n'
@@ -119,12 +138,27 @@ def _windows_bundle(
     gateway_url: str = "https://gateway.example",
     wheel_value: bytes | None = None,
     extra_files: dict[str, bytes] | None = None,
+    include_unrelated_runtime: bool = False,
 ) -> None:
     wheel_value = _wheel_bytes() if wheel_value is None else wheel_value
     wheel = f"vgen-{VERSION}-py3-none-any.whl"
+    pip_name = "pip-26.2-py3-none-any.whl"
+    pip_value = _wheel_bytes(distribution="pip", version="26.2", marker=b"reviewed pip")
+    requirements = (
+        f"vgen[worker-comfyui]=={VERSION} "
+        f"--hash=sha256:{hashlib.sha256(wheel_value).hexdigest()}\n"
+        "pip==26.2 "
+        f"--hash=sha256:{hashlib.sha256(pip_value).hexdigest()}\n"
+    ).encode()
+    unrelated_name = "unrelated-1.0.0-py3-none-any.whl"
+    unrelated_value = _wheel_bytes(distribution="unrelated", version="1.0.0")
+    if include_unrelated_runtime:
+        requirements += (
+            f"unrelated==1.0.0 --hash=sha256:{hashlib.sha256(unrelated_value).hexdigest()}\n"
+        ).encode()
     config = {
         "format": "vgen-windows-worker-bundle",
-        "version": 1,
+        "version": 2,
         "gateway_url": gateway_url,
         "worker_credentials": "worker-credentials.json",
         "wheel": {
@@ -132,12 +166,49 @@ def _windows_bundle(
             "version": VERSION,
             "sha256": hashlib.sha256(wheel_value).hexdigest(),
         },
+        "python_runtime": {
+            "implementation": "cp",
+            "python_version": "3.11",
+            "platform": "win_amd64",
+            "lock_set_sha256": MODULE.committed_worker_lock_set_sha256(),
+            "requirements": {
+                "name": "vgen-worker-requirements.txt",
+                "sha256": hashlib.sha256(requirements).hexdigest(),
+            },
+            "bootstrap_pip": {
+                "name": pip_name,
+                "sha256": hashlib.sha256(pip_value).hexdigest(),
+            },
+            "wheels": [
+                {
+                    "name": pip_name,
+                    "distribution": "pip",
+                    "version": "26.2",
+                    "sha256": hashlib.sha256(pip_value).hexdigest(),
+                },
+                {
+                    "name": wheel,
+                    "distribution": "vgen",
+                    "version": VERSION,
+                    "sha256": hashlib.sha256(wheel_value).hexdigest(),
+                },
+            ],
+        },
         "enrollment": {
             "kind": "worker",
             "identity": "generated_on_worker",
             "secret_input": "hidden_prompt_or_stdin",
         },
     }
+    if include_unrelated_runtime:
+        config["python_runtime"]["wheels"].append(
+            {
+                "name": unrelated_name,
+                "distribution": "unrelated",
+                "version": "1.0.0",
+                "sha256": hashlib.sha256(unrelated_value).hexdigest(),
+            }
+        )
     files = {
         "INSTALL.txt": b"credential-free worker\n",
         "enroll-worker.ps1": b"# enrollment\n",
@@ -146,8 +217,12 @@ def _windows_bundle(
         "supervise-worker.ps1": b"# supervisor\n",
         "comfyui-minimax-h3-policy.yaml": b"version: 1\n",
         "vgen-worker-bundle.json": json.dumps(config, sort_keys=True).encode() + b"\n",
+        "vgen-worker-requirements.txt": requirements,
+        pip_name: pip_value,
         wheel: wheel_value,
     }
+    if include_unrelated_runtime:
+        files[unrelated_name] = unrelated_value
     if include_credentials:
         files["worker-credentials.json"] = b'{"private_key":"must-not-ship"}\n'
     files.update(extra_files or {})
@@ -322,13 +397,13 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert "macOS artifact size or SHA-256 mismatch" in script
     assert "cross-origin release redirect refused" in script
     assert '"$candidate" -I -B -c' in script
-    assert '"$PYTHON_BIN" -I -B <<\'PY\'' in script
+    assert "\"$PYTHON_BIN\" -I -B <<'PY'" in script
     assert "Install the CLI for the current user now? [y/N]" in script
     assert 'status("Checking the latest VGen release...")' in script
     assert "Download interrupted; retrying" in script
     assert 'status("Download complete; verifying the package...")' in script
     assert "read -r answer 2>/dev/null </dev/tty" in script
-    assert "install.command\" --install-only" in script
+    assert 'install.command" --install-only' in script
     assert '"$VGEN_BIN" broker service-refresh' in script
     assert "jq" not in script
     assert "curl" not in script
@@ -346,6 +421,29 @@ def test_bootstrap_is_pinned_secret_free_and_requires_reviewed_execution(tmp_pat
     assert '"start-worker.cmd"' in windows
     assert 'Join-Path $vgenRoot "start-worker.cmd"' in windows
     assert 'Join-Path $desktop "VGen Worker.lnk"' in windows
+    assert '$backup = "$installRoot.backup-' in windows
+    assert "[IO.Directory]::Move($installRoot, $backup)" in windows
+    assert "[IO.Directory]::Move($backup, $installRoot)" in windows
+    assert "Move-Item -LiteralPath $staging -Destination $installRoot" not in windows
+    assert "Remove-Item -LiteralPath $installRoot -Recurse" not in windows
+    assert "Remove-Item -LiteralPath $backup -Recurse" not in windows
+    assert "Remove-Item -LiteralPath $staging -Recurse" not in windows
+    assert "function Remove-SafeVGenTree" in windows
+    assert 'throw "$Description contains an unsafe reparse point."' in windows
+    assert 'Remove-SafeVGenTree $backup $parent "The previous installer backup"' in windows
+    assert (
+        'Remove-SafeVGenTree $staging $parent "The failed installer staging directory"' in windows
+    )
+    assert windows.index("[IO.Directory]::Move($installRoot, $backup)") < windows.index(
+        "[IO.Directory]::Move($staging, $installRoot)"
+    )
+    assert windows.index("[IO.Directory]::Move($backup, $installRoot)") < windows.index(
+        'Remove-SafeVGenTree $staging $parent "The failed installer staging directory"'
+    )
+    assert "HttpCompletionOption]::ResponseHeadersRead" in windows
+    assert "ReadAsStreamAsync()" in windows
+    assert "$total -gt $Limit" in windows
+    assert "ReadAsByteArrayAsync()" not in windows
     assert "pause" not in windows.lower()
     for secret_word in ("invite_uri", "private_key", "session_token", "recovery_words"):
         assert secret_word not in windows
@@ -367,10 +465,7 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
 
     stable_path = '$stableLauncher = Join-Path $vgenRoot "start-worker.cmd"'
     shortcut_path = '$shortcutPath = Join-Path $desktop "VGen Worker.lnk"'
-    delegate = (
-        'set "VGEN_WORKER_VERSION_LAUNCHER='
-        '%~dp0installer\\$installLeaf\\start-worker.cmd"'
-    )
+    delegate = 'set "VGEN_WORKER_VERSION_LAUNCHER=%~dp0installer\\$installLeaf\\start-worker.cmd"'
     for script in (first, second):
         assert stable_path in script
         assert shortcut_path in script
@@ -382,7 +477,7 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
         assert "pause" not in script.lower()
         assert 'call "%VGEN_WORKER_VERSION_LAUNCHER%"' not in script
         assert "Run the public Windows Worker installer again to repair it." in script
-        assert "Get-ChildItem" not in script
+        assert "Get-ChildItem -LiteralPath $installerRoot" not in script
         assert "Sort-Object CreationTime" not in script
         assert 'Resolve-SafeVGenDirectory $parent "The VGen installer directory"' in script
         assert (
@@ -391,26 +486,34 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
         )
         assert "function Replace-VGenFileAtomically" in script
         assert "[IO.File]::Replace($Source, $Destination, $backup)" in script
+        assert "$replacementCommitted = $true" in script
+        assert "[IO.File]::Move($backup, $Destination)" in script
+        assert (
+            "$replacementCommitted -and (Test-Path -LiteralPath $backup -PathType Leaf)" in script
+        )
+        assert "original file backup remains at $backup" in script
         assert "Replace-VGenFileAtomically $launcherStaging $stableLauncher" in script
         assert "Replace-VGenFileAtomically $shortcutStaging $shortcutPath" in script
         assert "[IO.File]::Replace($launcherStaging, $stableLauncher, $null)" not in script
-        assert '[Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)' in script
+        assert (
+            "[Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)" in script
+        )
         assert "$shell.CreateShortcut($shortcutStaging)" in script
         assert "$shortcut.TargetPath = $LauncherPath" in script
         assert "$shortcut.WorkingDirectory = Split-Path -Parent $LauncherPath" in script
         assert "The VGen Worker desktop shortcut could not be installed" in script
-        assert script.index("Move-Item -LiteralPath $staging -Destination $installRoot") < script.index(
+        assert script.index("[IO.Directory]::Move($staging, $installRoot)") < script.index(
             "$stableLauncher = Install-VGenWorkerLauncher $installRoot"
         )
-        assert script.index("$stableLauncher = Install-VGenWorkerLauncher $installRoot") < script.index(
-            "& $stableLauncher"
-        )
+        assert script.index(
+            "$stableLauncher = Install-VGenWorkerLauncher $installRoot"
+        ) < script.index("& $stableLauncher")
 
-    assert '& $stableLauncher -Repair' in first
-    assert '& $stableLauncher -Repair' in second
+    assert "& $stableLauncher -Repair" in first
+    assert "& $stableLauncher -Repair" in second
 
     install_root = (
-        '$installRoot = Join-Path $parent '
+        "$installRoot = Join-Path $parent "
         '"$ExpectedVersion-$($ExpectedManifestSha256.Substring(0, 12))"'
     )
     assert install_root in first
@@ -431,7 +534,7 @@ def test_gateway_and_release_origins_are_independent(tmp_path: Path) -> None:
     assert "GATEWAY_ORIGIN=https://gateway.example" in script
     assert "RELEASE_ORIGIN=https://downloads.example" in script
     assert 'stable_url = origin + "/releases/channels/stable.json"' in script
-    assert 'configured_gateway != gateway_origin' in script
+    assert "configured_gateway != gateway_origin" in script
 
 
 def test_bootstrap_is_replaced_before_stable_pointer_and_mismatch_fails_closed(
@@ -733,6 +836,127 @@ def test_windows_public_bundle_rejects_every_extra_file_even_when_checksummed(
     with pytest.raises(MODULE.PublicReleaseBuildError, match="closed public allowlist"):
         MODULE._validate_windows_bundle(
             bundle,
+            version=VERSION,
+            gateway_origin="https://gateway.example",
+        )
+
+
+def test_windows_public_bundle_rejects_forged_runtime_identity_even_when_checksummed(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / f"vgen-windows-worker-installer-{VERSION}.zip"
+    _windows_bundle(bundle)
+    with zipfile.ZipFile(bundle) as archive:
+        files = {name: archive.read(name) for name in archive.namelist() if name != "SHA256SUMS"}
+    config = json.loads(files["vgen-worker-bundle.json"])
+    config["python_runtime"]["wheels"][0]["distribution"] = "not-pip"
+    files["vgen-worker-bundle.json"] = json.dumps(config, sort_keys=True).encode() + b"\n"
+    with zipfile.ZipFile(bundle, "w") as archive:
+        for name, value in files.items():
+            info, content = _zip_entry(name, value)
+            archive.writestr(info, content)
+        info, content = _zip_entry("SHA256SUMS", _checksums(files))
+        archive.writestr(info, content)
+
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="runtime wheel"):
+        MODULE._validate_windows_bundle(
+            bundle,
+            version=VERSION,
+            gateway_origin="https://gateway.example",
+        )
+
+
+def test_windows_public_bundle_rejects_a_forged_committed_lock_binding(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / f"vgen-windows-worker-installer-{VERSION}.zip"
+    _windows_bundle(bundle)
+    with zipfile.ZipFile(bundle) as archive:
+        files = {name: archive.read(name) for name in archive.namelist() if name != "SHA256SUMS"}
+    config = json.loads(files["vgen-worker-bundle.json"])
+    config["python_runtime"]["lock_set_sha256"] = "0" * 64
+    files["vgen-worker-bundle.json"] = json.dumps(config, sort_keys=True).encode() + b"\n"
+    with zipfile.ZipFile(bundle, "w") as archive:
+        for name, value in files.items():
+            info, content = _zip_entry(name, value)
+            archive.writestr(info, content)
+        info, content = _zip_entry("SHA256SUMS", _checksums(files))
+        archive.writestr(info, content)
+
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="runtime lock"):
+        MODULE._validate_windows_bundle(
+            bundle,
+            version=VERSION,
+            gateway_origin="https://gateway.example",
+        )
+
+
+def test_windows_public_bundle_rejects_a_self_consistent_alternate_runtime(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / f"vgen-windows-worker-installer-{VERSION}.zip"
+    _windows_bundle(bundle)
+    with zipfile.ZipFile(bundle) as archive:
+        files = {name: archive.read(name) for name in archive.namelist() if name != "SHA256SUMS"}
+
+    config = json.loads(files["vgen-worker-bundle.json"])
+    pip_name = "pip-26.2-py3-none-any.whl"
+    replacement_pip = _wheel_bytes(
+        distribution="pip",
+        version="26.2",
+        marker=b"different but dependency-closed runtime",
+    )
+    replacement_digest = hashlib.sha256(replacement_pip).hexdigest()
+    files[pip_name] = replacement_pip
+    for record in config["python_runtime"]["wheels"]:
+        if record["distribution"] == "pip":
+            record["sha256"] = replacement_digest
+    config["python_runtime"]["bootstrap_pip"]["sha256"] = replacement_digest
+    requirements = (
+        f"vgen[worker-comfyui]=={VERSION} "
+        f"--hash=sha256:{config['wheel']['sha256']}\n"
+        f"pip==26.2 --hash=sha256:{replacement_digest}\n"
+    ).encode()
+    files["vgen-worker-requirements.txt"] = requirements
+    config["python_runtime"]["requirements"]["sha256"] = hashlib.sha256(
+        requirements
+    ).hexdigest()
+    files["vgen-worker-bundle.json"] = json.dumps(config, sort_keys=True).encode() + b"\n"
+    with zipfile.ZipFile(bundle, "w") as archive:
+        for name, value in files.items():
+            info, content = _zip_entry(name, value)
+            archive.writestr(info, content)
+        info, content = _zip_entry("SHA256SUMS", _checksums(files))
+        archive.writestr(info, content)
+
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="committed runtime locks"):
+        MODULE._validate_windows_bundle(
+            bundle,
+            version=VERSION,
+            gateway_origin="https://gateway.example",
+        )
+
+
+def test_windows_public_bundle_revalidates_dependency_closure(tmp_path: Path) -> None:
+    unrelated = tmp_path / "unrelated" / f"vgen-windows-worker-installer-{VERSION}.zip"
+    unrelated.parent.mkdir()
+    _windows_bundle(unrelated, include_unrelated_runtime=True)
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="committed runtime locks"):
+        MODULE._validate_windows_bundle(
+            unrelated,
+            version=VERSION,
+            gateway_origin="https://gateway.example",
+        )
+
+    missing = tmp_path / "missing" / f"vgen-windows-worker-installer-{VERSION}.zip"
+    missing.parent.mkdir()
+    _windows_bundle(
+        missing,
+        wheel_value=_wheel_bytes(requirements=("missing-dependency==1.0.0",)),
+    )
+    with pytest.raises(MODULE.PublicReleaseBuildError, match="does not satisfy"):
+        MODULE._validate_windows_bundle(
+            missing,
             version=VERSION,
             gateway_origin="https://gateway.example",
         )

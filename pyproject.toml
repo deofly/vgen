@@ -79,6 +79,14 @@ local = "vgen.artifacts.local:LocalArtifactAdapter"
 [tool.hatch.build.targets.wheel]
 packages = ["src/vgen"]
 
+[tool.hatch.build.targets.sdist]
+# Hatch reads the repository-root ignore file, but not every nested ignore
+# file. Keep language-specific build trees out of the public source archive
+# even when contributors have built an SDK in place.
+exclude = [
+  "/sdks/java/target",
+]
+
 [tool.hatch.build.targets.wheel.force-include]
 "workflows/vgen/minimax-h3-8step/1.0.0" = "vgen/assets/workflows/vgen/minimax-h3-8step/1.0.0"
 "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0" = "vgen/assets/workflows/vgen/ltx-2.5-distilled-t2v/1.0.0"

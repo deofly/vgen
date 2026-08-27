@@ -74,20 +74,25 @@ def test_windows_worker_derives_and_validates_product_version_from_bundle() -> N
     assert "(?:a|b|rc)" not in settings
     assert "$wheelVersionValue -isnot [string]" in settings
     assert "BundleConfig wheel version is not a supported VGen release version." in settings
+    assert "[0-9]{0,8}" in settings
     assert '$expectedWheelName = "vgen-$resolvedVGenVersion-py3-none-any.whl"' in settings
     assert "$resolvedWheelName -cne $expectedWheelName" in settings
     assert "VGenVersion = $resolvedVGenVersion" in settings
+    assert 'RuntimeRequirementsName = $runtimeRequirementsName' in settings
+    assert 'RuntimeLockSetSha256 = $runtimeLockSetSha256' in settings
+    assert '$pythonRuntime "lock_set_sha256" "BundleConfig python_runtime"' in settings
+    assert 'BootstrapPipName = $bootstrapPipName' in settings
     assert "[string]$ExpectedVersion" in runtime
-    assert "$version -cne $ExpectedVersion" in runtime
     assert "$installedVersion -cne $ExpectedVersion" in runtime
-    assert '"VGen\\worker-runtime-$($bundleSettings.VGenVersion)"' in main
-    assert (
-        "Ensure-WorkerRuntime $runtimeRoot $wheelPath $bootstrapPython $bundleSettings.VGenVersion"
-    ) in main
+    assert '"VGen\\worker-runtime-$($bundleSettings.VGenVersion)-$runtimeLockId"' in main
+    assert "Ensure-WorkerRuntime `" in main
+    assert "$bootstrapPipPath `" in main
+    assert "$runtimeRequirementsPath" in main
 
 
 def test_windows_worker_native_installer_output_never_becomes_a_return_value() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
+    enrollment = ENROLLMENT_SCRIPT.read_text(encoding="utf-8")
     runtime = text.split("function Ensure-WorkerRuntime", 1)[1].split(
         "function Convert-ToComparableVersion", 1
     )[0]
@@ -95,10 +100,72 @@ def test_windows_worker_native_installer_output_never_becomes_a_return_value() -
         "function Resolve-Python311", 1
     )[0]
 
-    assert re.search(r"&\s+\$BootstrapPython\s+-m\s+venv\s+\$RuntimeRoot\s*\|\s*Out-Host", runtime)
-    assert len(re.findall(r"&\s+\$python\s+-m\s+pip\s+install[^\r\n]*\|\s*Out-Host", runtime)) == 2
+    assert re.search(
+        r"&\s+\$BootstrapPython\s+-I\s+-B\s+-m\s+venv\s+--without-pip\s+\$stagingRoot\s*\|\s*Out-Host",
+        runtime,
+    )
+    assert "--no-index" in text
+    assert "--require-hashes" in text
+    assert "--only-binary=:all:" in text
+    assert "--no-compile" in text
+    assert "--upgrade pip" not in text
+    assert "from pip._internal.cli.main import main" in text
+    assert "installed != expected" in text
+    assert 'distribution.read_text("RECORD")' in text
+    assert "os.walk(runtime_root, followlinks=False)" in text
+    assert "not in tracked" in text
+    assert 'getattr(path.lstat(), "st_file_attributes", 0)' in text
+    assert "attributes & 0x400" in text
+    assert "target in distribution_paths or target in tracked" in text
+    assert "& $TrustedPython -I -B -S -c $verificationCode $Python $Requirements" in text
+    assert 'getattr(path.lstat(), "st_file_attributes", 0)' in enrollment
+    assert "$runtimeLockSetSha256 -notmatch '^[0-9a-f]{64}$'" in enrollment
+    assert "target in distribution_paths or target in tracked" in enrollment
+    for installer in (text, enrollment):
+        assert "function Remove-WorkerRuntimeActivationScripts" in installer
+        assert installer.count("Remove-WorkerRuntimeActivationScripts ") == 2
+        removal = installer.split("function Remove-WorkerRuntimeActivationScripts", 1)[1].split(
+            "function Test-LockedWorkerRuntime", 1
+        )[0]
+        assert '"activate.fish"' not in removal
+        for activation_name in ("activate", "activate.bat", "Activate.ps1", "deactivate.bat"):
+            assert f'"{activation_name}"' in removal
+        assert '$null = $requiredLaunchers.Add("python.exe")' in installer
+        assert '$null = $requiredLaunchers.Add("pythonw.exe")' in installer
+        assert "for forbidden_activation_name in (" in installer
+        assert '(runtime_path / "Scripts" / forbidden_activation_name).exists()' in installer
+        assert "baseline_files.add(activator" not in installer
+        assert 'set(root_entries) != {"Include", "Lib", "Scripts", "pyvenv.cfg"}' in installer
+        assert 'trusted_python.name.casefold() != "python.exe"' in installer
+        assert 'bool(sysconfig.get_config_var("Py_DEBUG"))' in installer
+        assert "sysconfig.is_python_build()" in installer
+        assert 'trusted_stdlib / "venv" / "scripts" / "nt"' in installer
+        assert 'locate_launcher("python.exe", "venvlauncher.exe", "venvlauncher.exe")' in installer
+        assert 'locate_launcher("pythonw.exe", "venvwlauncher.exe", "venvwlauncher.exe")' in installer
+        assert 'sha256_file(target_python) != sha256_file(console_launcher)' in installer
+        assert 'sha256_file(target_pythonw) != sha256_file(windowed_launcher)' in installer
+        assert 'sha256_file(target_python) != sha256_file(trusted_python)' not in installer
+        assert 'configuration["include-system-site-packages"].casefold() != "false"' in installer
+        assert "os.walk(runtime_root, followlinks=False)" in installer
+        assert "$RuntimeRoot-invalid" in installer
+        assert '$quarantine = "$RuntimeRoot-invalid"' in installer
+        assert '"$RuntimeRoot-invalid-$([Guid]' not in installer
+        assert '"$RuntimeRoot-staging-$([Guid]' not in installer
+        assert "function Remove-ClosedWorkerRuntimeTree" in installer
+    assert runtime.index("Remove-WorkerRuntimeActivationScripts $stagingRoot") < runtime.index(
+        "Install-LockedWorkerPythonPackages `"
+    )
+    enrollment_runtime = enrollment.split(
+        'Write-Step "Creating the local Worker enrollment runtime"', 1
+    )[1]
+    assert enrollment_runtime.index(
+        "Remove-WorkerRuntimeActivationScripts $bootstrapStaging"
+    ) < enrollment_runtime.index("Install-LockedWorkerPythonPackages `")
+    assert "Complete-LockedWorkerRuntime $stagingRoot $RuntimeRoot" in runtime
+    assert "[System.IO.Directory]::Move($StagingRoot, $RuntimeRoot)" in text
+    assert '"$RuntimeRoot-repair-' not in runtime
     assert re.search(r"&\s+\$winget\.Source\s+install[^\r\n]*\|\s*Out-Host", winget)
-    assert runtime.count("return $python") == 2
+    assert runtime.count("return $python") == 3
     assert "$bootstrapPythonResults = @(Ensure-Python311)" in text
     assert '$bootstrapPythonResults "Python 3.11 discovery" ([bool]$CheckOnly)' in text
     assert "$runtimePythonResults = @(" in text
@@ -586,7 +653,11 @@ def test_windows_worker_stops_only_the_comfy_process_it_started() -> None:
     assert "$comfyProcess.HasExited" in text
     assert "Stop-Process -InputObject $process" in text
     assert "$null = $process.WaitForExit(10000)" in text
-    assert "finally {\n        Stop-VGenManagedComfyUI\n    }" in text
+    supervisor_loop = text.split("# This PowerShell loop is already the stable supervisor.", 1)[
+        1
+    ].split("catch {", 1)[0]
+    assert "finally {" in supervisor_loop
+    assert "Stop-VGenManagedComfyUI" in supervisor_loop.rsplit("finally {", 1)[1]
     catch_block = text.rsplit("catch {", 1)[1]
     assert "Stop-VGenManagedComfyUI" in catch_block
 
@@ -867,7 +938,7 @@ def test_windows_worker_normal_setup_uses_fixed_winget_packages_and_absolute_dis
     assert 'Install-WingetPackage "Git.Git" "Git for Windows"' in text
     assert '"Programs\\Python\\Python311\\python.exe"' in text
     assert '"Programs\\Git\\cmd\\git.exe"' in text
-    assert "& $BootstrapPython -m venv $RuntimeRoot" in text
+    assert "& $BootstrapPython -I -B -m venv --without-pip $stagingRoot" in text
     assert "& $script:GitExecutable" in text
 
 
@@ -943,15 +1014,73 @@ def test_windows_worker_missing_models_start_maintenance_only_without_direct_dow
     assert "Multiple directories exist for the same custom node" in text
 
 
-def test_windows_worker_foreground_supervisor_switches_and_rolls_back_updates() -> None:
+def test_windows_worker_foreground_supervisor_handles_verified_update_interleaving() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
+    state = text.split("function Get-WorkerRuntimeState", 1)[1].split(
+        "# Dot-sourcing is reserved", 1
+    )[0]
+    selection = text.split("function Select-InitialWorkerRuntime", 1)[1].split(
+        "function Replace-FileAtomically", 1
+    )[0]
+    loop = text.split("$workerExitCode = 1", 1)[1].split("catch {", 1)[0]
+
     assert 'Join-Path $WorkRoot "runtime-active.json"' in text
+    assert '$pointer.PSObject.Properties["activation_verified_at"]' in state
+    assert "ActivationVerified = $activationVerified" in state
+    assert "SupersededPending = $pending -and $versionComparison -lt 0" in state
     assert "$workerExitCode -eq 75" in text
+    assert "$runtimeState.Pending -and -not $runtimeState.ActiveAvailable" in text
+    assert "$activeWorkerPython = $runtimeState.PreviousPython" in text
     assert "Restarting Worker with the reviewed versioned runtime" in text
     assert '$env:VGEN_WORKER_UPDATE_ROLLBACK = "1"' in text
     assert "restarting the previous reviewed runtime" in text
     assert "runtime-releases" in text
-    assert "-m vgen.worker.main @workerArguments" in text
+    assert "-I -B -m vgen.worker.main @workerArguments" in text
+    assert '(@("-I", "-B", "-m", "vgen.worker.main") + $workerArguments)' in text
+
+    initial_verified_guard = selection.index(
+        "$RuntimeState.Pending -and -not $RuntimeState.SupersededPending"
+    )
+    initial_rollback_selection = selection.index("$rollback =")
+    assert initial_verified_guard < initial_rollback_selection
+    initial_runtime_selection = selection[
+        initial_rollback_selection : selection.index("$python = if", initial_rollback_selection)
+    ]
+    assert "$RuntimeState.SupersededPending" in initial_runtime_selection
+    assert "-not $RuntimeState.ActivationVerified" in initial_runtime_selection
+    assert "$runtimeSelection = Select-InitialWorkerRuntime $runtimeState" in loop
+
+    launch = loop.index("& $activeWorkerPython -I -B -m vgen.worker.main @workerArguments")
+    refreshed_state = loop.index("$runtimeState = Get-WorkerRuntimeState", launch)
+    superseded_branch = loop.index(
+        "$runtimeState.Pending -and $runtimeState.SupersededPending",
+        refreshed_state,
+    )
+    restart_missing = loop.index(
+        "$runtimeState.Pending -and -not $runtimeState.ActiveAvailable",
+        refreshed_state,
+    )
+    restart_verified_guard = loop.index("if ($runtimeState.ActivationVerified)", restart_missing)
+    restart_rollback = loop.index(
+        "$activeWorkerPython = $runtimeState.PreviousPython", restart_verified_guard
+    )
+    assert superseded_branch < restart_missing < restart_verified_guard < restart_rollback
+
+    generic_failure = loop.index("$workerExitCode -ne 0", refreshed_state)
+    verified_branch = loop.index("if ($runtimeState.ActivationVerified)", generic_failure)
+    unverified_rollback = loop.index(
+        "$activeWorkerPython = $runtimeState.PreviousPython", verified_branch
+    )
+    assert launch < refreshed_state < generic_failure < verified_branch < unverified_rollback
+
+    verified_retry = loop[verified_branch:unverified_rollback]
+    assert "$activeWorkerPython = $runtimeState.ActivePython" in verified_retry
+    assert "$launchingRollback = $false" in verified_retry
+    assert "$runtimeState.PreviousPython" not in verified_retry
+    assert '$env:VGEN_WORKER_UPDATE_ROLLBACK = "1"' not in verified_retry
+
+    explicit_rollback = loop.index("$workerExitCode -eq 76", refreshed_state)
+    assert explicit_rollback < generic_failure
 
 
 def test_windows_worker_ignores_terminal_rollback_from_older_base_runtime() -> None:
@@ -961,13 +1090,40 @@ def test_windows_worker_ignores_terminal_rollback_from_older_base_runtime() -> N
     )[0]
 
     assert '$pointer.PSObject.Properties["rolled_back_job_id"]' in state
-    assert "if ($rolledBack -and -not $pending)" in state
-    fallback = state.split("if ($rolledBack -and -not $pending)", 1)[1].split(
-        "if (-not (Test-AllowedWorkerPythonPath", 1
-    )[0]
+    assert "$rolledBack -and -not $pending -and $versionComparison -le 0" in state
+    fallback = state.split("$rolledBack -and -not $pending -and $versionComparison -le 0", 1)[
+        1
+    ].split("if (-not (Test-AllowedWorkerPythonPath", 1)[0]
     assert "ActivePython = $InitialPython" in fallback
     assert "PreviousPython = $null" in fallback
     assert "Pending = $false" in fallback
+    assert "ActiveAvailable = $true" in fallback
+
+
+def test_windows_worker_selects_completed_runtime_by_reviewed_version() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    state = text.split("function Get-WorkerRuntimeState", 1)[1].split(
+        "# Dot-sourcing is reserved", 1
+    )[0]
+    comparison = text.split("function Compare-WorkerReleaseVersion", 1)[1].split(
+        "function Get-WorkerRuntimeState", 1
+    )[0]
+
+    assert "[string]$InitialVersion" in state
+    assert "Compare-WorkerReleaseVersion" in state
+    assert "if (-not $pending -and $versionComparison -lt 0)" in state
+    assert "if ($versionComparison -le 0)" in state
+    assert "-AllowMissing" in state
+    assert "ActiveAvailable = $activeAvailable" in state
+    older = state.split("if (-not $pending -and $versionComparison -lt 0)", 1)[1].split(
+        "$previousPython = $null", 1
+    )[0]
+    assert "ActivePython = $InitialPython" in older
+    assert "PreviousPython = $null" in older
+    assert "Pending = $false" in older
+    assert "[string]::CompareOrdinal" in comparison
+    assert "[Version]" not in comparison
+    assert text.count("$workRoot $runtimePython $bundleSettings.VGenVersion") == 2
 
 
 def test_windows_worker_model_pins_match_reference_manifest() -> None:
@@ -1029,15 +1185,26 @@ def test_windows_worker_bootstraps_reviewed_comfyui_gguf_node() -> None:
     blocks = _blocks(text, "BootstrapCustomNodePins", "ComfyGgufPythonRequirements")
     assert len(blocks) == 1
     assert _quoted_value(blocks[0], "Source") == "https://github.com/city96/ComfyUI-GGUF"
-    assert _quoted_value(blocks[0], "Revision") == (
-        "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
-    )
+    assert _quoted_value(blocks[0], "Revision") == ("6ea2651e7df66d7585f6ffee804b20e92fb38b8a")
     requirements = text.split("$ComfyGgufPythonRequirements = @(", 1)[1].split(")", 1)[0]
     assert '"gguf==0.17.1"' in requirements
     assert '"sentencepiece==0.2.1"' in requirements
     assert '"protobuf==6.33.5"' in requirements
     assert "foreach ($pin in $BootstrapCustomNodePins)" in text
     assert "function Test-ComfyGgufPythonRequirements" in text
+
+
+def test_windows_worker_keeps_ltx_gguf_bootstrap_optional_and_reports_its_root() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    main = text.split("$comfyWorkerPortRunning = Test-ComfyHealth", 1)[1]
+
+    assert "[switch]$InstallLtxGguf" in text
+    assert "if ($InstallLtxGguf) {\n            foreach ($pin in $BootstrapCustomNodePins)" in main
+    assert "$InstallLtxGguf -and -not (Test-ComfyGgufPythonRequirements" in main
+    assert '"--comfy-custom-nodes-root", $customNodesRoot' in main
+    assert "UnetLoaderGGUF" not in text.split("$RequiredNodeClasses = @(", 1)[1].split(
+        ")", 1
+    )[0]
 
 
 def test_windows_worker_required_nodes_match_machine_policy() -> None:
@@ -1070,8 +1237,7 @@ def test_worker_assets_are_force_included_at_stable_importlib_resource_paths() -
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert pyproject.count("[tool.hatch.build.targets.wheel.force-include]") == 1
     assert (
-        '"examples/windows-worker/enroll-worker.ps1" = '
-        '"vgen/assets/worker/enroll-worker.ps1"'
+        '"examples/windows-worker/enroll-worker.ps1" = "vgen/assets/worker/enroll-worker.ps1"'
     ) in pyproject
     assert (
         '"examples/windows-worker/setup-worker.ps1" = "vgen/assets/worker/setup-worker.ps1"'
@@ -1080,8 +1246,7 @@ def test_worker_assets_are_force_included_at_stable_importlib_resource_paths() -
         '"examples/windows-worker/start-worker.cmd" = "vgen/assets/worker/start-worker.cmd"'
     ) in pyproject
     assert (
-        '"examples/windows-worker/supervise-worker.ps1" = '
-        '"vgen/assets/worker/supervise-worker.ps1"'
+        '"examples/windows-worker/supervise-worker.ps1" = "vgen/assets/worker/supervise-worker.ps1"'
     ) in pyproject
     assert (
         '"examples/comfyui-minimax-h3-policy.yaml" = '
