@@ -368,8 +368,9 @@ while ($true) {
     # GitHub's hosted Windows runner uses a non-interactive session, so Task
     # Scheduler cannot launch an InteractiveToken task there. Install/export
     # above still exercise the real scheduler. The control modes below run in
-    # isolated child PowerShell processes with executable scheduler doubles;
-    # dot-sourcing is safe because supervisor `exit` only terminates that child.
+    # isolated child PowerShell processes with executable scheduler doubles.
+    # Dot-sourcing keeps those doubles visible; an `exit` in the sourced script
+    # sets LASTEXITCODE and returns here, so the wrapper must relay that code.
     $mockTaskState = Join-Path $stateRoot "mock-task-state.txt"
     $mockStartMarker = Join-Path $stateRoot "mock-task-start.txt"
     $mockStopMarker = Join-Path $stateRoot "mock-task-stop.txt"
@@ -428,8 +429,13 @@ function Stop-ScheduledTask {
     Write-MockTaskState "Ready"
 }
 
+$global:LASTEXITCODE = 197
 . $SupervisorPath -Mode $Mode
-throw "The isolated supervisor control mode returned without an explicit exit."
+$supervisorExitCode = [int]$LASTEXITCODE
+if ($supervisorExitCode -eq 197) {
+    throw "The isolated supervisor control mode returned without an explicit exit."
+}
+exit $supervisorExitCode
 '@
     [IO.File]::WriteAllText($mockWrapper, $mockWrapperContent, $utf8)
     [IO.File]::WriteAllText($mockTaskState, "Ready`r`n", $utf8)
