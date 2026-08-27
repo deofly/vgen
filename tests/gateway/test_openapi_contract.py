@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -15,6 +17,25 @@ def _headers(operation: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if reference:
             result[reference.rsplit("/", 1)[-1]] = parameter
     return result
+
+
+def test_committed_openapi_contract_exactly_matches_runtime(tmp_path) -> None:
+    app = create_app(
+        database_path=str(tmp_path / "gateway.db"),
+        bootstrap_code="test-bootstrap-only",
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    try:
+        runtime = app.openapi()
+    finally:
+        app.state.db.close()
+    committed = json.loads(
+        (Path(__file__).resolve().parents[2] / "schemas/openapi-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert committed == runtime
 
 
 def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> None:
@@ -92,6 +113,25 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
     assert schema["components"]["parameters"]["IdempotencyKey"]["required"] is False
     assert protected_write["x-vgen-idempotency-supported"] is True
 
+    workers_response = schema["paths"]["/api/v1/workers"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+    assert workers_response["items"] == {"$ref": "#/components/schemas/WorkerView"}
+    worker_view = schema["components"]["schemas"]["WorkerView"]
+    assert "gateway_protocol_features" in worker_view["required"]
+    assert worker_view["properties"]["gateway_protocol_features"] == {
+        "$ref": "#/components/schemas/GatewayProtocolFeatures"
+    }
+    gateway_features = schema["components"]["schemas"]["GatewayProtocolFeatures"]
+    assert gateway_features["properties"]["capability_install_spec_version"]["const"] == 2
+
+    worker_heartbeat = schema["paths"]["/api/v1/workers/{worker_id}/heartbeat"]["post"]
+    assert worker_heartbeat["x-vgen-idempotency-supported"] is False
+    assert "IdempotencyKey" not in _headers(worker_heartbeat)
+    attempt_heartbeat = schema["paths"]["/api/v1/attempts/{attempt_id}/heartbeat"]["post"]
+    assert attempt_heartbeat["x-vgen-idempotency-supported"] is False
+    assert "IdempotencyKey" not in _headers(attempt_heartbeat)
+
     invite_write = schema["paths"]["/api/v1/workspaces/{workspace_id}/invites"]["post"]
     assert invite_write["x-vgen-idempotency-supported"] is False
     assert "IdempotencyKey" not in _headers(invite_write)
@@ -107,6 +147,21 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
     maintenance_create = schema["paths"][
         "/api/v1/brokers/{broker_id}/workers/{worker_id}/maintenance-jobs"
     ]["post"]
+    assert maintenance_create["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/WorkerMaintenanceCreateResponse"}
+    maintenance_create_response = schema["components"]["schemas"][
+        "WorkerMaintenanceCreateResponse"
+    ]
+    assert set(maintenance_create_response["required"]) == {
+        "id",
+        "creation_disposition",
+        "intent_owns_job",
+    }
+    assert maintenance_create_response["properties"]["creation_disposition"]["enum"] == [
+        "created",
+        "deduplicated",
+    ]
     maintenance_claim = schema["paths"][
         "/api/v1/workers/{worker_id}/maintenance-jobs/claim"
     ]["post"]

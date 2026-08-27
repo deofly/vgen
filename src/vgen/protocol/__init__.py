@@ -1,5 +1,10 @@
 """Stable, executor-neutral wire contracts shared by all VGen runtimes."""
 
+from .diagnostics import (
+    canonical_task_failure_details,
+    canonical_task_failure_details_for_code,
+    canonical_task_progress,
+)
 from .errors import (
     ERROR_REGISTRY,
     ErrorCode,
@@ -50,6 +55,9 @@ __all__ = [
     "VGenError",
     "can_transition_attempt",
     "can_transition_task",
+    "canonical_task_failure_details",
+    "canonical_task_failure_details_for_code",
+    "canonical_task_progress",
     "error_envelope",
     "get_error_spec",
     "new_id",

@@ -49,6 +49,44 @@ def _assert_aggregate(result: dict[str, object], *, state: str, ready: bool) -> 
     assert MODEL_DIGEST not in serialized
 
 
+def _authorize_test_workflow(app, worker_id: str, payload: dict[str, object]) -> None:
+    stamp = now()
+    spec_digest = "sha256:" + "e" * 64
+    app.state.db.execute(
+        """INSERT INTO worker_workflow_authorizations
+           (worker_id,workflow_ref,workflow_digest,spec_digest,
+            authorization_source_id,node_classes,authorized_at)
+           VALUES (?,?,?,?,?,'[]',?)""",
+        (
+            worker_id,
+            payload["workflow_ref"],
+            payload["workflow_digest"],
+            spec_digest,
+            "mtj_test_preflight",
+            stamp,
+        ),
+    )
+    app.state.db.execute(
+        """INSERT INTO worker_model_authorizations
+           (worker_id,workflow_ref,workflow_digest,model_digest,spec_digest,
+            authorization_source_id,authorized_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            worker_id,
+            payload["workflow_ref"],
+            payload["workflow_digest"],
+            MODEL_DIGEST,
+            spec_digest,
+            "mtj_test_preflight",
+            stamp,
+        ),
+    )
+    app.state.db.execute(
+        "UPDATE workers SET capability_auth_enforced_at=? WHERE id=?",
+        (stamp, worker_id),
+    )
+
+
 def test_preflight_reports_safe_states_and_never_reserves_or_bills(tmp_path) -> None:
     app = create_app(
         database_path=str(tmp_path / "gateway.db"),
@@ -87,6 +125,7 @@ def test_preflight_reports_safe_states_and_never_reserves_or_bills(tmp_path) -> 
             capabilities={},
             capacity=1,
         )
+        _authorize_test_workflow(app, worker["id"], payload)
         stamp = now()
         app.state.db.execute(
             """INSERT INTO worker_allocations
@@ -153,9 +192,7 @@ def test_preflight_reports_safe_states_and_never_reserves_or_bills(tmp_path) -> 
             user_id=boot["user"]["id"],
             rate_microtokens_per_second=1_000_000,
         )
-        app.state.repository.approve_rate(
-            rate_id=rate["id"], admin_user_id=boot["user"]["id"]
-        )
+        app.state.repository.approve_rate(rate_id=rate["id"], admin_user_id=boot["user"]["id"])
 
         before = {
             table: app.state.db.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"]
@@ -223,6 +260,7 @@ def test_v2_workflow_readiness_is_exact_unique_and_fail_closed(tmp_path) -> None
             capabilities={},
             capacity=1,
         )
+        _authorize_test_workflow(app, worker["id"], payload)
         stamp = now()
         app.state.db.execute(
             """INSERT INTO worker_allocations
@@ -248,9 +286,7 @@ def test_v2_workflow_readiness_is_exact_unique_and_fail_closed(tmp_path) -> None
             user_id=boot["user"]["id"],
             rate_microtokens_per_second=1,
         )
-        app.state.repository.approve_rate(
-            rate_id=rate["id"], admin_user_id=boot["user"]["id"]
-        )
+        app.state.repository.approve_rate(rate_id=rate["id"], admin_user_id=boot["user"]["id"])
 
         exact = {
             "workflow_ref": payload["workflow_ref"],
@@ -297,56 +333,66 @@ def test_v2_workflow_readiness_is_exact_unique_and_fail_closed(tmp_path) -> None
             "workflow_readiness": [exact],
         }
         assert preflight_state(v2) == "ready"
-        assert preflight_state(
-            {
-                **v2,
-                "workflow_readiness": [{**exact, "workflow_ref": "vgen/other@1.0.0"}],
-            }
-        ) == "capability_mismatch"
-        assert preflight_state(
-            {
-                **v2,
-                "workflow_readiness": [
-                    {**exact, "workflow_digest": "sha256:" + "c" * 64}
-                ],
-            }
-        ) == "capability_mismatch"
-        assert preflight_state(
-            {**v2, "workflow_readiness": [{**exact, "state": "missing_models"}]}
-        ) == "capability_mismatch"
-        for state in ("insufficient_vram", "insufficient_ram"):
-            assert preflight_state(
-                {**v2, "workflow_readiness": [{**exact, "state": state}]}
-            ) == "capability_mismatch"
-        assert preflight_state(
-            {**v2, "workflow_readiness": [exact, dict(exact)]}
-        ) == "capability_mismatch"
-        assert preflight_state(
-            {**v2, "workflow_readiness": [exact, "malformed"]}
-        ) == "capability_mismatch"
-        assert preflight_state(
-            {
-                **v2,
-                "workflow_readiness": [
-                    {
-                        key: value
-                        for key, value in exact.items()
-                        if key != "missing_node_classes"
-                    }
-                ],
-            }
-        ) == "capability_mismatch"
-        assert preflight_state(
-            {
-                **v2,
-                "workflow_readiness": [
-                    {**exact, "missing_model_digests": [MODEL_DIGEST]}
-                ],
-            }
-        ) == "capability_mismatch"
-        assert preflight_state({**v2, "capability_schema_version": 3}) == (
-            "capability_mismatch"
+        assert (
+            preflight_state(
+                {
+                    **v2,
+                    "workflow_readiness": [{**exact, "workflow_ref": "vgen/other@1.0.0"}],
+                }
+            )
+            == "capability_mismatch"
         )
+        assert (
+            preflight_state(
+                {
+                    **v2,
+                    "workflow_readiness": [{**exact, "workflow_digest": "sha256:" + "c" * 64}],
+                }
+            )
+            == "capability_mismatch"
+        )
+        assert (
+            preflight_state({**v2, "workflow_readiness": [{**exact, "state": "missing_models"}]})
+            == "capability_mismatch"
+        )
+        for state in ("insufficient_vram", "insufficient_ram"):
+            assert (
+                preflight_state({**v2, "workflow_readiness": [{**exact, "state": state}]})
+                == "capability_mismatch"
+            )
+        assert (
+            preflight_state({**v2, "workflow_readiness": [exact, dict(exact)]})
+            == "capability_mismatch"
+        )
+        assert (
+            preflight_state({**v2, "workflow_readiness": [exact, "malformed"]})
+            == "capability_mismatch"
+        )
+        assert (
+            preflight_state(
+                {
+                    **v2,
+                    "workflow_readiness": [
+                        {
+                            key: value
+                            for key, value in exact.items()
+                            if key != "missing_node_classes"
+                        }
+                    ],
+                }
+            )
+            == "capability_mismatch"
+        )
+        assert (
+            preflight_state(
+                {
+                    **v2,
+                    "workflow_readiness": [{**exact, "missing_model_digests": [MODEL_DIGEST]}],
+                }
+            )
+            == "capability_mismatch"
+        )
+        assert preflight_state({**v2, "capability_schema_version": 3}) == ("capability_mismatch")
 
         # A pre-v2 Worker has no per-workflow readiness list. Preserve the
         # model/resource matcher until that Worker upgrades its heartbeat.

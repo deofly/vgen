@@ -35,6 +35,7 @@ from vgen.crypto import (
     verify_maintenance_intent,
     verify_message,
 )
+from vgen.protocol.diagnostics import canonical_task_failure_details_for_code
 from vgen.protocol.errors import ErrorCode, VGenError, error_envelope, get_error_spec
 from vgen.protocol.ids import new_id as protocol_new_id
 from vgen.protocol.ids import validate_id
@@ -43,6 +44,10 @@ from vgen.protocol.user_enrollment import verify_user_registration_claim
 from .artifacts import ArtifactStore, LocalArtifactStore, OssArtifactStore
 from .database import GatewayDatabase, row_dict
 from .openapi import idempotency_cache_mode, install_openapi_contract
+from .public_metadata import (
+    PublicMetadataError,
+    project_reported_artifact_media_metadata,
+)
 from .releases import (
     PublicReleaseManifest,
     ReleaseCatalog,
@@ -92,9 +97,12 @@ from .schemas import (
     WorkerMaintenanceCommit,
     WorkerMaintenanceComplete,
     WorkerMaintenanceCreate,
+    WorkerMaintenanceCreateResponse,
     WorkerMaintenanceHeartbeat,
     WorkerManagerSet,
     WorkerOffer,
+    WorkerView,
+    WorkerWorkflowDeactivate,
     WorkspaceCreate,
     WorkspaceKeyEnvelopeGrant,
     WorkspaceKeyRotationCreate,
@@ -112,6 +120,16 @@ class Principal:
     user_id: str | None
     scopes: frozenset[str]
     session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedMaintenanceAuthorization:
+    spec: dict[str, Any]
+    authorization: dict[str, Any]
+    expires_at: int
+    spec_digest: str
+    intent_nonce: str
+    intent_issued_at: int
 
 
 @dataclass(slots=True)
@@ -173,9 +191,7 @@ class _TokenBucketRateLimiter:
                 bucket = _RateBucket(float(capacity), stamp)
             else:
                 elapsed = max(0.0, stamp - bucket.updated_at)
-                bucket.tokens = min(
-                    float(capacity), bucket.tokens + elapsed * refill_per_second
-                )
+                bucket.tokens = min(float(capacity), bucket.tokens + elapsed * refill_per_second)
                 bucket.updated_at = stamp
 
             allowed = bucket.tokens >= 1.0
@@ -232,6 +248,15 @@ def _declared_content_length(request: Request) -> int | None:
     if value < 0:
         raise ValueError("invalid_content_length")
     return value
+
+
+def _validated_sha256_digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    digest = value.removeprefix("sha256:")
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+    return digest
 
 
 async def _cache_bounded_body(request: Request, *, max_bytes: int) -> bool:
@@ -336,6 +361,82 @@ def _safe_idempotency_headers(headers: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() in allowed}
 
 
+def _invalid_finish_idempotency_hash() -> str:
+    return hashlib.sha256(b"vgen-attempt-finish-invalid-v1").hexdigest()
+
+
+def _attempt_finish_payload_hash(payload: AttemptFinish) -> str:
+    """Hash only the validated mutation semantics of a Worker finish report.
+
+    Legacy Workers signed executor-native metrics, filenames, and MIME values
+    that the Gateway verifies for compatibility but does not persist. A raw
+    SHA-256 would retain a durable dictionary oracle for those discarded
+    values. Invalid reports use one fixed non-success marker and are never
+    cached, so they cannot collide with a valid terminal mutation.
+    """
+
+    try:
+        metrics = GatewayRepository._validate_usage_metrics(payload.metrics)
+        terminal_state = (
+            "succeeded"
+            if payload.succeeded
+            else (
+                "cancelled"
+                if payload.failure_code == int(ErrorCode.EXECUTION_CANCELLED)
+                else "failed"
+            )
+        )
+        artifacts: list[dict[str, Any]] = []
+        for reported in payload.output_artifacts:
+            if reported.encrypted_size is not None and reported.encrypted_size > 100 * 1024**3:
+                return _invalid_finish_idempotency_hash()
+            digest = _validated_sha256_digest(reported.content_digest)
+            artifacts.append(
+                {
+                    "artifact_id": reported.artifact_id,
+                    "kind": reported.kind,
+                    "store_type": reported.store_type,
+                    "object_ref": reported.object_ref,
+                    "content_digest": digest,
+                    "encrypted_size": reported.encrypted_size,
+                    "media_metadata": project_reported_artifact_media_metadata(
+                        reported.media_metadata
+                    ),
+                }
+            )
+        semantics = {
+            "version": 1,
+            "fencing_token": payload.fencing_token,
+            "succeeded": payload.succeeded,
+            "output_artifacts": artifacts,
+            "metrics": metrics,
+            "failure_code": payload.failure_code,
+            "responsibility": payload.responsibility,
+            "safe_failure_details": canonical_task_failure_details_for_code(
+                payload.safe_failure_details,
+                payload.failure_code,
+                terminal_state=terminal_state,
+            ),
+        }
+    except (PublicMetadataError, RepositoryError, ValueError, VGenError):
+        return _invalid_finish_idempotency_hash()
+    return hashlib.sha256(canonical_json(semantics)).hexdigest()
+
+
+def _attempt_finish_idempotency_hash(body: bytes) -> str:
+    try:
+        payload = AttemptFinish.model_validate_json(body)
+    except ValueError:
+        return _invalid_finish_idempotency_hash()
+    return _attempt_finish_payload_hash(payload)
+
+
+def _idempotency_request_hash(mode: str, body: bytes) -> str:
+    if mode == "attempt_finish":
+        return _attempt_finish_idempotency_hash(body)
+    return hashlib.sha256(body).hexdigest()
+
+
 def _idempotency_storage_body(mode: str, status: int, body: bytes) -> bytes | None:
     """Build a capability-free replay recipe, or decline to cache it."""
 
@@ -350,6 +451,18 @@ def _idempotency_storage_body(mode: str, status: int, body: bytes) -> bytes | No
     if isinstance(existing_recipe, dict) and existing_recipe.get("kind") == mode:
         if _contains_capability_material(value):
             return None
+        if mode == "maintenance_create":
+            disposition = existing_recipe.get("creation_disposition")
+            owns_job = existing_recipe.get("intent_owns_job")
+            if (
+                disposition not in {"created", "deduplicated"}
+                or type(owns_job) is not bool
+                or owns_job != (disposition == "created")
+            ):
+                # Old recipes did not preserve request-relative ownership.
+                # Delete them during startup hygiene so the signed-intent
+                # receipt can reconstruct the authoritative result instead.
+                return None
         return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
     if 200 <= status < 300 and mode == "task_prepare":
         if (
@@ -390,11 +503,21 @@ def _idempotency_storage_body(mode: str, status: int, body: bytes) -> bytes | No
     elif 200 <= status < 300 and mode == "maintenance_create":
         if not isinstance(value, dict) or not isinstance(value.get("id"), str):
             return None
+        disposition = value.get("creation_disposition")
+        owns_job = value.get("intent_owns_job")
+        if (
+            disposition not in {"created", "deduplicated"}
+            or type(owns_job) is not bool
+            or owns_job != (disposition == "created")
+        ):
+            return None
         value = {
             "_vgen_replay": {
-                "version": 1,
+                "version": 2,
                 "kind": "maintenance_create",
                 "job_id": value["id"],
+                "creation_disposition": disposition,
+                "intent_owns_job": owns_job,
             }
         }
     elif 200 <= status < 300 and mode == "maintenance_claim" and status != 204:
@@ -488,9 +611,10 @@ def create_app(
         artifact_store = artifact_store_override
     elif configured_artifact_store == "oss":
         artifact_store = OssArtifactStore.from_environment()
-    elif configured_artifact_store == "local" and os.getenv(
-        "VGEN_ALLOW_LOCAL_ARTIFACT_STORE", ""
-    ) == "1":
+    elif (
+        configured_artifact_store == "local"
+        and os.getenv("VGEN_ALLOW_LOCAL_ARTIFACT_STORE", "") == "1"
+    ):
         resolved_artifact_root = artifact_root or os.getenv(
             "VGEN_ARTIFACT_ROOT", "./data/artifacts"
         )
@@ -685,9 +809,7 @@ def create_app(
 
     def maintenance_create_view(job: dict[str, Any], request: Request) -> dict[str, Any]:
         value = dict(job)
-        if value.get("state") == "awaiting_upload" and isinstance(
-            value.get("artifact"), dict
-        ):
+        if value.get("state") == "awaiting_upload" and isinstance(value.get("artifact"), dict):
             value["upload_ticket"] = maintenance_artifact_ticket(value, request, method="PUT")
         return value
 
@@ -880,6 +1002,14 @@ def create_app(
         elif mode == "maintenance_create" and 200 <= cached_status < 300:
             recipe = value.get("_vgen_replay", {})
             job_id = str(recipe.get("job_id", ""))
+            disposition = recipe.get("creation_disposition")
+            owns_job = recipe.get("intent_owns_job")
+            if (
+                disposition not in {"created", "deduplicated"}
+                or type(owns_job) is not bool
+                or owns_job != (disposition == "created")
+            ):
+                return _error_response(ErrorCode.INTERNAL_ERROR, request)
             if session["principal_type"] != "device" or not session["user_id"]:
                 return _error_response(ErrorCode.PERMISSION_DENIED, request)
             issued = db.fetchone(
@@ -896,6 +1026,8 @@ def create_app(
             except RepositoryError:
                 return _error_response(ErrorCode.WORKER_MAINTENANCE_JOB_NOT_FOUND, request)
             value = maintenance_create_view(job, request)
+            value["creation_disposition"] = disposition
+            value["intent_owns_job"] = owns_job
         elif mode == "maintenance_claim" and 200 <= cached_status < 300:
             recipe = value.get("_vgen_replay", {})
             job_id = str(recipe.get("job_id", ""))
@@ -915,30 +1047,84 @@ def create_app(
 
     # Upgrade-time hygiene: old alpha builds persisted complete prepare/lease
     # responses. Scrub them before serving a request, and delete every response
-    # from a route that is now explicitly non-cacheable.
-    for stale in db.fetchall("SELECT rowid,* FROM idempotency_records"):
-        stale_mode = idempotency_cache_mode(stale["path"])
-        safe_body = (
-            None
-            if stale_mode == "disabled"
-            else _idempotency_storage_body(
-                stale_mode, int(stale["response_status"]), bytes(stale["response_body"])
+    # from a route that is now explicitly non-cacheable. Finish rows created by
+    # older builds used a raw request hash, which can fingerprint fields that
+    # are now deliberately discarded; they cannot be safely transformed
+    # without retaining the original body and are therefore invalidated once.
+    with db.transaction(immediate=True) as conn:
+        migration_name = "idempotency-safe-recipes-v2"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?", (migration_name,)
+        ).fetchone()
+        if applied is None:
+            for stale in conn.execute("SELECT rowid,* FROM idempotency_records").fetchall():
+                stale_mode = idempotency_cache_mode(stale["path"])
+                if stale_mode == "attempt_finish":
+                    conn.execute("DELETE FROM idempotency_records WHERE rowid=?", (stale["rowid"],))
+                    continue
+                safe_body = (
+                    None
+                    if stale_mode == "disabled"
+                    else _idempotency_storage_body(
+                        stale_mode,
+                        int(stale["response_status"]),
+                        bytes(stale["response_body"]),
+                    )
+                )
+                if safe_body is None:
+                    conn.execute("DELETE FROM idempotency_records WHERE rowid=?", (stale["rowid"],))
+                else:
+                    try:
+                        stale_headers = json.loads(stale["response_headers"])
+                    except json.JSONDecodeError:
+                        stale_headers = {}
+                    conn.execute(
+                        """UPDATE idempotency_records
+                           SET response_headers=?,response_body=? WHERE rowid=?""",
+                        (
+                            json.dumps(
+                                _safe_idempotency_headers(stale_headers), separators=(",", ":")
+                            ),
+                            safe_body,
+                            stale["rowid"],
+                        ),
+                    )
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                (migration_name, time.time()),
             )
-        )
-        if safe_body is None:
-            db.execute("DELETE FROM idempotency_records WHERE rowid=?", (stale["rowid"],))
-        else:
-            try:
-                stale_headers = json.loads(stale["response_headers"])
-            except json.JSONDecodeError:
-                stale_headers = {}
-            db.execute(
-                "UPDATE idempotency_records SET response_headers=?,response_body=? WHERE rowid=?",
-                (
-                    json.dumps(_safe_idempotency_headers(stale_headers), separators=(",", ":")),
-                    safe_body,
-                    stale["rowid"],
-                ),
+
+    # v2 predates request-relative maintenance ownership. Do not rerun that
+    # broad hygiene pass on every upgrade because it deliberately invalidates
+    # legacy attempt-finish rows. Instead, remove only maintenance-create
+    # recipes that cannot prove whether their signed intent owns the job; a
+    # retry then reconstructs the result from the durable intent receipt.
+    with db.transaction(immediate=True) as conn:
+        migration_name = "maintenance-create-ownership-recipes-v1"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?", (migration_name,)
+        ).fetchone()
+        if applied is None:
+            for stale in conn.execute("SELECT rowid,* FROM idempotency_records").fetchall():
+                if idempotency_cache_mode(stale["path"]) != "maintenance_create":
+                    continue
+                safe_body = _idempotency_storage_body(
+                    "maintenance_create",
+                    int(stale["response_status"]),
+                    bytes(stale["response_body"]),
+                )
+                if safe_body is None:
+                    conn.execute(
+                        "DELETE FROM idempotency_records WHERE rowid=?", (stale["rowid"],)
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE idempotency_records SET response_body=? WHERE rowid=?",
+                        (safe_body, stale["rowid"]),
+                    )
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                (migration_name, time.time()),
             )
 
     async def verify_mutation_signature(
@@ -988,6 +1174,45 @@ def create_app(
             ),
         )
 
+    def verify_attempt_finish_report(
+        *, attempt_id: str, payload: AttemptFinish, worker_id: str
+    ) -> sqlite3.Row:
+        """Verify the Worker's application-level signature over the full report."""
+
+        attempt = db.fetchone(
+            """SELECT a.task_id,t.state AS task_state
+               FROM task_attempts a JOIN tasks t ON t.id=a.task_id
+               WHERE a.id=? AND a.worker_id=?""",
+            (attempt_id, worker_id),
+        )
+        worker = db.fetchone("SELECT signing_public_key FROM workers WHERE id=?", (worker_id,))
+        if attempt is None or worker is None or not payload.worker_signature:
+            raise VGenError(
+                ErrorCode.USAGE_REPORT_INVALID,
+                details={"reason": "worker_signature_missing"},
+            )
+        signed_report = {
+            "attempt_id": attempt_id,
+            "task_id": attempt["task_id"],
+            "worker_id": worker_id,
+            **payload.model_dump(exclude={"worker_signature"}),
+        }
+        try:
+            report_valid = verify_message(
+                b64url_decode(worker["signing_public_key"], expected_length=32),
+                canonical_json(signed_report),
+                b64url_decode(payload.worker_signature, expected_length=64),
+                context=b"vgen-worker-finish-v1",
+            )
+        except ValueError:
+            report_valid = False
+        if not report_valid:
+            raise VGenError(
+                ErrorCode.USAGE_REPORT_INVALID,
+                details={"reason": "worker_signature_invalid"},
+            )
+        return attempt
+
     @app.middleware("http")
     async def request_controls(request: Request, call_next):
         request.state.request_id = protocol_new_id("request")
@@ -1020,7 +1245,8 @@ def create_app(
                     details={"max_bytes": request_body_limit},
                 )
         protocol_exempt = (
-            request.url.path in {
+            request.url.path
+            in {
                 "/healthz",
                 "/api/v1/health",
                 "/docs",
@@ -1100,7 +1326,7 @@ def create_app(
         principal_key = "anonymous"
         if idempotency_key and method in {"POST", "PUT", "PATCH", "DELETE"} and safe_to_cache:
             body = await request.body()
-            request_hash = hashlib.sha256(body).hexdigest()
+            request_hash = _idempotency_request_hash(cache_mode, body)
             auth = request.headers.get("Authorization", "")
             principal_key = hashlib.sha256(auth.encode()).hexdigest() if auth else "anonymous"
             record = db.get_idempotency(principal_key, method, request.url.path, idempotency_key)
@@ -1122,6 +1348,19 @@ def create_app(
                 try:
                     validate_session_subject(session)
                     await verify_mutation_signature(request, session, body=body)
+                    if cache_mode == "attempt_finish":
+                        if session["principal_type"] != "worker":
+                            raise VGenError(ErrorCode.PERMISSION_DENIED)
+                        try:
+                            finish_payload = AttemptFinish.model_validate_json(body)
+                        except ValueError as exc:
+                            raise VGenError(ErrorCode.VALIDATION_FAILED) from exc
+                        attempt_id = request.url.path.rsplit("/", 2)[-2]
+                        verify_attempt_finish_report(
+                            attempt_id=attempt_id,
+                            payload=finish_payload,
+                            worker_id=session["principal_id"],
+                        )
                 except VGenError as exc:
                     return JSONResponse(
                         exc.to_envelope()
@@ -1164,7 +1403,13 @@ def create_app(
             # Persist only successful mutations and deterministic conflicts.
             # Validation/not-found responses can contain attacker-controlled
             # route or schema locations and are safe to recompute on retry.
-            and (200 <= response.status_code < 300 or response.status_code == 409)
+            # Attempt finish has an authoritative receipt on task_attempts.
+            # Never let a racing or attacker-influenced 409 win the HTTP cache
+            # before the successful terminal transaction stores its response.
+            and (
+                200 <= response.status_code < 300
+                or (response.status_code == 409 and cache_mode != "attempt_finish")
+            )
         ):
             body = b"".join([chunk async for chunk in response.body_iterator])
             response_headers = {
@@ -1414,10 +1659,12 @@ def create_app(
         worker_id: str,
         payload: WorkerMaintenanceCreate,
         principal: Principal,
-    ) -> tuple[dict[str, Any], dict[str, Any], int, str]:
+    ) -> _ValidatedMaintenanceAuthorization:
         if principal.principal_type != "device" or not principal.user_id:
             raise VGenError(ErrorCode.PERMISSION_DENIED)
-        spec = payload.spec.model_dump(mode="json")
+        # Optional v2 dependency identifiers are omitted for a legacy v1
+        # maintenance intent so the exact Owner-signed spec remains stable.
+        spec = payload.spec.model_dump(mode="json", exclude_none=True)
         authorization = payload.authorization.model_dump(mode="json")
         intent_payload = authorization["payload"]
         if (
@@ -1462,16 +1709,14 @@ def create_app(
                 details={"reason": "maintenance_intent_invalid"},
             )
         expires_at = int(intent_payload["expires_at"])
-        ttl_seconds = max(1, expires_at - int(time.time()))
-        if not db.claim_request_nonce(
-            principal_type="maintenance_intent",
-            principal_id=principal.principal_id,
-            nonce=str(intent_payload["nonce"]),
-            signature_created_at=int(intent_payload["issued_at"]),
-            ttl_seconds=ttl_seconds,
-        ):
-            raise VGenError(ErrorCode.REPLAY_DETECTED)
-        return spec, authorization, expires_at, str(intent_payload["spec_digest"])
+        return _ValidatedMaintenanceAuthorization(
+            spec=spec,
+            authorization=authorization,
+            expires_at=expires_at,
+            spec_digest=str(intent_payload["spec_digest"]),
+            intent_nonce=str(intent_payload["nonce"]),
+            intent_issued_at=int(intent_payload["issued_at"]),
+        )
 
     @app.get("/healthz", tags=["system"], response_model=HealthResponse)
     def health() -> dict[str, bool]:
@@ -2147,10 +2392,8 @@ def create_app(
                 and manifest.get("algorithm") == payload.algorithm
                 and manifest.get("envelope_sha256") == envelope_digest
                 and manifest.get("signer_root_key_id") == signed.get("signer_key_id")
-                and manifest.get("recipient_public_key_sha256")
-                == recipient["recipient_key_sha256"]
-                and manifest.get("recipient_admission_sha256")
-                == recipient["admission_digest"]
+                and manifest.get("recipient_public_key_sha256") == recipient["recipient_key_sha256"]
+                and manifest.get("recipient_admission_sha256") == recipient["admission_digest"]
                 and manifest.get("recipient_binding_digest")
                 == recipient["recipient_binding_digest"]
                 and (
@@ -2438,9 +2681,7 @@ def create_app(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Vary"] = (
-            "Authorization, Content-Digest, Signature-Input, Signature"
-        )
+        response.headers["Vary"] = "Authorization, Content-Digest, Signature-Input, Signature"
         if credentials is not None:
             session = db.resolve_session(credentials.credentials)
             if session is None:
@@ -2587,7 +2828,7 @@ def create_app(
 
     # -------------------------------------------------------------- worker/rates
 
-    @app.post("/api/v1/workers", tags=["worker"])
+    @app.post("/api/v1/workers", tags=["worker"], response_model=WorkerView)
     def create_worker(
         payload: WorkerCreate, principal: Principal = Depends(user_principal)
     ) -> dict[str, Any]:
@@ -2597,14 +2838,16 @@ def create_app(
         # short-lived session, which keeps idempotency records non-sensitive.
         return repository.create_worker(owner_user_id=principal.user_id, **payload.model_dump())
 
-    @app.get("/api/v1/workers", tags=["worker"])
+    @app.get("/api/v1/workers", tags=["worker"], response_model=list[WorkerView])
     def list_workers(
         principal: Principal = Depends(user_principal),
         workspace_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return repository.list_workers(user_id=principal.user_id, workspace_id=workspace_id)
 
-    @app.post("/api/v1/workers/{worker_id}/manager", tags=["worker"])
+    @app.post(
+        "/api/v1/workers/{worker_id}/manager", tags=["worker"], response_model=WorkerView
+    )
     def set_worker_manager(
         worker_id: str,
         payload: WorkerManagerSet,
@@ -2620,6 +2863,7 @@ def create_app(
     @app.post(
         "/api/v1/brokers/{broker_id}/workers/{worker_id}/maintenance-jobs",
         tags=["worker-maintenance"],
+        response_model=WorkerMaintenanceCreateResponse,
     )
     def create_worker_maintenance(
         broker_id: str,
@@ -2628,7 +2872,7 @@ def create_app(
         request: Request,
         principal: Principal = Depends(user_principal),
     ) -> dict[str, Any]:
-        spec, authorization, expires_at, spec_digest = validate_maintenance_authorization(
+        validated = validate_maintenance_authorization(
             broker_id=broker_id,
             worker_id=worker_id,
             payload=payload,
@@ -2640,10 +2884,12 @@ def create_app(
             user_id=principal.user_id,
             device_id=principal.principal_id,
             kind=payload.spec.kind,
-            spec=spec,
-            spec_digest=spec_digest,
-            authorization=authorization,
-            expires_at=expires_at,
+            spec=validated.spec,
+            spec_digest=validated.spec_digest,
+            authorization=validated.authorization,
+            expires_at=validated.expires_at,
+            intent_nonce=validated.intent_nonce,
+            intent_issued_at=validated.intent_issued_at,
             artifact_store_type=artifact_store.store_type,
         )
         return maintenance_create_view(job, request)
@@ -2665,9 +2911,7 @@ def create_app(
     def get_worker_maintenance(
         job_id: str, principal: Principal = Depends(user_principal)
     ) -> dict[str, Any]:
-        return repository.get_worker_maintenance(
-            job_id=job_id, owner_user_id=principal.user_id
-        )
+        return repository.get_worker_maintenance(job_id=job_id, owner_user_id=principal.user_id)
 
     @app.post("/api/v1/maintenance-jobs/{job_id}/commit", tags=["worker-maintenance"])
     def commit_worker_maintenance(
@@ -2687,9 +2931,7 @@ def create_app(
             size, digest = artifact_store.observe_upload(
                 artifact["id"], max_bytes=int(artifact["expected_size"])
             )
-            repository.mark_artifact_uploaded(
-                artifact_id=artifact["id"], size=size, digest=digest
-            )
+            repository.mark_artifact_uploaded(artifact_id=artifact["id"], size=size, digest=digest)
         return repository.commit_worker_maintenance(
             job_id=job_id,
             user_id=principal.user_id,
@@ -2757,6 +2999,21 @@ def create_app(
     ) -> dict[str, Any]:
         return repository.leave_worker(
             worker_id=worker_id, owner_user_id=principal.user_id, force=True
+        )
+
+    @app.post("/api/v1/workers/{worker_id}/workflows/deactivate", tags=["worker"])
+    def deactivate_worker_workflow(
+        worker_id: str,
+        payload: WorkerWorkflowDeactivate,
+        principal: Principal = Depends(user_principal),
+    ) -> dict[str, Any]:
+        return repository.deactivate_worker_workflow(
+            worker_id=worker_id,
+            owner_user_id=principal.user_id,
+            actor_device_id=principal.principal_id,
+            workflow_ref=payload.workflow_ref,
+            workflow_digest=payload.workflow_digest,
+            authorization_source_id=payload.authorization_source_id,
         )
 
     def require_worker(principal: Principal, worker_id: str) -> None:
@@ -3156,38 +3413,20 @@ def create_app(
         if principal.principal_type != "worker":
             raise VGenError(ErrorCode.PERMISSION_DENIED)
         require_scope(principal, "worker:complete")
-        attempt = db.fetchone(
-            """SELECT a.task_id,t.state AS task_state
-               FROM task_attempts a JOIN tasks t ON t.id=a.task_id
-               WHERE a.id=? AND a.worker_id=?""",
-            (attempt_id, principal.principal_id),
+        attempt = verify_attempt_finish_report(
+            attempt_id=attempt_id,
+            payload=payload,
+            worker_id=principal.principal_id,
         )
-        worker = db.fetchone(
-            "SELECT signing_public_key FROM workers WHERE id=?", (principal.principal_id,)
+        finish_semantic_hash = _attempt_finish_payload_hash(payload)
+        replayed = repository.replay_finished_attempt(
+            attempt_id=attempt_id,
+            worker_id=principal.principal_id,
+            fencing_token=payload.fencing_token,
+            finish_semantic_hash=finish_semantic_hash,
         )
-        if attempt is None or worker is None or not payload.worker_signature:
-            raise VGenError(
-                ErrorCode.USAGE_REPORT_INVALID, details={"reason": "worker_signature_missing"}
-            )
-        signed_report = {
-            "attempt_id": attempt_id,
-            "task_id": attempt["task_id"],
-            "worker_id": principal.principal_id,
-            **payload.model_dump(exclude={"worker_signature"}),
-        }
-        try:
-            report_valid = verify_message(
-                b64url_decode(worker["signing_public_key"], expected_length=32),
-                canonical_json(signed_report),
-                b64url_decode(payload.worker_signature, expected_length=64),
-                context=b"vgen-worker-finish-v1",
-            )
-        except ValueError:
-            report_valid = False
-        if not report_valid:
-            raise VGenError(
-                ErrorCode.USAGE_REPORT_INVALID, details={"reason": "worker_signature_invalid"}
-            )
+        if replayed is not None:
+            return replayed
         if payload.succeeded and attempt["task_state"] != "cancelled":
             for reported in payload.output_artifacts:
                 if not reported.artifact_id:
@@ -3197,29 +3436,41 @@ def create_app(
                        WHERE id=? AND attempt_id=? AND direction='output'""",
                     (reported.artifact_id, attempt_id),
                 )
-                if (
-                    artifact is not None
-                    and reported.encrypted_size is not None
-                    and reported.content_digest is not None
-                ):
-                    if reported.encrypted_size > 100 * 1024**3:
+                if artifact is None:
+                    continue
+                reported_size = reported.encrypted_size
+                if reported_size is not None and reported_size > 100 * 1024**3:
+                    raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+                reported_digest = _validated_sha256_digest(reported.content_digest)
+                observed_size, raw_observed_digest = artifact_store.observe_upload(
+                    artifact["id"],
+                    max_bytes=reported_size if reported_size is not None else 100 * 1024**3,
+                )
+                if reported_size is not None and observed_size != reported_size:
+                    raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+                observed_digest = _validated_sha256_digest(raw_observed_digest)
+                if observed_digest is not None:
+                    # A store capable of hashing the object is authoritative;
+                    # the signed Worker value is only a claim to verify.
+                    if reported_digest is not None and not secrets.compare_digest(
+                        observed_digest, reported_digest
+                    ):
                         raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
-                    digest = reported.content_digest.removeprefix("sha256:")
-                    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-                        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
-                    observed_size, _ = artifact_store.observe_upload(
-                        artifact["id"], max_bytes=reported.encrypted_size
-                    )
-                    if observed_size != reported.encrypted_size:
-                        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
-                    repository.mark_artifact_uploaded(
-                        artifact_id=artifact["id"],
-                        size=reported.encrypted_size,
-                        digest=digest,
-                    )
+                elif reported_size is None or reported_digest is None:
+                    # Remote object stores can currently prove only object size.
+                    # Keep requiring the already-verified Worker receipt before
+                    # promoting such an output; the repository will reject a
+                    # pending reservation when that receipt is incomplete.
+                    continue
+                repository.mark_artifact_uploaded(
+                    artifact_id=artifact["id"],
+                    size=observed_size,
+                    digest=(observed_digest if observed_digest is not None else reported_digest),
+                )
         return repository.finish_attempt(
             attempt_id=attempt_id,
             worker_id=principal.principal_id,
+            finish_semantic_hash=finish_semantic_hash,
             **payload.model_dump(),
         )
 

@@ -900,6 +900,39 @@
             "title": "Kind",
             "type": "string"
           },
+          "model_digests": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Digests"
+          },
+          "node_classes": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+                  "type": "string"
+                },
+                "maxItems": 512,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Classes"
+          },
           "node_classes_digest": {
             "pattern": "^[0-9a-f]{64}$",
             "title": "Node Classes Digest",
@@ -1235,6 +1268,21 @@
         "required": [
           "error"
         ],
+        "type": "object"
+      },
+      "GatewayProtocolFeatures": {
+        "additionalProperties": false,
+        "properties": {
+          "capability_install_spec_version": {
+            "const": 2,
+            "title": "Capability Install Spec Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capability_install_spec_version"
+        ],
+        "title": "GatewayProtocolFeatures",
         "type": "object"
       },
       "HealthCounts": {
@@ -2547,6 +2595,7 @@
               320006,
               320007,
               320008,
+              320009,
               330001,
               330002,
               330003,
@@ -2644,6 +2693,7 @@
               "WORKFLOW_NOT_FOUND",
               "WORKFLOW_SIGNATURE_INVALID",
               "EXECUTION_CANCELLED",
+              "SYSTEM_OUT_OF_MEMORY",
               "INPUT_DOWNLOAD_FAILED",
               "OUTPUT_UPLOAD_FAILED",
               "ARTIFACT_NOT_FOUND",
@@ -2813,6 +2863,55 @@
           "action",
           "after_ms"
         ],
+        "type": "object"
+      },
+      "WorkerCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "capability_install_spec_version": {
+            "anyOf": [
+              {
+                "const": 2,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability Install Spec Version"
+          },
+          "executors": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerExecutorCapability"
+            },
+            "title": "Executors",
+            "type": "array"
+          },
+          "maintenance_actions": {
+            "items": {
+              "enum": [
+                "worker_update",
+                "model_install",
+                "capability_install"
+              ],
+              "type": "string"
+            },
+            "title": "Maintenance Actions",
+            "type": "array"
+          },
+          "worker_runtime_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Runtime Version"
+          }
+        },
+        "title": "WorkerCapabilities",
         "type": "object"
       },
       "WorkerCreate": {
@@ -3034,6 +3133,130 @@
           "approve"
         ],
         "title": "WorkerEnrollmentDecision",
+        "type": "object"
+      },
+      "WorkerExecutorCapability": {
+        "additionalProperties": false,
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/WorkerExecutorCapabilityFacts"
+          },
+          "max_concurrency": {
+            "default": 1,
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "operations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Operations",
+            "type": "array"
+          },
+          "payload_formats": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Payload Formats",
+            "type": "array"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "WorkerExecutorCapability",
+        "type": "object"
+      },
+      "WorkerExecutorCapabilityFacts": {
+        "additionalProperties": false,
+        "properties": {
+          "capability_schema_version": {
+            "anyOf": [
+              {
+                "const": 2,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability Schema Version"
+          },
+          "model_digests": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Model Digests",
+            "type": "array"
+          },
+          "ram_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Bytes"
+          },
+          "ready_workflow_digests": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Ready Workflow Digests",
+            "type": "array"
+          },
+          "runtime_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Version"
+          },
+          "vram_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vram Bytes"
+          },
+          "workflow_readiness": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerWorkflowReadiness"
+            },
+            "title": "Workflow Readiness",
+            "type": "array"
+          }
+        },
+        "title": "WorkerExecutorCapabilityFacts",
         "type": "object"
       },
       "WorkerHeartbeat": {
@@ -3259,6 +3482,38 @@
         "title": "WorkerMaintenanceCreate",
         "type": "object"
       },
+      "WorkerMaintenanceCreateResponse": {
+        "additionalProperties": true,
+        "description": "Request-relative ownership metadata plus the maintenance job view.\n\nThe job view intentionally remains extensible because artifact-backed\njobs also carry freshly issued upload tickets. The two required fields\nprevent callers from treating a job deduplicated from another signed\nintent as their own rollback or cancellation source.",
+        "properties": {
+          "creation_disposition": {
+            "description": "Whether this signed maintenance intent created a new job or joined an already-active worker-update job. The value is stable across retries of the same intent.",
+            "enum": [
+              "created",
+              "deduplicated"
+            ],
+            "title": "Creation Disposition",
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^mtj_[a-z2-7]{26}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "intent_owns_job": {
+            "description": "True only when this signed maintenance intent created the job and may use its ID for automatic cancellation or source-scoped rollback.",
+            "title": "Intent Owns Job",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "creation_disposition",
+          "intent_owns_job"
+        ],
+        "title": "WorkerMaintenanceCreateResponse",
+        "type": "object"
+      },
       "WorkerMaintenanceHeartbeat": {
         "additionalProperties": false,
         "properties": {
@@ -3468,6 +3723,238 @@
           "artifact_size"
         ],
         "title": "WorkerUpdateSpec",
+        "type": "object"
+      },
+      "WorkerView": {
+        "additionalProperties": false,
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/WorkerCapabilities"
+          },
+          "capability_auth_enforced_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability Auth Enforced At"
+          },
+          "capacity": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Capacity",
+            "type": "integer"
+          },
+          "certificate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Certificate"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "number"
+          },
+          "encryption_public_key": {
+            "title": "Encryption Public Key",
+            "type": "string"
+          },
+          "executor_type": {
+            "title": "Executor Type",
+            "type": "string"
+          },
+          "executor_version": {
+            "title": "Executor Version",
+            "type": "string"
+          },
+          "fencing_counter": {
+            "minimum": 0.0,
+            "title": "Fencing Counter",
+            "type": "integer"
+          },
+          "gateway_protocol_features": {
+            "$ref": "#/components/schemas/GatewayProtocolFeatures"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "manager_broker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Manager Broker Id"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_user_id": {
+            "title": "Owner User Id",
+            "type": "string"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "signing_public_key": {
+            "title": "Signing Public Key",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "active",
+              "offline",
+              "draining",
+              "revoked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "owner_user_id",
+          "manager_broker_id",
+          "name",
+          "signing_public_key",
+          "encryption_public_key",
+          "certificate",
+          "executor_type",
+          "executor_version",
+          "capabilities",
+          "capacity",
+          "status",
+          "fencing_counter",
+          "last_seen_at",
+          "capability_auth_enforced_at",
+          "created_at",
+          "updated_at",
+          "revoked_at",
+          "gateway_protocol_features"
+        ],
+        "title": "WorkerView",
+        "type": "object"
+      },
+      "WorkerWorkflowDeactivate": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_source_id": {
+            "anyOf": [
+              {
+                "pattern": "^mtj_[a-z2-7]{26}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional maintenance job authorization to revoke during an automatic install rollback. Omit for an explicit uninstall of every dynamic grant for the release.",
+            "title": "Authorization Source Id"
+          },
+          "workflow_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Workflow Digest",
+            "type": "string"
+          },
+          "workflow_ref": {
+            "maxLength": 512,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+            "title": "Workflow Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_ref",
+          "workflow_digest"
+        ],
+        "title": "WorkerWorkflowDeactivate",
+        "type": "object"
+      },
+      "WorkerWorkflowReadiness": {
+        "additionalProperties": false,
+        "properties": {
+          "missing_model_digests": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Model Digests",
+            "type": "array"
+          },
+          "missing_node_classes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Node Classes",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "missing_models",
+              "missing_nodes",
+              "node_probe_unavailable",
+              "executor_incompatible",
+              "runtime_incompatible",
+              "insufficient_vram",
+              "insufficient_ram"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "workflow_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Workflow Digest",
+            "type": "string"
+          },
+          "workflow_ref": {
+            "title": "Workflow Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_ref",
+          "workflow_digest",
+          "state"
+        ],
+        "title": "WorkerWorkflowReadiness",
         "type": "object"
       },
       "WorkspaceCreate": {
@@ -4008,9 +4495,6 @@
             "$ref": "#/components/parameters/VgenProtocolVersion"
           },
           {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
             "$ref": "#/components/parameters/ContentDigest"
           },
           {
@@ -4100,7 +4584,8 @@
         "tags": [
           "worker"
         ],
-        "x-vgen-idempotency-supported": true,
+        "x-vgen-idempotency-exception": "Response replay caching is disabled because this operation carries or issues authentication, Invite, or artifact capability secrets.",
+        "x-vgen-idempotency-supported": false,
         "x-vgen-required-headers": [
           "Vgen-Protocol-Version",
           "Authorization",
@@ -4963,9 +5448,6 @@
             "$ref": "#/components/parameters/VgenProtocolVersion"
           },
           {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
             "$ref": "#/components/parameters/ContentDigest"
           },
           {
@@ -5055,7 +5537,8 @@
         "tags": [
           "broker"
         ],
-        "x-vgen-idempotency-supported": true,
+        "x-vgen-idempotency-exception": "Response replay caching is disabled because this operation carries or issues authentication, Invite, or artifact capability secrets.",
+        "x-vgen-idempotency-supported": false,
         "x-vgen-required-headers": [
           "Vgen-Protocol-Version",
           "Authorization",
@@ -5428,9 +5911,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Create Worker Maintenance Api V1 Brokers  Broker Id  Workers  Worker Id  Maintenance Jobs Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WorkerMaintenanceCreateResponse"
                 }
               }
             },
@@ -8402,8 +8883,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/WorkerView"
                   },
                   "title": "Response List Workers Api V1 Workers Get",
                   "type": "array"
@@ -8504,9 +8984,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Create Worker Api V1 Workers Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WorkerView"
                 }
               }
             },
@@ -8594,9 +9072,6 @@
           },
           {
             "$ref": "#/components/parameters/VgenProtocolVersion"
-          },
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
           },
           {
             "$ref": "#/components/parameters/ContentDigest"
@@ -8688,7 +9163,8 @@
         "tags": [
           "worker"
         ],
-        "x-vgen-idempotency-supported": true,
+        "x-vgen-idempotency-exception": "Response replay caching is disabled because this operation carries or issues authentication, Invite, or artifact capability secrets.",
+        "x-vgen-idempotency-supported": false,
         "x-vgen-required-headers": [
           "Vgen-Protocol-Version",
           "Authorization",
@@ -9307,9 +9783,6 @@
             "$ref": "#/components/parameters/VgenProtocolVersion"
           },
           {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
             "$ref": "#/components/parameters/ContentDigest"
           },
           {
@@ -9399,7 +9872,8 @@
         "tags": [
           "worker-maintenance"
         ],
-        "x-vgen-idempotency-supported": true,
+        "x-vgen-idempotency-exception": "Response replay caching is disabled because this operation carries or issues authentication, Invite, or artifact capability secrets.",
+        "x-vgen-idempotency-supported": false,
         "x-vgen-required-headers": [
           "Vgen-Protocol-Version",
           "Authorization",
@@ -9453,9 +9927,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Set Worker Manager Api V1 Workers  Worker Id  Manager Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WorkerView"
                 }
               }
             },
@@ -9862,6 +10334,125 @@
           }
         ],
         "summary": "Revoke Worker",
+        "tags": [
+          "worker"
+        ],
+        "x-vgen-idempotency-supported": true,
+        "x-vgen-required-headers": [
+          "Vgen-Protocol-Version",
+          "Authorization",
+          "Content-Digest",
+          "Signature-Input",
+          "Signature"
+        ]
+      }
+    },
+    "/api/v1/workers/{worker_id}/workflows/deactivate": {
+      "post": {
+        "operationId": "deactivate_worker_workflow_api_v1_workers__worker_id__workflows_deactivate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "title": "Worker Id",
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/VgenProtocolVersion"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/ContentDigest"
+          },
+          {
+            "$ref": "#/components/parameters/SignatureInput"
+          },
+          {
+            "$ref": "#/components/parameters/Signature"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerWorkflowDeactivate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Deactivate Worker Workflow Api V1 Workers  Worker Id  Workflows Deactivate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Opaque request correlation identifier.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/VGenError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/VGenError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/VGenError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/VGenError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/VGenError409"
+          },
+          "413": {
+            "$ref": "#/components/responses/VGenError413"
+          },
+          "422": {
+            "$ref": "#/components/responses/VGenError422"
+          },
+          "429": {
+            "$ref": "#/components/responses/VGenError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/VGenError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/VGenError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/VGenError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/VGenError504"
+          },
+          "507": {
+            "$ref": "#/components/responses/VGenError507"
+          }
+        },
+        "security": [
+          {
+            "VGenSession": []
+          }
+        ],
+        "summary": "Deactivate Worker Workflow",
         "tags": [
           "worker"
         ],

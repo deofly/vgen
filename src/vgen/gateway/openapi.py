@@ -34,13 +34,16 @@ IDEMPOTENCY_DISABLED_PREFIXES = (
 _INVITE_PATH = re.compile(r"^/api/v1/workspaces/[^/]+/invites(?:/.*)?$")
 _WORKER_INVITE_PATH = re.compile(r"^/api/v1/workspaces/[^/]+/worker-invites$")
 _ARTIFACT_TICKET_PATH = re.compile(r"^/api/v1/attempts/[^/]+/artifact-tickets$")
+_ATTEMPT_FINISH_PATH = re.compile(r"^/api/v1/attempts/[^/]+/finish$")
+_WORKER_HEARTBEAT_PATH = re.compile(r"^/api/v1/workers/[^/]+/heartbeat$")
+_ATTEMPT_HEARTBEAT_PATH = re.compile(r"^/api/v1/attempts/[^/]+/heartbeat$")
+_MAINTENANCE_HEARTBEAT_PATH = re.compile(
+    r"^/api/v1/workers/[^/]+/maintenance-jobs/[^/]+/heartbeat$"
+)
+_BROKER_HEARTBEAT_PATH = re.compile(r"^/api/v1/broker-devices/[^/]+/heartbeat$")
 _LEASE_PATH = re.compile(r"^/api/v1/workers/[^/]+/lease$")
-_MAINTENANCE_CREATE_PATH = re.compile(
-    r"^/api/v1/brokers/[^/]+/workers/[^/]+/maintenance-jobs$"
-)
-_MAINTENANCE_CLAIM_PATH = re.compile(
-    r"^/api/v1/workers/[^/]+/maintenance-jobs/claim$"
-)
+_MAINTENANCE_CREATE_PATH = re.compile(r"^/api/v1/brokers/[^/]+/workers/[^/]+/maintenance-jobs$")
+_MAINTENANCE_CLAIM_PATH = re.compile(r"^/api/v1/workers/[^/]+/maintenance-jobs/claim$")
 ERROR_HTTP_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504, 507)
 
 
@@ -58,6 +61,10 @@ def idempotency_cache_mode(path: str) -> str:
         or _INVITE_PATH.fullmatch(path)
         or _WORKER_INVITE_PATH.fullmatch(path)
         or _ARTIFACT_TICKET_PATH.fullmatch(path)
+        or _WORKER_HEARTBEAT_PATH.fullmatch(path)
+        or _ATTEMPT_HEARTBEAT_PATH.fullmatch(path)
+        or _MAINTENANCE_HEARTBEAT_PATH.fullmatch(path)
+        or _BROKER_HEARTBEAT_PATH.fullmatch(path)
     ):
         return "disabled"
     if path == "/api/v1/tasks/prepare":
@@ -68,6 +75,11 @@ def idempotency_cache_mode(path: str) -> str:
         return "maintenance_create"
     if _MAINTENANCE_CLAIM_PATH.fullmatch(path):
         return "maintenance_claim"
+    if _ATTEMPT_FINISH_PATH.fullmatch(path):
+        # Finish reports contain a second Worker signature plus compatibility
+        # fields that are verified but intentionally discarded.  The Gateway
+        # hashes their projected mutation semantics rather than the raw body.
+        return "attempt_finish"
     return "plain"
 
 
@@ -113,7 +125,7 @@ def _components() -> dict[str, Any]:
                     "generated Worker signing key. Content-Digest and Signature-Input are "
                     "required, and the signature nonce is replay protected."
                 ),
-            }
+            },
         },
         "parameters": {
             "VgenProtocolVersion": _header_parameter(

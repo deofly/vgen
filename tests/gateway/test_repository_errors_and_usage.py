@@ -12,6 +12,7 @@ from vgen.crypto import (
     derive_identity_keys,
     issue_device_certificate,
 )
+from vgen.gateway.app import create_app
 from vgen.gateway.database import GatewayDatabase, json_text, now
 from vgen.gateway.repository import GatewayRepository, RepositoryError
 from vgen.protocol.errors import ERROR_REGISTRY, ErrorCode
@@ -20,6 +21,55 @@ from vgen.protocol.user_enrollment import (
     build_user_registration_claim,
     sign_user_registration_claim,
 )
+
+
+def test_idempotency_hygiene_migration_does_not_delete_new_finish_replays(tmp_path) -> None:
+    path = tmp_path / "gateway.db"
+    first = create_app(
+        database_path=str(path),
+        bootstrap_code="test-bootstrap",
+        require_request_signatures=False,
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    try:
+        first.state.db.put_idempotency(
+            "worker:wrk_test",
+            "POST",
+            "/api/v1/attempts/atm_test/finish",
+            "finish-after-migration",
+            "a" * 64,
+            200,
+            {"content-type": "application/json"},
+            b'{"attempt_id":"atm_test","task_id":"tsk_test","state":"succeeded"}',
+        )
+        assert (
+            first.state.db.fetchone(
+                "SELECT applied_at FROM schema_migrations WHERE name=?",
+                ("idempotency-safe-recipes-v2",),
+            )
+            is not None
+        )
+
+        restarted = create_app(
+            database_path=str(path),
+            bootstrap_code="test-bootstrap",
+            require_request_signatures=False,
+            artifact_root=str(tmp_path / "artifacts"),
+        )
+        try:
+            assert (
+                restarted.state.db.get_idempotency(
+                    "worker:wrk_test",
+                    "POST",
+                    "/api/v1/attempts/atm_test/finish",
+                    "finish-after-migration",
+                )
+                is not None
+            )
+        finally:
+            restarted.state.db.close()
+    finally:
+        first.state.db.close()
 
 
 def test_existing_v1_ledger_adds_reversal_reference_reason_and_unique_index(tmp_path) -> None:
@@ -812,7 +862,7 @@ def test_worker_cannot_self_assign_consumer_billing_responsibility(tmp_path) -> 
             capabilities={},
             capacity=1,
         )
-        _task_id, attempt_id, fencing_token = _insert_running_attempt(
+        task_id, attempt_id, fencing_token = _insert_running_attempt(
             db,
             workspace_id=workspace["id"],
             pool_id=pool["id"],
@@ -835,7 +885,7 @@ def test_worker_cannot_self_assign_consumer_billing_responsibility(tmp_path) -> 
                 output_artifacts=[],
                 metrics=reported_metrics,
                 worker_signature="signed-worker-report",
-                failure_code=int(ErrorCode.GPU_OUT_OF_MEMORY),
+                failure_code=int(ErrorCode.SYSTEM_OUT_OF_MEMORY),
                 responsibility="consumer",
                 safe_failure_details={},
             )
@@ -859,9 +909,15 @@ def test_worker_cannot_self_assign_consumer_billing_responsibility(tmp_path) -> 
             output_artifacts=[],
             metrics=reported_metrics,
             worker_signature="signed-worker-report",
-            failure_code=int(ErrorCode.GPU_OUT_OF_MEMORY),
+            failure_code=int(ErrorCode.SYSTEM_OUT_OF_MEMORY),
             responsibility="provider",
-            safe_failure_details={},
+            safe_failure_details={
+                "reason": "system_out_of_memory",
+                "component": "sampler",
+                "phase": "executing",
+                "status_code": 507,
+                "prompt": "private prompt",
+            },
         )
         assert finished["state"] == "failed"
         event_metrics = json.loads(
@@ -879,6 +935,30 @@ def test_worker_cannot_self_assign_consumer_billing_responsibility(tmp_path) -> 
         assert ledger["billable"] == 0
         assert ledger["total_microtokens"] == 0
 
+        visible = repository.get_task(task_id=task_id, user_id=owner_id)
+        assert visible["attempts"][-1]["safe_failure_details"] == {
+            "reason": "system_out_of_memory",
+            "component": "sampler",
+        }
+
+        # A legacy row is sanitized again on read, including fixed values that
+        # are valid for a different error code and the removed status channel.
+        db.execute(
+            "UPDATE task_attempts SET safe_failure_details=? WHERE id=?",
+            (
+                json_text(
+                    {
+                        "reason": "gpu_out_of_memory",
+                        "component": "sampler",
+                        "status_code": 507,
+                    }
+                ),
+                attempt_id,
+            ),
+        )
+        legacy_visible = repository.get_task(task_id=task_id, user_id=owner_id)
+        assert legacy_visible["attempts"][-1]["safe_failure_details"] == {"component": "sampler"}
+
         assert GatewayRepository._canonical_attempt_outcome(
             succeeded=False,
             failure_code=int(ErrorCode.DECRYPTION_FAILED),
@@ -890,6 +970,68 @@ def test_worker_cannot_self_assign_consumer_billing_responsibility(tmp_path) -> 
                 failure_code=999_999,
                 reported_responsibility="platform",
             )
+    finally:
+        db.close()
+
+
+def test_finish_attempt_replays_terminal_receipt_inside_write_transaction(tmp_path) -> None:
+    db = GatewayDatabase(str(tmp_path / "gateway.db"))
+    repository = GatewayRepository(db)
+    try:
+        owner_id = _insert_user(db, "finish-replay-owner")
+        workspace = repository.create_workspace(user_id=owner_id, name="Finish replay")
+        pool = repository.create_pool(
+            workspace_id=workspace["id"], user_id=owner_id, name="GPU", policy={}
+        )
+        worker = repository.create_worker(
+            owner_user_id=owner_id,
+            manager_broker_id=None,
+            name="finish-replay-worker",
+            signing_public_key="finish-replay-signing-key",
+            encryption_public_key="finish-replay-encryption-key",
+            certificate=None,
+            executor_type="fake",
+            executor_version="1",
+            capabilities={},
+            capacity=1,
+        )
+        _task_id, attempt_id, fencing_token = _insert_running_attempt(
+            db,
+            workspace_id=workspace["id"],
+            pool_id=pool["id"],
+            worker_id=worker["id"],
+            provider_user_id=owner_id,
+            consumer_user_id=owner_id,
+        )
+        report = {
+            "attempt_id": attempt_id,
+            "worker_id": worker["id"],
+            "fencing_token": fencing_token,
+            "succeeded": True,
+            "output_artifacts": [],
+            "metrics": {"executor_wall_ms": 1_500, "gpu_count": 1},
+            "worker_signature": "verified-before-repository",
+            "failure_code": None,
+            "responsibility": "none",
+            "safe_failure_details": {},
+            "finish_semantic_hash": "a" * 64,
+        }
+
+        finished = repository.finish_attempt(**report)
+        # Models a request that passed the route-level replay check before a
+        # concurrent request committed. The transaction must replay, not lose
+        # the released lease or append a second usage entry.
+        assert repository.finish_attempt(**report) == finished
+        assert (
+            db.fetchone(
+                "SELECT COUNT(*) AS n FROM usage_events WHERE attempt_id=?", (attempt_id,)
+            )["n"]
+            == 1
+        )
+
+        with pytest.raises(RepositoryError) as conflict:
+            repository.finish_attempt(**{**report, "finish_semantic_hash": "b" * 64})
+        assert conflict.value.code == int(ErrorCode.IDEMPOTENCY_CONFLICT)
     finally:
         db.close()
 
@@ -1059,7 +1201,11 @@ def test_running_cancellation_waits_for_signed_usage_and_charges_once(tmp_path) 
             worker_signature="signed-running-cancel",
             failure_code=int(ErrorCode.EXECUTION_CANCELLED),
             responsibility="consumer",
-            safe_failure_details={},
+            safe_failure_details={
+                "reason": "system_out_of_memory",
+                "component": "sampler",
+                "status_code": 507,
+            },
         )
         finished = repository.finish_attempt(**report)
         assert finished["state"] == "cancelled"
@@ -1086,6 +1232,14 @@ def test_running_cancellation_waits_for_signed_usage_and_charges_once(tmp_path) 
             )["count"]
             == 1
         )
+        assert (
+            json.loads(
+                db.fetchone(
+                    "SELECT safe_failure_details FROM task_attempts WHERE id=?", (attempt_id,)
+                )["safe_failure_details"]
+            )
+            == {}
+        )
 
         with pytest.raises(RepositoryError) as late_success:
             repository.finish_attempt(
@@ -1101,55 +1255,230 @@ def test_running_cancellation_waits_for_signed_usage_and_charges_once(tmp_path) 
         db.close()
 
 
-@pytest.mark.parametrize(
-    "native",
-    [
-        {"nested": {"value": 1}},
-        {"sequence": [1, 2]},
-        {"label": "not-a-measurement"},
-        {"nan": float("nan")},
-        {"infinite": float("inf")},
-        {"too_large": 10**19},
-        {"bad key": 1},
-        {"x" * 65: 1},
-        {index: index for index in range(2)},
-    ],
-)
-def test_native_usage_rejects_unbounded_or_non_scalar_values(native) -> None:
-    with pytest.raises(RepositoryError) as raised:
-        GatewayRepository._validate_usage_metrics({"native": native})
-    assert raised.value.code == int(ErrorCode.USAGE_REPORT_INVALID)
+@pytest.mark.parametrize("native", [{}, {"cuda.utilization": 92.5}, {"cache_hit": True}])
+def test_legacy_native_usage_is_accepted_but_discarded(native) -> None:
+    assert GatewayRepository._validate_usage_metrics(
+        {"native": native, "executor_wall_ms": 42}
+    ) == {"executor_wall_ms": 42}
 
 
-def test_native_usage_accepts_only_bounded_flat_metrics() -> None:
-    native = {
-        "cuda.utilization": 92.5,
-        "cache_hit": True,
-        "optional": None,
-        "temperature_delta": -2,
-    }
-    assert GatewayRepository._validate_usage_metrics({"native": native}) == {"native": native}
+def test_repository_startup_scrubs_legacy_worker_controlled_plaintext(tmp_path) -> None:
+    db = GatewayDatabase(str(tmp_path / "gateway.db"))
+    repository = GatewayRepository(db)
+    secret = "customer-secret-must-not-persist"
+    try:
+        owner_id = _insert_user(db, "privacy-owner")
+        workspace = repository.create_workspace(user_id=owner_id, name="Privacy")
+        pool = repository.create_pool(
+            workspace_id=workspace["id"], user_id=owner_id, name="GPU", policy={}
+        )
+        worker = repository.create_worker(
+            owner_user_id=owner_id,
+            manager_broker_id=None,
+            name="privacy-worker",
+            signing_public_key="privacy-worker-signing-key",
+            encryption_public_key="privacy-worker-encryption-key",
+            certificate=None,
+            executor_type="fake",
+            executor_version="1",
+            capabilities={},
+            capacity=1,
+        )
+        task_id, attempt_id, _ = _insert_running_attempt(
+            db,
+            workspace_id=workspace["id"],
+            pool_id=pool["id"],
+            worker_id=worker["id"],
+            provider_user_id=owner_id,
+            consumer_user_id=owner_id,
+        )
+        artifact_id = new_id("artifact")
+        event_id = new_id("usage_event")
+        stamp = now()
+        raw_capabilities = {
+            "maintenance_actions": ["worker_update"],
+            "private_prompt": secret,
+            "executors": [
+                {
+                    "type": "fake",
+                    "version": "1",
+                    "payload_formats": [],
+                    "operations": [],
+                    "private_prompt": secret,
+                    "capabilities": {
+                        "model_digests": [],
+                        "workflow_readiness": [],
+                        "private_prompt": secret,
+                    },
+                }
+            ],
+        }
+        db.execute(
+            "UPDATE workers SET capabilities=? WHERE id=?",
+            (json_text(raw_capabilities), worker["id"]),
+        )
+        db.execute(
+            """UPDATE task_attempts
+               SET failure_code=?,progress=?,safe_failure_details=? WHERE id=?""",
+            (
+                int(ErrorCode.SYSTEM_OUT_OF_MEMORY),
+                json_text({"fraction": 0.123, "stage": secret, "prompt": secret}),
+                json_text(
+                    {
+                        "reason": "system_out_of_memory",
+                        "component": "sampler",
+                        "prompt": secret,
+                    }
+                ),
+                attempt_id,
+            ),
+        )
+        db.execute(
+            """INSERT INTO artifacts
+               (id,task_id,attempt_id,kind,direction,store_type,object_ref,
+                media_metadata,state,created_at,updated_at)
+               VALUES (?,?,?,'output_0','output','local',?,?,'available',?,?)""",
+            (
+                artifact_id,
+                task_id,
+                attempt_id,
+                artifact_id,
+                json_text(
+                    {
+                        "filename": "customer-secret-output.mp4",
+                        "media_type": "video/private",
+                        "frames": 81,
+                    }
+                ),
+                stamp,
+                stamp,
+            ),
+        )
+        db.execute(
+            """INSERT INTO usage_events
+               (id,attempt_id,worker_id,event_kind,metrics,worker_signature,
+                observed_at,created_at)
+               VALUES (?,?,?,'final',?,?,?,?)""",
+            (
+                event_id,
+                attempt_id,
+                worker["id"],
+                json_text({"executor_wall_ms": 42, "native": {"prompt": secret}}),
+                "legacy-signature-offline-oracle",
+                stamp,
+                stamp,
+            ),
+        )
 
-    oversized = {f"metric_{index:02d}_" + "x" * 54: 10**18 for index in range(64)}
-    with pytest.raises(RepositoryError) as raised:
-        GatewayRepository._validate_usage_metrics({"native": oversized})
-    assert raised.value.code == int(ErrorCode.USAGE_REPORT_INVALID)
+        db.execute(
+            "DELETE FROM schema_migrations WHERE name=?",
+            ("gateway-public-metadata-and-capability-auth-v2",),
+        )
+        restarted = GatewayRepository(db)
+
+        stored_worker = db.fetchone("SELECT capabilities FROM workers WHERE id=?", (worker["id"],))
+        stored_attempt = db.fetchone(
+            "SELECT progress,safe_failure_details FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        )
+        stored_artifact = db.fetchone(
+            "SELECT media_metadata FROM artifacts WHERE id=?", (artifact_id,)
+        )
+        stored_event = db.fetchone(
+            "SELECT metrics,worker_signature FROM usage_events WHERE id=?", (event_id,)
+        )
+        assert secret not in stored_worker["capabilities"]
+        assert json.loads(stored_attempt["progress"]) == {
+            "fraction": 0.12,
+            "stage": "processing",
+        }
+        assert json.loads(stored_attempt["safe_failure_details"]) == {
+            "component": "sampler",
+            "reason": "system_out_of_memory",
+        }
+        assert json.loads(stored_artifact["media_metadata"]) == {"frames": 81}
+        assert json.loads(stored_event["metrics"]) == {"executor_wall_ms": 42}
+        assert stored_event["worker_signature"] is None
+
+        # Read projection remains fail-closed after startup, including if an
+        # operator later imports a raw historical row by hand.
+        db.execute(
+            "UPDATE workers SET capabilities=? WHERE id=?",
+            (json_text(raw_capabilities), worker["id"]),
+        )
+        db.execute(
+            "UPDATE artifacts SET media_metadata=? WHERE id=?",
+            (
+                json_text({"filename": "customer-secret-output.mp4", "frames": 81}),
+                artifact_id,
+            ),
+        )
+        assert secret not in json.dumps(restarted.list_workers(user_id=owner_id))
+        visible = restarted.get_task(task_id=task_id, user_id=owner_id)
+        output = next(item for item in visible["artifacts"] if item["id"] == artifact_id)
+        assert output["media_metadata"] == {"frames": 81}
+    finally:
+        db.close()
 
 
 def test_worker_failure_details_cannot_persist_task_plaintext_or_urls() -> None:
     prompt = "private prompt with customer name"
+    assert (
+        GatewayRepository._canonical_failure_details(
+            {
+                "prompt": prompt,
+                "reason": prompt,
+                "upstream": "https://storage.example/signed?token=secret",
+                "error_type": "ComfyProtocolError",
+                "node_id": "405:344",
+                "node_type": "SamplerCustomAdvanced",
+                "status_code": 502,
+                "match_count": 2,
+                "nested": {"prompt": prompt},
+            },
+            int(ErrorCode.DEPENDENCY_MISSING),
+        )
+        == {}
+    )
+
     assert GatewayRepository._canonical_failure_details(
         {
-            "prompt": prompt,
-            "reason": prompt,
-            "upstream": "https://storage.example/signed?token=secret",
-            "error_type": "ComfyProtocolError",
-            "status_code": 502,
-            "match_count": 2,
-            "nested": {"prompt": prompt},
-        }
-    ) == {
-        "error_type": "ComfyProtocolError",
-        "match_count": 2,
-        "status_code": 502,
-    }
+            "reason": "node_runtime_error",
+            "node_id": "405:344\nprivate-prompt",
+            "node_type": "Sampler Custom / private-path",
+        },
+        int(ErrorCode.DEPENDENCY_MISSING),
+    ) == {"reason": "node_runtime_error"}
+
+    assert (
+        GatewayRepository._canonical_failure_details(
+            {
+                "reason": "C:/Users/Alice/.ssh/id_rsa",
+                "phase": "https://host/SECRET123",
+                "component": "U0VDUkVUX1BST01QVA",
+                "node_id": "U0VDUkVUX1BST01QVA",
+                "node_type": "SamplerSECRET123",
+            },
+            int(ErrorCode.DEPENDENCY_MISSING),
+        )
+        == {}
+    )
+
+    assert GatewayRepository._canonical_failure_details(
+        {
+            "reason": "system_out_of_memory",
+            "component": "sampler",
+            "phase": "executing",
+        },
+        int(ErrorCode.GPU_OUT_OF_MEMORY),
+    ) == {"component": "sampler"}
+
+    for terminal_state in ("succeeded", "cancelled"):
+        assert (
+            GatewayRepository._canonical_failure_details(
+                {"reason": "system_out_of_memory", "component": "sampler"},
+                int(ErrorCode.SYSTEM_OUT_OF_MEMORY),
+                terminal_state=terminal_state,
+            )
+            == {}
+        )

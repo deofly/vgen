@@ -21,7 +21,8 @@ from vgen.crypto import (
     sign_key_manifest,
     sign_message,
 )
-from vgen.gateway.app import create_app
+from vgen.gateway.app import _attempt_finish_idempotency_hash, create_app
+from vgen.protocol.errors import ErrorCode
 from vgen.protocol.ids import new_id
 from vgen.protocol.user_enrollment import (
     build_user_registration_claim,
@@ -41,6 +42,28 @@ def public_keys() -> tuple[str, str]:
         .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     )
     return b64url_encode(signing), b64url_encode(encryption)
+
+
+def authorize_test_workflow(
+    app, *, worker_id: str, workflow_ref: str, workflow_digest: str
+) -> None:
+    spec_digest = (
+        "sha256:" + hashlib.sha256((workflow_ref + "\x00" + workflow_digest).encode()).hexdigest()
+    )
+    app.state.db.execute(
+        """INSERT INTO worker_workflow_authorizations
+           (worker_id,workflow_ref,workflow_digest,spec_digest,
+            authorization_source_id,node_classes,authorized_at)
+           VALUES (?,?,?,?,?,'[]',?)""",
+        (
+            worker_id,
+            workflow_ref,
+            workflow_digest,
+            spec_digest,
+            "mtj_test_gateway_api",
+            time.time(),
+        ),
+    )
 
 
 def bootstrap_identity(
@@ -326,6 +349,13 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
         )
         assert response.status_code == 200, response.text
         worker = response.json()
+        for workflow_digest in ("sha256:" + "a" * 64, "sha256:" + "b" * 64):
+            authorize_test_workflow(
+                app,
+                worker_id=worker["id"],
+                workflow_ref="vgen/minimax-h3-8step@1.0.0",
+                workflow_digest=workflow_digest,
+            )
         assert "session" not in worker
         replayed_registration = client.post(
             "/api/v1/workers", json=registration, headers=registration_headers
@@ -445,7 +475,7 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
                     "executors": [
                         {
                             "type": "comfyui",
-                            "version": "1",
+                            "version": "1.2.0",
                             "payload_formats": ["opaque/v1"],
                             "operations": ["text-to-video"],
                             "max_concurrency": 1,
@@ -458,6 +488,12 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
         )
         assert announced.status_code == 200, announced.text
         assert announced.json()["status"] == "active"
+        assert (
+            app.state.db.fetchone(
+                "SELECT executor_version FROM workers WHERE id=?", (worker["id"],)
+            )["executor_version"]
+            == "1.2.0"
+        )
         limited_token, _ = app.state.db.create_session(
             principal_type="worker",
             principal_id=worker["id"],
@@ -542,6 +578,13 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             owner_identity.signing_public_bytes()
         )
         assert task["attempt_id"].startswith("atm_")
+        assert task["worker"]["executor_version"] == "1.2.0"
+        assert (
+            app.state.db.fetchone(
+                "SELECT executor_version FROM task_attempts WHERE id=?", (task["attempt_id"],)
+            )["executor_version"]
+            == "1.2.0"
+        )
         input_ticket = task["artifact_tickets"][0]
         assert input_ticket["url"].endswith("/" + input_ticket["artifact_id"])
         assert input_ticket["headers"]["Vgen-Artifact-Ticket"] not in input_ticket["url"]
@@ -619,9 +662,10 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             "UPDATE workers SET last_seen_at=? WHERE id=?",
             (stale_seen_at, worker["id"]),
         )
-        assert client.get("/api/v1/status", headers=user_headers).json()["counts"][
-            "workers_online"
-        ] == 0
+        assert (
+            client.get("/api/v1/status", headers=user_headers).json()["counts"]["workers_online"]
+            == 0
+        )
         heartbeat = client.post(
             f"/api/v1/attempts/{lease['attempt_id']}/heartbeat",
             json={"fencing_token": lease["fencing_token"], "started": True},
@@ -632,9 +676,10 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             "SELECT last_seen_at FROM workers WHERE id=?", (worker["id"],)
         )
         assert refreshed_worker["last_seen_at"] > stale_seen_at
-        assert client.get("/api/v1/status", headers=user_headers).json()["counts"][
-            "workers_online"
-        ] == 1
+        assert (
+            client.get("/api/v1/status", headers=user_headers).json()["counts"]["workers_online"]
+            == 1
+        )
 
         refreshed_tickets = client.post(
             f"/api/v1/attempts/{lease['attempt_id']}/artifact-tickets",
@@ -650,12 +695,14 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
             == 0
         )
         output_ticket = refreshed_tickets.json()["output_upload_tickets"][0]
+        output_bytes = b"encrypted-video"
         uploaded_output = client.put(
             output_ticket["url"],
             headers=output_ticket["headers"],
-            content=b"encrypted-video",
+            content=output_bytes,
         )
         assert uploaded_output.status_code == 204, uploaded_output.text
+        output_digest = hashlib.sha256(output_bytes).hexdigest()
 
         finish_body = {
             "fencing_token": lease["fencing_token"],
@@ -665,22 +712,85 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
                 "gateway_wall_ms": 2700,
                 "duration_ms": 1625,
                 "output_frames": 81,
+                "native": {"private_prompt": "must-not-persist"},
             },
             "responsibility": "none",
             "output_artifacts": [
                 {
                     "artifact_id": output_ticket["artifact_id"],
-                    "kind": "video",
+                    "kind": "output_0",
                     "store_type": None,
                     "object_ref": None,
                     "content_digest": None,
                     "encrypted_size": None,
-                    "media_metadata": {"frames": 81},
+                    # Signature verification must preserve legacy casing;
+                    # persistence canonicalizes only after verification.
+                    "media_metadata": {"media_type": "Video/MP4", "frames": 81},
                 }
             ],
             "failure_code": None,
             "safe_failure_details": {},
         }
+        wrong_same_size_digest = hashlib.sha256(b"x" * len(output_bytes)).hexdigest()
+        assert wrong_same_size_digest != output_digest
+        mismatched_finish = {
+            **finish_body,
+            "output_artifacts": [
+                {
+                    **finish_body["output_artifacts"][0],
+                    "content_digest": "sha256:" + wrong_same_size_digest,
+                    "encrypted_size": len(output_bytes),
+                }
+            ],
+        }
+        mismatched_finish["worker_signature"] = b64url_encode(
+            sign_message(
+                worker_keys.signing_private_key,
+                canonical_json(
+                    {
+                        "attempt_id": lease["attempt_id"],
+                        "task_id": lease["task_id"],
+                        "worker_id": worker["id"],
+                        **mismatched_finish,
+                    }
+                ),
+                context=b"vgen-worker-finish-v1",
+            )
+        )
+        integrity_failed = client.post(
+            f"/api/v1/attempts/{lease['attempt_id']}/finish",
+            json=mismatched_finish,
+            headers=worker_headers,
+        )
+        assert integrity_failed.status_code == 422, integrity_failed.text
+        assert integrity_failed.json()["error"]["code"] == int(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
+        assert integrity_failed.json()["error"]["name"] == "ARTIFACT_INTEGRITY_FAILED"
+        assert integrity_failed.json()["error"]["details"] == {}
+
+        stored_output = app.state.db.fetchone(
+            "SELECT state,encrypted_size,content_digest FROM artifacts WHERE id=?",
+            (output_ticket["artifact_id"],),
+        )
+        assert stored_output["state"] == "uploaded"
+        assert stored_output["encrypted_size"] == len(output_bytes)
+        assert stored_output["content_digest"] == "sha256:" + output_digest
+        nonterminal = app.state.db.fetchone(
+            """SELECT t.state AS task_state,a.state AS attempt_state,l.released_at
+               FROM tasks t JOIN task_attempts a ON a.task_id=t.id
+               JOIN leases l ON l.attempt_id=a.id WHERE a.id=?""",
+            (lease["attempt_id"],),
+        )
+        assert nonterminal["task_state"] == "running"
+        assert nonterminal["attempt_state"] == "running"
+        assert nonterminal["released_at"] is None
+        assert (
+            app.state.db.fetchone(
+                "SELECT COUNT(*) AS count FROM usage_events WHERE attempt_id=?",
+                (lease["attempt_id"],),
+            )["count"]
+            == 0
+        )
+
         finish_signed = {
             "attempt_id": lease["attempt_id"],
             "task_id": lease["task_id"],
@@ -694,13 +804,156 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
                 context=b"vgen-worker-finish-v1",
             )
         )
+        finish_headers = {**worker_headers, "Idempotency-Key": "finish-projected-v1"}
         finished = client.post(
             f"/api/v1/attempts/{lease['attempt_id']}/finish",
             json=finish_body,
-            headers=worker_headers,
+            headers=finish_headers,
         )
         assert finished.status_code == 200, finished.text
         assert finished.json()["state"] == "succeeded"
+        available_output = app.state.db.fetchone(
+            "SELECT state,encrypted_size,content_digest FROM artifacts WHERE id=?",
+            (output_ticket["artifact_id"],),
+        )
+        assert available_output["state"] == "available"
+        assert available_output["encrypted_size"] == len(output_bytes)
+        assert available_output["content_digest"] == "sha256:" + output_digest
+        usage_event = app.state.db.fetchone(
+            "SELECT metrics,worker_signature FROM usage_events WHERE attempt_id=?",
+            (lease["attempt_id"],),
+        )
+        stored_metrics = json.loads(usage_event["metrics"])
+        assert "native" not in stored_metrics
+        assert "must-not-persist" not in json.dumps(stored_metrics)
+        assert usage_event["worker_signature"] is None
+
+        finish_path = f"/api/v1/attempts/{lease['attempt_id']}/finish"
+        finish_record = app.state.db.fetchone(
+            """SELECT request_hash FROM idempotency_records
+               WHERE path=? AND idempotency_key='finish-projected-v1'""",
+            (finish_path,),
+        )
+        signed_wire = canonical_json(finish_body)
+        assert finish_record["request_hash"] == _attempt_finish_idempotency_hash(signed_wire)
+        assert finish_record["request_hash"] != hashlib.sha256(signed_wire).hexdigest()
+        terminal_receipt = app.state.db.fetchone(
+            """SELECT finish_semantic_hash,finish_receipt
+               FROM task_attempts WHERE id=?""",
+            (lease["attempt_id"],),
+        )
+        assert terminal_receipt["finish_semantic_hash"] == finish_record["request_hash"]
+        assert json.loads(terminal_receipt["finish_receipt"]) == finished.json()
+
+        # Simulate a process stop after the terminal SQLite transaction but
+        # before middleware durably cached the HTTP response. The Attempt-level
+        # semantic receipt is the authoritative replay boundary.
+        app.state.db.execute(
+            "DELETE FROM idempotency_records WHERE path=? AND idempotency_key=?",
+            (finish_path, "finish-projected-v1"),
+        )
+        crash_boundary_replay = client.post(
+            finish_path,
+            json=finish_body,
+            headers=finish_headers,
+        )
+        assert crash_boundary_replay.status_code == 200, crash_boundary_replay.text
+        assert crash_boundary_replay.json() == finished.json()
+        assert (
+            app.state.db.fetchone(
+                "SELECT COUNT(*) AS n FROM usage_events WHERE attempt_id=?",
+                (lease["attempt_id"],),
+            )["n"]
+            == 1
+        )
+
+        conflicting_finish = {
+            **finish_body,
+            "metrics": {**finish_body["metrics"], "executor_wall_ms": 2_501},
+        }
+        conflicting_signed = {
+            "attempt_id": lease["attempt_id"],
+            "task_id": lease["task_id"],
+            "worker_id": worker["id"],
+            **{
+                key: value
+                for key, value in conflicting_finish.items()
+                if key != "worker_signature"
+            },
+        }
+        conflicting_finish["worker_signature"] = b64url_encode(
+            sign_message(
+                worker_keys.signing_private_key,
+                canonical_json(conflicting_signed),
+                context=b"vgen-worker-finish-v1",
+            )
+        )
+        conflict_key = "terminal-finish-conflict-must-not-cache"
+        conflicting_response = client.post(
+            finish_path,
+            json=conflicting_finish,
+            headers={**worker_headers, "Idempotency-Key": conflict_key},
+        )
+        assert conflicting_response.status_code == 409, conflicting_response.text
+        assert conflicting_response.json()["error"]["code"] == int(ErrorCode.IDEMPOTENCY_CONFLICT)
+        assert (
+            app.state.db.fetchone(
+                """SELECT COUNT(*) AS n FROM idempotency_records
+                   WHERE path=? AND idempotency_key=?""",
+                (finish_path, conflict_key),
+            )["n"]
+            == 0
+        )
+
+        invalid_replay = {
+            **finish_body,
+            "worker_signature": b64url_encode(b"\x00" * 64),
+        }
+        rejected_replay = client.post(
+            finish_path,
+            json=invalid_replay,
+            headers=finish_headers,
+        )
+        assert rejected_replay.status_code == 422, rejected_replay.text
+        assert rejected_replay.json()["error"]["code"] == int(ErrorCode.USAGE_REPORT_INVALID)
+
+        projected_replay = {
+            **finish_body,
+            "metrics": {
+                **finish_body["metrics"],
+                "native": {"different_private_prompt": "also-must-not-persist"},
+            },
+            "output_artifacts": [
+                {
+                    **finish_body["output_artifacts"][0],
+                    "media_metadata": {
+                        "filename": "customer-secret-output.mp4",
+                        "media_type": "video/MP4",
+                        "frames": 81,
+                    },
+                }
+            ],
+        }
+        projected_signed = {
+            "attempt_id": lease["attempt_id"],
+            "task_id": lease["task_id"],
+            "worker_id": worker["id"],
+            **{key: value for key, value in projected_replay.items() if key != "worker_signature"},
+        }
+        projected_replay["worker_signature"] = b64url_encode(
+            sign_message(
+                worker_keys.signing_private_key,
+                canonical_json(projected_signed),
+                context=b"vgen-worker-finish-v1",
+            )
+        )
+        replayed_finish = client.post(
+            finish_path,
+            json=projected_replay,
+            headers=finish_headers,
+        )
+        assert replayed_finish.status_code == 200, replayed_finish.text
+        assert replayed_finish.headers["Idempotency-Replayed"] == "true"
         lost_lease_replay = client.post(lease_path, json={"ttl_seconds": 60}, headers=lease_headers)
         assert lost_lease_replay.status_code == 409
         assert lost_lease_replay.json()["error"]["code"] == 310001
@@ -721,6 +974,8 @@ def test_worker_task_attempt_and_usage_ledger(tmp_path) -> None:
         assert entries[0]["rate_snapshot"]["formula_status"] == "not_implemented"
         task_view = client.get(f"/api/v1/tasks/{task['id']}", headers=user_headers).json()
         output = next(item for item in task_view["artifacts"] if item["state"] == "available")
+        assert output["kind"] == "output_0"
+        assert output["media_metadata"] == {"media_type": "video/mp4", "frames": 81}
         downloaded_output = client.get(
             output["download_ticket"]["url"],
             headers=output["download_ticket"]["headers"],
@@ -944,7 +1199,7 @@ def test_running_cancel_is_acknowledged_and_billed_once_end_to_end(tmp_path) -> 
             headers={**worker_headers, "Idempotency-Key": "late-success-new-mutation"},
         )
         assert fenced.status_code == 409
-        assert fenced.json()["error"]["code"] == 310001
+        assert fenced.json()["error"]["code"] == int(ErrorCode.IDEMPOTENCY_CONFLICT)
         task = client.get(f"/api/v1/tasks/{task_id}", headers=user_headers).json()
         assert task["state"] == "cancelled"
         assert task["attempts"][0]["state"] == "cancelled"
@@ -1391,9 +1646,7 @@ def test_generic_claim_is_membership_only_and_preserves_dedicated_invites(tmp_pa
         )
         assert confused_claim.status_code == 422
         assert confused_claim.json()["error"]["code"] == 600001
-        membership_claim, membership_proof = registration_proof(
-            membership["enrollment"]["id"]
-        )
+        membership_claim, membership_proof = registration_proof(membership["enrollment"]["id"])
         claimed = client.post(
             "/api/v1/enrollments/claim",
             json={

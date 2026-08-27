@@ -36,6 +36,7 @@ from vgen.crypto import (
     sign_key_manifest,
 )
 from vgen.market.models import WorkflowManifest
+from vgen.protocol import ErrorCode
 
 
 class MemoryKeyring:
@@ -235,7 +236,23 @@ def test_task_detail_view_formats_times_without_mutating_and_removes_download_ti
         "id": "tsk_example",
         "created_at": 1_787_552_404.159,
         "reservation_expires_at": None,
-        "attempts": [{"finished_at": 1_787_552_500.0}],
+        "attempts": [
+            {
+                "finished_at": 1_787_552_500.0,
+                "state": "failed",
+                "failure_code": int(ErrorCode.DEPENDENCY_MISSING),
+                "safe_failure_details": {
+                    "reason": "private customer prompt",
+                    "phase": "C:/Users/private/model.gguf",
+                    "component": "model_loader",
+                },
+                "progress": {
+                    "fraction": 0.5,
+                    "stage": "C:/Users/private/model.gguf",
+                    "prompt": "private customer prompt",
+                },
+            }
+        ],
         "artifacts": [
             {
                 "created_at": 1_787_552_450.0,
@@ -262,6 +279,11 @@ def test_task_detail_view_formats_times_without_mutating_and_removes_download_ti
     assert display["attempts"][0]["finished_at"] == _task_list_datetime(
         raw["attempts"][0]["finished_at"]
     )
+    assert display["attempts"][0]["safe_failure_details"] == {"component": "model_loader"}
+    assert display["attempts"][0]["progress"] == {
+        "fraction": 0.5,
+        "stage": "processing",
+    }
     assert "download_ticket" not in display["artifacts"][0]
     assert raw["artifacts"][0]["download_ticket"]["credentials"]["access_key_secret"] == (
         "PRIVATE_SECRET"
@@ -270,6 +292,7 @@ def test_task_detail_view_formats_times_without_mutating_and_removes_download_ti
     machine = _task_detail_view(raw, readable_times=False)
     assert machine["created_at"] == raw["created_at"]
     assert machine["attempts"][0]["finished_at"] == raw["attempts"][0]["finished_at"]
+    assert "private" not in json.dumps(machine)
     assert "download_ticket" not in machine["artifacts"][0]
 
 
@@ -336,6 +359,39 @@ def test_task_show_and_watch_use_safe_readable_task_view(monkeypatch, capsys) ->
     assert "PRIVATE_" not in watch_json_output
 
 
+def test_task_watch_returns_registered_error_for_failed_task(monkeypatch, capsys) -> None:
+    failed = {
+        "id": "tsk_example",
+        "state": "failed",
+        "attempts": [
+            {
+                "state": "failed",
+                "failure_code": int(ErrorCode.DEPENDENCY_MISSING),
+                "safe_failure_details": {
+                    "reason": "model_not_found",
+                    "component": "model_loader",
+                },
+            }
+        ],
+    }
+
+    class TaskClient:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli_main, "_client", lambda _profile=None: TaskClient())
+    monkeypatch.setattr(cli_main, "_wait_for_task", lambda *_args, **_kwargs: failed)
+
+    exit_code = cli_main.main(["task", "watch", "tsk_example", "--format=json"])
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert json.loads(captured.out)["state"] == "failed"
+    assert "320003 DEPENDENCY_MISSING" in captured.err
+    assert "reason=model_not_found" in captured.err
+    assert "component=model_loader" in captured.err
+
+
 def test_worker_list_prints_runtime_summary_and_owned_upgrade_command(capsys) -> None:
     _print_worker_list(
         [
@@ -384,9 +440,7 @@ def test_worker_list_prints_runtime_summary_and_owned_upgrade_command(capsys) ->
     assert "24 GB" in output
     assert _task_list_datetime(1_787_552_404.159) in output
     assert "共 1 台，在线 1 台" in output
-    assert (
-        "vgen worker upgrade --worker wrk_example --wait --profile home" in output
-    )
+    assert "vgen worker upgrade --worker wrk_example --wait --profile home" in output
     assert "vgen worker list --format=json" in output
     assert "must-not-be-printed" not in output
 
@@ -509,12 +563,7 @@ def test_task_preflight_uses_submit_requirements_without_sending_private_inputs(
         ),
     ]
     for extra, operation in modes:
-        assert (
-            cli_main.main(
-                ["task", "preflight", "PRIVATE_PROMPT_must_stay_local", *extra]
-            )
-            == 0
-        )
+        assert cli_main.main(["task", "preflight", "PRIVATE_PROMPT_must_stay_local", *extra]) == 0
         payload = client.payloads[-1]
         assert payload["public_requirements"]["operation"] == operation
         serialized = json.dumps(payload)
@@ -609,8 +658,8 @@ def test_wait_for_task_returns_only_after_terminal_state(monkeypatch, capsys) ->
     assert "准备输入：8%" in status
     assert "生成采样：34%" in status
     assert "生成采样：35%" not in status
-    assert "生成处理中：当前节点暂无细分进度" in status
-    assert "生成处理：10%" not in status
+    assert "生成处理：10%" in status
+    assert "node:10" not in status
     assert "生成采样：57%" in status
     assert "上传结果：100%" in status
 
@@ -755,6 +804,7 @@ def test_task_download_overwrites_only_when_explicitly_requested(
             1,
         ),
     )
+
     def download(_artifact, destination: Path, **_kwargs):
         destination.write_bytes(b"replacement")
         return SimpleNamespace(size_bytes=11)

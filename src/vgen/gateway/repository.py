@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -22,7 +23,12 @@ from vgen.crypto import (
     verify_allocation_proof,
     verify_device_certificate,
     verify_key_manifest,
+    verify_maintenance_intent,
     verify_message,
+)
+from vgen.protocol.diagnostics import (
+    canonical_task_failure_details_for_code,
+    canonical_task_progress,
 )
 from vgen.protocol.errors import ErrorCode, get_error_spec
 from vgen.protocol.user_enrollment import (
@@ -31,6 +37,7 @@ from vgen.protocol.user_enrollment import (
     workspace_recipient_admission_digest,
 )
 
+from .bootstrap_capabilities import COMFYUI_BOOTSTRAP_WORKFLOWS
 from .database import (
     WORKER_ONLINE_WINDOW_SECONDS,
     GatewayDatabase,
@@ -41,6 +48,8 @@ from .database import (
 )
 from .public_metadata import (
     PublicMetadataError,
+    canonical_worker_capabilities,
+    project_reported_artifact_media_metadata,
     validate_artifact_media_metadata,
     validate_public_requirements,
 )
@@ -88,31 +97,7 @@ DEVICE_CERTIFICATE_INVALID = int(ErrorCode.DEVICE_CERTIFICATE_INVALID)
 ALLOCATION_PROOF_INVALID = int(ErrorCode.ALLOCATION_PROOF_INVALID)
 IDEMPOTENCY_CONFLICT = int(ErrorCode.IDEMPOTENCY_CONFLICT)
 
-_NATIVE_USAGE_KEY_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
-)
-_NATIVE_USAGE_MAX_ENTRIES = 64
-_NATIVE_USAGE_MAX_KEY_LENGTH = 64
-_NATIVE_USAGE_MAX_ABSOLUTE_NUMBER = 10**18
-_NATIVE_USAGE_MAX_SERIALIZED_BYTES = 4096
 _USAGE_MAX_WALL_MS = 30 * 24 * 60 * 60 * 1000
-_SAFE_FAILURE_DETAIL_KEYS = frozenset(
-    {
-        "error_type",
-        "executor_type",
-        "field",
-        "input",
-        "operation",
-        "payload_format",
-        "phase",
-        "reason",
-    }
-)
-_SAFE_FAILURE_DETAIL_NUMERIC_KEYS = frozenset({"match_count", "status_code"})
-_SAFE_FAILURE_DETAIL_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:/-"
-)
-
 SERVICE_SCOPES = frozenset({"task:submit", "task:read", "task:cancel", "usage:read"})
 USAGE_REVERSAL_REASON_CODES = frozenset(
     {
@@ -127,20 +112,16 @@ USAGE_REVERSAL_REASON_CODES = frozenset(
 _MAINTENANCE_ACTIVE_STATES = frozenset(
     {"awaiting_upload", "queued", "leased", "running", "restarting"}
 )
-_MAINTENANCE_SCHEDULING_BLOCK_STATES = frozenset(
-    {"queued", "leased", "running", "restarting"}
-)
+_MAINTENANCE_SCHEDULING_BLOCK_STATES = frozenset({"queued", "leased", "running", "restarting"})
 _MAINTENANCE_LEASE_STATES = frozenset({"leased", "running", "restarting"})
-_MAINTENANCE_TERMINAL_STATES = frozenset(
-    {"succeeded", "failed", "cancelled", "expired"}
-)
-_MAINTENANCE_KINDS = frozenset(
-    {"worker_update", "model_install", "capability_install"}
-)
-_ARTIFACT_MAINTENANCE_KINDS = frozenset(
-    {"worker_update", "capability_install"}
-)
+_MAINTENANCE_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "expired"})
+_MAINTENANCE_KINDS = frozenset({"worker_update", "model_install", "capability_install"})
+_ARTIFACT_MAINTENANCE_KINDS = frozenset({"worker_update", "capability_install"})
 _WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
+_EXECUTOR_VERSION_MAX_LENGTH = 120
+_EXECUTOR_VERSION_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-"
+)
 MAX_QUEUED_TASKS_PER_WORKER = 100
 TASK_LIST_SORTS: dict[str, tuple[str, str]] = {
     "created": ("t.created_at", "created_at"),
@@ -153,6 +134,727 @@ TASK_LIST_SORTS: dict[str, tuple[str, str]] = {
 class GatewayRepository:
     def __init__(self, db: GatewayDatabase) -> None:
         self.db = db
+        self._migrate_legacy_worker_enrollment_claims()
+        self._scrub_legacy_plaintext_metadata()
+        self._reconcile_bundled_bootstrap_policy()
+
+    @staticmethod
+    def _decode_stored_json(value: object, *, maximum_chars: int = 1_048_576) -> object:
+        """Decode one historical JSON column without trusting its shape or size."""
+
+        if not isinstance(value, str) or len(value) > maximum_chars:
+            return {}
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _fail_closed_worker_capabilities(value: object, *, executor_type: str) -> dict[str, Any]:
+        """Project stored capabilities, retaining only fixed maintenance actions on error."""
+
+        try:
+            return canonical_worker_capabilities(value, executor_type=executor_type)
+        except PublicMetadataError:
+            actions = value.get("maintenance_actions", []) if isinstance(value, dict) else []
+            safe_actions = [
+                action
+                for action in ("worker_update", "model_install", "capability_install")
+                if isinstance(actions, list) and action in actions
+            ]
+            return {"maintenance_actions": safe_actions, "executors": []}
+
+    def _authorization_sets(
+        self,
+        worker_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> tuple[
+        dict[tuple[str, str], set[str]],
+        dict[tuple[str, str], set[str]],
+        set[str],
+    ]:
+        fetch = (
+            (lambda sql, args: list(conn.execute(sql, args)))
+            if conn is not None
+            else self.db.fetchall
+        )
+        workflow_nodes: dict[tuple[str, str], set[str]] = {}
+        for row in fetch(
+            """SELECT workflow_ref,workflow_digest,node_classes
+               FROM worker_workflow_authorizations
+               WHERE worker_id=? AND revoked_at IS NULL""",
+            (worker_id,),
+        ):
+            identity = (row["workflow_ref"], row["workflow_digest"])
+            try:
+                values = json.loads(row["node_classes"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                values = []
+            workflow_nodes.setdefault(identity, set()).update(
+                item for item in values if isinstance(item, str)
+            )
+        workflow_models: dict[tuple[str, str], set[str]] = {}
+        all_models: set[str] = set()
+        for row in fetch(
+            """SELECT workflow_ref,workflow_digest,model_digest
+               FROM worker_model_authorizations
+               WHERE worker_id=? AND revoked_at IS NULL""",
+            (worker_id,),
+        ):
+            identity = (row["workflow_ref"], row["workflow_digest"])
+            workflow_models.setdefault(identity, set()).add(row["model_digest"])
+            all_models.add(row["model_digest"])
+        return workflow_nodes, workflow_models, all_models
+
+    def _managed_workflow_refs(
+        self,
+        worker_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> set[str]:
+        rows = (
+            conn.execute(
+                """SELECT DISTINCT workflow_ref FROM worker_workflow_authorizations
+                   WHERE worker_id=?""",
+                (worker_id,),
+            ).fetchall()
+            if conn is not None
+            else self.db.fetchall(
+                """SELECT DISTINCT workflow_ref FROM worker_workflow_authorizations
+                   WHERE worker_id=?""",
+                (worker_id,),
+            )
+        )
+        # Revocation must not make a managed ref silently fall back to legacy.
+        return {str(row["workflow_ref"]) for row in rows}
+
+    @staticmethod
+    def _reconcile_bundled_bootstrap_authorizations(
+        conn: sqlite3.Connection,
+        *,
+        worker_id: str,
+        executor_type: str,
+        authorized_at: float,
+    ) -> None:
+        desired_workflows: dict[tuple[str, str, str], Any] = {}
+        desired_models: set[tuple[str, str, str, str]] = set()
+        if executor_type == "comfyui":
+            for workflow in COMFYUI_BOOTSTRAP_WORKFLOWS:
+                source_id = f"bundled-bootstrap:{workflow.workflow_ref}"
+                desired_workflows[(source_id, workflow.workflow_ref, workflow.workflow_digest)] = (
+                    workflow
+                )
+                desired_models.update(
+                    (
+                        source_id,
+                        workflow.workflow_ref,
+                        workflow.workflow_digest,
+                        digest,
+                    )
+                    for digest in workflow.model_digests
+                )
+        for row in conn.execute(
+            """SELECT authorization_source_id,workflow_ref,workflow_digest
+               FROM worker_workflow_authorizations
+               WHERE worker_id=? AND authorization_source_id LIKE 'bundled-bootstrap:%'
+                 AND revoked_at IS NULL""",
+            (worker_id,),
+        ).fetchall():
+            key = (
+                str(row["authorization_source_id"]),
+                str(row["workflow_ref"]),
+                str(row["workflow_digest"]),
+            )
+            if key not in desired_workflows:
+                conn.execute(
+                    """UPDATE worker_workflow_authorizations SET revoked_at=?
+                       WHERE worker_id=? AND authorization_source_id=?
+                         AND workflow_ref=? AND workflow_digest=? AND revoked_at IS NULL""",
+                    (authorized_at, worker_id, *key),
+                )
+        for row in conn.execute(
+            """SELECT authorization_source_id,workflow_ref,workflow_digest,model_digest
+               FROM worker_model_authorizations
+               WHERE worker_id=? AND authorization_source_id LIKE 'bundled-bootstrap:%'
+                 AND revoked_at IS NULL""",
+            (worker_id,),
+        ).fetchall():
+            key = (
+                str(row["authorization_source_id"]),
+                str(row["workflow_ref"]),
+                str(row["workflow_digest"]),
+                str(row["model_digest"]),
+            )
+            if key not in desired_models:
+                conn.execute(
+                    """UPDATE worker_model_authorizations SET revoked_at=?
+                       WHERE worker_id=? AND authorization_source_id=? AND workflow_ref=?
+                         AND workflow_digest=? AND model_digest=? AND revoked_at IS NULL""",
+                    (authorized_at, worker_id, *key),
+                )
+        if executor_type != "comfyui":
+            return
+        for workflow in COMFYUI_BOOTSTRAP_WORKFLOWS:
+            source_id = f"bundled-bootstrap:{workflow.workflow_ref}"
+            conn.execute(
+                """INSERT INTO worker_workflow_authorizations
+                   (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                    spec_digest,node_classes,authorized_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(worker_id,authorization_source_id,workflow_ref,workflow_digest)
+                   DO UPDATE SET spec_digest=excluded.spec_digest,
+                                 node_classes=excluded.node_classes,revoked_at=NULL""",
+                (
+                    worker_id,
+                    source_id,
+                    workflow.workflow_ref,
+                    workflow.workflow_digest,
+                    workflow.workflow_digest,
+                    json_text(list(workflow.node_classes)),
+                    authorized_at,
+                ),
+            )
+            for digest in workflow.model_digests:
+                conn.execute(
+                    """INSERT INTO worker_model_authorizations
+                       (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                        model_digest,spec_digest,authorized_at)
+                       VALUES (?,?,?,?,?,?,?)
+                       ON CONFLICT(worker_id,authorization_source_id,workflow_ref,
+                                   workflow_digest,model_digest)
+                       DO UPDATE SET spec_digest=excluded.spec_digest,revoked_at=NULL""",
+                    (
+                        worker_id,
+                        source_id,
+                        workflow.workflow_ref,
+                        workflow.workflow_digest,
+                        digest,
+                        workflow.workflow_digest,
+                        authorized_at,
+                    ),
+                )
+
+    def _reconcile_bundled_bootstrap_policy(self) -> None:
+        """Converge every Worker onto the bootstrap policy shipped by this release."""
+
+        stamp = now()
+        with self.db.transaction(immediate=True) as conn:
+            for worker in conn.execute("SELECT id,executor_type FROM workers").fetchall():
+                self._reconcile_bundled_bootstrap_authorizations(
+                    conn,
+                    worker_id=worker["id"],
+                    executor_type=worker["executor_type"],
+                    authorized_at=stamp,
+                )
+
+    def _initialize_worker_capability_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        worker_id: str,
+        executor_type: str,
+        canonical_capabilities: dict[str, Any],
+        initialized_at: float,
+    ) -> str:
+        """Install Gateway-owned grants and persist the strict initial view."""
+
+        if executor_type == "comfyui":
+            self._reconcile_bundled_bootstrap_authorizations(
+                conn,
+                worker_id=worker_id,
+                executor_type=executor_type,
+                authorized_at=initialized_at,
+            )
+            conn.execute(
+                "UPDATE workers SET capability_auth_enforced_at=? WHERE id=?",
+                (initialized_at, worker_id),
+            )
+        projected = self._authorized_worker_capabilities(
+            canonical_capabilities,
+            worker_id=worker_id,
+            executor_type=executor_type,
+            conn=conn,
+        )
+        serialized = json_text(projected)
+        conn.execute(
+            "UPDATE workers SET capabilities=? WHERE id=?",
+            (serialized, worker_id),
+        )
+        return serialized
+
+    def _capability_auth_is_enforced(
+        self,
+        worker_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> bool:
+        row = (
+            conn.execute(
+                "SELECT capability_auth_enforced_at FROM workers WHERE id=?",
+                (worker_id,),
+            ).fetchone()
+            if conn is not None
+            else self.db.fetchone(
+                "SELECT capability_auth_enforced_at FROM workers WHERE id=?",
+                (worker_id,),
+            )
+        )
+        return row is not None and row["capability_auth_enforced_at"] is not None
+
+    def _authorized_worker_capabilities(
+        self,
+        value: object,
+        *,
+        worker_id: str,
+        executor_type: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        canonical = self._fail_closed_worker_capabilities(value, executor_type=executor_type)
+        # Non-ComfyUI executors may remain in an explicit legacy mode. ComfyUI
+        # workers enter strict mode at creation or migration; only Gateway-held
+        # bootstrap records and signed maintenance receipts can
+        # authorize identifiers. A heartbeat can never opt itself in or out.
+        if not self._capability_auth_is_enforced(worker_id, conn=conn):
+            return canonical
+        workflow_nodes, workflow_models, all_models = self._authorization_sets(worker_id, conn=conn)
+        managed_refs = self._managed_workflow_refs(worker_id, conn=conn)
+        executors = canonical.get("executors")
+        if not isinstance(executors, list):
+            return canonical
+        for descriptor in executors:
+            if not isinstance(descriptor, dict):
+                continue
+            nested = descriptor.get("capabilities")
+            if not isinstance(nested, dict):
+                continue
+            nested["model_digests"] = [
+                digest for digest in nested.get("model_digests", []) if digest in all_models
+            ]
+            readiness: list[dict[str, Any]] = []
+            for item in nested.get("workflow_readiness", []):
+                if not isinstance(item, dict):
+                    continue
+                identity = (item.get("workflow_ref"), item.get("workflow_digest"))
+                workflow_ref = item.get("workflow_ref")
+                if workflow_ref in managed_refs:
+                    if identity not in workflow_nodes:
+                        continue
+                    readiness.append(
+                        {
+                            **item,
+                            "missing_model_digests": [
+                                digest
+                                for digest in item.get("missing_model_digests", [])
+                                if digest in workflow_models.get(identity, set())
+                            ],
+                            "missing_node_classes": [
+                                node
+                                for node in item.get("missing_node_classes", [])
+                                if node in workflow_nodes[identity]
+                            ],
+                        }
+                    )
+            nested["workflow_readiness"] = readiness
+            nested["ready_workflow_digests"] = [
+                item["workflow_digest"] for item in readiness if item.get("state") == "ready"
+            ]
+        return canonical
+
+    def _worker_value(self, row: sqlite3.Row) -> dict[str, Any]:
+        """Return a Worker view whose capability report is safe even for legacy rows."""
+
+        value = row_dict(row, json_columns={"capabilities"})
+        value["capabilities"] = self._authorized_worker_capabilities(
+            value.get("capabilities"),
+            worker_id=str(value.get("id", "")),
+            executor_type=str(value.get("executor_type", "")),
+        )
+        # This is Gateway-owned negotiation state, deliberately outside the
+        # Worker's self-report. A v2 install spec is safe only when both ends
+        # advertise the contract explicitly during a rolling upgrade.
+        value["gateway_protocol_features"] = {
+            "capability_install_spec_version": 2,
+        }
+        return value
+
+    @classmethod
+    def _artifact_value(cls, row: sqlite3.Row) -> dict[str, Any]:
+        """Return an artifact view without legacy Worker-controlled output strings."""
+
+        value = row_dict(row, json_columns={"media_metadata"})
+        if value.get("direction") == "output":
+            try:
+                value["media_metadata"] = project_reported_artifact_media_metadata(
+                    value.get("media_metadata", {})
+                )
+            except PublicMetadataError:
+                value["media_metadata"] = {}
+        return value
+
+    @staticmethod
+    def _maintenance_intent_is_historically_valid(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        spec: dict[str, Any],
+    ) -> bool:
+        owner = conn.execute(
+            """SELECT root_signing_public_key FROM users
+               WHERE id=? AND status='active'""",
+            (row["issued_by_user_id"],),
+        ).fetchone()
+        if owner is None:
+            return False
+        try:
+            authorization = json.loads(row["authorization"])
+            issued_at = authorization["payload"]["issued_at"]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return False
+        return type(issued_at) is int and verify_maintenance_intent(
+            authorization,
+            owner["root_signing_public_key"],
+            expected_worker_id=row["worker_id"],
+            expected_broker_id=row["broker_id"],
+            expected_kind=row["kind"],
+            expected_spec=spec,
+            now=issued_at,
+        )
+
+    @staticmethod
+    def _successful_maintenance_result_matches(
+        *, kind: str, spec: dict[str, Any], result: dict[str, Any]
+    ) -> bool:
+        if kind == "capability_install":
+            return (
+                result.get("kind") == kind
+                and result.get("status") in {"activated", "already_active", "repaired"}
+                and result.get("workflow_ref") == spec.get("workflow_ref")
+                and result.get("workflow_digest") == spec.get("workflow_digest")
+                and result.get("artifact_sha256") == spec.get("artifact_sha256")
+                and type(result.get("ready")) is bool
+                and result.get("error_code") is None
+            )
+        if kind == "model_install":
+            requested = spec.get("model_digests")
+            installed = result.get("installed_model_digests")
+            return (
+                isinstance(requested, list)
+                and isinstance(installed, list)
+                and result.get("kind") == kind
+                and result.get("status") in {"installed", "already_installed"}
+                and set(installed) == set(requested)
+                and result.get("failed_model_digest") is None
+            )
+        return False
+
+    @staticmethod
+    def _bound_capability_identifiers(
+        spec: dict[str, Any],
+    ) -> tuple[str, str, list[str], list[str]] | None:
+        workflow_ref = spec.get("workflow_ref")
+        workflow_digest = spec.get("workflow_digest")
+        if (
+            not isinstance(workflow_ref, str)
+            or not 1 <= len(workflow_ref) <= 512
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,511}", workflow_ref) is None
+            or not isinstance(workflow_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", workflow_digest) is None
+        ):
+            return None
+        models = spec.get("model_digests", [])
+        nodes = spec.get("node_classes", [])
+        if (
+            not isinstance(models, list)
+            or len(models) > 128
+            or any(
+                not isinstance(item, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+                for item in models
+            )
+            or len(models) != len(set(models))
+            or not isinstance(nodes, list)
+            or len(nodes) > 512
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", item) is None
+                for item in nodes
+            )
+            or nodes != sorted(set(nodes))
+        ):
+            return None
+        models = sorted(models)
+        if "node_classes" in spec and hashlib.sha256(canonical_json(nodes)).hexdigest() != spec.get(
+            "node_classes_digest"
+        ):
+            return None
+        return workflow_ref, workflow_digest, models, nodes
+
+    def _record_maintenance_authorizations(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        spec: dict[str, Any],
+        *,
+        authorized_at: float,
+    ) -> None:
+        identifiers = self._bound_capability_identifiers(spec)
+        if identifiers is None:
+            return
+        workflow_ref, workflow_digest, models, nodes = identifiers
+        if row["kind"] == "capability_install":
+            conn.execute(
+                """INSERT OR IGNORE INTO worker_workflow_authorizations
+                   (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                    spec_digest,node_classes,authorized_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    row["worker_id"],
+                    row["id"],
+                    workflow_ref,
+                    workflow_digest,
+                    row["spec_digest"],
+                    json_text(nodes),
+                    authorized_at,
+                ),
+            )
+        for digest in models:
+            conn.execute(
+                """INSERT OR IGNORE INTO worker_model_authorizations
+                   (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                    model_digest,spec_digest,authorized_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    row["worker_id"],
+                    row["id"],
+                    workflow_ref,
+                    workflow_digest,
+                    digest,
+                    row["spec_digest"],
+                    authorized_at,
+                ),
+            )
+
+    def _rebuild_maintenance_authorizations(self, conn: sqlite3.Connection) -> None:
+        for row in conn.execute(
+            """SELECT * FROM worker_maintenance_jobs
+               WHERE state='succeeded'
+                 AND kind IN ('capability_install','model_install')"""
+        ).fetchall():
+            try:
+                spec = json.loads(row["spec"])
+                result = json.loads(row["result"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(spec, dict)
+                or not isinstance(result, dict)
+                or not self._successful_maintenance_result_matches(
+                    kind=row["kind"], spec=spec, result=result
+                )
+                or not self._maintenance_intent_is_historically_valid(conn, row, spec)
+            ):
+                continue
+            self._record_maintenance_authorizations(
+                conn,
+                row,
+                spec,
+                authorized_at=float(row["completed_at"] or row["updated_at"]),
+            )
+            if row["kind"] == "capability_install":
+                conn.execute(
+                    """UPDATE workers
+                       SET capability_auth_enforced_at=COALESCE(capability_auth_enforced_at, ?)
+                       WHERE id=?""",
+                    (float(row["completed_at"] or row["updated_at"]), row["worker_id"]),
+                )
+
+    def _scrub_legacy_plaintext_metadata(self) -> None:
+        """Rewrite pre-projection metadata left by older Gateway releases.
+
+        This potentially large rewrite runs once under a durable migration
+        marker; it does not touch encrypted payloads or the append-only billing
+        ledger. Read-boundary projection remains as defense in depth.
+        """
+
+        with self.db.transaction(immediate=True) as conn:
+            migration_name = "gateway-public-metadata-and-capability-auth-v2"
+            if conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name=?",
+                (migration_name,),
+            ).fetchone():
+                return
+            migration_stamp = now()
+            for worker in conn.execute(
+                "SELECT id,executor_type FROM workers WHERE executor_type='comfyui'"
+            ).fetchall():
+                self._reconcile_bundled_bootstrap_authorizations(
+                    conn,
+                    worker_id=worker["id"],
+                    executor_type=worker["executor_type"],
+                    authorized_at=migration_stamp,
+                )
+            self._rebuild_maintenance_authorizations(conn)
+            conn.execute(
+                """UPDATE workers
+                   SET capability_auth_enforced_at=COALESCE(
+                       capability_auth_enforced_at, ?
+                   )
+                   WHERE executor_type='comfyui'""",
+                (migration_stamp,),
+            )
+            for row in conn.execute("SELECT id,executor_type,capabilities FROM workers").fetchall():
+                raw = self._decode_stored_json(row["capabilities"])
+                canonical = self._authorized_worker_capabilities(
+                    raw,
+                    worker_id=row["id"],
+                    executor_type=row["executor_type"],
+                    conn=conn,
+                )
+                serialized = json_text(canonical)
+                if serialized != row["capabilities"]:
+                    conn.execute(
+                        "UPDATE workers SET capabilities=? WHERE id=?",
+                        (serialized, row["id"]),
+                    )
+
+            for row in conn.execute(
+                """SELECT id,state,failure_code,progress,safe_failure_details
+                   FROM task_attempts"""
+            ).fetchall():
+                raw_progress = self._decode_stored_json(row["progress"])
+                progress = canonical_task_progress(raw_progress)
+                raw_details = self._decode_stored_json(row["safe_failure_details"])
+                details = self._canonical_failure_details(
+                    raw_details if isinstance(raw_details, dict) else {},
+                    row["failure_code"],
+                    terminal_state=row["state"],
+                )
+                serialized_progress = json_text(progress or {})
+                serialized_details = json_text(details)
+                if serialized_progress != row["progress"] or serialized_details != (
+                    row["safe_failure_details"] or ""
+                ):
+                    conn.execute(
+                        """UPDATE task_attempts
+                           SET progress=?,safe_failure_details=? WHERE id=?""",
+                        (serialized_progress, serialized_details, row["id"]),
+                    )
+
+            for row in conn.execute(
+                """SELECT id,media_metadata FROM artifacts
+                   WHERE direction='output'"""
+            ).fetchall():
+                raw_metadata = self._decode_stored_json(row["media_metadata"])
+                try:
+                    metadata = project_reported_artifact_media_metadata(raw_metadata)
+                except PublicMetadataError:
+                    metadata = {}
+                serialized = json_text(metadata)
+                if serialized != row["media_metadata"]:
+                    conn.execute(
+                        "UPDATE artifacts SET media_metadata=? WHERE id=?",
+                        (serialized, row["id"]),
+                    )
+
+            for row in conn.execute(
+                "SELECT id,metrics,worker_signature FROM usage_events"
+            ).fetchall():
+                raw_metrics = self._decode_stored_json(row["metrics"])
+                try:
+                    metrics = self._validate_usage_metrics(
+                        raw_metrics if isinstance(raw_metrics, dict) else {}
+                    )
+                except RepositoryError:
+                    metrics = {}
+                serialized = json_text(metrics)
+                if serialized != row["metrics"] or row["worker_signature"] is not None:
+                    conn.execute(
+                        """UPDATE usage_events
+                           SET metrics=?,worker_signature=NULL WHERE id=?""",
+                        (serialized, row["id"]),
+                    )
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                (migration_name, now()),
+            )
+
+    def _migrate_legacy_worker_enrollment_claims(self) -> None:
+        """Scrub legacy Worker claims while preserving approvable pending records."""
+
+        migration_name = "worker-enrollment-safe-claims-v1"
+        with self.db.transaction(immediate=True) as conn:
+            if conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name=?",
+                (migration_name,),
+            ).fetchone():
+                return
+            migration_stamp = now()
+            rows = conn.execute(
+                "SELECT * FROM enrollments WHERE kind='worker'"
+            ).fetchall()
+            for row in rows:
+                try:
+                    record = self._worker_enrollment_record(row)
+                    claim = record.get("worker_claim")
+                    verified_at = record.get("claim_verified_at")
+                    if row["state"] != "pending":
+                        if isinstance(claim, dict):
+                            record["worker_claim"] = self._safe_worker_enrollment_claim(claim)
+                        else:
+                            record.pop("worker_claim", None)
+                            record.pop("claim_verified_at", None)
+                        record.pop("proof_signature", None)
+                        conn.execute(
+                            "UPDATE enrollments SET claim=? WHERE id=?",
+                            (json_text(record), row["id"]),
+                        )
+                        continue
+                    if isinstance(claim, dict) and isinstance(verified_at, (int, float)):
+                        safe_claim = self._safe_worker_enrollment_claim(claim)
+                    else:
+                        proof_signature = record.get("proof_signature")
+                        if not isinstance(claim, dict) or not isinstance(proof_signature, str):
+                            raise ValueError("legacy Worker claim proof is absent")
+                        self._verify_worker_enrollment_claim(claim, proof_signature)
+                        safe_claim = self._safe_worker_enrollment_claim(claim)
+                    record["worker_claim"] = safe_claim
+                    record["claim_verified_at"] = float(
+                        row["claimed_at"] or verified_at or migration_stamp
+                    )
+                    record.pop("proof_signature", None)
+                    conn.execute(
+                        "UPDATE enrollments SET claim=? WHERE id=?",
+                        (json_text(record), row["id"]),
+                    )
+                except (KeyError, TypeError, ValueError, RepositoryError):
+                    try:
+                        decoded = self._decode_stored_json(row["claim"])
+                        config = decoded.get("config", {}) if isinstance(decoded, dict) else {}
+                    except (TypeError, ValueError):
+                        config = {}
+                    safe_record = json_text(
+                        {"config": config if isinstance(config, dict) else {}}
+                    )
+                    if row["state"] == "pending":
+                        conn.execute(
+                            """UPDATE enrollments
+                               SET state='expired',invite_secret_hash=NULL,claim=?,
+                                   decided_at=?,updated_at=? WHERE id=?""",
+                            (
+                                safe_record,
+                                migration_stamp,
+                                migration_stamp,
+                                row["id"],
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE enrollments SET claim=? WHERE id=?",
+                            (safe_record, row["id"]),
+                        )
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                (migration_name, migration_stamp),
+            )
 
     @staticmethod
     def _public_requirements(value: object) -> dict[str, Any]:
@@ -170,7 +872,10 @@ class GatewayRepository:
     @staticmethod
     def _artifact_media_metadata(value: object) -> dict[str, Any]:
         try:
-            return validate_artifact_media_metadata(value)
+            canonical = validate_artifact_media_metadata(value)
+            if "media_type" in canonical:
+                canonical["media_type"] = canonical["media_type"].lower()
+            return canonical
         except PublicMetadataError as exc:
             raise RepositoryError(
                 VALIDATION_FAILED,
@@ -181,7 +886,33 @@ class GatewayRepository:
             ) from exc
 
     @staticmethod
+    def _worker_capabilities(value: object, *, executor_type: str) -> dict[str, Any]:
+        try:
+            return canonical_worker_capabilities(value, executor_type=executor_type)
+        except PublicMetadataError as exc:
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "WORKER_CAPABILITIES_INVALID",
+                "Worker capabilities are invalid.",
+                422,
+                details={"field": "capabilities", "reason": exc.reason},
+            ) from exc
+
+    @staticmethod
+    def _worker_artifact_media_metadata(value: object) -> dict[str, Any]:
+        try:
+            return project_reported_artifact_media_metadata(value)
+        except PublicMetadataError as exc:
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "VALIDATION_FAILED",
+                "Artifact media metadata is invalid.",
+                422,
+                details={"field": "media_metadata", "reason": exc.reason},
+            ) from exc
+
     def _matches_requirements(
+        self,
         worker: sqlite3.Row,
         requirements: dict[str, Any],
         *,
@@ -235,8 +966,15 @@ class GatewayRepository:
             capabilities = json.loads(worker["capabilities"] or "{}")
         except (TypeError, json.JSONDecodeError):
             return False
-        if not isinstance(capabilities, dict):
-            return False
+        if self._capability_auth_is_enforced(worker["id"]):
+            authorized_workflows, _, _ = self._authorization_sets(worker["id"])
+            if (workflow_ref, workflow_digest) not in authorized_workflows:
+                return False
+        capabilities = self._authorized_worker_capabilities(
+            capabilities,
+            worker_id=worker["id"],
+            executor_type=worker["executor_type"],
+        )
         executors = capabilities.get("executors")
         if not isinstance(executors, list):
             return False
@@ -327,10 +1065,7 @@ class GatewayRepository:
                         not isinstance(digest, str)
                         or len(digest) != 71
                         or not digest.startswith("sha256:")
-                        or any(
-                            character not in "0123456789abcdef"
-                            for character in digest[7:]
-                        )
+                        or any(character not in "0123456789abcdef" for character in digest[7:])
                         for digest in missing_models
                     )
                     or len(missing_models) != len(set(missing_models))
@@ -340,16 +1075,12 @@ class GatewayRepository:
                         not isinstance(node, str)
                         or not 1 <= len(node) <= 128
                         or any(
-                            not (character.isalnum() or character in "_.:-")
-                            for character in node
+                            not (character.isalnum() or character in "_.:-") for character in node
                         )
                         for node in missing_nodes
                     )
                     or len(missing_nodes) != len(set(missing_nodes))
-                    or (
-                        item_state == "ready"
-                        and (bool(missing_models) or bool(missing_nodes))
-                    )
+                    or (item_state == "ready" and (bool(missing_models) or bool(missing_nodes)))
                     or (item_state == "missing_models" and not missing_models)
                     or (item_state == "missing_nodes" and not missing_nodes)
                 ):
@@ -908,15 +1639,14 @@ class GatewayRepository:
         """Return an operator-safe Workspace roster with current task activity."""
 
         self.require_admin(workspace_id, user_id)
-        membership_filter = "" if include_revoked else " AND m.status='active'"
         rows = self.db.fetchall(
-            f"""SELECT m.workspace_id,m.user_id,m.role,m.status AS membership_status,
+            """SELECT m.workspace_id,m.user_id,m.role,m.status AS membership_status,
                        m.created_at,m.revoked_at,u.display_name,u.status AS user_status
                   FROM memberships m JOIN users u ON u.id=m.user_id
-                 WHERE m.workspace_id=?{membership_filter}
+                 WHERE m.workspace_id=? AND (? OR m.status='active')
                  ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
                           m.created_at,m.user_id""",
-            (workspace_id,),
+            (workspace_id, int(include_revoked)),
         )
         stamp = now()
         members: list[dict[str, Any]] = []
@@ -952,8 +1682,7 @@ class GatewayRepository:
                     "worker_name": task["worker_name"],
                 }
                 for task in task_rows
-                if task["state"] in {"reserved", "running"}
-                and task["assigned_worker_id"]
+                if task["state"] in {"reserved", "running"} and task["assigned_worker_id"]
             ]
             queued_task_count = sum(
                 task["state"] in {"prepared", "committed", "queued", "rekey_required"}
@@ -984,9 +1713,7 @@ class GatewayRepository:
                     "last_seen_at": last_seen_at,
                     "active_device_count": device_count,
                     "active_task_count": len(using_workers),
-                    "running_task_count": sum(
-                        task["state"] == "running" for task in task_rows
-                    ),
+                    "running_task_count": sum(task["state"] == "running" for task in task_rows),
                     "queued_task_count": queued_task_count,
                     "using_workers": using_workers,
                 }
@@ -1186,8 +1913,7 @@ class GatewayRepository:
             and subject_user["root_encryption_public_key"]
             == claim.get("root_encryption_public_key")
             and initial_device["signing_public_key"] == claim.get("device_signing_public_key")
-            and initial_device["encryption_public_key"]
-            == claim.get("device_encryption_public_key")
+            and initial_device["encryption_public_key"] == claim.get("device_encryption_public_key")
             and canonical_json(json.loads(initial_device["certificate"]))
             == canonical_json(claim.get("device_certificate", {}))
         )
@@ -1400,9 +2126,7 @@ class GatewayRepository:
             "admission_digest": bundle["admission_digest"],
             "signed_admission": bundle["signed_admission"],
             "admission_signer_user_id": bundle["owner_user_id"],
-            "admission_signer_root_signing_public_key": bundle[
-                "owner_root_signing_public_key"
-            ],
+            "admission_signer_root_signing_public_key": bundle["owner_root_signing_public_key"],
         }
 
     @staticmethod
@@ -1830,8 +2554,7 @@ class GatewayRepository:
         if not isinstance(manifest, dict) or (
             manifest.get("recipient_public_key_sha256") != recipient["recipient_key_sha256"]
             or manifest.get("recipient_admission_sha256") != recipient["admission_digest"]
-            or manifest.get("recipient_binding_digest")
-            != recipient["recipient_binding_digest"]
+            or manifest.get("recipient_binding_digest") != recipient["recipient_binding_digest"]
         ):
             raise RepositoryError(
                 SIGNATURE_INVALID,
@@ -2374,6 +3097,33 @@ class GatewayRepository:
             )
         return value
 
+    @classmethod
+    def _safe_worker_enrollment_claim(cls, claim: dict[str, Any]) -> dict[str, Any]:
+        """Retain only bounded identity facts after verifying the original claim.
+
+        Runtime capabilities are authenticated availability telemetry, not
+        enrollment identity. They are intentionally discarded here and must be
+        reported again through the Worker's authenticated heartbeat after
+        approval.
+        """
+
+        executor_type = str(claim["executor_type"])
+        return {
+            key: claim[key]
+            for key in (
+                "version",
+                "kind",
+                "invite_id",
+                "worker_key_id",
+                "name",
+                "signing_public_key",
+                "encryption_public_key",
+                "executor_type",
+                "executor_version",
+                "capacity",
+            )
+        } | {"capabilities": cls._worker_capabilities({}, executor_type=executor_type)}
+
     @staticmethod
     def _verify_worker_enrollment_claim(
         claim: dict[str, Any], proof_signature: str
@@ -2382,9 +3132,7 @@ class GatewayRepository:
 
         try:
             signing_key = b64url_decode(str(claim["signing_public_key"]), expected_length=32)
-            encryption_key = b64url_decode(
-                str(claim["encryption_public_key"]), expected_length=32
-            )
+            encryption_key = b64url_decode(str(claim["encryption_public_key"]), expected_length=32)
             signature = b64url_decode(proof_signature, expected_length=64)
             shape_is_valid = (
                 set(claim)
@@ -2467,7 +3215,6 @@ class GatewayRepository:
             enrollment["worker_key_id"] = worker_claim.get("worker_key_id")
             if include_claim:
                 enrollment["claim"] = worker_claim
-                enrollment["proof_signature"] = record.get("proof_signature")
 
         result: dict[str, Any] = {"enrollment": enrollment}
         if isinstance(worker_claim, dict) and record.get("owner_consent_at") is not None:
@@ -2487,13 +3234,11 @@ class GatewayRepository:
                     "status": "pending_workspace",
                 }
             else:
-                result["allocation"] = row_dict(
-                    allocation_row, json_columns={"allocation_proof"}
-                )
+                result["allocation"] = row_dict(allocation_row, json_columns={"allocation_proof"})
         if row["state"] == "active" and config.get("worker_id"):
             worker = self.db.fetchone("SELECT * FROM workers WHERE id=?", (config["worker_id"],))
             if worker is not None:
-                result["worker"] = row_dict(worker, json_columns={"capabilities"})
+                result["worker"] = self._worker_value(worker)
         return result
 
     def create_worker_invite(
@@ -2605,6 +3350,7 @@ class GatewayRepository:
         proof_signature: str,
     ) -> dict[str, Any]:
         signing_key, _ = self._verify_worker_enrollment_claim(claim, proof_signature)
+        safe_claim = self._safe_worker_enrollment_claim(claim)
         if claim.get("invite_id") != invite_id:
             raise RepositoryError(
                 INVITE_INVALID_OR_EXPIRED,
@@ -2632,12 +3378,9 @@ class GatewayRepository:
                 )
             record = self._worker_enrollment_record(row)
             existing_claim = record.get("worker_claim")
-            existing_proof = record.get("proof_signature")
-            if isinstance(existing_claim, dict) and (
-                canonical_json(existing_claim) != canonical_json(claim)
-                or not isinstance(existing_proof, str)
-                or not secrets.compare_digest(existing_proof, proof_signature)
-            ):
+            if isinstance(existing_claim, dict) and canonical_json(
+                existing_claim
+            ) != canonical_json(safe_claim):
                 raise RepositoryError(
                     IDEMPOTENCY_CONFLICT,
                     "IDEMPOTENCY_CONFLICT",
@@ -2645,12 +3388,9 @@ class GatewayRepository:
                     409,
                 )
             if row["state"] in {"pending", "active"}:
-                if (
-                    isinstance(existing_claim, dict)
-                    and canonical_json(existing_claim) == canonical_json(claim)
-                    and isinstance(existing_proof, str)
-                    and secrets.compare_digest(existing_proof, proof_signature)
-                ):
+                if isinstance(existing_claim, dict) and canonical_json(
+                    existing_claim
+                ) == canonical_json(safe_claim):
                     return self._worker_enrollment_value(row, include_claim=False)
                 raise RepositoryError(
                     IDEMPOTENCY_CONFLICT,
@@ -2696,8 +3436,8 @@ class GatewayRepository:
                 )
             record.update(
                 {
-                    "worker_claim": claim,
-                    "proof_signature": proof_signature,
+                    "worker_claim": safe_claim,
+                    "claim_verified_at": stamp,
                     "owner_consent_at": stamp,
                 }
             )
@@ -2720,7 +3460,7 @@ class GatewayRepository:
                     json_text(
                         {
                             "claim_digest": "sha256:"
-                            + hashlib.sha256(canonical_json(claim)).hexdigest(),
+                            + hashlib.sha256(canonical_json(safe_claim)).hexdigest(),
                             "worker_id": config["worker_id"],
                         }
                     ),
@@ -2831,8 +3571,8 @@ class GatewayRepository:
             record = self._worker_enrollment_record(row)
             config = record["config"]
             claim = record.get("worker_claim")
-            proof_signature = record.get("proof_signature")
-            if not isinstance(claim, dict) or not isinstance(proof_signature, str):
+            claim_verified_at = record.get("claim_verified_at")
+            if not isinstance(claim, dict) or not isinstance(claim_verified_at, (int, float)):
                 raise RepositoryError(
                     ENROLLMENT_APPROVAL_REQUIRED,
                     "ENROLLMENT_APPROVAL_REQUIRED",
@@ -2914,7 +3654,6 @@ class GatewayRepository:
                         "Approving a Worker requires its owner certificate and allocation proof.",
                         422,
                     )
-                self._verify_worker_enrollment_claim(claim, proof_signature)
                 pool = conn.execute(
                     """SELECT id FROM pools
                        WHERE id=? AND workspace_id=? AND status='active'""",
@@ -2950,9 +3689,7 @@ class GatewayRepository:
                 try:
                     certificate = json.loads(owner_certificate)
                     manifest = certificate["manifest"]
-                    root_key = b64url_decode(
-                        owner["root_signing_public_key"], expected_length=32
-                    )
+                    root_key = b64url_decode(owner["root_signing_public_key"], expected_length=32)
                     expected_root_id = root_signing_key_id(root_key)
                     issued_at = manifest["issued_at"]
                     certificate_is_valid = (
@@ -2976,8 +3713,7 @@ class GatewayRepository:
                         and manifest["kind"] == "vgen-worker-owner-certificate"
                         and manifest["owner_root_key_id"] == expected_root_id
                         and manifest["worker_key_id"] == claim["worker_key_id"]
-                        and manifest["worker_signing_public_key"]
-                        == claim["signing_public_key"]
+                        and manifest["worker_signing_public_key"] == claim["signing_public_key"]
                         and manifest["worker_encryption_public_key"]
                         == claim["encryption_public_key"]
                         and verify_key_manifest(certificate, root_key)
@@ -3042,11 +3778,26 @@ class GatewayRepository:
                         json_text(certificate),
                         claim["executor_type"],
                         claim["executor_version"],
-                        json_text(claim["capabilities"]),
+                        json_text(
+                            self._worker_capabilities(
+                                claim["capabilities"],
+                                executor_type=str(claim["executor_type"]),
+                            )
+                        ),
                         claim["capacity"],
                         stamp,
                         stamp,
                     ),
+                )
+                self._initialize_worker_capability_state(
+                    conn,
+                    worker_id=config["worker_id"],
+                    executor_type=str(claim["executor_type"]),
+                    canonical_capabilities=self._worker_capabilities(
+                        claim["capabilities"],
+                        executor_type=str(claim["executor_type"]),
+                    ),
+                    initialized_at=stamp,
                 )
                 conn.execute(
                     """INSERT INTO worker_allocations
@@ -3190,13 +3941,11 @@ class GatewayRepository:
                     or existing_device is None
                     or stored_device_id != claim["device_id"]
                     or existing_user["display_name"] != claim["display_name"]
-                    or existing_user["root_signing_public_key"]
-                    != claim["root_signing_public_key"]
+                    or existing_user["root_signing_public_key"] != claim["root_signing_public_key"]
                     or existing_user["root_encryption_public_key"]
                     != claim["root_encryption_public_key"]
                     or existing_device["name"] != claim["device_name"]
-                    or existing_device["signing_public_key"]
-                    != claim["device_signing_public_key"]
+                    or existing_device["signing_public_key"] != claim["device_signing_public_key"]
                     or existing_device["encryption_public_key"]
                     != claim["device_encryption_public_key"]
                     or canonical_json(json.loads(existing_device["certificate"]))
@@ -3554,9 +4303,7 @@ class GatewayRepository:
                 pool_id,
                 subject_user_id,
                 subject_device_id,
-                json_text(
-                    {"registration_claim": claim, "proof_signature": proof_signature}
-                ),
+                json_text({"registration_claim": claim, "proof_signature": proof_signature}),
                 relationship,
                 stamp,
                 stamp,
@@ -3901,12 +4648,22 @@ class GatewayRepository:
                     403,
                 )
         stamp = now()
-        capabilities_json = json_text(capabilities)
+        canonical_capabilities = self._worker_capabilities(
+            capabilities, executor_type=executor_type
+        )
         with self.db.transaction(immediate=True) as conn:
             existing = conn.execute(
                 "SELECT * FROM workers WHERE signing_public_key=?", (signing_public_key,)
             ).fetchone()
             if existing is not None:
+                projected_capabilities_json = json_text(
+                    self._authorized_worker_capabilities(
+                        canonical_capabilities,
+                        worker_id=existing["id"],
+                        executor_type=executor_type,
+                        conn=conn,
+                    )
+                )
                 matches = (
                     existing["owner_user_id"] == owner_user_id
                     and existing["manager_broker_id"] == manager_broker_id
@@ -3915,7 +4672,7 @@ class GatewayRepository:
                     and existing["certificate"] == certificate
                     and existing["executor_type"] == executor_type
                     and existing["executor_version"] == executor_version
-                    and existing["capabilities"] == capabilities_json
+                    and existing["capabilities"] == projected_capabilities_json
                     and existing["capacity"] == capacity
                 )
                 if not matches:
@@ -3925,7 +4682,7 @@ class GatewayRepository:
                         "The Worker signing key is already registered with different attributes.",
                         409,
                     )
-                return row_dict(existing, json_columns={"capabilities"})
+                return self._worker_value(existing)
             worker_id = new_id("wrk")
             conn.execute(
                 """INSERT INTO workers
@@ -3942,15 +4699,21 @@ class GatewayRepository:
                     certificate,
                     executor_type,
                     executor_version,
-                    capabilities_json,
+                    json_text(canonical_capabilities),
                     capacity,
                     stamp,
                     stamp,
                 ),
             )
-        return row_dict(
-            self.db.fetchone("SELECT * FROM workers WHERE id=?", (worker_id,)),
-            json_columns={"capabilities"},
+            self._initialize_worker_capability_state(
+                conn,
+                worker_id=worker_id,
+                executor_type=executor_type,
+                canonical_capabilities=canonical_capabilities,
+                initialized_at=stamp,
+            )
+        return self._worker_value(
+            self.db.fetchone("SELECT * FROM workers WHERE id=?", (worker_id,))
         )
 
     def list_workers(
@@ -3969,7 +4732,7 @@ class GatewayRepository:
             rows = self.db.fetchall(
                 "SELECT * FROM workers WHERE owner_user_id=? ORDER BY created_at", (user_id,)
             )
-        return [row_dict(row, json_columns={"capabilities"}) for row in rows]
+        return [self._worker_value(row) for row in rows]
 
     def list_allocations(self, *, workspace_id: str, user_id: str) -> list[dict[str, Any]]:
         self.require_member(workspace_id, user_id)
@@ -4101,31 +4864,357 @@ class GatewayRepository:
     def worker_heartbeat(
         self, *, worker_id: str, capabilities: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        worker = self.db.fetchone("SELECT * FROM workers WHERE id=?", (worker_id,))
-        if worker is None:
-            raise RepositoryError(WORKER_NOT_FOUND, "WORKER_NOT_FOUND", "Worker not found.", 404)
-        if worker["status"] == "revoked":
-            raise RepositoryError(WORKER_REVOKED, "WORKER_REVOKED", "Worker has been revoked.", 403)
-        if worker["status"] == "draining":
+        with self.db.transaction(immediate=True) as conn:
+            worker = conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
+            if worker is None:
+                raise RepositoryError(
+                    WORKER_NOT_FOUND, "WORKER_NOT_FOUND", "Worker not found.", 404
+                )
+            if worker["status"] == "revoked":
+                raise RepositoryError(
+                    WORKER_REVOKED, "WORKER_REVOKED", "Worker has been revoked.", 403
+                )
             stamp = now()
-            self.db.execute(
-                "UPDATE workers SET last_seen_at=?,updated_at=? WHERE id=?",
-                (stamp, stamp, worker_id),
+            if worker["status"] == "draining":
+                conn.execute(
+                    "UPDATE workers SET last_seen_at=?,updated_at=? WHERE id=?",
+                    (stamp, stamp, worker_id),
+                )
+                workflow_authorizations, _, _ = self._authorization_sets(
+                    worker_id, conn=conn
+                )
+                return {
+                    "ok": True,
+                    "status": "draining",
+                    "workflow_authorizations": [
+                        {
+                            "workflow_ref": workflow_ref,
+                            "workflow_digest": workflow_digest,
+                        }
+                        for workflow_ref, workflow_digest in sorted(workflow_authorizations)
+                    ],
+                }
+            if not isinstance(capabilities, dict) or not capabilities:
+                raise RepositoryError(
+                    VALIDATION_FAILED,
+                    "WORKER_CAPABILITIES_REQUIRED",
+                    "A healthy capability report is required.",
+                    422,
+                )
+            try:
+                canonical_capabilities = self._worker_capabilities(
+                    capabilities,
+                    executor_type=str(worker["executor_type"]),
+                )
+            except RepositoryError as exc:
+                if exc.name != "WORKER_CAPABILITIES_INVALID":
+                    raise
+                # Liveness and scheduling readiness are separate facts. Keep an
+                # authenticated Worker reachable for a rolling repair, but erase
+                # every executable descriptor when its report is malformed.
+                raw_actions = capabilities.get("maintenance_actions")
+                allowed_actions = (
+                    "worker_update",
+                    "model_install",
+                    "capability_install",
+                )
+                canonical_capabilities = {
+                    "maintenance_actions": [
+                        action
+                        for action in allowed_actions
+                        if isinstance(raw_actions, list) and action in raw_actions
+                    ],
+                    "executors": [],
+                }
+            canonical_capabilities = self._authorized_worker_capabilities(
+                canonical_capabilities,
+                worker_id=worker_id,
+                executor_type=str(worker["executor_type"]),
+                conn=conn,
             )
-            return {"ok": True, "status": "draining"}
-        if not isinstance(capabilities, dict) or not capabilities:
-            raise RepositoryError(
-                VALIDATION_FAILED,
-                "WORKER_CAPABILITIES_REQUIRED",
-                "A healthy capability report is required.",
-                422,
+            executor_version = self._heartbeat_executor_version(
+                capabilities=canonical_capabilities,
+                executor_type=str(worker["executor_type"]),
             )
+            conn.execute(
+                """UPDATE workers
+                   SET status='active',last_seen_at=?,capabilities=?,
+                       executor_version=COALESCE(?,executor_version),updated_at=?
+                   WHERE id=?""",
+                (
+                    stamp,
+                    json_text(canonical_capabilities),
+                    executor_version,
+                    stamp,
+                    worker_id,
+                ),
+            )
+            workflow_authorizations, _, _ = self._authorization_sets(worker_id, conn=conn)
+            authorization_snapshot = [
+                {"workflow_ref": workflow_ref, "workflow_digest": workflow_digest}
+                for workflow_ref, workflow_digest in sorted(workflow_authorizations)
+            ]
+        return {
+            "ok": True,
+            "status": "active",
+            "workflow_authorizations": authorization_snapshot,
+        }
+
+    def deactivate_worker_workflow(
+        self,
+        *,
+        worker_id: str,
+        owner_user_id: str,
+        actor_device_id: str,
+        workflow_ref: str,
+        workflow_digest: str,
+        authorization_source_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Revoke a dynamic workflow identity or one exact authorization source.
+
+        Omitting ``authorization_source_id`` is the explicit uninstall path and
+        revokes every dynamic grant for the immutable workflow identity.  An
+        automatic install rollback supplies the maintenance job ID instead, so
+        it cannot revoke an older grant for the same release.  The Worker
+        reconciles the resulting identity set on its next authenticated
+        heartbeat; content-addressed package/model bytes remain available.
+        """
+
         stamp = now()
-        self.db.execute(
-            "UPDATE workers SET status='active',last_seen_at=?,capabilities=?,updated_at=? WHERE id=?",
-            (stamp, json_text(capabilities), stamp, worker_id),
-        )
-        return {"ok": True, "status": "active"}
+        with self.db.transaction(immediate=True) as conn:
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE id=? AND owner_user_id=? AND status!='revoked'",
+                (worker_id, owner_user_id),
+            ).fetchone()
+            if worker is None:
+                raise RepositoryError(
+                    FORBIDDEN, "WORKER_ACCESS_DENIED", "Worker access denied.", 403
+                )
+            if authorization_source_id is not None:
+                workflow_source = conn.execute(
+                    """SELECT 1 FROM worker_workflow_authorizations
+                       WHERE worker_id=? AND authorization_source_id=?
+                         AND workflow_ref=? AND workflow_digest=? LIMIT 1""",
+                    (
+                        worker_id,
+                        authorization_source_id,
+                        workflow_ref,
+                        workflow_digest,
+                    ),
+                ).fetchone()
+                model_source = conn.execute(
+                    """SELECT 1 FROM worker_model_authorizations
+                       WHERE worker_id=? AND authorization_source_id=?
+                         AND workflow_ref=? AND workflow_digest=? LIMIT 1""",
+                    (
+                        worker_id,
+                        authorization_source_id,
+                        workflow_ref,
+                        workflow_digest,
+                    ),
+                ).fetchone()
+                maintenance_source = conn.execute(
+                    """SELECT spec FROM worker_maintenance_jobs
+                       WHERE id=? AND worker_id=?
+                         AND kind IN ('capability_install','model_install') LIMIT 1""",
+                    (authorization_source_id, worker_id),
+                ).fetchone()
+                maintenance_source_matches = False
+                if maintenance_source is not None:
+                    try:
+                        maintenance_spec = json.loads(maintenance_source["spec"])
+                    except (TypeError, json.JSONDecodeError):
+                        maintenance_spec = None
+                    maintenance_source_matches = (
+                        isinstance(maintenance_spec, dict)
+                        and maintenance_spec.get("workflow_ref") == workflow_ref
+                        and maintenance_spec.get("workflow_digest") == workflow_digest
+                    )
+                if (
+                    workflow_source is None
+                    and model_source is None
+                    and not maintenance_source_matches
+                ):
+                    raise RepositoryError(
+                        WORKER_MAINTENANCE_STATE_CONFLICT,
+                        "WORKFLOW_AUTHORIZATION_SOURCE_MISMATCH",
+                        "The authorization source does not belong to this workflow release.",
+                        409,
+                    )
+            bundled = conn.execute(
+                """SELECT 1 FROM worker_workflow_authorizations
+                   WHERE worker_id=? AND workflow_ref=? AND workflow_digest=?
+                     AND authorization_source_id LIKE 'bundled-bootstrap:%'
+                     AND revoked_at IS NULL LIMIT 1""",
+                (worker_id, workflow_ref, workflow_digest),
+            ).fetchone()
+            # An explicit identity-wide uninstall cannot deactivate a bundled
+            # release. Source-scoped rollback may still revoke its own dynamic
+            # grant; the response then reports ``still_authorized`` because the
+            # bundled bootstrap grant remains active.
+            if authorization_source_id is None and bundled is not None:
+                raise RepositoryError(
+                    WORKER_MAINTENANCE_STATE_CONFLICT,
+                    "BUNDLED_WORKFLOW_DEACTIVATE_UNSUPPORTED",
+                    "Bundled bootstrap workflows are managed by the Worker release.",
+                    409,
+                )
+
+            if authorization_source_id is not None:
+                source_parameters = (
+                    stamp,
+                    worker_id,
+                    workflow_ref,
+                    workflow_digest,
+                    authorization_source_id,
+                )
+                workflow_update = conn.execute(
+                    """UPDATE worker_workflow_authorizations
+                       SET revoked_at=COALESCE(revoked_at, ?)
+                       WHERE worker_id=? AND workflow_ref=? AND workflow_digest=?
+                         AND authorization_source_id NOT LIKE 'bundled-bootstrap:%'
+                         AND revoked_at IS NULL AND authorization_source_id=?""",
+                    source_parameters,
+                )
+                model_update = conn.execute(
+                    """UPDATE worker_model_authorizations
+                       SET revoked_at=COALESCE(revoked_at, ?)
+                       WHERE worker_id=? AND workflow_ref=? AND workflow_digest=?
+                         AND authorization_source_id NOT LIKE 'bundled-bootstrap:%'
+                         AND revoked_at IS NULL AND authorization_source_id=?""",
+                    source_parameters,
+                )
+            else:
+                identity_parameters = (
+                    stamp,
+                    worker_id,
+                    workflow_ref,
+                    workflow_digest,
+                )
+                workflow_update = conn.execute(
+                    """UPDATE worker_workflow_authorizations
+                       SET revoked_at=COALESCE(revoked_at, ?)
+                       WHERE worker_id=? AND workflow_ref=? AND workflow_digest=?
+                         AND authorization_source_id NOT LIKE 'bundled-bootstrap:%'
+                         AND revoked_at IS NULL""",
+                    identity_parameters,
+                )
+                model_update = conn.execute(
+                    """UPDATE worker_model_authorizations
+                       SET revoked_at=COALESCE(revoked_at, ?)
+                       WHERE worker_id=? AND workflow_ref=? AND workflow_digest=?
+                         AND authorization_source_id NOT LIKE 'bundled-bootstrap:%'
+                         AND revoked_at IS NULL""",
+                    identity_parameters,
+                )
+            still_authorized = (
+                conn.execute(
+                    """SELECT 1 FROM worker_workflow_authorizations
+                       WHERE worker_id=? AND workflow_ref=? AND workflow_digest=?
+                         AND revoked_at IS NULL LIMIT 1""",
+                    (worker_id, workflow_ref, workflow_digest),
+                ).fetchone()
+                is not None
+            )
+
+            cancelled_jobs: list[str] = []
+            rows = conn.execute(
+                """SELECT id,spec FROM worker_maintenance_jobs
+                   WHERE worker_id=? AND kind IN ('capability_install','model_install')
+                     AND state IN ('awaiting_upload','queued','leased','running','restarting')""",
+                (worker_id,),
+            ).fetchall()
+            for row in rows:
+                if (
+                    authorization_source_id is not None
+                    and row["id"] != authorization_source_id
+                ):
+                    continue
+                try:
+                    spec = json.loads(row["spec"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    not isinstance(spec, dict)
+                    or spec.get("workflow_ref") != workflow_ref
+                    or spec.get("workflow_digest") != workflow_digest
+                ):
+                    continue
+                conn.execute(
+                    """UPDATE worker_maintenance_jobs
+                       SET state='cancelled',completed_at=?,updated_at=?,lease_session_id=NULL,
+                           lease_expires_at=NULL,fencing_token=fencing_token+1
+                       WHERE id=?""",
+                    (stamp, stamp, row["id"]),
+                )
+                conn.execute(
+                    """UPDATE maintenance_artifacts SET state='deleted',updated_at=?
+                       WHERE job_id=? AND state IN ('pending','uploaded')""",
+                    (stamp, row["id"]),
+                )
+                cancelled_jobs.append(str(row["id"]))
+
+            conn.execute(
+                """INSERT INTO audit_events
+                   (id,actor_type,actor_id,action,subject_type,subject_id,safe_details,created_at)
+                   VALUES (?, 'device',?,'worker.workflow_deactivated','worker',?,?,?)""",
+                (
+                    new_id("aud"),
+                    actor_device_id,
+                    worker_id,
+                    json_text(
+                        {
+                            "workflow_ref": workflow_ref,
+                            "workflow_digest": workflow_digest,
+                            "authorization_source_id": authorization_source_id,
+                            "cancelled_jobs": len(cancelled_jobs),
+                        }
+                    ),
+                    stamp,
+                ),
+            )
+        response = {
+            "worker_id": worker_id,
+            "workflow_ref": workflow_ref,
+            "workflow_digest": workflow_digest,
+            "state": (
+                "authorization_source_revoked"
+                if authorization_source_id is not None
+                else "deactivated"
+            ),
+            "scope": "authorization_source" if authorization_source_id else "workflow",
+            "still_authorized": still_authorized,
+            "workflow_grants_revoked": workflow_update.rowcount,
+            "model_grants_revoked": model_update.rowcount,
+            "cancelled_jobs": cancelled_jobs,
+        }
+        if authorization_source_id is not None:
+            response["authorization_source_id"] = authorization_source_id
+        return response
+
+    @staticmethod
+    def _heartbeat_executor_version(
+        *, capabilities: dict[str, Any], executor_type: str
+    ) -> str | None:
+        executors = capabilities.get("executors")
+        if not isinstance(executors, list):
+            return None
+        matching_descriptors = [
+            descriptor
+            for descriptor in executors
+            if isinstance(descriptor, dict) and descriptor.get("type") == executor_type
+        ]
+        if len(matching_descriptors) != 1:
+            return None
+        version = matching_descriptors[0].get("version")
+        if not isinstance(version, str):
+            return None
+        if not version or len(version) > _EXECUTOR_VERSION_MAX_LENGTH:
+            return None
+        version = version.strip(" ")
+        if not version or not set(version) <= _EXECUTOR_VERSION_CHARACTERS:
+            return None
+        return version
 
     def leave_worker(self, *, worker_id: str, owner_user_id: str, force: bool) -> dict[str, Any]:
         worker = self.db.fetchone(
@@ -4280,9 +5369,7 @@ class GatewayRepository:
         return value
 
     def _maintenance_artifact_value(self, job_id: str) -> dict[str, Any] | None:
-        row = self.db.fetchone(
-            "SELECT * FROM maintenance_artifacts WHERE job_id=?", (job_id,)
-        )
+        row = self.db.fetchone("SELECT * FROM maintenance_artifacts WHERE job_id=?", (job_id,))
         return row_dict(row) if row is not None else None
 
     def _require_exact_broker_device(
@@ -4344,7 +5431,7 @@ class GatewayRepository:
                         403,
                     )
             if worker["manager_broker_id"] == broker_id:
-                return row_dict(worker, json_columns={"capabilities"})
+                return self._worker_value(worker)
             active = conn.execute(
                 """SELECT 1 FROM worker_maintenance_jobs
                    WHERE worker_id=? AND state IN
@@ -4379,9 +5466,8 @@ class GatewayRepository:
                     stamp,
                 ),
             )
-        return row_dict(
-            self.db.fetchone("SELECT * FROM workers WHERE id=?", (worker_id,)),
-            json_columns={"capabilities"},
+        return self._worker_value(
+            self.db.fetchone("SELECT * FROM workers WHERE id=?", (worker_id,))
         )
 
     def create_worker_maintenance(
@@ -4396,28 +5482,33 @@ class GatewayRepository:
         spec_digest: str,
         authorization: dict[str, Any],
         expires_at: int,
+        intent_nonce: str,
+        intent_issued_at: int,
         artifact_store_type: str,
     ) -> dict[str, Any]:
-        self._require_exact_broker_device(
-            broker_id=broker_id, user_id=user_id, device_id=device_id
-        )
-        worker = self.db.fetchone(
-            """SELECT * FROM workers
-               WHERE id=? AND owner_user_id=? AND manager_broker_id=? AND status!='revoked'""",
-            (worker_id, user_id, broker_id),
-        )
-        if worker is None:
-            raise RepositoryError(
-                FORBIDDEN,
-                "WORKER_MANAGER_BROKER_REQUIRED",
-                "This Broker is not the Worker's delegated manager.",
-                403,
-            )
         if kind not in _MAINTENANCE_KINDS:
             raise RepositoryError(
                 VALIDATION_FAILED,
                 "WORKER_MAINTENANCE_KIND_INVALID",
                 "Worker maintenance kind is invalid.",
+                422,
+            )
+        intent_payload = authorization.get("payload")
+        if (
+            not isinstance(intent_payload, dict)
+            or intent_payload.get("worker_id") != worker_id
+            or intent_payload.get("broker_id") != broker_id
+            or intent_payload.get("device_id") != device_id
+            or intent_payload.get("action") != kind
+            or intent_payload.get("spec_digest") != spec_digest
+            or intent_payload.get("nonce") != intent_nonce
+            or intent_payload.get("issued_at") != intent_issued_at
+            or intent_payload.get("expires_at") != expires_at
+        ):
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "WORKER_MAINTENANCE_AUTHORIZATION_INVALID",
+                "Worker maintenance authorization does not match the requested job.",
                 422,
             )
         stamp = now()
@@ -4428,9 +5519,142 @@ class GatewayRepository:
                 "Worker maintenance authorization has expired.",
                 422,
             )
+        # Capability/model jobs are authorization sources. Sharing one active
+        # job across distinct signed intents would also share its lifecycle:
+        # either caller could then cancel or revoke the source while the other
+        # caller still depends on it. Keep those jobs intent-scoped and rely on
+        # the Worker CAS for byte-level model/package reuse. Worker updates do
+        # not mint workflow/model grants, so they may still safely converge on
+        # one active immutable artifact job.
         dedupe_key = spec_digest
+        if kind in {"capability_install", "model_install"}:
+            dedupe_key = "sha256:" + hashlib.sha256(
+                canonical_json(
+                    {
+                        "device_id": device_id,
+                        "intent_nonce": intent_nonce,
+                        "spec_digest": spec_digest,
+                    }
+                )
+            ).hexdigest()
+        spec_text = json_text(spec)
+        authorization_text = json_text(authorization)
+        authorization_digest = hashlib.sha256(canonical_json(authorization)).hexdigest()
         with self.db.transaction(immediate=True) as conn:
+            broker_device = conn.execute(
+                """SELECT 1 FROM brokers b JOIN broker_devices bd ON bd.broker_id=b.id
+                   JOIN devices d ON d.id=bd.device_id
+                   WHERE b.id=? AND b.owner_user_id=? AND b.status='active'
+                     AND bd.device_id=? AND bd.status='active'
+                     AND d.user_id=? AND d.status='active'""",
+                (broker_id, user_id, device_id, user_id),
+            ).fetchone()
+            if broker_device is None:
+                raise RepositoryError(
+                    FORBIDDEN,
+                    "BROKER_DEVICE_ACCESS_DENIED",
+                    "The authenticated Device is not an active Device of this Broker.",
+                    403,
+                )
+            worker = conn.execute(
+                """SELECT 1 FROM workers
+                   WHERE id=? AND owner_user_id=? AND manager_broker_id=? AND status!='revoked'""",
+                (worker_id, user_id, broker_id),
+            ).fetchone()
+            if worker is None:
+                raise RepositoryError(
+                    FORBIDDEN,
+                    "WORKER_MANAGER_BROKER_REQUIRED",
+                    "This Broker is not the Worker's delegated manager.",
+                    403,
+                )
             self._expire_maintenance_jobs(conn, stamp)
+            receipt = conn.execute(
+                """SELECT authorization_digest,job_id
+                   FROM maintenance_intent_receipts
+                   WHERE device_id=? AND nonce=?""",
+                (device_id, intent_nonce),
+            ).fetchone()
+            if receipt is not None:
+                if not secrets.compare_digest(
+                    str(receipt["authorization_digest"]), authorization_digest
+                ):
+                    raise RepositoryError(
+                        int(ErrorCode.REPLAY_DETECTED),
+                        "REPLAY_DETECTED",
+                        "Maintenance authorization nonce was reused.",
+                        409,
+                    )
+                replayed = conn.execute(
+                    "SELECT * FROM worker_maintenance_jobs WHERE id=?", (receipt["job_id"],)
+                ).fetchone()
+                if replayed is None:
+                    raise RepositoryError(
+                        int(ErrorCode.INTERNAL_ERROR),
+                        "INTERNAL_ERROR",
+                        "Stored maintenance authorization receipt is invalid.",
+                        500,
+                        "later",
+                        "platform",
+                    )
+                return self._maintenance_create_result(
+                    replayed,
+                    authorization_text=authorization_text,
+                )
+            exact = conn.execute(
+                """SELECT * FROM worker_maintenance_jobs
+                   WHERE worker_id=? AND broker_id=? AND issued_by_user_id=?
+                     AND issued_by_device_id=? AND kind=? AND spec_digest=?
+                     AND spec=? AND authorization=?
+                   ORDER BY created_at,id LIMIT 1""",
+                (
+                    worker_id,
+                    broker_id,
+                    user_id,
+                    device_id,
+                    kind,
+                    spec_digest,
+                    spec_text,
+                    authorization_text,
+                ),
+            ).fetchone()
+            if exact is not None:
+                # The signed intent and job were committed together. This is
+                # the durable replay boundary if the process stopped before
+                # middleware cached the HTTP response. Record old jobs lazily
+                # so upgrades gain the same receipt semantics.
+                conn.execute(
+                    """INSERT INTO maintenance_intent_receipts
+                       (device_id,nonce,authorization_digest,job_id,expires_at,created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (
+                        device_id,
+                        intent_nonce,
+                        authorization_digest,
+                        exact["id"],
+                        float(expires_at),
+                        stamp,
+                    ),
+                )
+                return self._maintenance_create_result(
+                    exact,
+                    authorization_text=authorization_text,
+                )
+
+            conn.execute("DELETE FROM request_nonces WHERE expires_at<=?", (stamp,))
+            claimed = conn.execute(
+                """INSERT OR IGNORE INTO request_nonces
+                   (principal_type,principal_id,nonce,signature_created_at,expires_at,claimed_at)
+                   VALUES ('maintenance_intent',?,?,?,?,?)""",
+                (device_id, intent_nonce, intent_issued_at, float(expires_at), stamp),
+            )
+            if claimed.rowcount != 1:
+                raise RepositoryError(
+                    int(ErrorCode.REPLAY_DETECTED),
+                    "REPLAY_DETECTED",
+                    "Maintenance authorization was already used.",
+                    409,
+                )
             existing = conn.execute(
                 """SELECT * FROM worker_maintenance_jobs
                    WHERE worker_id=? AND dedupe_key=?
@@ -4438,14 +5662,23 @@ class GatewayRepository:
                 (worker_id, dedupe_key),
             ).fetchone()
             if existing is not None:
-                value = self._maintenance_job_value(existing)
-                artifact = conn.execute(
-                    "SELECT * FROM maintenance_artifacts WHERE job_id=?", (existing["id"],)
-                ).fetchone()
-                if artifact is not None:
-                    value["artifact"] = row_dict(artifact)
-                    value["artifact_id"] = artifact["id"]
-                return value
+                conn.execute(
+                    """INSERT INTO maintenance_intent_receipts
+                       (device_id,nonce,authorization_digest,job_id,expires_at,created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (
+                        device_id,
+                        intent_nonce,
+                        authorization_digest,
+                        existing["id"],
+                        float(expires_at),
+                        stamp,
+                    ),
+                )
+                return self._maintenance_create_result(
+                    existing,
+                    authorization_text=authorization_text,
+                )
 
             job_id = new_id("mtj")
             state = "awaiting_upload" if kind in _ARTIFACT_MAINTENANCE_KINDS else "queued"
@@ -4461,9 +5694,9 @@ class GatewayRepository:
                     user_id,
                     device_id,
                     kind,
-                    json_text(spec),
+                    spec_text,
                     spec_digest,
-                    json_text(authorization),
+                    authorization_text,
                     dedupe_key,
                     state,
                     float(expires_at),
@@ -4515,14 +5748,23 @@ class GatewayRepository:
             created = conn.execute(
                 "SELECT * FROM worker_maintenance_jobs WHERE id=?", (job_id,)
             ).fetchone()
-            value = self._maintenance_job_value(created)
-            if artifact_id is not None:
-                artifact = conn.execute(
-                    "SELECT * FROM maintenance_artifacts WHERE id=?", (artifact_id,)
-                ).fetchone()
-                value["artifact"] = row_dict(artifact)
-                value["artifact_id"] = artifact_id
-            return value
+            conn.execute(
+                """INSERT INTO maintenance_intent_receipts
+                   (device_id,nonce,authorization_digest,job_id,expires_at,created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (
+                    device_id,
+                    intent_nonce,
+                    authorization_digest,
+                    job_id,
+                    float(expires_at),
+                    stamp,
+                ),
+            )
+            return self._maintenance_create_result(
+                created,
+                authorization_text=authorization_text,
+            )
 
     def _require_broker_maintenance_job(
         self,
@@ -4531,9 +5773,7 @@ class GatewayRepository:
         user_id: str,
         device_id: str,
     ) -> sqlite3.Row:
-        job = self.db.fetchone(
-            "SELECT * FROM worker_maintenance_jobs WHERE id=?", (job_id,)
-        )
+        job = self.db.fetchone("SELECT * FROM worker_maintenance_jobs WHERE id=?", (job_id,))
         if job is None:
             raise RepositoryError(
                 WORKER_MAINTENANCE_JOB_NOT_FOUND,
@@ -4579,9 +5819,7 @@ class GatewayRepository:
     def commit_worker_maintenance(
         self, *, job_id: str, user_id: str, device_id: str
     ) -> dict[str, Any]:
-        self._require_broker_maintenance_job(
-            job_id=job_id, user_id=user_id, device_id=device_id
-        )
+        self._require_broker_maintenance_job(job_id=job_id, user_id=user_id, device_id=device_id)
         stamp = now()
         with self.db.transaction(immediate=True) as conn:
             self._expire_maintenance_jobs(conn, stamp)
@@ -4631,9 +5869,7 @@ class GatewayRepository:
             (worker_id, owner_user_id),
         )
         if worker is None:
-            raise RepositoryError(
-                FORBIDDEN, "WORKER_ACCESS_DENIED", "Worker access denied.", 403
-            )
+            raise RepositoryError(FORBIDDEN, "WORKER_ACCESS_DENIED", "Worker access denied.", 403)
         return [
             self._maintenance_job_value(row)
             for row in self.db.fetchall(
@@ -4782,13 +6018,20 @@ class GatewayRepository:
             ).fetchone()
             if active_attempt is not None:
                 return None
-            placeholders = ",".join("?" for _ in allowed_actions)
             job = conn.execute(
-                f"""SELECT * FROM worker_maintenance_jobs
-                    WHERE worker_id=? AND state='queued' AND expires_at>?
-                      AND kind IN ({placeholders})
-                    ORDER BY created_at LIMIT 1""",
-                (worker_id, stamp, *allowed_actions),
+                """SELECT * FROM worker_maintenance_jobs
+                   WHERE worker_id=? AND state='queued' AND expires_at>?
+                     AND ((kind='worker_update' AND ?=1)
+                       OR (kind='model_install' AND ?=1)
+                       OR (kind='capability_install' AND ?=1))
+                   ORDER BY created_at LIMIT 1""",
+                (
+                    worker_id,
+                    stamp,
+                    int("worker_update" in allowed_actions),
+                    int("model_install" in allowed_actions),
+                    int("capability_install" in allowed_actions),
+                ),
             ).fetchone()
             if job is None:
                 return None
@@ -4822,6 +6065,29 @@ class GatewayRepository:
         if artifact is not None:
             value["artifact"] = row_dict(artifact)
             value["artifact_id"] = artifact["id"]
+        return value
+
+    def _maintenance_create_result(
+        self,
+        row: sqlite3.Row,
+        *,
+        authorization_text: str,
+    ) -> dict[str, Any]:
+        """Return request-relative ownership for a create or intent replay.
+
+        A job stores the authorization that originally created it. Comparing
+        canonical serialized authorizations therefore distinguishes the
+        creating intent from an intent deduplicated onto an existing update
+        job without another mutable ownership table. The result remains stable
+        if either the HTTP idempotency record or the intent receipt is replayed.
+        """
+
+        value = self._maintenance_job_with_artifact(row, include_authorization=False)
+        intent_owns_job = secrets.compare_digest(str(row["authorization"]), authorization_text)
+        value["creation_disposition"] = (
+            "created" if intent_owns_job else "deduplicated"
+        )
+        value["intent_owns_job"] = intent_owns_job
         return value
 
     def active_worker_maintenance_lease(
@@ -4864,6 +6130,7 @@ class GatewayRepository:
             ).fetchone()
             if row is not None and row["state"] == "cancelled":
                 return {"ok": True, "cancelled": True, "state": "cancelled"}
+            worker = conn.execute("SELECT status FROM workers WHERE id=?", (worker_id,)).fetchone()
             lease_unexpired = (
                 row is not None
                 and float(row["lease_expires_at"] or 0) > stamp
@@ -4884,6 +6151,7 @@ class GatewayRepository:
                     and row["lease_session_id"] == session_id
                     and row["state"] in _MAINTENANCE_LEASE_STATES
                 )
+            lease_valid = lease_valid and worker is not None and worker["status"] == "active"
             if not lease_valid:
                 raise RepositoryError(
                     MAINTENANCE_LEASE_LOST,
@@ -4917,6 +6185,20 @@ class GatewayRepository:
                     job_id,
                 ),
             )
+            refreshed = conn.execute(
+                """UPDATE workers SET last_seen_at=?,updated_at=?
+                   WHERE id=? AND status='active'""",
+                (stamp, stamp, worker_id),
+            )
+            if refreshed.rowcount != 1:
+                raise RepositoryError(
+                    MAINTENANCE_LEASE_LOST,
+                    "MAINTENANCE_LEASE_LOST",
+                    "Worker maintenance lease is no longer valid.",
+                    409,
+                    "later",
+                    "platform",
+                )
         return {
             "ok": True,
             "cancelled": False,
@@ -5026,6 +6308,8 @@ class GatewayRepository:
                     and succeeded == (status in {"installed", "already_installed"})
                     and (not succeeded or installed == requested)
                 )
+            if valid and succeeded and row["kind"] in {"capability_install", "model_install"}:
+                valid = self._maintenance_intent_is_historically_valid(conn, row, spec)
             if not valid:
                 raise RepositoryError(
                     VALIDATION_FAILED,
@@ -5046,6 +6330,20 @@ class GatewayRepository:
                        WHERE job_id=? AND state='uploaded'""",
                     (stamp, job_id),
                 )
+            if succeeded and row["kind"] in {"capability_install", "model_install"}:
+                self._record_maintenance_authorizations(
+                    conn,
+                    row,
+                    spec,
+                    authorized_at=stamp,
+                )
+            if succeeded and row["kind"] == "capability_install":
+                conn.execute(
+                    """UPDATE workers
+                       SET capability_auth_enforced_at=COALESCE(capability_auth_enforced_at, ?)
+                       WHERE id=?""",
+                    (stamp, worker_id),
+                )
             conn.execute(
                 """INSERT INTO audit_events
                    (id,actor_type,actor_id,action,subject_type,subject_id,safe_details,created_at)
@@ -5055,9 +6353,7 @@ class GatewayRepository:
                     new_id("aud"),
                     worker_id,
                     job_id,
-                    json_text(
-                        {"kind": row["kind"], "status": status, "succeeded": succeeded}
-                    ),
+                    json_text({"kind": row["kind"], "status": status, "succeeded": succeeded}),
                     stamp,
                 ),
             )
@@ -5201,11 +6497,10 @@ class GatewayRepository:
                     ),
                 )
                 values.append(
-                    row_dict(
+                    self._artifact_value(
                         conn.execute(
                             "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
-                        ).fetchone(),
-                        json_columns={"media_metadata"},
+                        ).fetchone()
                     )
                 )
         return values
@@ -5244,7 +6539,7 @@ class GatewayRepository:
                     ),
                 )
         return [
-            row_dict(row, json_columns={"media_metadata"})
+            self._artifact_value(row)
             for row in self.db.fetchall(
                 """SELECT * FROM artifacts WHERE attempt_id=? AND direction='output'
                    AND state IN ('pending','uploaded') ORDER BY created_at LIMIT ?""",
@@ -5261,7 +6556,7 @@ class GatewayRepository:
         if lease is None:
             raise RepositoryError(LEASE_LOST, "LEASE_LOST", "Lease is no longer valid.", 409)
         return [
-            row_dict(row, json_columns={"media_metadata"})
+            self._artifact_value(row)
             for row in self.db.fetchall(
                 """SELECT * FROM artifacts WHERE attempt_id=? AND direction='output' AND state='pending'
                    ORDER BY created_at""",
@@ -5278,9 +6573,8 @@ class GatewayRepository:
             (size, None if digest is None else "sha256:" + digest, now(), artifact_id),
         )
         if cursor.rowcount == 1:
-            return row_dict(
-                self.db.fetchone("SELECT * FROM artifacts WHERE id=?", (artifact_id,)),
-                json_columns={"media_metadata"},
+            return self._artifact_value(
+                self.db.fetchone("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
             )
         maintenance = self.db.fetchone(
             """SELECT ma.*,j.spec AS job_spec FROM maintenance_artifacts ma
@@ -5902,7 +7196,7 @@ class GatewayRepository:
                 "UPDATE tasks SET state='reserved',updated_at=? WHERE id=?", (stamp, task["id"])
             )
         artifacts = [
-            row_dict(row, json_columns={"media_metadata"})
+            self._artifact_value(row)
             for row in self.db.fetchall(
                 "SELECT * FROM artifacts WHERE task_id=? AND direction='input'", (task["id"],)
             )
@@ -5993,19 +7287,14 @@ class GatewayRepository:
                 (stamp, stamp + ttl_seconds, attempt_id),
             )
             if progress is not None:
-                fraction = progress.get("fraction")
-                stage = progress.get("stage", "")
-                if (
-                    not isinstance(fraction, (int, float))
-                    or not 0 <= float(fraction) <= 1
-                    or not isinstance(stage, str)
-                ):
+                canonical_progress = canonical_task_progress(progress)
+                if canonical_progress is None:
                     raise RepositoryError(
                         VALIDATION_FAILED, "PROGRESS_INVALID", "Progress is invalid.", 422
                     )
                 conn.execute(
                     "UPDATE task_attempts SET progress=? WHERE id=?",
-                    (json_text({"fraction": float(fraction), "stage": stage[:64]}), attempt_id),
+                    (json_text(canonical_progress), attempt_id),
                 )
             if started and lease["attempt_state"] == "leased":
                 conn.execute(
@@ -6017,6 +7306,101 @@ class GatewayRepository:
                     (stamp, lease["task_id"]),
                 )
         return {"ok": True, "cancelled": False, "expires_at": stamp + ttl_seconds}
+
+    def replay_finished_attempt(
+        self,
+        *,
+        attempt_id: str,
+        worker_id: str,
+        fencing_token: int,
+        finish_semantic_hash: str,
+    ) -> dict[str, Any] | None:
+        """Replay a finish receipt committed atomically with the Attempt.
+
+        The HTTP idempotency row is intentionally a cache.  This receipt is
+        the authoritative crash boundary when SQLite committed the terminal
+        mutation but the process stopped before middleware stored that cache.
+        """
+
+        if re.fullmatch(r"[0-9a-f]{64}", finish_semantic_hash) is None:
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "VALIDATION_FAILED",
+                "Attempt finish semantics are invalid.",
+                422,
+            )
+        row = self.db.fetchone(
+            """SELECT state,finish_semantic_hash,finish_receipt
+               FROM task_attempts
+               WHERE id=? AND worker_id=? AND fencing_token=?""",
+            (attempt_id, worker_id, fencing_token),
+        )
+        if row is None or row["state"] not in {"succeeded", "failed", "cancelled"}:
+            return None
+        return self._decode_finished_attempt_receipt(
+            row=row,
+            attempt_id=attempt_id,
+            finish_semantic_hash=finish_semantic_hash,
+        )
+
+    @staticmethod
+    def _decode_finished_attempt_receipt(
+        *,
+        row: sqlite3.Row,
+        attempt_id: str,
+        finish_semantic_hash: str,
+    ) -> dict[str, Any] | None:
+        """Validate and decode a terminal receipt selected for one exact fence."""
+
+        stored_hash = row["finish_semantic_hash"]
+        stored_receipt = row["finish_receipt"]
+        if stored_hash is None and stored_receipt is None:
+            # A terminal row written by an older release has no semantic
+            # receipt and cannot be guessed into an exact replay.
+            return None
+        if not isinstance(stored_hash, str) or not isinstance(stored_receipt, str):
+            raise RepositoryError(
+                int(ErrorCode.INTERNAL_ERROR),
+                "INTERNAL_ERROR",
+                "Stored Attempt finish receipt is invalid.",
+                500,
+                "later",
+                "platform",
+            )
+        if not secrets.compare_digest(stored_hash, finish_semantic_hash):
+            raise RepositoryError(
+                IDEMPOTENCY_CONFLICT,
+                "IDEMPOTENCY_CONFLICT",
+                "Attempt was already completed with different semantics.",
+                409,
+            )
+        try:
+            receipt = json.loads(stored_receipt)
+        except json.JSONDecodeError as exc:
+            raise RepositoryError(
+                int(ErrorCode.INTERNAL_ERROR),
+                "INTERNAL_ERROR",
+                "Stored Attempt finish receipt is invalid.",
+                500,
+                "later",
+                "platform",
+            ) from exc
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"attempt_id", "task_id", "state"}
+            or receipt.get("attempt_id") != attempt_id
+            or receipt.get("state") != row["state"]
+            or not isinstance(receipt.get("task_id"), str)
+        ):
+            raise RepositoryError(
+                int(ErrorCode.INTERNAL_ERROR),
+                "INTERNAL_ERROR",
+                "Stored Attempt finish receipt is invalid.",
+                500,
+                "later",
+                "platform",
+            )
+        return receipt
 
     def finish_attempt(
         self,
@@ -6031,16 +7415,31 @@ class GatewayRepository:
         failure_code: int | None,
         responsibility: str,
         safe_failure_details: dict[str, Any] | None,
+        finish_semantic_hash: str | None = None,
     ) -> dict[str, Any]:
+        if (
+            finish_semantic_hash is not None
+            and re.fullmatch(r"[0-9a-f]{64}", finish_semantic_hash) is None
+        ):
+            raise RepositoryError(
+                VALIDATION_FAILED,
+                "VALIDATION_FAILED",
+                "Attempt finish semantics are invalid.",
+                422,
+            )
         canonical_output_artifacts = [
             {
                 **artifact,
-                "media_metadata": self._artifact_media_metadata(artifact.get("media_metadata", {})),
+                # Executor filenames stay private. A media type survives only
+                # after the shared validator maps it to the small reviewed
+                # protocol enum; all other persisted facts are numeric probes.
+                "media_metadata": self._worker_artifact_media_metadata(
+                    artifact.get("media_metadata", {})
+                ),
             }
             for artifact in output_artifacts
         ]
         reported_metrics = self._validate_usage_metrics(metrics)
-        canonical_failure_details = self._canonical_failure_details(safe_failure_details)
         canonical_failure_code, canonical_responsibility = self._canonical_attempt_outcome(
             succeeded=succeeded,
             failure_code=failure_code,
@@ -6061,11 +7460,24 @@ class GatewayRepository:
                 or lease["attempt_state"] not in ("leased", "running")
             ):
                 existing = conn.execute(
-                    """SELECT a.state,t.id AS task_id,t.state AS task_state
+                    """SELECT a.state,a.finish_semantic_hash,a.finish_receipt,
+                              t.id AS task_id,t.state AS task_state
                        FROM task_attempts a JOIN tasks t ON t.id=a.task_id
                        WHERE a.id=? AND a.worker_id=? AND a.fencing_token=?""",
                     (attempt_id, worker_id, fencing_token),
                 ).fetchone()
+                if (
+                    existing is not None
+                    and existing["state"] in {"succeeded", "failed", "cancelled"}
+                    and finish_semantic_hash is not None
+                ):
+                    replayed = self._decode_finished_attempt_receipt(
+                        row=existing,
+                        attempt_id=attempt_id,
+                        finish_semantic_hash=finish_semantic_hash,
+                    )
+                    if replayed is not None:
+                        return replayed
                 if (
                     existing is not None
                     and existing["state"] == "cancelled"
@@ -6101,8 +7513,77 @@ class GatewayRepository:
             else:
                 attempt_state = "succeeded" if succeeded else "failed"
                 task_state = "succeeded" if succeeded else "failed"
+            finish_receipt = {
+                "attempt_id": attempt_id,
+                "task_id": lease["task_id"],
+                "state": attempt_state,
+            }
+            canonical_failure_details = self._canonical_failure_details(
+                safe_failure_details,
+                canonical_failure_code,
+                terminal_state=attempt_state,
+            )
+            validated_outputs: list[tuple[str, dict[str, Any]]] = []
+            seen_artifact_ids: set[str] = set()
+            for artifact in [] if cancellation else canonical_output_artifacts:
+                artifact_id = artifact.get("artifact_id")
+                if (
+                    not isinstance(artifact_id, str)
+                    or not artifact_id
+                    or artifact_id in seen_artifact_ids
+                ):
+                    raise RepositoryError(
+                        VALIDATION_FAILED,
+                        "OUTPUT_ARTIFACT_INVALID",
+                        "Output artifact does not match its reservation.",
+                        422,
+                    )
+                reserved = conn.execute(
+                    """SELECT * FROM artifacts
+                       WHERE id=? AND task_id=? AND attempt_id=?
+                         AND direction='output' AND state='uploaded'""",
+                    (artifact_id, lease["task_id"], attempt_id),
+                ).fetchone()
+                if reserved is None or artifact.get("kind") != reserved["kind"]:
+                    raise RepositoryError(
+                        VALIDATION_FAILED,
+                        "OUTPUT_ARTIFACT_INVALID",
+                        "Output artifact does not match its reservation.",
+                        422,
+                    )
+                reported_store = artifact.get("store_type")
+                reported_ref = artifact.get("object_ref")
+                reported_size = artifact.get("encrypted_size")
+                reported_digest = artifact.get("content_digest")
+                if isinstance(reported_digest, str) and not reported_digest.startswith("sha256:"):
+                    reported_digest = "sha256:" + reported_digest
+                if (
+                    (reported_store is not None and reported_store != reserved["store_type"])
+                    or (reported_ref is not None and reported_ref != reserved["object_ref"])
+                    or (
+                        reported_size is not None
+                        and int(reported_size) != int(reserved["encrypted_size"])
+                    )
+                    or (
+                        reported_digest is not None
+                        and reported_digest != reserved["content_digest"]
+                    )
+                ):
+                    raise RepositoryError(
+                        VALIDATION_FAILED,
+                        "OUTPUT_ARTIFACT_INVALID",
+                        "Output artifact does not match its uploaded object.",
+                        422,
+                    )
+                seen_artifact_ids.add(artifact_id)
+                reserved_metadata = json.loads(reserved["media_metadata"] or "{}")
+                validated_outputs.append(
+                    (artifact_id, {**reserved_metadata, **artifact["media_metadata"]})
+                )
             conn.execute(
-                """UPDATE task_attempts SET state=?,responsibility=?,failure_code=?,safe_failure_details=?,finished_at=?
+                """UPDATE task_attempts
+                   SET state=?,responsibility=?,failure_code=?,safe_failure_details=?,finished_at=?,
+                       finish_semantic_hash=?,finish_receipt=?
                    WHERE id=?""",
                 (
                     attempt_state,
@@ -6110,6 +7591,8 @@ class GatewayRepository:
                     canonical_failure_code,
                     json_text(canonical_failure_details),
                     stamp,
+                    finish_semantic_hash,
+                    json_text(finish_receipt) if finish_semantic_hash is not None else None,
                     attempt_id,
                 ),
             )
@@ -6119,21 +7602,12 @@ class GatewayRepository:
                     "UPDATE tasks SET state=?,finished_at=?,updated_at=? WHERE id=?",
                     (task_state, stamp, stamp, lease["task_id"]),
                 )
-            for artifact in [] if cancellation else canonical_output_artifacts:
-                artifact_id = artifact.get("artifact_id")
-                if not isinstance(artifact_id, str) or not artifact_id:
-                    raise RepositoryError(
-                        VALIDATION_FAILED,
-                        "OUTPUT_ARTIFACT_INVALID",
-                        "Output artifact requires its reserved artifact_id.",
-                        422,
-                    )
+            for artifact_id, media_metadata in validated_outputs:
                 updated = conn.execute(
-                    """UPDATE artifacts SET kind=?,state='available',media_metadata=?,updated_at=?
+                    """UPDATE artifacts SET state='available',media_metadata=?,updated_at=?
                        WHERE id=? AND task_id=? AND attempt_id=? AND direction='output' AND state='uploaded'""",
                     (
-                        artifact["kind"],
-                        json_text(artifact.get("media_metadata", {})),
+                        json_text(media_metadata),
                         stamp,
                         artifact_id,
                         lease["task_id"],
@@ -6160,7 +7634,12 @@ class GatewayRepository:
                         attempt_id,
                         worker_id,
                         json_text(reported_metrics),
-                        worker_signature,
+                        # The signature has already authenticated the exact
+                        # report at the HTTP boundary. Persisting it would keep
+                        # an offline verifier for discarded legacy filename or
+                        # executor-native fields, so the database records only
+                        # the projected metrics and terminal state.
+                        None,
                         stamp,
                         stamp,
                     ),
@@ -6197,34 +7676,28 @@ class GatewayRepository:
             ).fetchone()
             if worker_state and worker_state["status"] == "draining":
                 self._finalize_drained_workers(conn, stamp)
-        return {"attempt_id": attempt_id, "task_id": lease["task_id"], "state": attempt_state}
+        return finish_receipt
 
     @staticmethod
-    def _canonical_failure_details(details: dict[str, Any] | None) -> dict[str, Any]:
-        """Keep only bounded diagnostic codes, never Worker-supplied prose.
+    def _canonical_failure_details(
+        details: dict[str, Any] | None,
+        failure_code: int | None,
+        *,
+        terminal_state: str | None = None,
+    ) -> dict[str, str]:
+        """Keep only fixed diagnostic codes, never Worker-supplied prose.
 
         A Worker necessarily sees task plaintext and is not trusted to decide
-        what may be persisted by the Gateway.  Free-form strings could smuggle
-        a prompt or signed capability into an otherwise "safe" error field.
+        what may be persisted by the Gateway. Character allowlists and length
+        limits are insufficient because paths, tokens, and encoded plaintext
+        can satisfy them.
         """
 
-        if not isinstance(details, dict):
-            return {}
-        canonical: dict[str, Any] = {}
-        for key in sorted(_SAFE_FAILURE_DETAIL_KEYS & details.keys()):
-            value = details[key]
-            if (
-                isinstance(value, str)
-                and 0 < len(value) <= 96
-                and set(value) <= _SAFE_FAILURE_DETAIL_CHARACTERS
-                and "://" not in value
-            ):
-                canonical[key] = value
-        for key in sorted(_SAFE_FAILURE_DETAIL_NUMERIC_KEYS & details.keys()):
-            value = details[key]
-            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
-                canonical[key] = value
-        return canonical
+        return canonical_task_failure_details_for_code(
+            details,
+            failure_code,
+            terminal_state=terminal_state,
+        )
 
     @staticmethod
     def _canonical_attempt_outcome(
@@ -6319,6 +7792,11 @@ class GatewayRepository:
             raise RepositoryError(
                 500001, "USAGE_REPORT_INVALID", "Usage metrics must be an object.", 422
             )
+        # Pre-0.13 Workers could include executor-specific ``native`` metrics.
+        # They were never billable or trusted.  Accept and discard that one
+        # legacy field so a rolling upgrade cannot strand an otherwise valid
+        # completion report; new Workers omit it at the protocol boundary.
+        metrics = {key: value for key, value in metrics.items() if key != "native"}
         allowed = {
             "gpu_active_ms",
             "executor_wall_ms",
@@ -6333,7 +7811,6 @@ class GatewayRepository:
             "output_frames",
             "duration_ms",
             "denoise_steps",
-            "native",
         }
         if set(metrics) - allowed:
             raise RepositoryError(
@@ -6360,45 +7837,6 @@ class GatewayRepository:
         }
         normalized: dict[str, Any] = {}
         for key, value in metrics.items():
-            if key == "native":
-                if not isinstance(value, dict) or len(value) > _NATIVE_USAGE_MAX_ENTRIES:
-                    raise RepositoryError(
-                        500001, "USAGE_REPORT_INVALID", "Native usage metrics are invalid.", 422
-                    )
-                native: dict[str, int | float | bool | None] = {}
-                for native_key, native_value in value.items():
-                    valid_key = (
-                        isinstance(native_key, str)
-                        and 0 < len(native_key) <= _NATIVE_USAGE_MAX_KEY_LENGTH
-                        and set(native_key) <= _NATIVE_USAGE_KEY_CHARACTERS
-                    )
-                    valid_value = False
-                    if native_value is None or isinstance(native_value, bool):
-                        valid_value = True
-                    elif isinstance(native_value, int):
-                        valid_value = abs(native_value) <= _NATIVE_USAGE_MAX_ABSOLUTE_NUMBER
-                    elif isinstance(native_value, float):
-                        valid_value = (
-                            math.isfinite(native_value)
-                            and abs(native_value) <= _NATIVE_USAGE_MAX_ABSOLUTE_NUMBER
-                        )
-                    if not valid_key or not valid_value:
-                        raise RepositoryError(
-                            500001,
-                            "USAGE_REPORT_INVALID",
-                            "Native usage metrics must be a flat map of bounded numeric values.",
-                            422,
-                        )
-                    native[native_key] = native_value
-                if len(json_text(native).encode("utf-8")) > _NATIVE_USAGE_MAX_SERIALIZED_BYTES:
-                    raise RepositoryError(
-                        500001,
-                        "USAGE_REPORT_INVALID",
-                        "Native usage metrics exceed the serialized size limit.",
-                        422,
-                    )
-                normalized[key] = native
-                continue
             if (
                 isinstance(value, bool)
                 or not isinstance(value, int)
@@ -6445,9 +7883,7 @@ class GatewayRepository:
         }
         ledger_rate_snapshot = {
             "rate_card_id": rate.get("rate_card_id"),
-            "rate_microtokens_per_second": max(
-                0, int(rate.get("rate_microtokens_per_second", 0))
-            ),
+            "rate_microtokens_per_second": max(0, int(rate.get("rate_microtokens_per_second", 0))),
             "pricing_model": "video_duration_and_generation_time",
             "formula_version": 0,
             "formula_status": "not_implemented",
@@ -6524,17 +7960,25 @@ class GatewayRepository:
         # Deliberately omit encrypted payloads and key envelopes from ordinary metadata reads.
         value.pop("encrypted_payload", None)
         value.pop("reader_envelope", None)
-        value["attempts"] = [
-            row_dict(
+        attempts: list[dict[str, Any]] = []
+        for row in self.db.fetchall(
+            "SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_number", (task_id,)
+        ):
+            attempt = row_dict(
                 row,
                 json_columns={"progress", "rate_snapshot", "safe_failure_details"},
             )
-            for row in self.db.fetchall(
-                "SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_number", (task_id,)
+            if attempt.get("progress") is not None:
+                attempt["progress"] = canonical_task_progress(attempt["progress"])
+            attempt["safe_failure_details"] = self._canonical_failure_details(
+                attempt.get("safe_failure_details"),
+                attempt.get("failure_code"),
+                terminal_state=attempt.get("state"),
             )
-        ]
+            attempts.append(attempt)
+        value["attempts"] = attempts
         value["artifacts"] = [
-            row_dict(row, json_columns={"media_metadata"})
+            self._artifact_value(row)
             for row in self.db.fetchall(
                 "SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at", (task_id,)
             )
@@ -6578,9 +8022,7 @@ class GatewayRepository:
         return values
 
     @staticmethod
-    def _encode_task_cursor(
-        row: sqlite3.Row | dict[str, Any], *, sort: str, order: str
-    ) -> str:
+    def _encode_task_cursor(row: sqlite3.Row | dict[str, Any], *, sort: str, order: str) -> str:
         _expression, field = TASK_LIST_SORTS[sort]
         value: str | int | float
         if field == "state":
@@ -6710,16 +8152,11 @@ class GatewayRepository:
             where.append("t.state=?")
             args.append(state)
         count_args = tuple(args)
-        total = int(
-            self.db.fetchone(
-                f"SELECT COUNT(*) AS n FROM tasks t WHERE {' AND '.join(where)}",
-                count_args,
-            )["n"]
-        )
+        # Every clause in ``where`` is a constant above; all values remain bound.
+        count_query = f"SELECT COUNT(*) AS n FROM tasks t WHERE {' AND '.join(where)}"  # nosec
+        total = int(self.db.fetchone(count_query, count_args)["n"])
         if cursor:
-            primary, created_at, task_id = self._decode_task_cursor(
-                cursor, sort=sort, order=order
-            )
+            primary, created_at, task_id = self._decode_task_cursor(cursor, sort=sort, order=order)
             expression, _field = TASK_LIST_SORTS[sort]
             comparator = ">" if order == "asc" else "<"
             where.append(
@@ -6732,20 +8169,22 @@ class GatewayRepository:
         args.append(page_limit + 1)
         expression, _field = TASK_LIST_SORTS[sort]
         direction = "ASC" if order == "asc" else "DESC"
-        rows = self.db.fetchall(
-            f"""SELECT t.*,u.display_name AS consumer_display_name,
-                       s.name AS consumer_service_name,w.name AS worker_name,
-                       (SELECT MIN(a.started_at) FROM task_attempts a
-                         WHERE a.task_id=t.id AND a.started_at IS NOT NULL) AS started_at
-                  FROM tasks t
-                  LEFT JOIN users u ON u.id=t.consumer_user_id
-                  LEFT JOIN services s ON s.id=t.consumer_principal_id
-                       AND t.consumer_principal_type='service'
-                 LEFT JOIN workers w ON w.id=t.assigned_worker_id
-                 WHERE {' AND '.join(where)}
-                 ORDER BY {expression} {direction},t.created_at DESC,t.id DESC LIMIT ?""",
-            tuple(args),
+        # ``expression`` comes from TASK_LIST_SORTS and ``direction`` from the
+        # validated asc/desc enum; clauses contain no caller-provided SQL text.
+        page_query = (
+            "SELECT t.*,u.display_name AS consumer_display_name, "  # nosec
+            "s.name AS consumer_service_name,w.name AS worker_name, "
+            "(SELECT MIN(a.started_at) FROM task_attempts a "
+            "WHERE a.task_id=t.id AND a.started_at IS NOT NULL) AS started_at "
+            "FROM tasks t "
+            "LEFT JOIN users u ON u.id=t.consumer_user_id "
+            "LEFT JOIN services s ON s.id=t.consumer_principal_id "
+            "AND t.consumer_principal_type='service' "
+            "LEFT JOIN workers w ON w.id=t.assigned_worker_id "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY {expression} {direction},t.created_at DESC,t.id DESC LIMIT ?"
         )
+        rows = self.db.fetchall(page_query, tuple(args))
         has_more = len(rows) > page_limit
         visible = rows[:page_limit]
         return {

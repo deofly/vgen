@@ -62,17 +62,11 @@ def test_capability_install_result_allows_not_ready_but_separates_failure_fields
         "workflow_digest": "sha256:" + "a" * 64,
         "artifact_sha256": "b" * 64,
     }
-    result = CapabilityInstallMaintenanceResult(
-        **identifiers, status="activated", ready=False
-    )
+    result = CapabilityInstallMaintenanceResult(**identifiers, status="activated", ready=False)
     assert result.ready is False
-    repaired = CapabilityInstallMaintenanceResult(
-        **identifiers, status="repaired", ready=True
-    )
+    repaired = CapabilityInstallMaintenanceResult(**identifiers, status="repaired", ready=True)
     assert repaired.ready is True
-    CapabilityInstallMaintenanceResult(
-        **identifiers, status="failed", error_code=330006
-    )
+    CapabilityInstallMaintenanceResult(**identifiers, status="failed", error_code=330006)
 
     with pytest.raises(ValidationError):
         CapabilityInstallMaintenanceResult(**identifiers, status="activated")
@@ -135,12 +129,18 @@ def test_v1_maintenance_tables_rebuild_to_v2_without_losing_rows(tmp_path) -> No
     database = GatewayDatabase(str(path))
     try:
         assert database.fetchone("SELECT version FROM schema_meta")["version"] == 2
-        assert database.fetchone(
-            "SELECT kind,state FROM worker_maintenance_jobs WHERE id='mtj_existing'"
-        )["kind"] == "worker_update"
-        assert database.fetchone(
-            "SELECT state FROM maintenance_artifacts WHERE id='art_existing'"
-        )["state"] == "uploaded"
+        assert (
+            database.fetchone(
+                "SELECT kind,state FROM worker_maintenance_jobs WHERE id='mtj_existing'"
+            )["kind"]
+            == "worker_update"
+        )
+        assert (
+            database.fetchone("SELECT state FROM maintenance_artifacts WHERE id='art_existing'")[
+                "state"
+            ]
+            == "uploaded"
+        )
         assert database.fetchall("PRAGMA foreign_key_check") == []
         assert database.fetchone("PRAGMA foreign_keys")[0] == 1
 
@@ -160,6 +160,121 @@ def test_v1_maintenance_tables_rebuild_to_v2_without_losing_rows(tmp_path) -> No
                        'art_capability',10,?,'pending',2,2)""",
             ("b" * 64,),
         )
+        database.execute(
+            """INSERT INTO maintenance_intent_receipts
+               (device_id,nonce,authorization_digest,job_id,expires_at,created_at)
+               VALUES ('dev_owner','post-migration-nonce',?,'mtj_capability',100,2)""",
+            ("c" * 64,),
+        )
+        receipt_foreign_keys = {
+            row["from"]: row["table"]
+            for row in database.fetchall("PRAGMA foreign_key_list(maintenance_intent_receipts)")
+        }
+        assert receipt_foreign_keys["job_id"] == "worker_maintenance_jobs"
+        assert database.fetchall("PRAGMA foreign_key_check") == []
+    finally:
+        database.close()
+
+
+def test_v2_capability_authorizations_migrate_to_independent_sources(tmp_path) -> None:
+    path = tmp_path / "legacy-capability-auth-v2.db"
+    initialized = GatewayDatabase(str(path))
+    initialized.close()
+
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+        DROP TABLE worker_workflow_authorizations;
+        DROP TABLE worker_model_authorizations;
+        CREATE TABLE worker_workflow_authorizations (
+            worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+            workflow_ref TEXT NOT NULL,
+            workflow_digest TEXT NOT NULL,
+            spec_digest TEXT NOT NULL,
+            maintenance_job_id TEXT NOT NULL,
+            node_classes TEXT NOT NULL DEFAULT '[]',
+            authorized_at REAL NOT NULL,
+            revoked_at REAL,
+            PRIMARY KEY(worker_id, workflow_ref, workflow_digest, spec_digest)
+        );
+        CREATE TABLE worker_model_authorizations (
+            worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+            workflow_ref TEXT NOT NULL,
+            workflow_digest TEXT NOT NULL,
+            model_digest TEXT NOT NULL,
+            spec_digest TEXT NOT NULL,
+            maintenance_job_id TEXT NOT NULL,
+            authorized_at REAL NOT NULL,
+            revoked_at REAL,
+            PRIMARY KEY(worker_id, workflow_ref, workflow_digest, model_digest, spec_digest)
+        );
+        UPDATE schema_meta SET version=2;
+        INSERT INTO users
+            (id,display_name,root_signing_public_key,root_encryption_public_key,status,
+             is_operator,created_at,updated_at)
+            VALUES ('usr_owner','Owner','root-sign','root-encrypt','active',0,1,1);
+        INSERT INTO workers
+            (id,owner_user_id,name,signing_public_key,encryption_public_key,
+             executor_type,executor_version,capabilities,capacity,status,created_at,updated_at)
+            VALUES ('wrk_gpu','usr_owner','GPU','worker-sign','worker-encrypt',
+                    'comfyui','1.0.0','{}',1,'offline',1,1);
+        INSERT INTO worker_workflow_authorizations
+            (worker_id,workflow_ref,workflow_digest,spec_digest,maintenance_job_id,
+             node_classes,authorized_at)
+            VALUES ('wrk_gpu','vgen/test@1.0.0','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'mtj_first','[]',1);
+        INSERT INTO worker_model_authorizations
+            (worker_id,workflow_ref,workflow_digest,model_digest,spec_digest,
+             maintenance_job_id,authorized_at)
+            VALUES ('wrk_gpu','vgen/test@1.0.0','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                    'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'mtj_first',1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = GatewayDatabase(str(path))
+    try:
+        assert database.fetchone("SELECT version FROM schema_meta")["version"] == 2
+        workflow_columns = {
+            row["name"]
+            for row in database.fetchall("PRAGMA table_info(worker_workflow_authorizations)")
+        }
+        assert "authorization_source_id" in workflow_columns
+        assert "maintenance_job_id" not in workflow_columns
+        assert (
+            database.fetchone("SELECT authorization_source_id FROM worker_workflow_authorizations")[
+                "authorization_source_id"
+            ]
+            == "mtj_first"
+        )
+
+        workflow_digest = "sha256:" + "a" * 64
+        spec_digest = "sha256:" + "b" * 64
+        model_digest = "sha256:" + "c" * 64
+        database.execute(
+            """INSERT INTO worker_workflow_authorizations
+               (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                spec_digest,node_classes,authorized_at)
+               VALUES ('wrk_gpu','mtj_second','vgen/test@1.0.0',?,?,'[]',2)""",
+            (workflow_digest, spec_digest),
+        )
+        database.execute(
+            """INSERT INTO worker_model_authorizations
+               (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                model_digest,spec_digest,authorized_at)
+               VALUES ('wrk_gpu','mtj_second','vgen/test@1.0.0',?,?,?,2)""",
+            (workflow_digest, model_digest, spec_digest),
+        )
+        assert (
+            database.fetchone("SELECT COUNT(*) AS n FROM worker_workflow_authorizations")["n"] == 2
+        )
+        assert database.fetchone("SELECT COUNT(*) AS n FROM worker_model_authorizations")["n"] == 2
+        assert database.fetchall("PRAGMA foreign_key_check") == []
     finally:
         database.close()
 
@@ -183,9 +298,7 @@ def test_existing_gateway_adds_broker_runtime_columns(tmp_path) -> None:
 
     database = GatewayDatabase(str(path))
     try:
-        columns = {
-            row["name"] for row in database.fetchall("PRAGMA table_info(broker_devices)")
-        }
+        columns = {row["name"] for row in database.fetchall("PRAGMA table_info(broker_devices)")}
     finally:
         database.close()
 

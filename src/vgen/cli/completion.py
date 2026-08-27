@@ -62,7 +62,10 @@ _DIRECTORY_ARGUMENTS = frozenset(
 def shell_completion(shell: str) -> str:
     if shell not in SUPPORTED_SHELLS:
         raise ValueError(f"unsupported shell: {shell}")
-    return argcomplete.shellcode(["vgen"], shell=shell).rstrip() + "\n"
+    # The third positional argument selects argcomplete's renderer; this call
+    # never starts a process. Positional form also avoids conflating the
+    # library's ``shell`` parameter with subprocess ``shell=True``.
+    return argcomplete.shellcode(["vgen"], True, shell).rstrip() + "\n"
 
 
 def _completion_cache_path() -> Path:

@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import shlex
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
@@ -54,9 +56,15 @@ from vgen.crypto import (
     wrap_task_key,
     wrap_task_key_for_workspace,
 )
-from vgen.market import WorkflowRegistry, comfyui_capability_facts
+from vgen.market import WorkflowRegistry, comfyui_capability_facts, workflow_model_digests
 from vgen.market.builder import build_comfy_graph, load_json
-from vgen.market.models import SEMVER_RE, WORKFLOW_ID_RE, WorkflowManifest, WorkflowVariant
+from vgen.market.models import (
+    SEMVER_RE,
+    WorkflowManifest,
+    WorkflowVariant,
+    validate_workflow_id,
+    validate_workflow_version,
+)
 from vgen.market.registry import (
     RegistryError,
     build_archive,
@@ -64,6 +72,10 @@ from vgen.market.registry import (
     validate_package,
 )
 from vgen.protocol import ErrorCode, TaskState, VGenError, get_error_spec, new_id
+from vgen.protocol.diagnostics import (
+    canonical_task_failure_details_for_code,
+    canonical_task_progress,
+)
 from vgen.protocol.user_enrollment import user_verification_code
 
 from .artifacts import (
@@ -142,15 +154,42 @@ def _task_detail_view(value: Any, *, readable_times: bool, field_name: str = "")
     """Build a terminal-safe Task view without mutating the API response."""
 
     if isinstance(value, Mapping):
-        return {
-            key: _task_detail_view(
+        result: dict[Any, Any] = {}
+        terminal_state = value.get("state")
+        for key, item in value.items():
+            name = str(key)
+            if name in _TASK_DETAIL_PRIVATE_FIELDS:
+                continue
+            if name == "safe_failure_details":
+                details = item
+                if isinstance(details, str):
+                    try:
+                        details = json.loads(details)
+                    except json.JSONDecodeError:
+                        details = None
+                result[key] = canonical_task_failure_details_for_code(
+                    details if isinstance(details, Mapping) else None,
+                    value.get("failure_code"),
+                    terminal_state=(terminal_state if isinstance(terminal_state, str) else None),
+                )
+                continue
+            if name == "progress":
+                progress = item
+                if isinstance(progress, str):
+                    try:
+                        progress = json.loads(progress)
+                    except json.JSONDecodeError:
+                        progress = None
+                result[key] = canonical_task_progress(
+                    progress if isinstance(progress, Mapping) else None
+                )
+                continue
+            result[key] = _task_detail_view(
                 item,
                 readable_times=readable_times,
-                field_name=str(key),
+                field_name=name,
             )
-            for key, item in value.items()
-            if str(key) not in _TASK_DETAIL_PRIVATE_FIELDS
-        }
+        return result
     if isinstance(value, list):
         return [_task_detail_view(item, readable_times=readable_times) for item in value]
     if readable_times and field_name.endswith("_at") and value is not None:
@@ -281,10 +320,7 @@ def _print_task_list(page: Mapping[str, Any]) -> None:
 
     print()
     order = str(page.get("order") or "desc")
-    print(
-        f"本页 {len(rows)} 条，共 {int(page.get('total') or 0)} 条"
-        f"（排序：{sort} {order}）"
-    )
+    print(f"本页 {len(rows)} 条，共 {int(page.get('total') or 0)} 条（排序：{sort} {order}）")
     next_command = page.get("next")
     if isinstance(next_command, str) and next_command:
         print(f"下一页：{next_command}")
@@ -1229,12 +1265,8 @@ def _confirm_legacy_owner_migration(
     if accept_legacy_tofu:
         return
     if not sys.stdin.isatty():
-        raise ValueError(
-            "非交互 legacy Owner 迁移必须显式提供 --accept-legacy-tofu"
-        )
-    confirmation = input(
-        f"请输入 {LEGACY_OWNER_MIGRATION_CONFIRMATION} 继续: "
-    ).strip()
+        raise ValueError("非交互 legacy Owner 迁移必须显式提供 --accept-legacy-tofu")
+    confirmation = input(f"请输入 {LEGACY_OWNER_MIGRATION_CONFIRMATION} 继续: ").strip()
     if confirmation != LEGACY_OWNER_MIGRATION_CONFIRMATION:
         raise ValueError("legacy Owner 迁移确认词不匹配，未写入任何 pin")
 
@@ -1341,7 +1373,9 @@ def _workspace_command(args: argparse.Namespace) -> None:
                 _json(values)
             else:
                 members = values.get("members") if isinstance(values, Mapping) else None
-                active_total = int(values.get("active_total") or 0) if isinstance(values, Mapping) else 0
+                active_total = (
+                    int(values.get("active_total") or 0) if isinstance(values, Mapping) else 0
+                )
                 total = int(values.get("total") or 0) if isinstance(values, Mapping) else 0
                 _print_flat_list(
                     members,
@@ -1522,9 +1556,7 @@ def _workspace_command(args: argparse.Namespace) -> None:
                 raise ValueError("workspace is required")
             _, identity = _profile_and_identity(profile.name)
             if args.kind in {"user", "workspace_member", "service"}:
-                require_local_workspace_owner(
-                    client, identity, workspace_id=workspace_id
-                )
+                require_local_workspace_owner(client, identity, workspace_id=workspace_id)
             result = client.request(
                 "POST",
                 f"/api/v1/workspaces/{workspace_id}/invites",
@@ -1619,9 +1651,7 @@ def _workspace_command(args: argparse.Namespace) -> None:
             workspace_id = args.workspace or profile.default_workspace
             if not workspace_id:
                 raise ValueError("workspace is required")
-            enrollments = client.request(
-                "GET", f"/api/v1/workspaces/{workspace_id}/enrollments"
-            )
+            enrollments = client.request("GET", f"/api/v1/workspaces/{workspace_id}/enrollments")
             enrollment = next(
                 (
                     item
@@ -1639,9 +1669,7 @@ def _workspace_command(args: argparse.Namespace) -> None:
                     getattr(args, "verification_code", None)
                 )
                 _, identity = _profile_and_identity(profile.name)
-                require_local_workspace_owner(
-                    client, identity, workspace_id=workspace_id
-                )
+                require_local_workspace_owner(client, identity, workspace_id=workspace_id)
                 signed_admission = sign_enrollment_admission(
                     identity,
                     workspace_id=workspace_id,
@@ -1690,7 +1718,11 @@ def _workspace_command(args: argparse.Namespace) -> None:
                             ("KIND", 18, lambda row: row.get("kind")),
                             ("METHOD", 16, lambda row: row.get("method")),
                             ("STATE", 10, lambda row: row.get("state")),
-                            ("SUBJECT", 31, lambda row: row.get("subject_id") or row.get("subject_user_id")),
+                            (
+                                "SUBJECT",
+                                31,
+                                lambda row: row.get("subject_id") or row.get("subject_user_id"),
+                            ),
                             ("CREATED", 19, lambda row: _list_datetime(row, "created_at")),
                             ("EXPIRES", 19, lambda row: _list_datetime(row, "expires_at")),
                         ),
@@ -1739,14 +1771,27 @@ _BUNDLED_WORKFLOW_DIGESTS = {
 }
 
 
+def _is_trusted_bundled_workflow_release(
+    manifest: WorkflowManifest,
+    digest: str,
+) -> bool:
+    """Return whether these exact package bytes ship with this CLI release."""
+
+    expected = _BUNDLED_WORKFLOW_DIGESTS.get((manifest.id, manifest.version))
+    return (
+        manifest.provenance == "market"
+        and manifest.publisher.id == "vgen"
+        and expected is not None
+        and digest == expected
+    )
+
+
 def _maintenance_broker_id(client: GatewayClient, requested: str | None) -> str:
     if client.profile.principal_type != "device":
         raise ValueError("Worker maintenance requires a User Device profile")
     broker_id = requested or client.profile.home_broker_id
     if not broker_id:
-        raise ValueError(
-            "no Home Broker is selected; run `vgen setup` or pass --broker explicitly"
-        )
+        raise ValueError("no Home Broker is selected; run `vgen setup` or pass --broker explicitly")
     return str(broker_id)
 
 
@@ -1754,7 +1799,9 @@ def _select_owned_worker(client: GatewayClient, selector: str | None) -> dict[st
     workers = client.request("GET", "/api/v1/workers")
     if not isinstance(workers, list):
         raise ValueError("Gateway returned an invalid Worker list")
-    active = [item for item in workers if isinstance(item, dict) and item.get("status") != "revoked"]
+    active = [
+        item for item in workers if isinstance(item, dict) and item.get("status") != "revoked"
+    ]
     if selector:
         matches = [
             worker
@@ -1881,9 +1928,7 @@ def _maintenance_upload_ticket(
 ) -> TransferTicket:
     max_bytes = value.get("max_bytes")
     if max_bytes is not None and (
-        not isinstance(max_bytes, int)
-        or isinstance(max_bytes, bool)
-        or max_bytes < expected_size
+        not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < expected_size
     ):
         raise ValueError("Gateway maintenance upload ticket is smaller than the update wheel")
     headers = value.get("headers") or {}
@@ -1896,8 +1941,7 @@ def _maintenance_upload_ticket(
             headers={str(key): str(item) for key, item in headers.items()},
             endpoint=(None if value.get("endpoint") is None else str(value["endpoint"])),
             credentials={
-                str(key): str(item)
-                for key, item in dict(value.get("credentials") or {}).items()
+                str(key): str(item) for key, item in dict(value.get("credentials") or {}).items()
             },
             expires_at=(None if value.get("expires_at") is None else float(value["expires_at"])),
             expected_size=expected_size,
@@ -1931,7 +1975,9 @@ def _worker_capability_model_digests(worker: Mapping[str, Any]) -> set[str]:
             normalized = value.lower()
             if not normalized.startswith("sha256:"):
                 normalized = "sha256:" + normalized
-            if len(normalized) == 71 and all(character in "0123456789abcdef" for character in normalized[7:]):
+            if len(normalized) == 71 and all(
+                character in "0123456789abcdef" for character in normalized[7:]
+            ):
                 result.add(normalized)
     return result
 
@@ -1985,31 +2031,20 @@ def _refresh_owned_worker(client: GatewayClient, worker_id: str) -> dict[str, An
 
 
 def _unique_model_requirements(models: Sequence[Any]) -> list[Any]:
-    """Collapse shared content placements to one signed model request."""
+    """Collapse shared content placements to one digest-addressed request.
+
+    Source, revision, and license fields describe provenance rather than content
+    identity.  A mirror or a corrected attribution must not force another
+    download when the immutable digest and byte size are unchanged.
+    """
 
     selected: dict[str, Any] = {}
     for model in models:
         digest = str(model.sha256)
         previous = selected.get(digest)
         if previous is not None:
-            if (
-                int(previous.size),
-                str(previous.source or ""),
-                str(previous.revision or ""),
-                str(previous.license),
-                bool(previous.gated),
-                bool(previous.manual_download),
-            ) != (
-                int(model.size),
-                str(model.source or ""),
-                str(model.revision or ""),
-                str(model.license),
-                bool(model.gated),
-                bool(model.manual_download),
-            ):
-                raise ValueError(
-                    "shared model digest has conflicting source, size, or license metadata"
-                )
+            if int(previous.size) != int(model.size):
+                raise ValueError("shared model digest has conflicting byte sizes")
             continue
         selected[digest] = model
     return list(selected.values())
@@ -2044,6 +2079,27 @@ def _create_maintenance_job(
     return created
 
 
+def _maintenance_intent_owns_job(job: Mapping[str, Any]) -> bool:
+    """Return whether this create intent may roll back the returned job.
+
+    Gateways predating the ownership contract omit both fields. Treat that as
+    unowned: leaving a failed install for explicit inspection is safer than
+    cancelling a job that may have been created by another concurrent caller.
+    """
+
+    disposition = job.get("creation_disposition")
+    owns_job = job.get("intent_owns_job")
+    if disposition is None and owns_job is None:
+        return False
+    if (
+        disposition not in {"created", "deduplicated"}
+        or type(owns_job) is not bool
+        or owns_job != (disposition == "created")
+    ):
+        raise ValueError("Gateway returned invalid maintenance job ownership metadata")
+    return owns_job
+
+
 def _apply_worker_update(
     client: GatewayClient,
     args: argparse.Namespace,
@@ -2057,9 +2113,7 @@ def _apply_worker_update(
     artifact = inspect_worker_update_wheel(wheel)
     capabilities = worker.get("capabilities")
     current_version = (
-        capabilities.get("worker_runtime_version")
-        if isinstance(capabilities, Mapping)
-        else None
+        capabilities.get("worker_runtime_version") if isinstance(capabilities, Mapping) else None
     )
     if isinstance(current_version, str):
         try:
@@ -2103,9 +2157,7 @@ def _apply_worker_update(
             expected_sha256=artifact.sha256,
         )
         adapter = (
-            OssStsArtifactAdapter()
-            if ticket.url.startswith("oss://")
-            else HttpArtifactAdapter()
+            OssStsArtifactAdapter() if ticket.url.startswith("oss://") else HttpArtifactAdapter()
         )
         adapter.upload(ticket, artifact.path)
         committed = client.commit_worker_maintenance(str(created["id"]))
@@ -2139,21 +2191,18 @@ def _apply_model_install(
     *,
     broker_id: str | None = None,
     worker: Mapping[str, Any] | None = None,
+    created_authorization_source_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     selected_broker = broker_id or _maintenance_broker_id(client, args.broker)
-    selected_worker = dict(worker) if worker is not None else _select_owned_worker(client, args.worker)
-    selected_worker = _ensure_broker_manages_worker(
-        client, selected_worker, selected_broker
+    selected_worker = (
+        dict(worker) if worker is not None else _select_owned_worker(client, args.worker)
     )
+    selected_worker = _ensure_broker_manages_worker(client, selected_worker, selected_broker)
     manifest, _, digest = _resolve_workflow(args.workflow)
     executor_type = str(selected_worker.get("executor_type") or "")
-    variants = [
-        variant for variant in manifest.variants if variant.executor_type == executor_type
-    ]
+    variants = [variant for variant in manifest.variants if variant.executor_type == executor_type]
     if not variants:
-        raise ValueError(
-            f"workflow has no {executor_type or 'selected Worker'} executor variant"
-        )
+        raise ValueError(f"workflow has no {executor_type or 'selected Worker'} executor variant")
     if len(variants) > 1:
         raise ValueError("workflow has more than one matching executor variant")
     _reject_known_insufficient_workflow_resources(selected_worker, variants[0])
@@ -2169,12 +2218,17 @@ def _apply_model_install(
         raw_missing = readiness.get("missing_model_digests")
         if state == "ready":
             missing_digests: set[str] = set()
-        elif state in {"missing_models", "missing_nodes", "node_probe_unavailable"} and isinstance(
-            raw_missing, list
-        ) and all(
-            isinstance(item, str) for item in raw_missing
+        elif (
+            state in {"missing_models", "missing_nodes", "node_probe_unavailable"}
+            and isinstance(raw_missing, list)
+            and all(isinstance(item, str) for item in raw_missing)
         ):
             missing_digests = set(raw_missing)
+            if state == "missing_models" and not missing_digests:
+                # Legacy capability specs do not bind dependency identifiers.
+                # The Gateway redacts them, so reconcile the manifest's full
+                # set; the Worker's CAS makes already-present blobs a no-op.
+                missing_digests = {"sha256:" + model.sha256 for model in variants[0].models}
         elif state in {
             "executor_incompatible",
             "runtime_incompatible",
@@ -2188,9 +2242,7 @@ def _apply_model_install(
         if not missing_digests <= known_digests:
             raise ValueError("Worker reported an unknown model for the selected workflow")
         missing = [
-            model
-            for model in variants[0].models
-            if "sha256:" + model.sha256 in missing_digests
+            model for model in variants[0].models if "sha256:" + model.sha256 in missing_digests
         ]
     else:
         # Legacy Workers report only a flat digest set. Dynamic Workers report
@@ -2213,8 +2265,7 @@ def _apply_model_install(
     gated = [model.filename for model in missing if model.gated]
     if gated:
         print(
-            "以下受限模型将只使用 Worker 本机的 HF_TOKEN/HF_TOKEN_PATH 下载："
-            + "、".join(gated),
+            "以下受限模型将只使用 Worker 本机的 HF_TOKEN/HF_TOKEN_PATH 下载：" + "、".join(gated),
             file=sys.stderr,
         )
     total_bytes = sum(int(model.size) for model in missing)
@@ -2236,6 +2287,14 @@ def _apply_model_install(
         worker=selected_worker,
         spec=spec,
     )
+    # Expose the exact source before waiting.  A timeout or transport failure
+    # can otherwise hide a still-running job from the enclosing workflow
+    # installer, leaving it unable to cancel/revoke only this attempt.
+    if (
+        created_authorization_source_ids is not None
+        and _maintenance_intent_owns_job(created)
+    ):
+        created_authorization_source_ids.append(str(created["id"]))
     result = (
         _wait_for_maintenance(
             client,
@@ -2261,6 +2320,17 @@ def _worker_maintenance_actions(worker: Mapping[str, Any]) -> set[str]:
     return {str(value) for value in values if isinstance(value, str)}
 
 
+def _worker_supports_bound_capability_spec(worker: Mapping[str, Any]) -> bool:
+    capabilities = worker.get("capabilities")
+    gateway_features = worker.get("gateway_protocol_features")
+    return (
+        isinstance(capabilities, Mapping)
+        and capabilities.get("capability_install_spec_version") == 2
+        and isinstance(gateway_features, Mapping)
+        and gateway_features.get("capability_install_spec_version") == 2
+    )
+
+
 def _reject_known_insufficient_workflow_resources(
     worker: Mapping[str, Any], variant: WorkflowVariant
 ) -> None:
@@ -2274,8 +2344,7 @@ def _reject_known_insufficient_workflow_resources(
         (
             item
             for item in executors
-            if isinstance(item, Mapping)
-            and item.get("type") == variant.executor_type
+            if isinstance(item, Mapping) and item.get("type") == variant.executor_type
         ),
         None,
     )
@@ -2411,6 +2480,141 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
         workflow_digest=f"sha256:{digest}",
     )
     if existing_report is not None:
+        rollback_source_ids: list[str] = []
+        try:
+            model_args = argparse.Namespace(
+                workflow=workflow_ref,
+                worker=args.worker,
+                broker=args.broker,
+                wait=args.wait,
+                interval=args.interval,
+                timeout=args.timeout,
+            )
+            model_result = _apply_model_install(
+                client,
+                model_args,
+                broker_id=broker_id,
+                worker=worker,
+                created_authorization_source_ids=rollback_source_ids,
+            )
+            result: dict[str, Any] = {
+                "workflow": workflow_ref,
+                "workflow_digest": f"sha256:{digest}",
+                "capability": {"state": "already_active", "uploaded": False},
+                "activation": existing_report,
+                "models": model_result,
+            }
+            if args.wait:
+                result["readiness"] = _wait_for_workflow_ready(
+                    client,
+                    worker_id=str(worker["id"]),
+                    workflow_ref=workflow_ref,
+                    workflow_digest=f"sha256:{digest}",
+                    interval=args.interval,
+                    timeout=args.timeout,
+                )
+            return result
+        except Exception:
+            _attempt_workflow_install_rollback(
+                client,
+                worker_id=str(worker["id"]),
+                workflow_ref=workflow_ref,
+                workflow_digest=f"sha256:{digest}",
+                authorization_source_ids=rollback_source_ids,
+            )
+            raise
+    _, verified_digest, signed = validate_package(directory, allow_unsigned=True)
+    if verified_digest != digest:
+        raise RegistryError("installed workflow digest changed during capability packaging")
+    trusted_bundled_release = _is_trusted_bundled_workflow_release(
+        manifest,
+        verified_digest,
+    )
+    _approve_capability_nodes(
+        workflow_ref,
+        sorted(facts.node_classes),
+        approved=args.approve_nodes or trusted_bundled_release,
+    )
+    if not signed and not (args.allow_unsigned or trusted_bundled_release):
+        raise RegistryError(
+            "workflow is unsigned; pass --allow-unsigned only after reviewing the local package"
+        )
+    publisher_key = manifest.publisher.public_key if signed else None
+
+    rollback_source_ids: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="vgen-capability-upload-") as temporary:
+            archive = build_archive(
+                directory,
+                Path(temporary) / f"{manifest.id.replace('/', '-')}-{manifest.version}.zip",
+                allow_unsigned=not signed,
+            )
+            artifact_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+            artifact_size = archive.stat().st_size
+            spec = {
+                "kind": "capability_install",
+                "workflow_ref": workflow_ref,
+                "workflow_digest": f"sha256:{digest}",
+                "artifact_sha256": artifact_sha256,
+                "artifact_size": artifact_size,
+                "publisher_key": publisher_key,
+                "allow_unsigned_workflow": not signed,
+                "node_classes_digest": facts.node_classes_digest,
+                "apply": "on_idle",
+            }
+            if _worker_supports_bound_capability_spec(worker):
+                # These immutable package facts let the Gateway intersect future
+                # Worker heartbeat identifiers with this exact Owner-signed spec.
+                # Workers without the explicit feature bit receive the original v1
+                # shape. Published 0.13.10 builds did not implement this contract,
+                # so a semver comparison would be an unsafe capability guess.
+                spec["model_digests"] = list(workflow_model_digests(facts.variant))
+                spec["node_classes"] = sorted(facts.node_classes)
+            _, identity = _profile_and_identity(client.profile.name)
+            created = _create_maintenance_job(
+                client,
+                identity,
+                broker_id=broker_id,
+                worker=worker,
+                spec=spec,
+            )
+            capability_source_id = str(created["id"])
+            if _maintenance_intent_owns_job(created):
+                rollback_source_ids.append(capability_source_id)
+            upload_ticket = created.get("upload_ticket")
+            if isinstance(upload_ticket, Mapping):
+                ticket = _maintenance_upload_ticket(
+                    upload_ticket,
+                    expected_size=artifact_size,
+                    expected_sha256=artifact_sha256,
+                )
+                adapter = (
+                    OssStsArtifactAdapter()
+                    if ticket.url.startswith("oss://")
+                    else HttpArtifactAdapter()
+                )
+                print(f"正在上传 {workflow_ref} 工作流能力包…", file=sys.stderr)
+                adapter.upload(ticket, archive)
+                committed = client.commit_worker_maintenance(capability_source_id)
+            elif created.get("state") in {"queued", "leased", "running", "restarting"}:
+                committed = created
+            else:
+                raise ValueError("Gateway capability job has no upload ticket")
+        capability_result = _wait_for_maintenance(
+            client,
+            str(committed.get("id") or capability_source_id),
+            interval=args.interval,
+            timeout=args.timeout,
+        )
+        _raise_for_unsuccessful_maintenance(capability_result)
+        reported_worker, activation_report = _wait_for_workflow_report(
+            client,
+            worker_id=str(worker["id"]),
+            workflow_ref=workflow_ref,
+            workflow_digest=f"sha256:{digest}",
+            interval=args.interval,
+            timeout=args.timeout,
+        )
         model_args = argparse.Namespace(
             workflow=workflow_ref,
             worker=args.worker,
@@ -2423,13 +2627,14 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
             client,
             model_args,
             broker_id=broker_id,
-            worker=worker,
+            worker=reported_worker,
+            created_authorization_source_ids=rollback_source_ids,
         )
         result: dict[str, Any] = {
             "workflow": workflow_ref,
             "workflow_digest": f"sha256:{digest}",
-            "capability": {"state": "already_active", "uploaded": False},
-            "activation": existing_report,
+            "capability": capability_result,
+            "activation": activation_report,
             "models": model_result,
         }
         if args.wait:
@@ -2442,113 +2647,94 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
                 timeout=args.timeout,
             )
         return result
-    _approve_capability_nodes(
-        workflow_ref,
-        sorted(facts.node_classes),
-        approved=args.approve_nodes,
-    )
-    _, verified_digest, signed = validate_package(directory, allow_unsigned=True)
-    if verified_digest != digest:
-        raise RegistryError("installed workflow digest changed during capability packaging")
-    if not signed and not args.allow_unsigned:
-        raise RegistryError(
-            "workflow is unsigned; pass --allow-unsigned only after reviewing the local package"
-        )
-    publisher_key = manifest.publisher.public_key if signed else None
-
-    with tempfile.TemporaryDirectory(prefix="vgen-capability-upload-") as temporary:
-        archive = build_archive(
-            directory,
-            Path(temporary) / f"{manifest.id.replace('/', '-')}-{manifest.version}.zip",
-            allow_unsigned=not signed,
-        )
-        artifact_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
-        artifact_size = archive.stat().st_size
-        spec = {
-            "kind": "capability_install",
-            "workflow_ref": workflow_ref,
-            "workflow_digest": f"sha256:{digest}",
-            "artifact_sha256": artifact_sha256,
-            "artifact_size": artifact_size,
-            "publisher_key": publisher_key,
-            "allow_unsigned_workflow": not signed,
-            "node_classes_digest": facts.node_classes_digest,
-            "apply": "on_idle",
-        }
-        _, identity = _profile_and_identity(client.profile.name)
-        created = _create_maintenance_job(
-            client,
-            identity,
-            broker_id=broker_id,
-            worker=worker,
-            spec=spec,
-        )
-        upload_ticket = created.get("upload_ticket")
-        if isinstance(upload_ticket, Mapping):
-            ticket = _maintenance_upload_ticket(
-                upload_ticket,
-                expected_size=artifact_size,
-                expected_sha256=artifact_sha256,
-            )
-            adapter = (
-                OssStsArtifactAdapter()
-                if ticket.url.startswith("oss://")
-                else HttpArtifactAdapter()
-            )
-            print(f"正在上传 {workflow_ref} 工作流能力包…", file=sys.stderr)
-            adapter.upload(ticket, archive)
-            committed = client.commit_worker_maintenance(str(created["id"]))
-        elif created.get("state") in {"queued", "leased", "running", "restarting"}:
-            committed = created
-        else:
-            raise ValueError("Gateway capability job has no upload ticket")
-    capability_result = _wait_for_maintenance(
-        client,
-        str(committed.get("id") or created["id"]),
-        interval=args.interval,
-        timeout=args.timeout,
-    )
-    _raise_for_unsuccessful_maintenance(capability_result)
-    reported_worker, activation_report = _wait_for_workflow_report(
-        client,
-        worker_id=str(worker["id"]),
-        workflow_ref=workflow_ref,
-        workflow_digest=f"sha256:{digest}",
-        interval=args.interval,
-        timeout=args.timeout,
-    )
-
-    model_args = argparse.Namespace(
-        workflow=workflow_ref,
-        worker=args.worker,
-        broker=args.broker,
-        wait=args.wait,
-        interval=args.interval,
-        timeout=args.timeout,
-    )
-    model_result = _apply_model_install(
-        client,
-        model_args,
-        broker_id=broker_id,
-        worker=reported_worker,
-    )
-    result: dict[str, Any] = {
-        "workflow": workflow_ref,
-        "workflow_digest": f"sha256:{digest}",
-        "capability": capability_result,
-        "activation": activation_report,
-        "models": model_result,
-    }
-    if args.wait:
-        result["readiness"] = _wait_for_workflow_ready(
+    except Exception:
+        _attempt_workflow_install_rollback(
             client,
             worker_id=str(worker["id"]),
             workflow_ref=workflow_ref,
             workflow_digest=f"sha256:{digest}",
-            interval=args.interval,
-            timeout=args.timeout,
+            authorization_source_ids=rollback_source_ids,
         )
+        raise
+
+
+def _attempt_workflow_install_rollback(
+    client: GatewayClient,
+    *,
+    worker_id: str,
+    workflow_ref: str,
+    workflow_digest: str,
+    authorization_source_ids: Sequence[str],
+) -> None:
+    sources = list(dict.fromkeys(authorization_source_ids))
+    if not sources:
+        return
+    failed = False
+    for source_id in sources:
+        try:
+            _request_workflow_deactivation(
+                client,
+                worker_id=worker_id,
+                workflow_ref=workflow_ref,
+                workflow_digest=workflow_digest,
+                authorization_source_id=source_id,
+            )
+        except Exception:
+            failed = True
+    if failed:
+        print(
+            "工作流安装未完成，部分本次安装授权未能自动撤销；Worker 就绪检查仍会阻止调度，"
+            "请保留维护任务 ID 以便排查。",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"工作流安装未完成，已撤销本次安装新增的 {len(sources)} 个授权来源。",
+        file=sys.stderr,
+    )
+
+
+def _request_workflow_deactivation(
+    client: GatewayClient,
+    *,
+    worker_id: str,
+    workflow_ref: str,
+    workflow_digest: str,
+    authorization_source_id: str | None = None,
+) -> dict[str, Any]:
+    body = {
+        "workflow_ref": workflow_ref,
+        "workflow_digest": workflow_digest,
+    }
+    if authorization_source_id is not None:
+        body["authorization_source_id"] = authorization_source_id
+    result = client.request(
+        "POST",
+        f"/api/v1/workers/{worker_id}/workflows/deactivate",
+        json_body=body,
+        idempotency_key=f"workflow-deactivate:{worker_id}:{uuid.uuid4().hex}",
+    )
+    expected_state = (
+        "authorization_source_revoked"
+        if authorization_source_id is not None
+        else "deactivated"
+    )
+    if not isinstance(result, dict) or result.get("state") != expected_state:
+        raise ValueError("Gateway returned an invalid workflow deactivation result")
     return result
+
+
+def _apply_workflow_deactivate(client: GatewayClient, args: argparse.Namespace) -> dict[str, Any]:
+    broker_id = _maintenance_broker_id(client, args.broker)
+    worker = _select_owned_worker(client, args.worker)
+    worker = _ensure_broker_manages_worker(client, worker, broker_id)
+    manifest, _directory, digest = _resolve_workflow(args.workflow)
+    return _request_workflow_deactivation(
+        client,
+        worker_id=str(worker["id"]),
+        workflow_ref=f"{manifest.id}@{manifest.version}",
+        workflow_digest=f"sha256:{digest}",
+    )
 
 
 def _broker_command(args: argparse.Namespace) -> None:
@@ -2630,9 +2816,11 @@ def _broker_command(args: argparse.Namespace) -> None:
                         (
                             "DEV",
                             3,
-                            lambda row: len(row.get("devices"))
-                            if isinstance(row.get("devices"), list)
-                            else 0,
+                            lambda row: (
+                                len(row.get("devices"))
+                                if isinstance(row.get("devices"), list)
+                                else 0
+                            ),
                         ),
                         ("RUNTIME", 18, lambda row: _broker_device_values(row, "runtime_version")),
                         ("LAST SEEN", 19, _broker_last_seen),
@@ -2655,6 +2843,8 @@ def _broker_command(args: argparse.Namespace) -> None:
             _json(_apply_model_install(client, args))
         elif args.broker_action == "workflow-install":
             _json(_apply_workflow_install(client, args))
+        elif args.broker_action in {"workflow-deactivate", "workflow-uninstall"}:
+            _json(_apply_workflow_deactivate(client, args))
         elif args.broker_action == "maintenance-list":
             worker = _select_owned_worker(client, args.worker)
             values = client.list_worker_maintenance(str(worker["id"]))
@@ -2845,22 +3035,26 @@ def _worker_command(args: argparse.Namespace) -> None:
             enrollment_id, workspace_id, invite_uri = _create_worker_invite(
                 client, owner_identity, args
             )
-            print("\n在 Windows 运行统一 Worker 安装器，然后把下面的一次性 Invite 粘贴到隐藏输入框：\n")
+            print(
+                "\n在 Windows 运行统一 Worker 安装器，然后把下面的一次性 Invite 粘贴到隐藏输入框：\n"
+            )
             print(invite_uri)
             print("\nInvite 不要发送到群聊、截图或命令参数。正在等待 Windows 领取……")
             deadline = time.monotonic() + args.timeout
             while True:
-                pending = client.request(
-                    "GET", f"/api/v1/worker-enrollments/{enrollment_id}"
-                )
+                pending = client.request("GET", f"/api/v1/worker-enrollments/{enrollment_id}")
                 enrollment = pending.get("enrollment") if isinstance(pending, dict) else None
                 state = str(enrollment.get("state") or "") if isinstance(enrollment, dict) else ""
                 if state == "pending" and isinstance(enrollment.get("claim"), dict):
                     break
                 if state in {"active", "expired", "rejected", "revoked"}:
-                    raise ValueError(f"Worker enrollment finished unexpectedly with state '{state}'")
+                    raise ValueError(
+                        f"Worker enrollment finished unexpectedly with state '{state}'"
+                    )
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("等待 Windows 领取 Worker Invite 超时；请重新运行 vgen worker add")
+                    raise TimeoutError(
+                        "等待 Windows 领取 Worker Invite 超时；请重新运行 vgen worker add"
+                    )
                 time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
             print("\n✓ Windows 已生成本机 Worker 密钥并领取 Invite。")
             code = input("请输入 Windows 显示的完整验证码以批准接入: ").strip()
@@ -2971,10 +3165,7 @@ def _worker_command(args: argparse.Namespace) -> None:
                         "workspace_id": workspace_id,
                         "rate_microtokens_per_second": args.rate,
                     },
-                    idempotency_key=(
-                        f"worker-rate:{args.worker_id}:{workspace_id}:"
-                        f"{args.rate}"
-                    ),
+                    idempotency_key=(f"worker-rate:{args.worker_id}:{workspace_id}:{args.rate}"),
                 )
             )
         elif args.worker_action == "rate-approve":
@@ -3094,6 +3285,10 @@ def _workflow_command(args: argparse.Namespace) -> None:
             }
         )
     elif args.workflow_action == "update":
+        try:
+            validate_workflow_id(args.workflow_id)
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
         installed = [
             item
             for item in registry.installed()
@@ -3101,26 +3296,37 @@ def _workflow_command(args: argparse.Namespace) -> None:
         ]
         if not installed:
             raise RegistryError("market workflow is not installed")
+        if any(not item.signed for item in installed):
+            raise RegistryError("unsigned installed market releases cannot establish update trust")
+        publisher_keys = {item.manifest.publisher.public_key for item in installed}
+        if len(publisher_keys) != 1 or None in publisher_keys:
+            raise RegistryError("installed market releases have no single trusted publisher key")
+        publisher_key = next(iter(publisher_keys))
         current = max(Version(item.manifest.version) for item in installed)
-        candidates = [
-            entry
-            for entry in registry.search_index(args.index, args.workflow_id)
-            if entry.get("id") == args.workflow_id
-            and entry.get("source")
-            and Version(str(entry.get("version"))) > current
-        ]
+        candidates: list[dict[str, str]] = []
+        for entry in registry.search_index(args.index, args.workflow_id):
+            target = _validated_workflow_update_target(entry, args.workflow_id)
+            if target is not None and Version(target["version"]) > current:
+                candidates.append(target)
         if not candidates:
             _json({"id": args.workflow_id, "updated": False, "version": str(current)})
             return
         selected = max(candidates, key=lambda entry: Version(str(entry["version"])))
-        publisher_keys = {item.manifest.publisher.public_key for item in installed}
-        if len(publisher_keys) != 1 or None in publisher_keys:
-            raise RegistryError("installed market releases have no single trusted publisher key")
         result = registry.install(
-            str(selected["source"]),
-            expected_digest=str(selected.get("digest") or "") or None,
-            expected_publisher_key=next(iter(publisher_keys)),
+            selected["source"],
+            expected_digest=selected["digest"],
+            expected_publisher_key=publisher_key,
+            expected_workflow_id=args.workflow_id,
+            expected_version=selected["version"],
         )
+        if (
+            result.manifest.id != args.workflow_id
+            or result.manifest.version != selected["version"]
+            or f"sha256:{result.digest}" != selected["digest"]
+            or not result.signed
+            or result.manifest.publisher.public_key != publisher_key
+        ):
+            raise RegistryError("installed workflow does not match the validated market target")
         _json(
             {
                 "id": result.manifest.id,
@@ -3131,12 +3337,67 @@ def _workflow_command(args: argparse.Namespace) -> None:
         )
 
 
+def _validated_workflow_update_target(
+    entry: object,
+    workflow_id: str,
+) -> dict[str, str] | None:
+    """Validate the complete binding used to fetch one market update target."""
+
+    if not isinstance(entry, Mapping) or entry.get("id") != workflow_id:
+        return None
+    version = entry.get("version")
+    source = entry.get("source")
+    digest = entry.get("digest")
+    if (
+        not isinstance(version, str)
+        or not SEMVER_RE.fullmatch(version)
+        or not isinstance(source, str)
+        or source != source.strip()
+        or any(ord(character) < 32 for character in source)
+        or not isinstance(digest, str)
+        or len(digest) != 71
+        or not digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise RegistryError("market index workflow target is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(source)
+        validate_workflow_version(version)
+        Version(version)
+        _ = parsed.port
+    except (InvalidVersion, ValueError):
+        raise RegistryError("market index workflow target is invalid") from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise RegistryError("market index workflow source must use HTTPS")
+    hostname = parsed.hostname.casefold()
+    try:
+        literal_address = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_address = None
+    if hostname == "localhost" or (literal_address is not None and not literal_address.is_global):
+        raise RegistryError("market index workflow source must use a public host")
+    return {
+        "id": workflow_id,
+        "version": version,
+        "source": source,
+        "digest": digest,
+    }
+
+
 def _workflow_reference(value: str) -> bool:
     workflow_id, separator, version = value.partition("@")
-    return bool(
-        WORKFLOW_ID_RE.fullmatch(workflow_id)
-        and (not separator or SEMVER_RE.fullmatch(version))
-    )
+    try:
+        validate_workflow_id(workflow_id)
+        if separator:
+            validate_workflow_version(version)
+    except ValueError:
+        return False
+    return True
 
 
 def _inspect_workflow_source(
@@ -3175,16 +3436,24 @@ def _resolve_workflow(
         for item in selected_registry.installed()
         if item.manifest.id == workflow_id and (not separator or item.manifest.version == version)
     ]
+    bundled = [
+        (release_version, digest)
+        for (release_id, release_version), digest in _BUNDLED_WORKFLOW_DIGESTS.items()
+        if release_id == workflow_id and (not separator or release_version == version)
+    ]
+    provenances = {item.manifest.provenance for item in matches}
+    if bundled:
+        provenances.add("market")
+    if len(provenances) > 1:
+        selector = f"{workflow_id}@{version}" if separator else workflow_id
+        raise RegistryError(
+            "both market and custom workflow releases match "
+            f"{selector}; remove the unwanted source with "
+            f"`vgen workflow remove {workflow_id} <version> --provenance market|custom`"
+        )
     if not matches:
-        bundled = [
-            (release_version, digest)
-            for (release_id, release_version), digest in _BUNDLED_WORKFLOW_DIGESTS.items()
-            if release_id == workflow_id and (not separator or release_version == version)
-        ]
         if bundled:
-            release_version, expected_digest = max(
-                bundled, key=lambda item: Version(item[0])
-            )
+            release_version, expected_digest = max(bundled, key=lambda item: Version(item[0]))
             namespace, name = workflow_id.split("/", 1)
             packaged = (
                 Path(__file__).resolve().parents[1]
@@ -3285,21 +3554,10 @@ def _workflow_public_requirements(
             else {}
         ),
         **(
-            {"min_vram_bytes": variant.min_vram_bytes}
-            if variant.min_vram_bytes is not None
-            else {}
+            {"min_vram_bytes": variant.min_vram_bytes} if variant.min_vram_bytes is not None else {}
         ),
-        **(
-            {"min_ram_bytes": variant.min_ram_bytes}
-            if variant.min_ram_bytes is not None
-            else {}
-        ),
-        "model_digests": [
-            model.sha256
-            if model.sha256.startswith("sha256:")
-            else f"sha256:{model.sha256}"
-            for model in variant.models
-        ],
+        **({"min_ram_bytes": variant.min_ram_bytes} if variant.min_ram_bytes is not None else {}),
+        "model_digests": list(workflow_model_digests(variant)),
     }
 
 
@@ -3568,9 +3826,7 @@ def _publish_task_output(staged: Path, requested: Path, *, overwrite: bool) -> P
         candidate = (
             requested
             if sequence == 0
-            else requested.with_name(
-                f"{requested.stem}-{sequence:02d}{requested.suffix}"
-            )
+            else requested.with_name(f"{requested.stem}-{sequence:02d}{requested.suffix}")
         )
         try:
             os.link(staged, candidate)
@@ -3612,6 +3868,67 @@ def _wait_for_task(
         time.sleep(interval)
 
 
+def _task_terminal_error(task: Mapping[str, Any]) -> VgenClientError:
+    """Convert a terminal task into the public CLI error contract.
+
+    Only the Gateway's bounded diagnostic vocabulary is rendered.  Unknown
+    fields and free-form values are ignored so an executor exception cannot
+    smuggle prompts, paths, credentials, or tracebacks into terminal output.
+    """
+
+    attempts = task.get("attempts")
+    candidates = (
+        [item for item in attempts if isinstance(item, Mapping)]
+        if isinstance(attempts, list)
+        else []
+    )
+    attempt = candidates[-1] if candidates else {}
+    raw_code = attempt.get("failure_code")
+    if not isinstance(raw_code, int) or isinstance(raw_code, bool):
+        state = str(task.get("state") or "")
+        if state == "cancelled":
+            raw_code = int(ErrorCode.EXECUTION_CANCELLED)
+        elif state == "expired":
+            raw_code = int(ErrorCode.RESERVATION_EXPIRED)
+        else:
+            raw_code = int(ErrorCode.INTERNAL_ERROR)
+    try:
+        spec = get_error_spec(raw_code)
+    except ValueError:
+        spec = get_error_spec(ErrorCode.INTERNAL_ERROR)
+        raw_code = int(spec.code)
+
+    safe_details = canonical_task_failure_details_for_code(
+        attempt.get("safe_failure_details"),
+        raw_code,
+        terminal_state=(
+            str(attempt.get("state")) if isinstance(attempt.get("state"), str) else None
+        ),
+    )
+
+    task_id = task.get("id")
+    identity = (
+        str(task_id)
+        if isinstance(task_id, str)
+        and task_id.startswith("tsk_")
+        and 5 <= len(task_id) <= 160
+        and task_id[4:].isalnum()
+        and task_id.isascii()
+        else "unknown"
+    )
+    diagnostic = ", ".join(f"{key}={value}" for key, value in safe_details.items())
+    message = f"{spec.message} task_id={identity}"
+    if diagnostic:
+        message += f" ({diagnostic})"
+    return VgenClientError(
+        raw_code,
+        spec.code.name,
+        message,
+        retry_action=spec.retry_action.value,
+        details=safe_details,
+    )
+
+
 def _task_progress(task: Mapping[str, Any]) -> tuple[str, str, int] | None:
     attempts = task.get("attempts")
     if not isinstance(attempts, list):
@@ -3628,18 +3945,13 @@ def _task_progress(task: Mapping[str, Any]) -> tuple[str, str, int] | None:
                 continue
         if not isinstance(progress, Mapping):
             continue
-        fraction = progress.get("fraction")
-        stage = progress.get("stage")
-        if (
-            not isinstance(fraction, (int, float))
-            or isinstance(fraction, bool)
-            or not 0 <= float(fraction) <= 1
-            or not isinstance(stage, str)
-            or not stage
-        ):
+        canonical_progress = canonical_task_progress(progress)
+        if canonical_progress is None:
             continue
+        fraction = float(canonical_progress["fraction"])
+        stage = str(canonical_progress["stage"])
         attempt_id = str(attempt.get("id") or f"attempt-{index}")
-        return attempt_id, stage, min(100, max(0, round(float(fraction) * 100)))
+        return attempt_id, stage, min(100, max(0, round(fraction * 100)))
     return None
 
 
@@ -3648,7 +3960,7 @@ def _task_progress_label(stage: str) -> str:
         return "准备输入"
     if stage in {"queued", "sampling", "sampled"}:
         return "生成采样"
-    if stage.startswith("node:"):
+    if stage == "processing":
         return "生成处理"
     if stage == "uploading_outputs":
         return "上传结果"
@@ -3675,10 +3987,7 @@ def _print_task_update(task: Mapping[str, Any], display: dict[str, Any]) -> None
     stage_changed = stage != display["stage"]
     if not stage_changed and percent < previous_percent + 2 and percent != 100:
         return
-    if stage.startswith("node:"):
-        print("生成处理中：当前节点暂无细分进度", file=sys.stderr)
-    else:
-        print(f"{_task_progress_label(stage)}：{percent}%", file=sys.stderr)
+    print(f"{_task_progress_label(stage)}：{percent}%", file=sys.stderr)
     display["stage"] = stage
     display["percent"] = percent
 
@@ -3832,6 +4141,7 @@ def _task_command(args: argparse.Namespace) -> None:
                 _json(committed)
             else:
                 task_id = str(committed.get("id") or prepared["id"])
+                print(f"任务已提交：{task_id}", file=sys.stderr)
                 completed = _wait_for_task(
                     client,
                     task_id,
@@ -3839,7 +4149,7 @@ def _task_command(args: argparse.Namespace) -> None:
                     timeout=args.timeout,
                 )
                 if completed.get("state") != "succeeded":
-                    raise ValueError(f"task ended without a video (state={completed.get('state')})")
+                    raise _task_terminal_error(completed)
                 _json(
                     _download_task_outputs(
                         client,
@@ -3965,17 +4275,20 @@ def _task_command(args: argparse.Namespace) -> None:
                 )
             )
         elif args.task_action == "watch":
+            completed = _wait_for_task(
+                client,
+                args.task_id,
+                interval=args.interval,
+                timeout=args.timeout,
+            )
             _json(
                 _task_detail_view(
-                    _wait_for_task(
-                        client,
-                        args.task_id,
-                        interval=args.interval,
-                        timeout=args.timeout,
-                    ),
+                    completed,
                     readable_times=args.format == "text",
                 )
             )
+            if completed.get("state") != "succeeded":
+                raise _task_terminal_error(completed)
         elif args.task_action == "usage":
             workspace_id = args.workspace or client.profile.default_workspace
             if not workspace_id:
@@ -4094,6 +4407,8 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("broker", "worker-update"): "向 Worker 推送经过校验的 VGen wheel 更新任务。",
     ("broker", "model-install"): "要求 Worker 按工作流清单校验并下载缺失模型。",
     ("broker", "workflow-install"): "上传工作流能力包，并让 Worker 激活及安装缺失模型。",
+    ("broker", "workflow-deactivate"): "撤销一个 Worker 上的工作流调度授权并原子停用。",
+    ("broker", "workflow-uninstall"): "撤销一个 Worker 上的工作流调度授权并原子停用。",
     ("broker", "maintenance-list"): "列出 Worker 更新、工作流和模型安装任务。",
     ("broker", "maintenance-show"): "查看一条 Worker 维护任务的状态和结果。",
     ("broker", "maintenance-cancel"): "取消尚未结束的 Worker 维护任务。",
@@ -4267,9 +4582,7 @@ _COMMAND_ARGUMENT_HELP: dict[tuple[str, ...], str] = {
     ("task", "list", "sort"): (
         "排序因子：created 提交时间、updated 更新时间、priority 优先级、state 状态。"
     ),
-    ("task", "list", "state"): (
-        "按任务状态筛选，例如 queued、running、succeeded 或 failed。"
-    ),
+    ("task", "list", "state"): ("按任务状态筛选，例如 queued、running、succeeded 或 failed。"),
 }
 
 
@@ -4294,9 +4607,7 @@ def _enhance_cli_help(parser: argparse.ArgumentParser) -> None:
         current.formatter_class = _VGenHelpFormatter
         current._optionals.title = "选项"
         subparser_actions = [
-            action
-            for action in current._actions
-            if isinstance(action, argparse._SubParsersAction)
+            action for action in current._actions if isinstance(action, argparse._SubParsersAction)
         ]
         current._positionals.title = "可用命令" if subparser_actions else "参数"
         if path in _COMMAND_HELP:
@@ -4329,7 +4640,11 @@ def _enhance_cli_help(parser: argparse.ArgumentParser) -> None:
             if action.help == argparse.SUPPRESS:
                 continue
             option_help = next(
-                (_OPTION_HELP[option] for option in action.option_strings if option in _OPTION_HELP),
+                (
+                    _OPTION_HELP[option]
+                    for option in action.option_strings
+                    if option in _OPTION_HELP
+                ),
                 None,
             )
             action.help = (
@@ -4382,7 +4697,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     upgrade = sub.add_parser("upgrade", help="upgrade the managed macOS CLI and Home Broker")
     upgrade.add_argument("--profile")
-    upgrade.add_argument("--check", action="store_true", help="only report whether an update exists")
+    upgrade.add_argument(
+        "--check", action="store_true", help="only report whether an update exists"
+    )
     upgrade.add_argument("--yes", action="store_true", help="install without an interactive prompt")
 
     completion = sub.add_parser("completion")
@@ -4700,9 +5017,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="upload and activate a workflow release, then install its missing models",
     )
     broker_workflow.add_argument("workflow", help="installed workflow reference")
-    broker_workflow.add_argument(
-        "--worker", help="owned Worker name or ID; automatic when unique"
-    )
+    broker_workflow.add_argument("--worker", help="owned Worker name or ID; automatic when unique")
     broker_workflow.add_argument(
         "--broker", help="Broker ID; defaults to this profile's Home Broker"
     )
@@ -4720,6 +5035,28 @@ def build_parser() -> argparse.ArgumentParser:
     broker_workflow.add_argument("--interval", type=float, default=2)
     broker_workflow.add_argument("--timeout", type=float, default=86_400)
     broker_workflow.add_argument("--profile")
+    broker_workflow_deactivate = broker_sub.add_parser(
+        "workflow-deactivate",
+        help="revoke and deactivate one exact workflow on an owned Worker",
+    )
+    broker_workflow_uninstall = broker_sub.add_parser(
+        "workflow-uninstall",
+        help="uninstall one exact workflow from an owned Worker",
+    )
+    for workflow_lifecycle_parser in (
+        broker_workflow_deactivate,
+        broker_workflow_uninstall,
+    ):
+        workflow_lifecycle_parser.add_argument(
+            "workflow", help="installed workflow reference"
+        )
+        workflow_lifecycle_parser.add_argument(
+            "--worker", help="owned Worker name or ID; automatic when unique"
+        )
+        workflow_lifecycle_parser.add_argument(
+            "--broker", help="Broker ID; defaults to this profile's Home Broker"
+        )
+        workflow_lifecycle_parser.add_argument("--profile")
     maintenance_list = broker_sub.add_parser(
         "maintenance-list", help="list maintenance jobs for an owned Worker"
     )
@@ -4758,9 +5095,7 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade",
         help="download the trusted stable Worker and apply it remotely when idle",
     )
-    worker_upgrade.add_argument(
-        "--worker", help="owned Worker name or ID; automatic when unique"
-    )
+    worker_upgrade.add_argument("--worker", help="owned Worker name or ID; automatic when unique")
     worker_upgrade.add_argument(
         "--broker", help="Broker ID; defaults to this profile's Home Broker"
     )

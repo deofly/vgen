@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from enum import StrEnum
@@ -14,6 +15,7 @@ from .public_metadata import (
     PublicMetadataError,
     validate_artifact_media_metadata,
     validate_public_requirements,
+    validate_reported_artifact_media_metadata,
 )
 
 _WORKFLOW_RELEASE_REF_PATTERN = (
@@ -266,6 +268,79 @@ class WorkerCreate(WireModel):
     capacity: int = Field(default=1, ge=1, le=64)
 
 
+class GatewayProtocolFeatures(WireModel):
+    capability_install_spec_version: Literal[2]
+
+
+class WorkerWorkflowReadiness(WireModel):
+    workflow_ref: str
+    workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    state: Literal[
+        "ready",
+        "missing_models",
+        "missing_nodes",
+        "node_probe_unavailable",
+        "executor_incompatible",
+        "runtime_incompatible",
+        "insufficient_vram",
+        "insufficient_ram",
+    ]
+    missing_model_digests: list[str] = Field(default_factory=list)
+    missing_node_classes: list[str] = Field(default_factory=list)
+
+
+class WorkerExecutorCapabilityFacts(WireModel):
+    capability_schema_version: Literal[2] | None = None
+    model_digests: list[str] = Field(default_factory=list)
+    workflow_readiness: list[WorkerWorkflowReadiness] = Field(default_factory=list)
+    ready_workflow_digests: list[str] = Field(default_factory=list)
+    vram_bytes: int | None = Field(default=None, ge=0)
+    ram_bytes: int | None = Field(default=None, ge=0)
+    runtime_version: str | None = None
+
+
+class WorkerExecutorCapability(WireModel):
+    type: str
+    version: str | None = None
+    payload_formats: list[str] = Field(default_factory=list)
+    operations: list[str] = Field(default_factory=list)
+    max_concurrency: int = Field(default=1, ge=1, le=64)
+    capabilities: WorkerExecutorCapabilityFacts = Field(
+        default_factory=WorkerExecutorCapabilityFacts
+    )
+
+
+class WorkerCapabilities(WireModel):
+    worker_runtime_version: str | None = None
+    capability_install_spec_version: Literal[2] | None = None
+    maintenance_actions: list[
+        Literal["worker_update", "model_install", "capability_install"]
+    ] = Field(default_factory=list)
+    executors: list[WorkerExecutorCapability] = Field(default_factory=list)
+
+
+class WorkerView(WireModel):
+    id: str
+    owner_user_id: str
+    manager_broker_id: str | None
+    name: str
+    signing_public_key: str
+    encryption_public_key: str
+    certificate: str | None
+    executor_type: str
+    executor_version: str
+    capabilities: WorkerCapabilities
+    capacity: int = Field(ge=1, le=64)
+    status: Literal["pending", "active", "offline", "draining", "revoked"]
+    fencing_counter: int = Field(ge=0)
+    last_seen_at: float | None
+    capability_auth_enforced_at: float | None
+    created_at: float
+    updated_at: float
+    revoked_at: float | None
+    gateway_protocol_features: GatewayProtocolFeatures
+
+
 class WorkerInviteCreate(WireModel):
     """Owner/admin authorization for a credential-free Worker enrollment."""
 
@@ -315,7 +390,9 @@ class WorkerEnrollmentDecision(WireModel):
     @model_validator(mode="after")
     def approval_material_is_complete(self) -> WorkerEnrollmentDecision:
         if self.approve and (not self.owner_certificate or self.allocation_proof is None):
-            raise ValueError("approving a Worker requires its owner certificate and allocation proof")
+            raise ValueError(
+                "approving a Worker requires its owner certificate and allocation proof"
+            )
         if not self.approve and (
             self.owner_certificate is not None or self.allocation_proof is not None
         ):
@@ -333,6 +410,23 @@ class WorkerLeave(WireModel):
 
 class WorkerHeartbeat(WireModel):
     capabilities: dict[str, Any] | None = None
+
+
+class WorkerWorkflowDeactivate(WireModel):
+    workflow_ref: str = Field(
+        min_length=1,
+        max_length=512,
+        pattern=_WORKFLOW_RELEASE_REF_PATTERN,
+    )
+    workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    authorization_source_id: str | None = Field(
+        default=None,
+        pattern=r"^mtj_[a-z2-7]{26}$",
+        description=(
+            "Optional maintenance job authorization to revoke during an automatic install "
+            "rollback. Omit for an explicit uninstall of every dynamic grant for the release."
+        ),
+    )
 
 
 class WorkerManagerSet(WireModel):
@@ -369,7 +463,10 @@ class ModelInstallSpec(WireModel):
             re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None for item in value
         ):
             raise ValueError("model digests must be unique canonical SHA-256 values")
-        return value
+        # Signing and authorization use one deterministic representation even
+        # when a client supplied the same valid set in another order.
+        return sorted(value)
+
 
 class CapabilityInstallSpec(WireModel):
     kind: Literal["capability_install"]
@@ -382,15 +479,23 @@ class CapabilityInstallSpec(WireModel):
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     artifact_size: int = Field(ge=1, le=1024**3, strict=True)
     node_classes_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_digests: list[str] | None = Field(default=None, max_length=128)
+    node_classes: (
+        list[
+            Annotated[
+                str,
+                Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"),
+            ]
+        ]
+        | None
+    ) = Field(default=None, max_length=512)
     publisher_key: str | None
     allow_unsigned_workflow: bool = Field(strict=True)
     apply: Literal["on_idle"] = "on_idle"
 
     @field_validator("publisher_key")
     @classmethod
-    def publisher_key_is_canonical_ed25519_base64(
-        cls, value: str | None
-    ) -> str | None:
+    def publisher_key_is_canonical_ed25519_base64(cls, value: str | None) -> str | None:
         if value is None:
             return None
         try:
@@ -408,6 +513,29 @@ class CapabilityInstallSpec(WireModel):
                 raise ValueError("unsigned workflows must not include a publisher key")
         elif self.publisher_key is None:
             raise ValueError("signed workflows require a publisher key")
+        if (self.model_digests is None) != (self.node_classes is None):
+            raise ValueError(
+                "model_digests and node_classes must both be omitted or both be present"
+            )
+        if self.model_digests is not None and (
+            self.model_digests != sorted(set(self.model_digests))
+            or any(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None for item in self.model_digests
+            )
+        ):
+            raise ValueError("model digests must be sorted unique canonical SHA-256 values")
+        if self.node_classes is not None:
+            if self.node_classes != sorted(set(self.node_classes)):
+                raise ValueError("node classes must be sorted and unique")
+            node_digest = hashlib.sha256(
+                json.dumps(
+                    sorted(self.node_classes),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if node_digest != self.node_classes_digest:
+                raise ValueError("node classes do not match node_classes_digest")
         return self
 
 
@@ -444,9 +572,10 @@ class MaintenanceAuthorization(WireModel):
     @field_validator("device_certificate")
     @classmethod
     def device_certificate_is_bounded(cls, value: dict[str, Any]) -> dict[str, Any]:
-        if set(value) != {"payload", "signature"} or len(
-            json.dumps(value, ensure_ascii=True, separators=(",", ":"))
-        ) > 16_384:
+        if (
+            set(value) != {"payload", "signature"}
+            or len(json.dumps(value, ensure_ascii=True, separators=(",", ":"))) > 16_384
+        ):
             raise ValueError("maintenance Device certificate is invalid")
         return value
 
@@ -462,6 +591,34 @@ class WorkerMaintenanceCreate(WireModel):
         return self
 
 
+class WorkerMaintenanceCreateResponse(BaseModel):
+    """Request-relative ownership metadata plus the maintenance job view.
+
+    The job view intentionally remains extensible because artifact-backed
+    jobs also carry freshly issued upload tickets. The two required fields
+    prevent callers from treating a job deduplicated from another signed
+    intent as their own rollback or cancellation source.
+    """
+
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
+
+    id: str = Field(pattern=r"^mtj_[a-z2-7]{26}$")
+    creation_disposition: Literal["created", "deduplicated"] = Field(
+        description=(
+            "Whether this signed maintenance intent created a new job or joined an "
+            "already-active worker-update job. The value is stable across retries of "
+            "the same intent."
+        )
+    )
+    intent_owns_job: bool = Field(
+        strict=True,
+        description=(
+            "True only when this signed maintenance intent created the job and may use "
+            "its ID for automatic cancellation or source-scoped rollback."
+        )
+    )
+
+
 class WorkerMaintenanceCommit(WireModel):
     pass
 
@@ -472,12 +629,12 @@ class WorkerMaintenanceCancel(WireModel):
 
 class WorkerMaintenanceClaim(WireModel):
     ttl_seconds: int = Field(default=60, ge=15, le=300)
-    supported_actions: list[
-        Literal["worker_update", "model_install", "capability_install"]
-    ] = Field(
-        default_factory=lambda: ["worker_update", "model_install"],
-        min_length=1,
-        max_length=3,
+    supported_actions: list[Literal["worker_update", "model_install", "capability_install"]] = (
+        Field(
+            default_factory=lambda: ["worker_update", "model_install"],
+            min_length=1,
+            max_length=3,
+        )
     )
 
     @field_validator("supported_actions")
@@ -538,9 +695,7 @@ class ModelInstallMaintenanceResult(WireModel):
     kind: Literal["model_install"]
     status: Literal["installed", "already_installed", "failed"]
     installed_model_digests: list[str] = Field(default_factory=list, max_length=128)
-    failed_model_digest: str | None = Field(
-        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
-    )
+    failed_model_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     error_code: int | None = Field(default=None, ge=100000, le=999999)
 
     @field_validator("installed_model_digests")
@@ -760,7 +915,7 @@ class OutputArtifact(WireModel):
     @classmethod
     def media_metadata_is_plaintext_safe(cls, value: dict[str, Any]) -> dict[str, Any]:
         try:
-            return validate_artifact_media_metadata(value)
+            return validate_reported_artifact_media_metadata(value)
         except PublicMetadataError as exc:
             raise ValueError(exc.reason) from exc
 

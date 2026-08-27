@@ -81,6 +81,7 @@ class ErrorRegistryTest(unittest.TestCase):
         self.assertTrue(all(100_000 <= code <= 999_999 for code in values))
         self.assertEqual(ErrorCode.NO_ELIGIBLE_WORKER, 220001)
         self.assertEqual(ErrorCode.EXECUTION_CANCELLED, 320008)
+        self.assertEqual(ErrorCode.SYSTEM_OUT_OF_MEMORY, 320009)
 
     def test_error_envelope_has_retry_policy_and_redacts_details(self) -> None:
         body = error_envelope(

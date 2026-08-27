@@ -21,6 +21,7 @@ from vgen.crypto import (
 )
 from vgen.gateway.app import create_app
 from vgen.gateway.openapi import idempotency_cache_mode
+from vgen.gateway.repository import GatewayRepository
 
 WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
 
@@ -145,9 +146,7 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
     app, client, boot, headers, owner, workspace, pool = _setup(tmp_path)
     with client:
         _, invite_id, secret = _invite(client, headers, workspace, pool)
-        stored_invite = app.state.db.fetchone(
-            "SELECT * FROM enrollments WHERE id=?", (invite_id,)
-        )
+        stored_invite = app.state.db.fetchone("SELECT * FROM enrollments WHERE id=?", (invite_id,))
         assert stored_invite is not None
         assert stored_invite["invite_secret_hash"] == hashlib.sha256(secret.encode()).hexdigest()
         assert secret not in str(dict(stored_invite))
@@ -160,6 +159,31 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
 
         worker = DeviceKeys.generate()
         claim = _claim(worker, invite_id)
+        forged_digest = "sha256:" + "f" * 64
+        forged_ref = "vgen/forged-private@1.0.0"
+        claim["capabilities"] = {
+            "executors": [
+                {
+                    "type": "comfyui",
+                    "version": "1.1.0",
+                    "payload_formats": ["comfyui-api-graph/v1"],
+                    "operations": ["t2v"],
+                    "capabilities": {
+                        "capability_schema_version": 2,
+                        "model_digests": [forged_digest],
+                        "workflow_readiness": [
+                            {
+                                "workflow_ref": forged_ref,
+                                "workflow_digest": forged_digest,
+                                "state": "ready",
+                                "missing_model_digests": [],
+                                "missing_node_classes": [],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
         bad_proof = _claim_signature(DeviceKeys.generate(), claim)
         rejected_proof = client.post(
             "/api/v1/worker-enrollments/claim",
@@ -172,9 +196,10 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
         )
         assert rejected_proof.status_code == 401
         assert rejected_proof.json()["error"]["code"] == 100003
-        assert app.state.db.fetchone(
-            "SELECT state FROM enrollments WHERE id=?", (invite_id,)
-        )["state"] == "issued"
+        assert (
+            app.state.db.fetchone("SELECT state FROM enrollments WHERE id=?", (invite_id,))["state"]
+            == "issued"
+        )
 
         claim_body = {
             "invite_id": invite_id,
@@ -194,9 +219,12 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
         assert "claim" not in pending["enrollment"]
         assert "proof_signature" not in pending["enrollment"]
         assert pending["allocation"]["worker_id"] == pending["enrollment"]["subject_id"]
-        assert app.state.db.fetchone(
-            "SELECT id FROM workers WHERE id=?", (pending["allocation"]["worker_id"],)
-        ) is None
+        assert (
+            app.state.db.fetchone(
+                "SELECT id FROM workers WHERE id=?", (pending["allocation"]["worker_id"],)
+            )
+            is None
+        )
         assert (
             app.state.db.fetchone(
                 "SELECT COUNT(*) AS n FROM idempotency_records WHERE path='/api/v1/worker-enrollments/claim'"
@@ -219,6 +247,30 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
         )
         assert changed.status_code == 409
         assert changed.json()["error"]["code"] == 600002
+
+        # Simulate a v0.13.10 pending record. The rolling upgrade must verify
+        # its original proof once, scrub raw telemetry, and keep approval live.
+        legacy_record = json.loads(
+            app.state.db.fetchone("SELECT claim FROM enrollments WHERE id=?", (invite_id,))["claim"]
+        )
+        legacy_record["worker_claim"] = claim
+        legacy_record["proof_signature"] = claim_body["proof_signature"]
+        legacy_record.pop("claim_verified_at", None)
+        app.state.db.execute(
+            "UPDATE enrollments SET claim=? WHERE id=?",
+            (json.dumps(legacy_record), invite_id),
+        )
+        app.state.db.execute(
+            "DELETE FROM schema_migrations WHERE name=?",
+            ("worker-enrollment-safe-claims-v1",),
+        )
+        GatewayRepository(app.state.db)
+        migrated_record = app.state.db.fetchone(
+            "SELECT claim,state FROM enrollments WHERE id=?", (invite_id,)
+        )
+        assert migrated_record["state"] == "pending"
+        assert forged_digest not in migrated_record["claim"]
+        assert claim_body["proof_signature"] not in migrated_record["claim"]
 
         status_path = f"/api/v1/worker-enrollments/{invite_id}"
         unsigned = client.get(status_path)
@@ -244,28 +296,37 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
         assert admin_status.status_code == 200, admin_status.text
         assert admin_status.headers["cache-control"] == "no-store"
         review = admin_status.json()
-        assert review["enrollment"]["claim"] == claim
-        assert review["enrollment"]["proof_signature"] == claim_body["proof_signature"]
+        safe_claim = {**claim, "capabilities": {}}
+        assert review["enrollment"]["claim"] == safe_claim
+        assert "proof_signature" not in review["enrollment"]
+        pending_record = app.state.db.fetchone(
+            "SELECT claim FROM enrollments WHERE id=?", (invite_id,)
+        )["claim"]
+        assert forged_digest not in pending_record
+        assert claim_body["proof_signature"] not in pending_record
 
         certificate = _owner_certificate(owner, claim)
-        allocation_proof = _allocation_proof(
-            owner, claim, review["allocation"], certificate
-        )
+        allocation_proof = _allocation_proof(owner, claim, review["allocation"], certificate)
         decision_body = {
             "approve": True,
             "owner_certificate": json.dumps(certificate, separators=(",", ":")),
             "allocation_proof": allocation_proof,
         }
-        approved = client.post(
-            f"{status_path}/decision", json=decision_body, headers=headers
-        )
+        approved = client.post(f"{status_path}/decision", json=decision_body, headers=headers)
         assert approved.status_code == 200, approved.text
         active = approved.json()
         assert active["enrollment"]["state"] == "active"
         assert active["worker"]["status"] == "offline"
         assert active["worker"]["owner_user_id"] == boot["user"]["id"]
         assert active["worker"]["signing_public_key"] == claim["signing_public_key"]
+        assert forged_digest not in json.dumps(active["worker"], sort_keys=True)
         assert active["allocation"]["status"] == "active"
+        worker_row = app.state.db.fetchone(
+            "SELECT capabilities,capability_auth_enforced_at FROM workers WHERE id=?",
+            (active["worker"]["id"],),
+        )
+        assert worker_row["capability_auth_enforced_at"] is not None
+        assert forged_digest not in worker_row["capabilities"]
         rate = app.state.db.fetchone(
             "SELECT * FROM rate_cards WHERE worker_id=? AND workspace_id=? AND status='approved'",
             (active["worker"]["id"], workspace["id"]),
@@ -275,9 +336,7 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
         assert secret not in json.dumps(active, sort_keys=True)
         assert "invite_secret_hash" not in json.dumps(active, sort_keys=True)
 
-        same_decision = client.post(
-            f"{status_path}/decision", json=decision_body, headers=headers
-        )
+        same_decision = client.post(f"{status_path}/decision", json=decision_body, headers=headers)
         assert same_decision.status_code == 200, same_decision.text
         conflicting_decision = json.loads(json.dumps(decision_body))
         conflicting_decision["allocation_proof"]["payload"]["issued_at"] += 1
@@ -307,15 +366,79 @@ def test_worker_invite_claim_signed_status_and_atomic_approval(tmp_path) -> None
             },
         )
         assert session.status_code == 200, session.text
+        worker_headers = {"Authorization": f"Bearer {session.json()['session_token']}"}
+        heartbeat = client.post(
+            f"/api/v1/workers/{active['worker']['id']}/heartbeat",
+            json={"capabilities": claim["capabilities"]},
+            headers=worker_headers,
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        worker_row = app.state.db.fetchone(
+            "SELECT * FROM workers WHERE id=?", (active["worker"]["id"],)
+        )
+        assert forged_digest not in worker_row["capabilities"]
+        shown = client.get("/api/v1/workers", headers=headers)
+        assert shown.status_code == 200, shown.text
+        assert forged_digest not in shown.text
+        assert not app.state.repository._matches_requirements(
+            worker_row,
+            {},
+            workflow_ref=forged_ref,
+            workflow_digest=forged_digest,
+        )
+
+
+def test_invalid_legacy_pending_worker_claim_expires_fail_closed(tmp_path) -> None:
+    app, client, _, headers, _, workspace, pool = _setup(tmp_path)
+    with client:
+        _, invite_id, secret = _invite(client, headers, workspace, pool)
+        worker = DeviceKeys.generate()
+        claim = _claim(worker, invite_id)
+        claimed = client.post(
+            "/api/v1/worker-enrollments/claim",
+            json={
+                "invite_id": invite_id,
+                "secret": secret,
+                "claim": claim,
+                "proof_signature": _claim_signature(worker, claim),
+            },
+        )
+        assert claimed.status_code == 200, claimed.text
+
+        legacy_record = json.loads(
+            app.state.db.fetchone(
+                "SELECT claim FROM enrollments WHERE id=?", (invite_id,)
+            )["claim"]
+        )
+        legacy_record["worker_claim"] = claim
+        legacy_record["proof_signature"] = "invalid-proof"
+        legacy_record.pop("claim_verified_at", None)
+        app.state.db.execute(
+            "UPDATE enrollments SET claim=? WHERE id=?",
+            (json.dumps(legacy_record), invite_id),
+        )
+        app.state.db.execute(
+            "DELETE FROM schema_migrations WHERE name=?",
+            ("worker-enrollment-safe-claims-v1",),
+        )
+
+        GatewayRepository(app.state.db)
+
+        migrated = app.state.db.fetchone(
+            "SELECT state,invite_secret_hash,claim FROM enrollments WHERE id=?",
+            (invite_id,),
+        )
+        assert migrated["state"] == "expired"
+        assert migrated["invite_secret_hash"] is None
+        assert set(json.loads(migrated["claim"])) == {"config"}
+        assert claim["signing_public_key"] not in migrated["claim"]
 
 
 def test_worker_enrollment_reject_expiry_and_timestamp_bounds(tmp_path) -> None:
     app, client, _, headers, owner, workspace, pool = _setup(tmp_path)
     with client:
         _, expired_id, expired_secret = _invite(client, headers, workspace, pool)
-        app.state.db.execute(
-            "UPDATE enrollments SET expires_at=0 WHERE id=?", (expired_id,)
-        )
+        app.state.db.execute("UPDATE enrollments SET expires_at=0 WHERE id=?", (expired_id,))
         expired_worker = DeviceKeys.generate()
         expired_claim = _claim(expired_worker, expired_id)
         expired = client.post(
@@ -360,9 +483,10 @@ def test_worker_enrollment_reject_expiry_and_timestamp_bounds(tmp_path) -> None:
         )
         assert old_certificate_decision.status_code == 401
         assert old_certificate_decision.json()["error"]["code"] == 110002
-        assert app.state.db.fetchone(
-            "SELECT state FROM enrollments WHERE id=?", (invite_id,)
-        )["state"] == "pending"
+        assert (
+            app.state.db.fetchone("SELECT state FROM enrollments WHERE id=?", (invite_id,))["state"]
+            == "pending"
+        )
 
         certificate = _owner_certificate(owner, claim)
         old_proof = _allocation_proof(
@@ -383,10 +507,13 @@ def test_worker_enrollment_reject_expiry_and_timestamp_bounds(tmp_path) -> None:
         )
         assert old_proof_decision.status_code == 422
         assert old_proof_decision.json()["error"]["code"] == 230004
-        assert app.state.db.fetchone(
-            "SELECT id FROM workers WHERE signing_public_key=?",
-            (claim["signing_public_key"],),
-        ) is None
+        assert (
+            app.state.db.fetchone(
+                "SELECT id FROM workers WHERE signing_public_key=?",
+                (claim["signing_public_key"],),
+            )
+            is None
+        )
 
         rejected = client.post(
             f"/api/v1/worker-enrollments/{invite_id}/decision",
@@ -416,10 +543,7 @@ def test_worker_enrollment_reject_expiry_and_timestamp_bounds(tmp_path) -> None:
 
 
 def test_worker_enrollment_secret_routes_disable_response_replay_cache(tmp_path) -> None:
-    assert (
-        idempotency_cache_mode("/api/v1/workspaces/wsp_example/worker-invites")
-        == "disabled"
-    )
+    assert idempotency_cache_mode("/api/v1/workspaces/wsp_example/worker-invites") == "disabled"
     assert idempotency_cache_mode("/api/v1/worker-enrollments/claim") == "disabled"
     assert idempotency_cache_mode("/api/v1/worker-enrollments/inv_example/decision") == "plain"
 
@@ -430,9 +554,7 @@ def test_worker_enrollment_secret_routes_disable_response_replay_cache(tmp_path)
         artifact_root=str(tmp_path / "openapi-artifacts"),
     )
     schema = app.openapi()
-    status_operation = schema["paths"][
-        "/api/v1/worker-enrollments/{enrollment_id}"
-    ]["get"]
+    status_operation = schema["paths"]["/api/v1/worker-enrollments/{enrollment_id}"]["get"]
     assert status_operation["security"] == [
         {"VGenSession": []},
         {"VGenWorkerEnrollmentSignature": []},

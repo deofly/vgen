@@ -112,6 +112,7 @@ class ErrorCode(IntEnum):
     WORKFLOW_NOT_FOUND = 320006
     WORKFLOW_SIGNATURE_INVALID = 320007
     EXECUTION_CANCELLED = 320008
+    SYSTEM_OUT_OF_MEMORY = 320009
 
     # 33xxxx: artifact / storage
     INPUT_DOWNLOAD_FAILED = 330001
@@ -515,6 +516,14 @@ _ERROR_SPECS = (
     _spec(
         ErrorCode.GPU_OUT_OF_MEMORY,
         "The worker GPU does not have enough memory.",
+        503,
+        ErrorOrigin.EXECUTOR,
+        retry=RetryAction.ANOTHER_WORKER,
+        responsibility=Responsibility.PROVIDER,
+    ),
+    _spec(
+        ErrorCode.SYSTEM_OUT_OF_MEMORY,
+        "The worker does not have enough system memory.",
         503,
         ErrorOrigin.EXECUTOR,
         retry=RetryAction.ANOTHER_WORKER,

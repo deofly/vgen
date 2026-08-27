@@ -16,17 +16,26 @@ from vgen.cli.identity_store import DeviceIdentityStore
 from vgen.cli.main import (
     _apply_model_install,
     _apply_worker_update,
+    _apply_workflow_install,
     _broker_command,
+    _is_trusted_bundled_workflow_release,
+    _maintenance_intent_owns_job,
     _reject_known_insufficient_workflow_resources,
     _resolve_workflow,
     _unique_model_requirements,
     _worker_command,
+    _worker_supports_bound_capability_spec,
     build_parser,
     main,
 )
 from vgen.crypto import verify_maintenance_intent
 from vgen.market.models import WorkflowManifest
-from vgen.market.registry import WorkflowRegistry, write_checksums
+from vgen.market.registry import (
+    RegistryError,
+    WorkflowRegistry,
+    validate_package,
+    write_checksums,
+)
 from vgen.protocol import ErrorCode
 
 
@@ -77,14 +86,25 @@ class MaintenanceClient:
         self.manager_calls: list[tuple[str, str | None]] = []
         self.created: list[dict[str, Any]] = []
         self.committed: list[str] = []
+        self.requests: list[tuple[str, str, dict[str, Any]]] = []
         self.terminal_job = terminal_job
         self.worker_after_commit = worker_after_commit
         self.closed = False
 
-    def request(self, method: str, path: str, **_: Any) -> Any:
-        assert method == "GET"
-        assert path == "/api/v1/workers"
-        return [dict(self.worker)]
+    def request(self, method: str, path: str, **kwargs: Any) -> Any:
+        self.requests.append((method, path, kwargs))
+        if method == "GET" and path == "/api/v1/workers":
+            return [dict(self.worker)]
+        if method == "POST" and path.endswith("/workflows/deactivate"):
+            body = kwargs.get("json_body")
+            source_scoped = isinstance(body, dict) and body.get("authorization_source_id")
+            return {
+                "state": (
+                    "authorization_source_revoked" if source_scoped else "deactivated"
+                ),
+                "scope": "authorization_source" if source_scoped else "workflow",
+            }
+        raise AssertionError(f"unexpected request: {method} {path}")
 
     def set_worker_manager(self, worker_id: str, broker_id: str | None) -> dict[str, Any]:
         self.manager_calls.append((worker_id, broker_id))
@@ -100,6 +120,8 @@ class MaintenanceClient:
         response = {
             "id": "mtn_example",
             "state": "awaiting_upload" if uploads_artifact else "queued",
+            "creation_disposition": "created",
+            "intent_owns_job": True,
         }
         if uploads_artifact:
             response["artifact_id"] = "art_update"
@@ -142,6 +164,18 @@ def _identity():  # type: ignore[no-untyped-def]
     return DeviceIdentityStore(MemorySecrets()).initialize()[1]
 
 
+def test_maintenance_job_ownership_is_fail_closed_for_legacy_or_invalid_metadata() -> None:
+    assert _maintenance_intent_owns_job({"id": "mtj_legacy"}) is False
+    with pytest.raises(ValueError, match="invalid maintenance job ownership"):
+        _maintenance_intent_owns_job(
+            {
+                "id": "mtj_invalid",
+                "creation_disposition": "deduplicated",
+                "intent_owns_job": True,
+            }
+        )
+
+
 def test_shared_model_placements_become_one_signed_download_request() -> None:
     shared = {
         "sha256": "a" * 64,
@@ -157,12 +191,18 @@ def test_shared_model_placements_become_one_signed_download_request() -> None:
 
     assert _unique_model_requirements([first, second]) == [first]
 
-    conflicting = SimpleNamespace(
+    corrected_provenance = SimpleNamespace(
         **{**shared, "license": "LicenseRef-Different"},
         path="clip/shared.safetensors",
     )
-    with pytest.raises(ValueError, match="conflicting source, size, or license"):
-        _unique_model_requirements([first, conflicting])
+    assert _unique_model_requirements([first, corrected_provenance]) == [first]
+
+    conflicting_size = SimpleNamespace(
+        **{**shared, "size": 456},
+        path="clip/shared.safetensors",
+    )
+    with pytest.raises(ValueError, match="conflicting byte sizes"):
+        _unique_model_requirements([first, conflicting_size])
 
 
 def test_ltx_release_is_installed_from_digest_pinned_cli_bundle(
@@ -179,10 +219,42 @@ def test_ltx_release_is_installed_from_digest_pinned_cli_bundle(
     assert path.is_relative_to(registry.root)
 
 
+def test_workflow_resolution_fails_closed_when_custom_can_shadow_market(
+    tmp_path: Path,
+) -> None:
+    registry = WorkflowRegistry(tmp_path / "registry")
+    custom = (
+        registry.root
+        / "custom"
+        / "vgen"
+        / "ltx-2.5-distilled-t2v"
+        / "9.0.0"
+    )
+    custom.mkdir(parents=True)
+    _tiny_ltx_workflow(custom)
+    raw = yaml.safe_load((custom / "manifest.yaml").read_text(encoding="utf-8"))
+    raw["version"] = "9.0.0"
+    raw["provenance"] = "custom"
+    (custom / "manifest.yaml").write_text(
+        yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+    )
+    write_checksums(custom)
+
+    with pytest.raises(RegistryError, match="both market and custom workflow releases"):
+        _resolve_workflow("vgen/ltx-2.5-distilled-t2v", registry=registry)
+
+    # An exact version that exists only in custom is unambiguous and must not
+    # depend on registry glob order.
+    manifest, path, _digest = _resolve_workflow(
+        "vgen/ltx-2.5-distilled-t2v@9.0.0", registry=registry
+    )
+    assert manifest.provenance == "custom"
+    assert path == custom
+
+
 def test_workflow_install_rejects_known_insufficient_vram_before_upload() -> None:
     manifest = WorkflowManifest.load(
-        Path(__file__).parents[2]
-        / "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/manifest.yaml"
+        Path(__file__).parents[2] / "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0/manifest.yaml"
     )
     worker = {
         "capabilities": {
@@ -208,10 +280,7 @@ def test_workflow_install_rejects_known_insufficient_vram_before_upload() -> Non
 def test_model_install_rejects_known_insufficient_vram_before_download(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    package = (
-        Path(__file__).parents[2]
-        / "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0"
-    )
+    package = Path(__file__).parents[2] / "workflows/vgen/ltx-2.5-distilled-t2v/1.0.0"
     manifest = WorkflowManifest.load(package / "manifest.yaml")
     worker = _worker()
     worker["capabilities"] = {
@@ -256,6 +325,7 @@ def _worker(*, manager: str | None = "brk_home") -> dict[str, Any]:
         "manager_broker_id": manager,
         "executor_type": "comfyui",
         "capabilities": {"model_digests": []},
+        "gateway_protocol_features": {"capability_install_spec_version": 2},
     }
 
 
@@ -340,6 +410,11 @@ def test_parser_exposes_simple_broker_maintenance_commands() -> None:
         ]
     )
     assert workflow.broker_action == "workflow-install"
+    deactivate = build_parser().parse_args(
+        ["broker", "workflow-deactivate", "vgen/ltx-2.5-gguf-q4-t2v@1.0.2"]
+    )
+    assert deactivate.broker_action == "workflow-deactivate"
+    assert deactivate.workflow == "vgen/ltx-2.5-gguf-q4-t2v@1.0.2"
     assert workflow.approve_nodes is True
     assert workflow.allow_unsigned is True
 
@@ -540,6 +615,190 @@ def test_model_install_only_sends_missing_digests(
     assert client.committed == []
 
 
+def test_bundled_workflow_install_uses_exact_cli_digest_as_local_trust_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = (
+        Path(__file__).parents[2]
+        / "workflows/vgen/minimax-h3-8step/1.0.0"
+    )
+    manifest, digest, signed = validate_package(package, allow_unsigned=True)
+    assert signed is False
+    assert _is_trusted_bundled_workflow_release(manifest, digest) is True
+
+    workflow_ref = f"{manifest.id}@{manifest.version}"
+    model_digests = [
+        f"sha256:{model.sha256}" for model in manifest.variants[0].models
+    ]
+    worker_after_commit = _worker()
+    worker_after_commit["capabilities"] = {
+        "capability_install_spec_version": 2,
+        "maintenance_actions": ["worker_update", "model_install", "capability_install"],
+        "executors": [
+            {
+                "type": "comfyui",
+                "capabilities": {
+                    "capability_schema_version": 2,
+                    "model_digests": model_digests,
+                    "workflow_readiness": [
+                        {
+                            "workflow_ref": workflow_ref,
+                            "workflow_digest": f"sha256:{digest}",
+                            "state": "ready",
+                            "missing_model_digests": [],
+                            "missing_node_classes": [],
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+    worker = _worker()
+    worker["capabilities"] = {
+        "capability_install_spec_version": 2,
+        "maintenance_actions": ["worker_update", "model_install", "capability_install"],
+        "executors": [
+            {
+                "type": "comfyui",
+                "capabilities": {
+                    "capability_schema_version": 2,
+                    "model_digests": model_digests,
+                    "workflow_readiness": [],
+                },
+            }
+        ],
+    }
+    client = MaintenanceClient(
+        worker,
+        terminal_job={
+            "id": "mtn_example",
+            "state": "succeeded",
+            "result": {"kind": "capability_install", "status": "activated"},
+        },
+        worker_after_commit=worker_after_commit,
+    )
+    identity = _identity()
+    adapter = RecordingArtifactAdapter()
+    monkeypatch.setattr(
+        "vgen.cli.main._profile_and_identity",
+        lambda _: (client.profile, identity),
+    )
+    monkeypatch.setattr("vgen.cli.main.HttpArtifactAdapter", lambda: adapter)
+    monkeypatch.setattr(
+        "vgen.cli.main._resolve_workflow",
+        lambda _: (manifest, package, digest),
+    )
+
+    result = _apply_workflow_install(
+        client,
+        argparse.Namespace(
+            workflow=workflow_ref,
+            worker=None,
+            broker=None,
+            approve_nodes=False,
+            allow_unsigned=False,
+            wait=False,
+            interval=0.01,
+            timeout=1,
+        ),
+    )
+
+    assert result["models"]["state"] == "already_satisfied"
+    assert len(client.created) == 1
+    capability = client.created[0]["spec"]
+    assert capability["workflow_digest"] == f"sha256:{digest}"
+    assert capability["allow_unsigned_workflow"] is True
+    assert capability["publisher_key"] is None
+    assert len(adapter.contents) == 1
+
+
+def test_bundled_workflow_trust_rejects_custom_legacy_or_changed_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = (
+        Path(__file__).parents[2]
+        / "workflows/vgen/minimax-h3-8step/1.0.0"
+    )
+    official, digest, _ = validate_package(package, allow_unsigned=True)
+    assert _is_trusted_bundled_workflow_release(official, "0" * 64) is False
+    assert (
+        _is_trusted_bundled_workflow_release(
+            official.model_copy(update={"provenance": "custom"}),
+            digest,
+        )
+        is False
+    )
+    assert (
+        _is_trusted_bundled_workflow_release(
+            official.model_copy(update={"version": "0.9.0"}),
+            digest,
+        )
+        is False
+    )
+
+    changed_manifest, changed_digest = _tiny_ltx_workflow(tmp_path)
+    worker = _worker()
+    worker["capabilities"] = {
+        "capability_install_spec_version": 2,
+        "maintenance_actions": ["worker_update", "model_install", "capability_install"],
+    }
+    client = MaintenanceClient(worker)
+    approvals: list[bool] = []
+
+    def require_explicit_approval(
+        _workflow_ref: str,
+        _node_classes: list[str],
+        *,
+        approved: bool,
+    ) -> None:
+        approvals.append(approved)
+        if not approved:
+            raise ValueError("explicit node approval is required")
+
+    monkeypatch.setattr(
+        "vgen.cli.main._resolve_workflow",
+        lambda _: (changed_manifest, tmp_path, changed_digest),
+    )
+    monkeypatch.setattr(
+        "vgen.cli.main._approve_capability_nodes",
+        require_explicit_approval,
+    )
+
+    with pytest.raises(ValueError, match="explicit node approval"):
+        _apply_workflow_install(
+            client,
+            argparse.Namespace(
+                workflow=f"{changed_manifest.id}@{changed_manifest.version}",
+                worker=None,
+                broker=None,
+                approve_nodes=False,
+                allow_unsigned=False,
+                wait=False,
+                interval=0.01,
+                timeout=1,
+            ),
+        )
+
+    with pytest.raises(RegistryError, match="workflow is unsigned"):
+        _apply_workflow_install(
+            client,
+            argparse.Namespace(
+                workflow=f"{changed_manifest.id}@{changed_manifest.version}",
+                worker=None,
+                broker=None,
+                approve_nodes=True,
+                allow_unsigned=False,
+                wait=False,
+                interval=0.01,
+                timeout=1,
+            ),
+        )
+
+    assert approvals == [False, True]
+    assert client.created == []
+
+
 def test_workflow_install_uploads_reviewed_pack_then_requests_only_reported_models(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -571,6 +830,8 @@ def test_workflow_install_uploads_reviewed_pack_then_requests_only_reported_mode
     }
     worker = _worker()
     worker["capabilities"] = {
+        "worker_runtime_version": "0.13.11",
+        "capability_install_spec_version": 2,
         "maintenance_actions": ["worker_update", "model_install", "capability_install"],
         "executors": [
             {
@@ -624,6 +885,8 @@ def test_workflow_install_uploads_reviewed_pack_then_requests_only_reported_mode
     assert capability["allow_unsigned_workflow"] is True
     assert capability["publisher_key"] is None
     assert len(capability["node_classes_digest"]) == 64
+    assert capability["model_digests"] == [model_digest]
+    assert capability["node_classes"]
     assert len(adapter.contents) == 1
     assert hashlib.sha256(adapter.contents[0]).hexdigest() == capability["artifact_sha256"]
     assert len(adapter.contents[0]) == capability["artifact_size"]
@@ -643,6 +906,371 @@ def test_workflow_install_uploads_reviewed_pack_then_requests_only_reported_mode
         expected_kind="capability_install",
         expected_spec=capability,
     )
+
+
+@pytest.mark.parametrize("activation_status", ["activated", "already_active", "repaired"])
+def test_failed_workflow_install_rolls_back_only_its_maintenance_authorization(
+    activation_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, digest = _tiny_ltx_workflow(tmp_path)
+    workflow_ref = f"{manifest.id}@{manifest.version}"
+    worker = _worker()
+    worker["capabilities"] = {
+        "worker_runtime_version": "0.13.11",
+        "capability_install_spec_version": 2,
+        "maintenance_actions": ["worker_update", "model_install", "capability_install"],
+        "executors": [
+            {
+                "type": "comfyui",
+                "capabilities": {
+                    "capability_schema_version": 2,
+                    "model_digests": [],
+                    "workflow_readiness": [],
+                },
+            }
+        ],
+    }
+    worker_after_commit = json.loads(json.dumps(worker))
+    worker_after_commit["capabilities"]["executors"][0]["capabilities"][
+        "workflow_readiness"
+    ] = [
+        {
+            "workflow_ref": workflow_ref,
+            "workflow_digest": f"sha256:{digest}",
+            "state": "missing_nodes",
+            "missing_model_digests": [],
+            "missing_node_classes": ["UntrustedNode"],
+        }
+    ]
+    client = MaintenanceClient(
+        worker,
+        terminal_job={
+            "id": "mtn_example",
+            "state": "succeeded",
+            "result": {"kind": "capability_install", "status": activation_status},
+        },
+        worker_after_commit=worker_after_commit,
+    )
+    identity = _identity()
+    monkeypatch.setattr("vgen.cli.main._profile_and_identity", lambda _: (client.profile, identity))
+    monkeypatch.setattr("vgen.cli.main.HttpArtifactAdapter", RecordingArtifactAdapter)
+    monkeypatch.setattr(
+        "vgen.cli.main._resolve_workflow",
+        lambda _: (manifest, tmp_path, digest),
+    )
+
+    with pytest.raises(ValueError, match="missing_nodes"):
+        _apply_workflow_install(
+            client,
+            argparse.Namespace(
+                workflow=workflow_ref,
+                worker=None,
+                broker=None,
+                approve_nodes=True,
+                allow_unsigned=True,
+                wait=True,
+                interval=0.01,
+                timeout=1,
+            ),
+        )
+
+    rollback_requests = [
+        request
+        for request in client.requests
+        if request[0] == "POST" and request[1].endswith("/workflows/deactivate")
+    ]
+    assert len(rollback_requests) == 1
+    assert rollback_requests[0][2]["json_body"] == {
+        "workflow_ref": workflow_ref,
+        "workflow_digest": f"sha256:{digest}",
+        "authorization_source_id": "mtn_example",
+    }
+
+
+def test_failed_legacy_deduplicated_workflow_install_does_not_rollback_shared_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, digest = _tiny_ltx_workflow(tmp_path)
+    workflow_ref = f"{manifest.id}@{manifest.version}"
+    worker = _worker()
+    worker["capabilities"] = {
+        "worker_runtime_version": "0.13.11",
+        "capability_install_spec_version": 2,
+        "maintenance_actions": ["worker_update", "model_install", "capability_install"],
+        "executors": [
+            {
+                "type": "comfyui",
+                "capabilities": {
+                    "capability_schema_version": 2,
+                    "model_digests": [],
+                    "workflow_readiness": [],
+                },
+            }
+        ],
+    }
+    worker_after_commit = json.loads(json.dumps(worker))
+    worker_after_commit["capabilities"]["executors"][0]["capabilities"][
+        "workflow_readiness"
+    ] = [
+        {
+            "workflow_ref": workflow_ref,
+            "workflow_digest": f"sha256:{digest}",
+            "state": "missing_nodes",
+            "missing_model_digests": [],
+            "missing_node_classes": ["UntrustedNode"],
+        }
+    ]
+
+    class DeduplicatedMaintenanceClient(MaintenanceClient):
+        """Model an older Gateway that may share an active capability job."""
+
+        def create_worker_maintenance(self, **values: Any) -> dict[str, Any]:
+            response = super().create_worker_maintenance(**values)
+            self.worker = json.loads(json.dumps(worker_after_commit))
+            response.pop("artifact_id", None)
+            response.pop("upload_ticket", None)
+            response.update(
+                {
+                    "state": "queued",
+                    "creation_disposition": "deduplicated",
+                    "intent_owns_job": False,
+                }
+            )
+            return response
+
+    client = DeduplicatedMaintenanceClient(
+        worker,
+        terminal_job={
+            "id": "mtn_example",
+            "state": "succeeded",
+            "result": {"kind": "capability_install", "status": "activated"},
+        },
+        worker_after_commit=worker_after_commit,
+    )
+    identity = _identity()
+    monkeypatch.setattr("vgen.cli.main._profile_and_identity", lambda _: (client.profile, identity))
+    monkeypatch.setattr(
+        "vgen.cli.main._resolve_workflow",
+        lambda _: (manifest, tmp_path, digest),
+    )
+
+    with pytest.raises(ValueError, match="missing_nodes"):
+        _apply_workflow_install(
+            client,
+            argparse.Namespace(
+                workflow=workflow_ref,
+                worker=None,
+                broker=None,
+                approve_nodes=True,
+                allow_unsigned=True,
+                wait=True,
+                interval=0.01,
+                timeout=1,
+            ),
+        )
+
+    assert not any(
+        request[0] == "POST" and request[1].endswith("/workflows/deactivate")
+        for request in client.requests
+    )
+
+
+def test_final_readiness_failure_rolls_back_succeeded_capability_and_model_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, digest = _tiny_ltx_workflow(tmp_path)
+    workflow_ref = f"{manifest.id}@{manifest.version}"
+    workflow_digest = f"sha256:{digest}"
+    model_digest = "sha256:" + manifest.variants[0].models[0].sha256
+    capability_job_id = "mtj_" + "a" * 26
+    model_job_id = "mtj_" + "b" * 26
+    worker = _worker()
+    worker["capabilities"] = {
+        "worker_runtime_version": "0.13.11",
+        "capability_install_spec_version": 2,
+        "maintenance_actions": ["worker_update", "model_install", "capability_install"],
+        "executors": [
+            {
+                "type": "comfyui",
+                "capabilities": {
+                    "capability_schema_version": 2,
+                    "model_digests": [],
+                    "workflow_readiness": [],
+                },
+            }
+        ],
+    }
+    after_capability = json.loads(json.dumps(worker))
+    after_capability["capabilities"]["executors"][0]["capabilities"][
+        "workflow_readiness"
+    ] = [
+        {
+            "workflow_ref": workflow_ref,
+            "workflow_digest": workflow_digest,
+            "state": "missing_models",
+            "missing_model_digests": [model_digest],
+            "missing_node_classes": [],
+        }
+    ]
+    after_model = json.loads(json.dumps(after_capability))
+    after_model["capabilities"]["executors"][0]["capabilities"][
+        "workflow_readiness"
+    ] = [
+        {
+            "workflow_ref": workflow_ref,
+            "workflow_digest": workflow_digest,
+            "state": "missing_nodes",
+            "missing_model_digests": [],
+            "missing_node_classes": ["UntrustedNode"],
+        }
+    ]
+
+    class SequencedMaintenanceClient(MaintenanceClient):
+        def create_worker_maintenance(self, **values: Any) -> dict[str, Any]:
+            response = super().create_worker_maintenance(**values)
+            job_id = (
+                capability_job_id
+                if values["spec"]["kind"] == "capability_install"
+                else model_job_id
+            )
+            response["id"] = job_id
+            return response
+
+        def get_worker_maintenance(self, job_id: str) -> dict[str, Any]:
+            if job_id == capability_job_id:
+                return {
+                    "id": capability_job_id,
+                    "state": "succeeded",
+                    "result": {"kind": "capability_install", "status": "activated"},
+                }
+            if job_id == model_job_id:
+                self.worker = json.loads(json.dumps(after_model))
+                return {
+                    "id": model_job_id,
+                    "state": "succeeded",
+                    "result": {"kind": "model_install", "status": "installed"},
+                }
+            raise AssertionError(f"unexpected maintenance job: {job_id}")
+
+    client = SequencedMaintenanceClient(
+        worker,
+        worker_after_commit=after_capability,
+    )
+    identity = _identity()
+    monkeypatch.setattr("vgen.cli.main._profile_and_identity", lambda _: (client.profile, identity))
+    monkeypatch.setattr("vgen.cli.main.HttpArtifactAdapter", RecordingArtifactAdapter)
+    monkeypatch.setattr(
+        "vgen.cli.main._resolve_workflow",
+        lambda _: (manifest, tmp_path, digest),
+    )
+
+    with pytest.raises(ValueError, match="missing_nodes"):
+        _apply_workflow_install(
+            client,
+            argparse.Namespace(
+                workflow=workflow_ref,
+                worker=None,
+                broker=None,
+                approve_nodes=True,
+                allow_unsigned=True,
+                wait=True,
+                interval=0.01,
+                timeout=1,
+            ),
+        )
+
+    rollback_sources = {
+        request[2]["json_body"]["authorization_source_id"]
+        for request in client.requests
+        if request[0] == "POST" and request[1].endswith("/workflows/deactivate")
+    }
+    assert rollback_sources == {capability_job_id, model_job_id}
+
+
+def test_model_install_exposes_created_source_before_wait_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, digest = _tiny_ltx_workflow(tmp_path)
+    workflow_ref = f"{manifest.id}@{manifest.version}"
+    model_digest = "sha256:" + manifest.variants[0].models[0].sha256
+    worker = _worker()
+    worker["capabilities"] = {
+        "worker_runtime_version": "0.13.11",
+        "maintenance_actions": ["model_install"],
+        "executors": [
+            {
+                "type": "comfyui",
+                "capabilities": {
+                    "workflow_readiness": [
+                        {
+                            "workflow_ref": workflow_ref,
+                            "workflow_digest": f"sha256:{digest}",
+                            "state": "missing_models",
+                            "missing_model_digests": [model_digest],
+                            "missing_node_classes": [],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    client = MaintenanceClient(worker)
+    identity = _identity()
+    monkeypatch.setattr("vgen.cli.main._profile_and_identity", lambda _: (client.profile, identity))
+    monkeypatch.setattr(
+        "vgen.cli.main._resolve_workflow",
+        lambda _: (manifest, tmp_path, digest),
+    )
+
+    def fail_wait(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("maintenance wait timed out")
+
+    monkeypatch.setattr("vgen.cli.main._wait_for_maintenance", fail_wait)
+    created_sources: list[str] = []
+
+    with pytest.raises(TimeoutError, match="maintenance wait timed out"):
+        _apply_model_install(
+            client,
+            argparse.Namespace(
+                workflow=workflow_ref,
+                worker=None,
+                broker=None,
+                wait=True,
+                interval=0.01,
+                timeout=1,
+            ),
+            created_authorization_source_ids=created_sources,
+        )
+
+    assert created_sources == ["mtn_example"]
+
+
+@pytest.mark.parametrize(
+    ("gateway_feature", "worker_feature", "supported"),
+    [
+        (None, None, False),  # old Gateway, old Worker
+        (2, None, False),  # new Gateway, old Worker
+        (None, 2, False),  # old Gateway, new Worker
+        (2, 2, True),  # new Gateway, new Worker
+        (1, 2, False),
+        (2, 1, False),
+    ],
+)
+def test_bound_capability_spec_requires_gateway_and_worker_feature_bits(
+    gateway_feature, worker_feature, supported
+) -> None:
+    worker = _worker()
+    worker.pop("gateway_protocol_features")
+    if gateway_feature is not None:
+        worker["gateway_protocol_features"] = {"capability_install_spec_version": gateway_feature}
+    if worker_feature is not None:
+        worker["capabilities"]["capability_install_spec_version"] = worker_feature
+    assert _worker_supports_bound_capability_spec(worker) is supported
 
 
 def test_workflow_install_requires_upgraded_worker_before_local_packaging(
@@ -739,9 +1367,7 @@ def test_workflow_install_skips_upload_when_exact_release_is_already_ready(
     ],
 )
 def test_maintenance_requires_explicit_manager_binding(
-    manager: str | None,
-    message: str,
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    manager: str | None, message: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = MaintenanceClient(_worker(manager=manager))
     monkeypatch.setattr("vgen.cli.main._client", lambda _: client)

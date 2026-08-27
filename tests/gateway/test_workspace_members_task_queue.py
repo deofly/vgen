@@ -94,6 +94,26 @@ def _add_worker(app, owner_id: str, workspace_id: str, pool_id: str, owner_ident
         """UPDATE workers SET status='active',last_seen_at=?,updated_at=? WHERE id=?""",
         (stamp, stamp, worker["id"]),
     )
+    # This fixture intentionally exercises four synthetic workflow digests.
+    # Production ComfyUI workers obtain these rows from a signed capability
+    # receipt (or the narrowly pinned H3 compatibility bridge), never from a
+    # heartbeat.
+    for marker in ("a", "b", "c", "d"):
+        digest = "sha256:" + marker * 64
+        app.state.db.execute(
+            """INSERT INTO worker_workflow_authorizations
+               (worker_id,workflow_ref,workflow_digest,spec_digest,
+                authorization_source_id,node_classes,authorized_at)
+               VALUES (?,?,?,?,?,'[]',?)""",
+            (
+                worker["id"],
+                "vgen/test@1.0.0",
+                digest,
+                digest,
+                f"test-fixture:{marker}",
+                stamp,
+            ),
+        )
     app.state.db.execute(
         """INSERT INTO worker_allocations
            (id,worker_id,workspace_id,pool_id,owner_consent_at,workspace_approved_at,
@@ -177,9 +197,7 @@ def test_single_worker_queues_tasks_and_reports_members_with_worker_usage(tmp_pa
             headers=owner_headers,
         ).json()
         member_id, member_headers = _add_member(app, workspace["id"])
-        worker = _add_worker(
-            app, boot["user"]["id"], workspace["id"], pool["id"], owner_identity
-        )
+        worker = _add_worker(app, boot["user"]["id"], workspace["id"], pool["id"], owner_identity)
 
         first = _submit(client, owner_headers, workspace["id"], pool["id"], "a-first")
         assert first["state"] == "queued"
@@ -209,9 +227,7 @@ def test_single_worker_queues_tasks_and_reports_members_with_worker_usage(tmp_pa
         assert lease["task_id"] == first["id"]
         assert app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60) is None
 
-        roster = client.get(
-            f"/api/v1/workspaces/{workspace['id']}/members", headers=owner_headers
-        )
+        roster = client.get(f"/api/v1/workspaces/{workspace['id']}/members", headers=owner_headers)
         assert roster.status_code == 200, roster.text
         assert roster.json()["active_total"] == 2
         members = {item["user_id"]: item for item in roster.json()["members"]}
@@ -255,9 +271,7 @@ def test_single_worker_advances_queue_after_terminal_state(tmp_path, terminal_st
             headers=owner_headers,
         ).json()
         _, member_headers = _add_member(app, workspace["id"])
-        worker = _add_worker(
-            app, boot["user"]["id"], workspace["id"], pool["id"], owner_identity
-        )
+        worker = _add_worker(app, boot["user"]["id"], workspace["id"], pool["id"], owner_identity)
         first = _submit(client, owner_headers, workspace["id"], pool["id"], "a-first")
         second = _submit(client, member_headers, workspace["id"], pool["id"], "b-second")
 
@@ -271,9 +285,7 @@ def test_single_worker_advances_queue_after_terminal_state(tmp_path, terminal_st
         }
 
         if terminal_state == "cancelled_before_start":
-            app.state.repository.cancel_task(
-                task_id=first["id"], user_id=boot["user"]["id"]
-            )
+            app.state.repository.cancel_task(task_id=first["id"], user_id=boot["user"]["id"])
         else:
             app.state.repository.heartbeat_attempt(
                 **reference,
@@ -281,13 +293,8 @@ def test_single_worker_advances_queue_after_terminal_state(tmp_path, terminal_st
                 started=True,
             )
             if terminal_state == "cancelled_while_running":
-                app.state.repository.cancel_task(
-                    task_id=first["id"], user_id=boot["user"]["id"]
-                )
-                assert (
-                    app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60)
-                    is None
-                )
+                app.state.repository.cancel_task(task_id=first["id"], user_id=boot["user"]["id"])
+                assert app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60) is None
                 succeeded = False
                 failure_code = int(ErrorCode.EXECUTION_CANCELLED)
                 responsibility = "consumer"
@@ -336,12 +343,8 @@ def test_graceful_leave_rekeys_queued_task_then_revokes_after_running_attempt(tm
         ).json()
         _, member_headers = _add_member(app, workspace["id"])
         worker = _add_worker(app, owner_id, workspace["id"], pool["id"], owner_identity)
-        running_task = _submit(
-            client, owner_headers, workspace["id"], pool["id"], "a-running"
-        )
-        queued_task = _submit(
-            client, member_headers, workspace["id"], pool["id"], "b-queued"
-        )
+        running_task = _submit(client, owner_headers, workspace["id"], pool["id"], "a-running")
+        queued_task = _submit(client, member_headers, workspace["id"], pool["id"], "b-queued")
         lease = app.state.repository.lease(worker_id=worker["id"], ttl_seconds=60)
         assert lease is not None
         app.state.repository.heartbeat_attempt(
@@ -357,9 +360,12 @@ def test_graceful_leave_rekeys_queued_task_then_revokes_after_running_attempt(tm
         )
 
         assert left["status"] == "draining"
-        assert app.state.db.fetchone(
-            "SELECT state FROM tasks WHERE id=?", (queued_task["id"],)
-        )["state"] == "rekey_required"
+        assert (
+            app.state.db.fetchone("SELECT state FROM tasks WHERE id=?", (queued_task["id"],))[
+                "state"
+            ]
+            == "rekey_required"
+        )
         queued_attempt = app.state.db.fetchone(
             "SELECT state,responsibility,failure_code FROM task_attempts WHERE task_id=?",
             (queued_task["id"],),
@@ -382,12 +388,18 @@ def test_graceful_leave_rekeys_queued_task_then_revokes_after_running_attempt(tm
             responsibility="none",
             safe_failure_details={},
         )
-        assert app.state.db.fetchone(
-            "SELECT state FROM tasks WHERE id=?", (running_task["id"],)
-        )["state"] == "succeeded"
-        assert app.state.db.fetchone(
-            "SELECT status FROM workers WHERE id=?", (worker["id"],)
-        )["status"] == "revoked"
+        assert (
+            app.state.db.fetchone("SELECT state FROM tasks WHERE id=?", (running_task["id"],))[
+                "state"
+            ]
+            == "succeeded"
+        )
+        assert (
+            app.state.db.fetchone("SELECT status FROM workers WHERE id=?", (worker["id"],))[
+                "status"
+            ]
+            == "revoked"
+        )
 
 
 def test_graceful_leave_expires_prepared_task_and_rekeys_idle_queue(tmp_path) -> None:
@@ -410,12 +422,8 @@ def test_graceful_leave_expires_prepared_task_and_rekeys_idle_queue(tmp_path) ->
             headers=owner_headers,
         ).json()
         worker = _add_worker(app, owner_id, workspace["id"], pool["id"], owner_identity)
-        queued_task = _submit(
-            client, owner_headers, workspace["id"], pool["id"], "a-queued"
-        )
-        pending_rekey_task = _submit(
-            client, owner_headers, workspace["id"], pool["id"], "c-rekey"
-        )
+        queued_task = _submit(client, owner_headers, workspace["id"], pool["id"], "a-queued")
+        pending_rekey_task = _submit(client, owner_headers, workspace["id"], pool["id"], "c-rekey")
         app.state.db.execute(
             "UPDATE tasks SET state='rekey_required' WHERE id=?",
             (pending_rekey_task["id"],),
@@ -452,13 +460,19 @@ def test_graceful_leave_expires_prepared_task_and_rekeys_idle_queue(tmp_path) ->
             pending_rekey_task["id"]: "rekey_required",
             prepared_task["id"]: "expired",
         }
-        assert app.state.db.fetchone(
-            "SELECT state FROM task_attempts WHERE task_id=?",
-            (pending_rekey_task["id"],),
-        )["state"] == "cancelled"
-        assert app.state.db.fetchone(
-            "SELECT state FROM task_attempts WHERE task_id=?", (prepared_task["id"],)
-        )["state"] == "expired"
+        assert (
+            app.state.db.fetchone(
+                "SELECT state FROM task_attempts WHERE task_id=?",
+                (pending_rekey_task["id"],),
+            )["state"]
+            == "cancelled"
+        )
+        assert (
+            app.state.db.fetchone(
+                "SELECT state FROM task_attempts WHERE task_id=?", (prepared_task["id"],)
+            )["state"]
+            == "expired"
+        )
 
 
 def test_task_page_is_short_paginated_and_member_cannot_read_other_users_tasks(tmp_path) -> None:
@@ -569,12 +583,8 @@ def test_task_page_is_short_paginated_and_member_cannot_read_other_users_tasks(t
         assert member_page.json()["total"] == 1
         assert [item["id"] for item in member_page.json()["items"]] == [member_task["id"]]
 
-        hidden_detail = client.get(
-            f"/api/v1/tasks/{owner_task['id']}", headers=member_headers
-        )
+        hidden_detail = client.get(f"/api/v1/tasks/{owner_task['id']}", headers=member_headers)
         assert hidden_detail.status_code == 403
-        visible_detail = client.get(
-            f"/api/v1/tasks/{owner_task['id']}", headers=owner_headers
-        )
+        visible_detail = client.get(f"/api/v1/tasks/{owner_task['id']}", headers=owner_headers)
         assert visible_detail.status_code == 200, visible_detail.text
         assert visible_detail.json()["id"] == owner_task["id"]

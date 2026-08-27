@@ -271,6 +271,10 @@ CREATE TABLE IF NOT EXISTS workers (
     status TEXT NOT NULL CHECK(status IN ('pending','active','offline','draining','revoked')),
     fencing_counter INTEGER NOT NULL DEFAULT 0,
     last_seen_at REAL,
+    -- NULL is retained only for executor types without the managed ComfyUI
+    -- capability protocol. ComfyUI creation/migration and Owner-signed
+    -- capability jobs set this; a heartbeat can never change it.
+    capability_auth_enforced_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     revoked_at REAL
@@ -278,6 +282,32 @@ CREATE TABLE IF NOT EXISTS workers (
 CREATE INDEX IF NOT EXISTS idx_workers_schedulable
     ON workers(status, executor_type, last_seen_at);
 
+-- Owner-authorized identifiers are kept separately from the Worker's latest
+-- self-report.  A compromised executor can therefore make a capability
+-- unavailable, but cannot introduce arbitrary plaintext identifiers into the
+-- control plane or make an unapproved workflow schedulable.
+CREATE TABLE IF NOT EXISTS worker_workflow_authorizations (
+    worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+    authorization_source_id TEXT NOT NULL,
+    workflow_ref TEXT NOT NULL,
+    workflow_digest TEXT NOT NULL,
+    spec_digest TEXT NOT NULL,
+    node_classes TEXT NOT NULL DEFAULT '[]',
+    authorized_at REAL NOT NULL,
+    revoked_at REAL,
+    PRIMARY KEY(worker_id, authorization_source_id, workflow_ref, workflow_digest)
+);
+CREATE TABLE IF NOT EXISTS worker_model_authorizations (
+    worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+    authorization_source_id TEXT NOT NULL,
+    workflow_ref TEXT NOT NULL,
+    workflow_digest TEXT NOT NULL,
+    model_digest TEXT NOT NULL,
+    spec_digest TEXT NOT NULL,
+    authorized_at REAL NOT NULL,
+    revoked_at REAL,
+    PRIMARY KEY(worker_id, authorization_source_id, workflow_ref, workflow_digest, model_digest)
+);
 CREATE TABLE IF NOT EXISTS worker_maintenance_jobs (
     id TEXT PRIMARY KEY,
     worker_id TEXT NOT NULL REFERENCES workers(id),
@@ -309,6 +339,23 @@ CREATE INDEX IF NOT EXISTS idx_worker_maintenance_poll
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_maintenance_active_dedupe
     ON worker_maintenance_jobs(worker_id, dedupe_key)
     WHERE state IN ('awaiting_upload','queued','leased','running','restarting');
+
+-- Every accepted Owner-signed maintenance intent has a durable result pointer.
+-- This is authoritative when SQLite committed but the HTTP idempotency cache
+-- was not written before a process stop, including worker-update intents
+-- deduped onto a job originally created by a different nonce. Capability/model
+-- jobs are intent-scoped because their IDs own rollback lifecycles.
+CREATE TABLE IF NOT EXISTS maintenance_intent_receipts (
+    device_id TEXT NOT NULL REFERENCES devices(id),
+    nonce TEXT NOT NULL,
+    authorization_digest TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES worker_maintenance_jobs(id),
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(device_id, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_maintenance_intent_receipts_expiry
+    ON maintenance_intent_receipts(expires_at);
 
 CREATE TABLE IF NOT EXISTS maintenance_artifacts (
     id TEXT PRIMARY KEY,
@@ -449,6 +496,8 @@ CREATE TABLE IF NOT EXISTS task_attempts (
     leased_at REAL,
     started_at REAL,
     finished_at REAL,
+    finish_semantic_hash TEXT,
+    finish_receipt TEXT,
     UNIQUE(task_id, attempt_number),
     UNIQUE(worker_id, fencing_token)
 );
@@ -555,6 +604,11 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
 );
 CREATE INDEX IF NOT EXISTS idx_idempotency_records_expiry ON idempotency_records(expires_at);
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS transfer_ticket_uses (
     ticket_hash TEXT PRIMARY KEY,
     artifact_id TEXT NOT NULL,
@@ -609,6 +663,23 @@ class GatewayDatabase:
             if "content_key_version" not in task_columns:
                 self._conn.execute(
                     "ALTER TABLE tasks ADD COLUMN content_key_version INTEGER NOT NULL DEFAULT 1"
+                )
+            attempt_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(task_attempts)")
+            }
+            if "finish_semantic_hash" not in attempt_columns:
+                self._conn.execute("ALTER TABLE task_attempts ADD COLUMN finish_semantic_hash TEXT")
+            if "finish_receipt" not in attempt_columns:
+                self._conn.execute("ALTER TABLE task_attempts ADD COLUMN finish_receipt TEXT")
+            worker_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(workers)")
+            }
+            if "capability_auth_enforced_at" not in worker_columns:
+                # The repository migration immediately establishes strict
+                # ComfyUI authorization from Gateway-owned compatibility and
+                # signed maintenance records; a heartbeat never populates it.
+                self._conn.execute(
+                    "ALTER TABLE workers ADD COLUMN capability_auth_enforced_at REAL"
                 )
             broker_command_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(broker_commands)")
@@ -673,6 +744,7 @@ class GatewayDatabase:
                 raise RuntimeError(
                     f"unsupported gateway schema version {row['version']}; expected {SCHEMA_VERSION}"
                 )
+            self._migrate_capability_authorization_sources()
 
     def _migrate_schema_v1_to_v2(self) -> None:
         """Rebuild maintenance tables whose v1 CHECK constraints are immutable."""
@@ -683,6 +755,11 @@ class GatewayDatabase:
             self._conn.execute("DROP INDEX IF EXISTS idx_maintenance_artifacts_job")
             self._conn.execute("DROP INDEX IF EXISTS idx_worker_maintenance_poll")
             self._conn.execute("DROP INDEX IF EXISTS idx_worker_maintenance_active_dedupe")
+            # SCHEMA creates this new empty table before an old v1 database is
+            # rebuilt. Drop it before renaming the referenced jobs table;
+            # otherwise SQLite rewrites its FK to the temporary v1 table name.
+            self._conn.execute("DROP INDEX IF EXISTS idx_maintenance_intent_receipts_expiry")
+            self._conn.execute("DROP TABLE IF EXISTS maintenance_intent_receipts")
             self._conn.execute(
                 "ALTER TABLE maintenance_artifacts RENAME TO _v1_maintenance_artifacts"
             )
@@ -762,10 +839,127 @@ class GatewayDatabase:
                 """CREATE INDEX idx_maintenance_artifacts_job
                    ON maintenance_artifacts(job_id, state)"""
             )
+            self._conn.execute(
+                """CREATE TABLE maintenance_intent_receipts (
+                    device_id TEXT NOT NULL REFERENCES devices(id),
+                    nonce TEXT NOT NULL,
+                    authorization_digest TEXT NOT NULL,
+                    job_id TEXT NOT NULL REFERENCES worker_maintenance_jobs(id),
+                    expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(device_id, nonce)
+                )"""
+            )
+            self._conn.execute(
+                """CREATE INDEX idx_maintenance_intent_receipts_expiry
+                   ON maintenance_intent_receipts(expires_at)"""
+            )
             violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("gateway schema v1 to v2 migration violated foreign keys")
-            self._conn.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
+            self._conn.execute("UPDATE schema_meta SET version=2")
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_capability_authorization_sources(self) -> None:
+        """Give every capability grant a source without breaking v2 rollback."""
+
+        workflow_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(worker_workflow_authorizations)")
+        }
+        model_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(worker_model_authorizations)")
+        }
+        migration_name = "capability-authorization-sources-v1"
+        if "authorization_source_id" in workflow_columns and (
+            "authorization_source_id" in model_columns
+        ):
+            self._conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                (migration_name, now()),
+            )
+            return
+        if (
+            "maintenance_job_id" not in workflow_columns
+            or "maintenance_job_id" not in model_columns
+        ):
+            raise RuntimeError("gateway capability authorization schema is invalid")
+
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "ALTER TABLE worker_workflow_authorizations "
+                "RENAME TO _v2_worker_workflow_authorizations"
+            )
+            self._conn.execute(
+                "ALTER TABLE worker_model_authorizations RENAME TO _v2_worker_model_authorizations"
+            )
+            self._conn.execute(
+                """CREATE TABLE worker_workflow_authorizations (
+                    worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+                    authorization_source_id TEXT NOT NULL,
+                    workflow_ref TEXT NOT NULL,
+                    workflow_digest TEXT NOT NULL,
+                    spec_digest TEXT NOT NULL,
+                    node_classes TEXT NOT NULL DEFAULT '[]',
+                    authorized_at REAL NOT NULL,
+                    revoked_at REAL,
+                    PRIMARY KEY(
+                        worker_id, authorization_source_id, workflow_ref, workflow_digest
+                    )
+                )"""
+            )
+            self._conn.execute(
+                """CREATE TABLE worker_model_authorizations (
+                    worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+                    authorization_source_id TEXT NOT NULL,
+                    workflow_ref TEXT NOT NULL,
+                    workflow_digest TEXT NOT NULL,
+                    model_digest TEXT NOT NULL,
+                    spec_digest TEXT NOT NULL,
+                    authorized_at REAL NOT NULL,
+                    revoked_at REAL,
+                    PRIMARY KEY(
+                        worker_id, authorization_source_id, workflow_ref,
+                        workflow_digest, model_digest
+                    )
+                )"""
+            )
+            self._conn.execute(
+                """INSERT INTO worker_workflow_authorizations
+                   (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                    spec_digest,node_classes,authorized_at,revoked_at)
+                   SELECT worker_id,maintenance_job_id,workflow_ref,workflow_digest,
+                          spec_digest,node_classes,authorized_at,revoked_at
+                   FROM _v2_worker_workflow_authorizations"""
+            )
+            self._conn.execute(
+                """INSERT INTO worker_model_authorizations
+                   (worker_id,authorization_source_id,workflow_ref,workflow_digest,
+                    model_digest,spec_digest,authorized_at,revoked_at)
+                   SELECT worker_id,maintenance_job_id,workflow_ref,workflow_digest,
+                          model_digest,spec_digest,authorized_at,revoked_at
+                   FROM _v2_worker_model_authorizations"""
+            )
+            self._conn.execute("DROP TABLE _v2_worker_workflow_authorizations")
+            self._conn.execute("DROP TABLE _v2_worker_model_authorizations")
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    "gateway capability authorization migration violated foreign keys"
+                )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO schema_migrations(name,applied_at) VALUES (?,?)",
+                (migration_name, now()),
+            )
             self._conn.execute("COMMIT")
         except Exception:
             if self._conn.in_transaction:
@@ -1019,6 +1213,10 @@ class GatewayDatabase:
                 ),
                 "request_nonces": (
                     "DELETE FROM request_nonces WHERE expires_at<=?",
+                    (cutoff,),
+                ),
+                "maintenance_intent_receipts": (
+                    "DELETE FROM maintenance_intent_receipts WHERE expires_at<=?",
                     (cutoff,),
                 ),
                 "idempotency_records": (

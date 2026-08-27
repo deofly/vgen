@@ -364,6 +364,7 @@ def test_expired_security_records_are_pruned_without_breaking_active_lease_fk(tm
         "service_auth_challenges": 1,
         "request_nonces": 1,
         "idempotency_records": 1,
+        "maintenance_intent_receipts": 0,
         "sessions": 2,
         "transfer_ticket_uses": 1,
     }

@@ -558,6 +558,16 @@ def test_user_without_broker_and_cross_user_pool_scheduling(tmp_path: Path) -> N
         )
         _announce_worker(client, worker_b)
         _announce_worker(client, worker_a)
+        # A fresh machine-admin/static-policy Worker remains schedulable during
+        # the staged migration. Only a successful Owner-signed capability job
+        # flips this durable marker into strict authorization mode.
+        assert (
+            app.state.db.fetchone(
+                "SELECT capability_auth_enforced_at FROM workers WHERE id=?",
+                (worker_a.worker_id,),
+            )["capability_auth_enforced_at"]
+            is None
+        )
 
         allocations = client.get(
             f"/api/v1/workspaces/{workspace['id']}/worker-allocations",
@@ -976,16 +986,14 @@ def test_enrollment_policies_expiry_reuse_approval_and_rejection(
 
         assert pending_user.certificate is not None
         rejected_application_id = new_id("application")
-        rejected_application_claim, rejected_application_proof = (
-            _user_registration_material(
-                identity=pending_user.identity,
-                device=pending_user.device,
-                device_id=pending_user.device_id,
-                certificate=pending_user.certificate,
-                invite_id=rejected_application_id,
-                display_name="Pending User",
-                device_name="Pending User-device",
-            )
+        rejected_application_claim, rejected_application_proof = _user_registration_material(
+            identity=pending_user.identity,
+            device=pending_user.device,
+            device_id=pending_user.device_id,
+            certificate=pending_user.certificate,
+            invite_id=rejected_application_id,
+            display_name="Pending User",
+            device_name="Pending User-device",
         )
         rejected_application = client.post(
             "/api/v1/applications",
@@ -1135,12 +1143,10 @@ def test_worker_leave_revoke_and_fencing_reject_late_result(tmp_path: Path) -> N
             headers=worker.headers,
         )
         assert running.status_code == 200, running.text
-        task = client.get(
-            f"/api/v1/tasks/{prepared['id']}", headers=owner.headers
-        ).json()
+        task = client.get(f"/api/v1/tasks/{prepared['id']}", headers=owner.headers).json()
         assert task["attempts"][-1]["progress"] == {
             "fraction": 0.5,
-            "stage": "fake",
+            "stage": "processing",
         }
 
         leave = client.post(
@@ -1566,7 +1572,7 @@ def test_gateway_database_and_artifact_store_never_persist_plaintext(
         assert output_upload.status_code == 204, output_upload.text
         output_artifact = {
             "artifact_id": output_ticket["artifact_id"],
-            "kind": "video",
+            "kind": output_ticket["kind"],
             "store_type": None,
             "object_ref": None,
             "content_digest": None,
