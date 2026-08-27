@@ -854,7 +854,7 @@ class WorkerMaintenanceController:
         ):
             raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
         if self._node_pack_installer is None:
-            raise NodePackInstallError("NODE_PACK_RUNTIME_UNAVAILABLE")
+            raise NodePackInstallError("NODE_PACK_INSTALLER_UNAVAILABLE")
 
         ticket = self._gateway.maintenance_artifact_ticket(job)
         self._validate_update_ticket(ticket, artifact_size, artifact_sha256)
@@ -1446,7 +1446,10 @@ def _node_pack_error_code(reason: str) -> int:
         return int(ErrorCode.DOWNLOAD_INTERRUPTED)
     if any(item in reason for item in ("DIGEST", "INTEGRITY")):
         return int(ErrorCode.DIGEST_MISMATCH)
-    if any(item in reason for item in ("ROOT", "TARGET", "PATH", "RUNTIME_UNAVAILABLE")):
+    if any(
+        item in reason
+        for item in ("ROOT", "TARGET", "PATH", "RUNTIME_UNAVAILABLE", "INSTALLER_UNAVAILABLE")
+    ):
         return int(ErrorCode.PATH_CONFLICT)
     if any(item in reason for item in ("REJECTED", "INTENT", "TICKET", "SPEC")):
         return int(ErrorCode.MAINTENANCE_POLICY_DENIED)

@@ -1811,7 +1811,7 @@ class ComfyUIExecutor:
         self._custom_nodes_root = (
             custom_nodes_root.expanduser().absolute()
             if custom_nodes_root is not None
-            else None
+            else (self._output_dir.parent / "custom_nodes").resolve()
         )
         self._model_digest_cache: dict[Path, tuple[int, int, int, int, int, str]] = {}
         self._model_fingerprint_observations: dict[
@@ -1827,7 +1827,7 @@ class ComfyUIExecutor:
         return self._policy is not None or bool(self._dynamic_capabilities)
 
     @property
-    def maintenance_custom_nodes_root(self) -> Path | None:
+    def maintenance_custom_nodes_root(self) -> Path:
         return self._custom_nodes_root
 
     def maintenance_node_classes(self) -> set[str] | None:

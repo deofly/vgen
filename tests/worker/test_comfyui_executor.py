@@ -404,6 +404,7 @@ def test_comfyui_executor_keeps_graph_inside_adapter(tmp_path: Path) -> None:
         client=client,
         policy=_policy("LoadImage"),
     )
+    assert executor.maintenance_custom_nodes_root == tmp_path / "custom_nodes"
     first_frame = tmp_path / "first.png"
     first_frame.write_bytes(b"image")
     payload = json.dumps(
