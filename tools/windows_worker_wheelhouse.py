@@ -10,15 +10,20 @@ this source contract and fail closed on any drift.
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import hashlib
+import io
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import venv
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
@@ -53,10 +58,10 @@ _SOURCE_ARTIFACTS = {
 }
 _EXPECTED_BUILT_WHEELS = {
     "crcmod-1.7-py3-none-any.whl": (
-        "57efbf1bf9719f1593c583ddb65749b2c5a42181d167ce8a8eef1416c20f2b2c"
+        "a8869ea2ef024d04db62fdde952876e8e99140827c03dccc5739b16c47e10320"
     ),
     "oss2-2.19.1-py3-none-any.whl": (
-        "4d6dcec69b4c391c9e57e00579543a689eee7ed0d9620801eefbbdc8615f38d6"
+        "a64801d68ac00f9328b7bf2107fd574ead5958127a57cadd2422dda823837a10"
     ),
 }
 _LOCK_FILES = (BINARY_LOCK, SOURCE_LOCK, BUILD_LOCK)
@@ -413,6 +418,114 @@ def _prepare_crcmod_source(root: Path) -> None:
     setup.write_bytes(value.replace(_CRCMOD_EXTENSION_BLOCK, b"ext_modules=[],"))
 
 
+def _canonicalize_built_wheel(path: Path) -> None:
+    """Remove platform-dependent text and ZIP metadata from a source wheel.
+
+    Wheel hashes cover the ZIP container as well as installed file contents.
+    Setuptools can emit CRLF (and CRCRLF for an existing CRLF description) in
+    METADATA on Windows, while ``wheel`` delegates archive metadata and
+    compression to the host Python.  Normalize the textual metadata, rebuild
+    RECORD, then repack with stored entries, fixed metadata, and UTF-8 byte
+    ordering.  The locked output is consequently independent of newline
+    translation, host permissions, ZIP creator fields, and zlib versions.
+    """
+
+    entries: dict[str, bytes] = {}
+    folded: set[str] = set()
+    total = 0
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if archive.comment or not infos or len(infos) > _MAX_SOURCE_ENTRIES:
+                raise WheelhouseBuildError(f"invalid source-built wheel: {path.name}")
+            for info in infos:
+                raw = info.filename
+                candidate = PurePosixPath(raw)
+                mode = info.external_attr >> 16
+                if (
+                    info.is_dir()
+                    or "\\" in raw
+                    or "\x00" in raw
+                    or raw.startswith("/")
+                    or not candidate.parts
+                    or candidate.as_posix() != raw
+                    or any(part in {"", ".", ".."} for part in candidate.parts)
+                    or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+                    or (mode and not stat.S_ISREG(mode))
+                    or info.flag_bits & 0x1
+                ):
+                    raise WheelhouseBuildError(f"unsafe source-built wheel: {path.name}")
+                key = raw.casefold()
+                if raw in entries or key in folded:
+                    raise WheelhouseBuildError(f"duplicate source-built wheel path: {path.name}")
+                total += info.file_size
+                if total > _MAX_SOURCE_BYTES:
+                    raise WheelhouseBuildError(f"source-built wheel is too large: {path.name}")
+                entries[raw] = archive.read(info)
+                folded.add(key)
+    except WheelhouseBuildError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise WheelhouseBuildError(f"unreadable source-built wheel: {path.name}") from exc
+
+    metadata_names = [
+        name
+        for name in entries
+        if len(PurePosixPath(name).parts) == 2
+        and PurePosixPath(name).parts[0].endswith(".dist-info")
+        and PurePosixPath(name).name == "METADATA"
+    ]
+    if len(metadata_names) != 1:
+        raise WheelhouseBuildError(f"invalid source-built wheel metadata: {path.name}")
+    metadata_name = metadata_names[0]
+    record_name = (PurePosixPath(metadata_name).parent / "RECORD").as_posix()
+    if record_name not in entries:
+        raise WheelhouseBuildError(f"invalid source-built wheel RECORD: {path.name}")
+    normalized_metadata = re.sub(rb"\r+\n", b"\n", entries[metadata_name]).replace(
+        b"\r",
+        b"\n",
+    )
+    try:
+        normalized_metadata.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WheelhouseBuildError(f"invalid source-built wheel metadata: {path.name}") from exc
+    entries[metadata_name] = normalized_metadata
+
+    record = io.StringIO(newline="")
+    writer = csv.writer(record, lineterminator="\n")
+    for name in sorted(
+        (name for name in entries if name != record_name),
+        key=lambda value: value.encode("utf-8"),
+    ):
+        value = entries[name]
+        digest = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).rstrip(b"=")
+        writer.writerow((name, f"sha256={digest.decode('ascii')}", len(value)))
+    writer.writerow((record_name, "", ""))
+    entries[record_name] = record.getvalue().encode("utf-8")
+
+    temporary = path.with_name(f".{path.name}.{os.urandom(8).hex()}.canonical")
+    try:
+        with zipfile.ZipFile(
+            temporary,
+            "x",
+            compression=zipfile.ZIP_STORED,
+            allowZip64=False,
+        ) as archive:
+            for name in sorted(entries, key=lambda value: value.encode("utf-8")):
+                info = zipfile.ZipInfo(name, (2020, 2, 2, 0, 0, 0))
+                info.create_system = 3
+                info.compress_type = zipfile.ZIP_STORED
+                info.external_attr = (stat.S_IFREG | 0o644) << 16
+                archive.writestr(info, entries[name])
+        os.replace(temporary, path)
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise WheelhouseBuildError(
+            f"source-built wheel could not be canonicalized: {path.name}"
+        ) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _build_sources(
     python: Path,
     downloads: Path,
@@ -478,6 +591,8 @@ def _build_sources(
         ],
         env=environment,
     )
+    for path in sorted(output.glob("*.whl")):
+        _canonicalize_built_wheel(path)
     actual = {path.name: _sha256(path) for path in output.glob("*.whl")}
     if actual != _EXPECTED_BUILT_WHEELS:
         raise WheelhouseBuildError(
