@@ -1810,6 +1810,11 @@ class ComfyUIExecutor:
             else None
         )
         self._model_digest_cache: dict[Path, tuple[int, int, int, int, int, str]] = {}
+        self._model_fingerprint_observations: dict[
+            Path,
+            tuple[tuple[int, int, int, int, int], int],
+        ] = {}
+        self._model_resolved_placements: dict[Path, Path] = {}
         self._model_verification_progress = model_verification_progress
 
     @property
@@ -1864,6 +1869,8 @@ class ComfyUIExecutor:
         """Force the next capability report to observe newly installed files."""
 
         self._model_digest_cache.clear()
+        self._model_fingerprint_observations.clear()
+        self._model_resolved_placements.clear()
 
     def reload_capabilities(self) -> None:
         """Force an already-running Worker to observe an atomically activated release."""
@@ -1944,6 +1951,7 @@ class ComfyUIExecutor:
             capabilities.values()
         )
         all_pins = self.maintenance_model_pins
+        self._prune_model_digest_state(all_pins)
         verified_model_placements: set[tuple[str, str]] = set()
         model_digests, model_failures = self._verified_model_digests(
             all_pins,
@@ -2322,11 +2330,8 @@ class ComfyUIExecutor:
         total_bytes_read = 0
         last_reported_total_percent = -1
         cache_now_ns = time.time_ns()
-        fingerprint_digests: dict[tuple[int, int, int, int, int], str] = {
-            tuple(cached[:5]): cached[5]
-            for cached in self._model_digest_cache.values()
-            if cache_now_ns - max(cached[3], cached[4]) >= _MODEL_DIGEST_CACHE_SETTLE_NS
-        }
+        observation_now_ns = time.monotonic_ns()
+        fingerprint_digests: dict[tuple[int, int, int, int, int], str] = {}
 
         def report(
             *,
@@ -2355,16 +2360,26 @@ class ComfyUIExecutor:
             )
 
         for model_index, pin in enumerate(pins, start=1):
-            candidate = (self._model_root / pin.path).resolve()
-            if self._model_root != candidate and self._model_root not in candidate.parents:
+            unresolved = (self._model_root / pin.path).absolute()
+            try:
+                candidate = unresolved.resolve()
+            except (OSError, RuntimeError):
+                self._forget_model_placement(unresolved)
                 failures += 1
                 continue
+            if self._model_root != candidate and self._model_root not in candidate.parents:
+                self._forget_model_placement(unresolved, candidate)
+                failures += 1
+                continue
+            self._remember_model_placement(unresolved, candidate)
             try:
                 metadata = candidate.stat()
             except OSError:
+                self._forget_model_placement(unresolved, candidate)
                 failures += 1
                 continue
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != pin.size:
+                self._forget_model_placement(unresolved, candidate)
                 failures += 1
                 continue
             cached = self._model_digest_cache.get(candidate)
@@ -2375,19 +2390,32 @@ class ComfyUIExecutor:
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
             )
+            observation = self._model_fingerprint_observations.get(candidate)
+            if observation is None or observation[0] != fingerprint:
+                observation = (fingerprint, observation_now_ns)
+                self._model_fingerprint_observations[candidate] = observation
+                self._model_digest_cache.pop(candidate, None)
+                cached = None
+            observation_age_ns = max(0, observation_now_ns - observation[1])
             metadata_age_ns = cache_now_ns - max(
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
             )
-            cache_identity_is_stable = metadata_age_ns >= _MODEL_DIGEST_CACHE_SETTLE_NS
+            cache_identity_is_stable = (
+                metadata_age_ns >= _MODEL_DIGEST_CACHE_SETTLE_NS
+                or observation_age_ns >= _MODEL_DIGEST_CACHE_SETTLE_NS
+            )
             if cached is not None and (
                 cached[:5] != fingerprint or not cache_identity_is_stable
             ):
                 # Never let a digest recorded for a fresh or superseded stat
                 # identity become trusted merely because wall time advanced.
                 self._model_digest_cache.pop(candidate, None)
+                cached = None
             if cached is not None and cached[:5] == fingerprint and cache_identity_is_stable:
                 digest = cached[5]
+                if metadata.st_ino != 0:
+                    fingerprint_digests[fingerprint] = digest
                 total_bytes_read += pin.size
                 report(
                     model_index=model_index,
@@ -2399,15 +2427,11 @@ class ComfyUIExecutor:
                 # ModelInstaller materializes one verified CAS blob through
                 # hard links. Reuse the digest for the same immutable file
                 # identity instead of rereading tens of gigabytes per placement.
-                # The map is seeded only with settled cross-probe identities;
-                # freshly hashed identities are also safe to share with another
-                # hard-link placement during this single verification probe.
+                # Only identities that were already settled when this probe
+                # started enter the map, and inode zero is never treated as a
+                # portable hard-link identity.
                 digest = fingerprint_digests[fingerprint]
-                if (
-                    time.time_ns() - max(metadata.st_mtime_ns, metadata.st_ctime_ns)
-                    >= _MODEL_DIGEST_CACHE_SETTLE_NS
-                ):
-                    self._model_digest_cache[candidate] = (*fingerprint, digest)
+                self._model_digest_cache[candidate] = (*fingerprint, digest)
                 total_bytes_read += pin.size
                 report(
                     model_index=model_index,
@@ -2431,6 +2455,7 @@ class ComfyUIExecutor:
                                 file_bytes_read=file_bytes_read,
                             )
                 except OSError:
+                    self._forget_model_placement(unresolved, candidate)
                     failures += 1
                     continue
                 digest = hasher.hexdigest()
@@ -2443,6 +2468,7 @@ class ComfyUIExecutor:
                 try:
                     after = candidate.stat()
                 except OSError:
+                    self._forget_model_placement(unresolved, candidate)
                     failures += 1
                     continue
                 if (
@@ -2452,18 +2478,13 @@ class ComfyUIExecutor:
                     after.st_mtime_ns,
                     after.st_ctime_ns,
                 ) != fingerprint:
+                    self._forget_model_placement(unresolved, candidate)
                     failures += 1
                     continue
-                fingerprint_digests[fingerprint] = digest
-                if (
-                    time.time_ns() - max(after.st_mtime_ns, after.st_ctime_ns)
-                    >= _MODEL_DIGEST_CACHE_SETTLE_NS
-                ):
-                    # Large models commonly take longer than the settle window
-                    # to hash. Cache them immediately when the post-read stat is
-                    # unchanged and old enough; small fresh files are rehashed
-                    # once after settling before cross-probe reuse is allowed.
+                if cache_identity_is_stable:
                     self._model_digest_cache[candidate] = (*fingerprint, digest)
+                    if metadata.st_ino != 0:
+                        fingerprint_digests[fingerprint] = digest
             if digest != pin.sha256:
                 failures += 1
                 continue
@@ -2471,6 +2492,50 @@ class ComfyUIExecutor:
                 verified_placements.add((pin.path, pin.sha256))
             verified.append(f"sha256:{digest}")
         return sorted(set(verified)), failures
+
+    def _forget_model_digest_state(self, candidate: Path) -> None:
+        self._model_digest_cache.pop(candidate, None)
+        self._model_fingerprint_observations.pop(candidate, None)
+
+    def _remember_model_placement(self, unresolved: Path, candidate: Path) -> None:
+        previous = self._model_resolved_placements.get(unresolved)
+        if previous is not None and previous != candidate:
+            self._forget_model_digest_state(previous)
+        self._model_resolved_placements[unresolved] = candidate
+
+    def _forget_model_placement(
+        self,
+        unresolved: Path,
+        candidate: Path | None = None,
+    ) -> None:
+        previous = self._model_resolved_placements.pop(unresolved, None)
+        for resolved in {unresolved, previous, candidate} - {None}:
+            self._forget_model_digest_state(resolved)
+
+    def _prune_model_digest_state(self, pins: tuple[ComfyUIModelPin, ...]) -> None:
+        active: set[Path] = set()
+        active_placements: set[Path] = set()
+        for pin in pins:
+            unresolved = (self._model_root / pin.path).absolute()
+            try:
+                candidate = unresolved.resolve()
+            except (OSError, RuntimeError):
+                self._forget_model_placement(unresolved)
+                continue
+            if candidate == self._model_root or self._model_root in candidate.parents:
+                self._remember_model_placement(unresolved, candidate)
+                active_placements.add(unresolved)
+                active.add(candidate)
+            else:
+                self._forget_model_placement(unresolved, candidate)
+        for unresolved in self._model_resolved_placements.keys() - active_placements:
+            self._forget_model_placement(unresolved)
+        for state in (
+            self._model_digest_cache,
+            self._model_fingerprint_observations,
+        ):
+            for candidate in state.keys() - active:
+                state.pop(candidate, None)
 
     def _reload_capabilities(self) -> None:
         if self._capability_source is None:

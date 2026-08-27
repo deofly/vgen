@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -797,7 +798,7 @@ def test_same_model_bytes_may_be_shared_at_the_same_placement(tmp_path: Path) ->
     }
 
 
-def test_hardlinked_shared_model_is_hashed_once_per_capability_probe(
+def test_hardlinked_shared_model_is_reused_only_after_fingerprint_settles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     contents = b"one CAS blob with two workflow placements"
@@ -829,6 +830,18 @@ def test_hardlinked_shared_model_is_hashed_once_per_capability_probe(
     second.parent.mkdir(parents=True)
     first.write_bytes(contents)
     second.hardlink_to(first)
+    metadata = first.stat()
+    monotonic_now = [1]
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "time_ns",
+        lambda: max(metadata.st_mtime_ns, metadata.st_ctime_ns) + 1,
+    )
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "monotonic_ns",
+        lambda: monotonic_now[0],
+    )
     executor = ComfyUIExecutor(
         "http://127.0.0.1:8188",
         tmp_path / "outputs",
@@ -850,22 +863,124 @@ def test_hardlinked_shared_model_is_hashed_once_per_capability_probe(
     report = executor.capabilities()
 
     assert report["execution_policy"]["models_verified"] == 1
-    assert len(reads) == 1
+    assert len(reads) == 2
 
-    metadata = first.stat()
+    monotonic_now[0] += comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS
+    executor.capabilities()
+
+    assert len(reads) == 3
+
+    executor.capabilities()
+
+    assert len(reads) == 3
+
+
+def test_zero_inode_model_identities_are_never_deduplicated_across_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contents = b"same bytes without a portable file identity"
+    model_digest = hashlib.sha256(contents).hexdigest()
+    releases: list[InstallResult] = []
+    for name, folder in (("first", "text_encoders"), ("second", "clip")):
+        directory = tmp_path / "packages" / name
+        manifest = _write_workflow(
+            directory,
+            workflow_id=f"test/zero-inode-{name}",
+            model_folder=folder,
+            model_digest=model_digest,
+            model_size=len(contents),
+        )
+        releases.append(InstallResult(manifest, directory, package_digest(directory), False))
+    model_root = tmp_path / "models"
+    model_paths = {
+        (model_root / "text_encoders/shared.safetensors").absolute(),
+        (model_root / "clip/shared.safetensors").absolute(),
+    }
+    for model in model_paths:
+        model.parent.mkdir(parents=True)
+        model.write_bytes(contents)
+    original_stat = Path.stat
+    original_open = Path.open
+    reads: list[Path] = []
+
+    def zero_inode_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        metadata = original_stat(path, *args, **kwargs)
+        if path.absolute() not in model_paths:
+            return metadata
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=0,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns,
+        )
+
+    def counting_open(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if "b" in mode and path.absolute() in model_paths:
+            reads.append(path.absolute())
+        return original_open(path, mode, *args, **kwargs)
+
+    latest_model_timestamp = max(
+        max(original_stat(model).st_mtime_ns, original_stat(model).st_ctime_ns)
+        for model in model_paths
+    )
+    monkeypatch.setattr(Path, "stat", zero_inode_stat)
+    monkeypatch.setattr(Path, "open", counting_open)
     monkeypatch.setattr(
         comfyui_module.time,
         "time_ns",
-        lambda: max(metadata.st_mtime_ns, metadata.st_ctime_ns)
-        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
+        lambda: latest_model_timestamp + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
     )
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        tmp_path / "outputs",
+        client=_ComfyClient(),  # type: ignore[arg-type]
+        capability_source=_CapabilitySource(tuple(releases)),
+        model_root=model_root,
+    )
+
+    executor.capabilities()
     executor.capabilities()
 
     assert len(reads) == 2
 
+
+def test_removed_capability_prunes_model_digest_state(tmp_path: Path) -> None:
+    contents = b"model removed with its workflow"
+    model_digest = hashlib.sha256(contents).hexdigest()
+    directory = tmp_path / "packages/workflow"
+    manifest = _write_workflow(
+        directory,
+        workflow_id="test/cache-pruning",
+        model_folder="clip",
+        model_digest=model_digest,
+        model_size=len(contents),
+    )
+    release = InstallResult(manifest, directory, package_digest(directory), False)
+    source = _CapabilitySource((release,))
+    model_root = tmp_path / "models"
+    model = model_root / "clip/shared.safetensors"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(contents)
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        tmp_path / "outputs",
+        client=_ComfyClient(),  # type: ignore[arg-type]
+        capability_source=source,
+        model_root=model_root,
+    )
+
+    executor.capabilities()
+    assert executor._model_fingerprint_observations
+
+    source.releases = ()
+    executor.reload_capabilities()
     executor.capabilities()
 
-    assert len(reads) == 2
+    assert executor._model_digest_cache == {}
+    assert executor._model_fingerprint_observations == {}
+    assert executor._model_resolved_placements == {}
 
 
 def test_invalid_dynamic_capability_does_not_suppress_legacy_h3_policy(

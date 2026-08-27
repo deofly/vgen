@@ -805,6 +805,7 @@ def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     contents = b"trusted-model"
     model.write_bytes(contents)
     verified_metadata = model.stat()
+    resolved_model = model.resolve()
     monkeypatch.setattr(
         comfyui_module.time,
         "time_ns",
@@ -841,7 +842,7 @@ def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     real_stat = Path.stat
 
     def coarse_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
-        if path == model:
+        if path == resolved_model:
             return verified_metadata
         return real_stat(path, *args, **kwargs)
 
@@ -904,6 +905,147 @@ def test_comfyui_model_verification_reports_bytes_and_completion(tmp_path: Path)
     assert progress[-1].file_bytes_read == len(contents)
     assert progress[-1].total_bytes_read == len(contents)
     assert progress[-1].total_size == len(contents)
+
+
+def test_model_symlink_resolution_failure_clears_prior_resolved_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "outputs"
+    model_root = tmp_path / "models"
+    output_dir.mkdir()
+    target = model_root / "target"
+    target.mkdir(parents=True)
+    model = target / "model.safetensors"
+    contents = b"trusted-model"
+    model.write_bytes(contents)
+    verified_metadata = model.stat()
+    alias = model_root / "alias"
+    alias.symlink_to("target", target_is_directory=True)
+    resolved_model = model.resolve()
+    digest = sha256(contents).hexdigest()
+    policy = ComfyUIExecutionPolicy.from_mapping(
+        {
+            "version": 1,
+            "allowed_node_classes": ["SafeNode"],
+            "models": [
+                {
+                    "path": "alias/model.safetensors",
+                    "sha256": f"sha256:{digest}",
+                    "size": len(contents),
+                }
+            ],
+        }
+    )
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        output_dir,
+        client=FakeComfyClient(output_dir / "result.mp4"),
+        policy=policy,
+        model_root=model_root,
+    )
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "time_ns",
+        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
+        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
+    )
+
+    assert executor._verified_model_digests(policy.model_files) == (
+        [f"sha256:{digest}"],
+        0,
+    )
+    assert executor._model_digest_cache
+
+    alias.unlink()
+    alias.symlink_to("alias", target_is_directory=True)
+
+    assert executor._verified_model_digests(policy.model_files) == ([], 1)
+    assert executor._model_digest_cache == {}
+    assert executor._model_fingerprint_observations == {}
+    assert executor._model_resolved_placements == {}
+
+    alias.unlink()
+    alias.symlink_to("target", target_is_directory=True)
+    model.write_bytes(b"altered-model")
+    real_stat = Path.stat
+
+    def coarse_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == resolved_model:
+            return verified_metadata
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", coarse_stat)
+
+    verified, failures = executor._verified_model_digests(policy.model_files)
+
+    assert verified == []
+    assert failures == 1
+
+
+def test_missing_model_clears_cache_before_same_fingerprint_recreation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "outputs"
+    model_root = tmp_path / "models"
+    output_dir.mkdir()
+    model = model_root / "diffusion_models/model.safetensors"
+    model.parent.mkdir(parents=True)
+    contents = b"trusted-model"
+    model.write_bytes(contents)
+    verified_metadata = model.stat()
+    digest = sha256(contents).hexdigest()
+    policy = ComfyUIExecutionPolicy.from_mapping(
+        {
+            "version": 1,
+            "allowed_node_classes": ["SafeNode"],
+            "models": [
+                {
+                    "path": "diffusion_models/model.safetensors",
+                    "sha256": f"sha256:{digest}",
+                    "size": len(contents),
+                }
+            ],
+        }
+    )
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        output_dir,
+        client=FakeComfyClient(output_dir / "result.mp4"),
+        policy=policy,
+        model_root=model_root,
+    )
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "time_ns",
+        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
+        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
+    )
+
+    assert executor.capabilities()["model_digests"] == [f"sha256:{digest}"]
+    assert executor._model_digest_cache
+
+    model.unlink()
+    assert executor.capabilities()["execution_policy"]["models_failed"] == 1
+    assert executor._model_digest_cache == {}
+    assert executor._model_fingerprint_observations == {}
+    assert executor._model_resolved_placements == {}
+
+    model.write_bytes(b"altered-model")
+    real_stat = Path.stat
+
+    def coarse_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == model:
+            return verified_metadata
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", coarse_stat)
+
+    capabilities = executor.capabilities()
+
+    assert capabilities["model_digests"] == []
+    assert capabilities["execution_policy"]["models_failed"] == 1
 
 
 @pytest.mark.parametrize(
