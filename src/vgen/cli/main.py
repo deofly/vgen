@@ -2387,8 +2387,8 @@ def _install_workflow_node_packs(
         return []
     if not _worker_supports_node_pack_install(worker):
         raise ValueError(
-            "Worker runtime does not support remote Node Pack installation; "
-            "run `vgen worker upgrade --wait` first"
+            "Worker remote Node Pack host control is not active; upgrade the Worker first, "
+            "then restart Windows once if the Worker is already current"
         )
     grouped: dict[str, CustomNodeRequirement] = {}
     for dependency in dependencies:

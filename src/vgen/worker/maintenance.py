@@ -924,6 +924,7 @@ class WorkerMaintenanceController:
             stage="activating",
             gateway_lock=self._gateway_lock,
         ) as keeper:
+            keeper.update_progress(artifact_size, artifact_size)
             installed = self._node_pack_installer.install(
                 archive,
                 expected_sha256=artifact_sha256,

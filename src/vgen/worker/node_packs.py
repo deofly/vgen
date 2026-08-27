@@ -226,7 +226,11 @@ class NodePackInstaller:
                 if isinstance(exc, NodePackInstallError):
                     raise
                 if isinstance(exc, ComfyUIHostControlError):
-                    raise NodePackInstallError(str(exc)) from exc
+                    # Completion results deliberately expose only bounded
+                    # Node Pack reason codes. Preserve the fixed host-control
+                    # reason without leaking it outside that namespace; the
+                    # Gateway rejects arbitrary Worker-controlled strings.
+                    raise NodePackInstallError(f"NODE_PACK_{exc}") from exc
                 raise NodePackInstallError("NODE_PACK_ACTIVATION_FAILED") from exc
 
             if backup.exists():

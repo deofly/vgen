@@ -683,8 +683,12 @@ class WorkerMaintenanceProgress(WireModel):
         "downloading",
         "verifying",
         "installing",
+        "installing_dependencies",
         "staging",
         "activating",
+        "pausing_comfyui",
+        "probing_nodes",
+        "rolling_back",
     ]
     completed_bytes: int = Field(ge=0)
     total_bytes: int | None = Field(default=None, ge=0)

@@ -56,6 +56,7 @@ from .supervisor import (
     supervise_worker,
 )
 from .updater import WorkerUpdateError
+from .windows_supervisor import prepare_windows_supervisor
 
 logger = logging.getLogger("vgen.worker")
 
@@ -411,7 +412,8 @@ def _build_maintenance(
     )
     node_probe = getattr(executor, "maintenance_node_classes", None)
     node_pack_installer = None
-    if custom_nodes_root is not None and callable(node_probe):
+    host_control_ready = prepare_windows_supervisor(work_root)
+    if custom_nodes_root is not None and callable(node_probe) and host_control_ready:
         configured_python = _safe_configured_python(arguments.comfy_python_executable)
         installer_python = configured_python or Path(sys.executable).resolve(strict=True)
         node_pack_installer = NodePackInstaller(

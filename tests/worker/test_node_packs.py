@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from vgen.market.node_packs import build_node_pack_archive
+from vgen.worker.host_control import ComfyUIHostControlError
 from vgen.worker.node_packs import NodePackInstaller, NodePackInstallError
 
 
@@ -18,6 +19,13 @@ class HostControl:
     @contextlib.contextmanager
     def paused(self, **_kwargs: object) -> Iterator[None]:
         self.pauses += 1
+        yield
+
+
+class UnavailableHostControl:
+    @contextlib.contextmanager
+    def paused(self, **_kwargs: object) -> Iterator[None]:
+        raise ComfyUIHostControlError("COMFYUI_HOST_PAUSE_TIMEOUT")
         yield
 
 
@@ -160,6 +168,35 @@ def test_failed_node_validation_rolls_back_previous_directory(tmp_path: Path) ->
     assert host.pauses == 2
     assert (existing / "old.py").read_text(encoding="utf-8") == "old\n"
     assert not (existing / ".vgen-node-pack.json").exists()
+
+
+def test_host_control_failure_is_reported_as_bounded_node_pack_reason(tmp_path: Path) -> None:
+    archive, digest = _archive(tmp_path)
+    custom_nodes = tmp_path / "custom_nodes"
+    custom_nodes.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"python")
+    installer = NodePackInstaller(
+        work,
+        custom_nodes,
+        python,
+        UnavailableHostControl(),  # type: ignore[arg-type]
+        lambda: set(),
+        wheel_installer=lambda _python, _wheels, target: target.mkdir(),
+    )
+
+    with pytest.raises(
+        NodePackInstallError,
+        match="NODE_PACK_COMFYUI_HOST_PAUSE_TIMEOUT",
+    ):
+        installer.install(
+            archive,
+            expected_sha256=digest,
+            expected_node_pack_ref="vgen/comfyui-gguf@1.0.0",
+            expected_node_classes=("UnetLoaderGGUF",),
+        )
 
 
 def test_rejects_wrong_artifact_digest_before_pause(tmp_path: Path) -> None:

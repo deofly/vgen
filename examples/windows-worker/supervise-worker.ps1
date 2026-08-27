@@ -33,6 +33,8 @@ $SupervisorFormat = "vgen-windows-worker-supervisor"
 $SupervisorVersion = 1
 $MaxLogBytes = [Int64](8 * 1024 * 1024)
 $MaxChildLogFiles = 12
+$HostControlFormat = "vgen-windows-worker-host-control"
+$HostControlVersion = 1
 
 function Write-Step {
     param([string]$Message)
@@ -676,11 +678,15 @@ switch ($Mode) {
         }
         $workerProcess = $null
         $comfyProcess = $null
+        $hostControlStatus = $null
         try {
             $config = Read-SupervisorConfig $configPath $vgenRoot
             $launch = Read-LaunchConfig $config.LaunchConfig
             $pauseRequest = Join-Path $launch.Worker.WorkingDirectory "comfyui-pause.request"
             $pauseAcknowledgement = Join-Path $launch.Worker.WorkingDirectory "comfyui-pause.ack"
+            $hostControlStatus = Join-Path $launch.Worker.WorkingDirectory "host-control-status.json"
+            $supervisorScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $hostControlStatusNextWrite = [DateTimeOffset]::MinValue
             $workerFailures = 0
             $comfyFailures = 0
             $workerNextStart = [DateTimeOffset]::Now
@@ -689,11 +695,21 @@ switch ($Mode) {
             $comfyStartedAt = $null
             $comfyPausedNonce = $null
             while ($true) {
+                $now = [DateTimeOffset]::Now
+                if ($now -ge $hostControlStatusNextWrite) {
+                    Write-AtomicUtf8Json $hostControlStatus ([ordered]@{
+                        format = $HostControlFormat
+                        version = $HostControlVersion
+                        process_id = [int]$PID
+                        script_sha256 = $supervisorScriptSha256
+                        heartbeat_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                    })
+                    $hostControlStatusNextWrite = $now.AddSeconds(2)
+                }
                 if (Test-Path -LiteralPath $stopRequest -PathType Leaf) {
                     Write-SupervisorLog $logPath "A reviewed repair requested a clean supervisor stop."
                     break
                 }
-                $now = [DateTimeOffset]::Now
                 $pause = $null
                 try {
                     $pause = Read-ComfyPauseRequest $pauseRequest
@@ -801,6 +817,14 @@ switch ($Mode) {
             if ($cleanupFailures.Count -eq 0 -and
                 (Test-Path -LiteralPath $stopRequest -PathType Leaf)) {
                 Remove-Item -LiteralPath $stopRequest -Force
+            }
+            if ($null -ne $hostControlStatus) {
+                try {
+                    Remove-SafeControlFile $hostControlStatus
+                }
+                catch {
+                    $cleanupFailures.Add("The Worker host-control status could not be removed safely.")
+                }
             }
             $mutex.ReleaseMutex()
             $mutex.Dispose()

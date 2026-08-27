@@ -3748,8 +3748,12 @@
               "downloading",
               "verifying",
               "installing",
+              "installing_dependencies",
               "staging",
-              "activating"
+              "activating",
+              "pausing_comfyui",
+              "probing_nodes",
+              "rolling_back"
             ],
             "title": "Stage",
             "type": "string"

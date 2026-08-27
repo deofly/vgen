@@ -16,6 +16,7 @@ from vgen.gateway.schemas import (
     RateProposal,
     TaskPreflight,
     TaskPrepare,
+    WorkerMaintenanceProgress,
 )
 
 
@@ -108,6 +109,24 @@ def test_node_pack_failure_exposes_only_a_fixed_machine_reason() -> None:
             error_code=340004,
             reason_code="C:\\Users\\private",
         )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "installing_dependencies",
+        "pausing_comfyui",
+        "probing_nodes",
+        "rolling_back",
+    ],
+)
+def test_node_pack_maintenance_progress_accepts_reviewed_stages(stage: str) -> None:
+    progress = WorkerMaintenanceProgress(
+        stage=stage,
+        completed_bytes=123,
+        total_bytes=123,
+    )
+    assert progress.stage == stage
 
 
 def test_v1_maintenance_tables_rebuild_to_v3_without_losing_rows(tmp_path) -> None:
