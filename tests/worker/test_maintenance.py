@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import vgen.worker.maintenance as maintenance_module
 from vgen.artifacts import TransferTicket
 from vgen.crypto import (
     DeviceKeys,
@@ -20,9 +21,11 @@ from vgen.crypto import (
 )
 from vgen.protocol import ErrorCode, VGenError
 from vgen.worker import WorkerCredentials
+from vgen.worker.core import GatewayUnavailableError
 from vgen.worker.maintenance import (
     WorkerMaintenanceController,
     _capability_error_code,
+    _LeaseKeeper,
     _model_error_code,
     _update_error_code,
 )
@@ -55,6 +58,35 @@ class FakeGateway:
 
     def maintenance_artifact_ticket(self, job: dict[str, Any]) -> TransferTicket:
         return job["ticket"]
+
+
+def test_lease_keeper_retries_one_transient_gateway_timeout(monkeypatch: Any) -> None:
+    renewed = threading.Event()
+
+    class TransientGateway:
+        attempts = 0
+
+        def heartbeat_maintenance(self, _job_id: str, **_value: Any) -> dict[str, Any]:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise GatewayUnavailableError()
+            renewed.set()
+            return {"cancelled": False}
+
+    gateway = TransientGateway()
+    monkeypatch.setattr(maintenance_module, "_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+
+    with _LeaseKeeper(
+        gateway,  # type: ignore[arg-type]
+        "mtj_test",
+        1,
+        stage="activating",
+        gateway_lock=threading.Lock(),
+    ) as keeper:
+        assert renewed.wait(timeout=1)
+        keeper.check()
+
+    assert gateway.attempts >= 2
 
 
 class FakeExecutor:
@@ -227,8 +259,10 @@ def test_node_pack_job_installs_cached_artifact_and_reports_loaded(tmp_path: Pat
             "expected_sha256": digest,
             "expected_node_pack_ref": "vgen/comfyui-gguf@1.0.0",
             "expected_node_classes": ("UnetLoaderGGUF",),
+            "stage": calls[0]["stage"],
         }
     ]
+    assert callable(calls[0]["stage"])
     assert gateway.completions[-1]["result"] == {
         "kind": "node_pack_install",
         "status": "installed",

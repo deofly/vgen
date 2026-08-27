@@ -50,6 +50,7 @@ class NodePackInstallResult:
 
 WheelInstaller = Callable[[Path, tuple[Path, ...], Path], None]
 NodeProbe = Callable[[], set[str] | None]
+StageReporter = Callable[[str], None]
 
 
 def _safe_directory(path: Path, *, create: bool) -> Path:
@@ -99,7 +100,7 @@ def _default_wheel_installer(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=600,
+            timeout=120,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -152,6 +153,7 @@ class NodePackInstaller:
         expected_node_pack_ref: str,
         expected_node_classes: tuple[str, ...],
         probe_timeout: float = 120,
+        stage: StageReporter | None = None,
     ) -> NodePackInstallResult:
         expected = expected_sha256.removeprefix("sha256:").lower()
         if not _DIGEST.fullmatch(expected) or probe_timeout <= 0:
@@ -163,6 +165,8 @@ class NodePackInstaller:
         failed = transaction / "failed"
         transaction.mkdir(parents=True)
         try:
+            if stage is not None:
+                stage("validating")
             try:
                 manifest, source_root, wheel_root, artifact_digest = materialize_node_pack(
                     archive, unpacked
@@ -189,6 +193,8 @@ class NodePackInstaller:
                 not wheel.name.endswith("-py3-none-any.whl") for wheel in wheels
             ):
                 raise NodePackInstallError("NODE_PACK_RUNTIME_INCOMPATIBLE")
+            if stage is not None:
+                stage("installing_dependencies")
             self.wheel_installer(
                 self.python_executable,
                 wheels,
@@ -198,16 +204,22 @@ class NodePackInstaller:
 
             activated = False
             try:
+                if stage is not None:
+                    stage("pausing_comfyui")
                 with self.host_control.paused(timeout=90, ttl_seconds=600):
                     if target.exists():
                         self._validate_activation_path(target)
                         os.replace(target, backup)
                     os.replace(candidate, target)
                     activated = True
+                if stage is not None:
+                    stage("probing_nodes")
                 self._wait_for_nodes(set(manifest.node_classes), timeout=probe_timeout)
             except BaseException as exc:
                 if activated:
                     try:
+                        if stage is not None:
+                            stage("rolling_back")
                         self._rollback(target, backup, failed)
                     except BaseException as rollback_exc:
                         raise NodePackInstallError("NODE_PACK_ROLLBACK_FAILED") from rollback_exc

@@ -55,6 +55,7 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
     work.mkdir()
     host = HostControl()
     wheel_calls: list[tuple[tuple[str, ...], Path]] = []
+    stages: list[str] = []
     loaded: set[str] = set()
     python = tmp_path / "python.exe"
     python.write_bytes(b"python")
@@ -79,12 +80,19 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
         expected_sha256=digest,
         expected_node_pack_ref="vgen/comfyui-gguf@1.0.0",
         expected_node_classes=("UnetLoaderGGUF",),
+        stage=stages.append,
     )
 
     target = custom_nodes / "ComfyUI-GGUF"
     assert result.status == "installed"
     assert host.pauses == 1
     assert wheel_calls[0][0] == ("gguf-0.17.1-py3-none-any.whl",)
+    assert stages == [
+        "validating",
+        "installing_dependencies",
+        "pausing_comfyui",
+        "probing_nodes",
+    ]
     assert (target / ".vgen-deps/gguf.py").is_file()
     assert (target / "__init__.py").read_text(encoding="utf-8").startswith(
         "# VGen managed dependency path"

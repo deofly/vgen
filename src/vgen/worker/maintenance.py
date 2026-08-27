@@ -34,6 +34,7 @@ from vgen.crypto import verify_maintenance_intent
 from vgen.protocol import ErrorCode, VGenError
 
 from .capabilities import CapabilityInstallError, WorkerCapabilityStore
+from .core import GatewayUnavailableError
 from .credentials import WorkerCredentials
 from .model_installer import ModelInstaller, ModelInstallError
 from .node_packs import NodePackInstaller, NodePackInstallError
@@ -174,6 +175,9 @@ class _LeaseKeeper:
         # from overwriting a real transfer position with its initial 0/unknown.
         self._progress = (completed, total)
 
+    def update_stage(self, stage: str) -> None:
+        self._stage = stage
+
     def _run(self) -> None:
         # The caller sends the first heartbeat before entering.  Renew every
         # twenty seconds and request a five-minute lease for slow Windows disk
@@ -196,6 +200,12 @@ class _LeaseKeeper:
                     )
                     if response.get("cancelled") is True:
                         raise _MaintenanceCancelled()
+            except GatewayUnavailableError:
+                # A single transport timeout must not abandon a still-valid
+                # five-minute lease during slow Windows disk or restart work.
+                # The next renewal retries; a definitive fence/cancellation
+                # response still stops the operation below.
+                continue
             except BaseException as exc:  # surfaced in the foreground thread
                 self._error = exc
                 self._stop.set()
@@ -919,6 +929,7 @@ class WorkerMaintenanceController:
                 expected_sha256=artifact_sha256,
                 expected_node_pack_ref=node_pack_ref,
                 expected_node_classes=tuple(raw_node_classes),
+                stage=keeper.update_stage,
             )
             keeper.check()
         self._gateway.complete_maintenance(
