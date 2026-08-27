@@ -53,9 +53,10 @@ public static class VGenFakeNative
         }
 
         Console.WriteLine("python-native-noise-must-not-be-returned");
-        if (args.Length >= 3 && args[0] == "-m" && args[1] == "venv")
+        int venvIndex = Array.IndexOf(args, "venv");
+        if (venvIndex >= 0 && args.Length > venvIndex + 1)
         {
-            string scripts = Path.Combine(args[2], "Scripts");
+            string scripts = Path.Combine(args[args.Length - 1], "Scripts");
             Directory.CreateDirectory(scripts);
             File.Copy(executable, Path.Combine(scripts, "python.exe"), true);
             return 0;
@@ -90,14 +91,38 @@ public static class VGenFakeNative
         throw "The executable result guard accepted native stdout together with a path."
     }
 
+    # Keep this test focused on PowerShell's native-output boundary. The locked
+    # dependency installer and verifier have dedicated end-to-end coverage; the
+    # two stubs let the real Ensure-WorkerRuntime function reach its native venv
+    # and version checks without constructing an unrelated wheelhouse here.
+    function Test-LockedWorkerRuntime {
+        param(
+            [string]$Python,
+            [string]$Requirements,
+            [string]$TrustedPython
+        )
+        return $false
+    }
+    function Install-LockedWorkerPythonPackages {
+        param(
+            [string]$Python,
+            [string]$BundleRoot,
+            [string]$BootstrapPip,
+            [string]$Requirements,
+            [string]$TrustedPython
+        )
+    }
+
     $script:CheckOnly = $false
     $runtimeRoot = Join-Path $testRoot "worker-runtime"
     $runtimeResult = @(
         Ensure-WorkerRuntime `
-            $runtimeRoot `
-            (Join-Path $testRoot "vgen-0.2.2-py3-none-any.whl") `
-            $fakeNative `
-            "0.2.2"
+            -RuntimeRoot $runtimeRoot `
+            -BootstrapPython $fakeNative `
+            -ExpectedVersion "0.2.2" `
+            -BundleRoot $testRoot `
+            -BootstrapPip (Join-Path $testRoot "bootstrap-pip") `
+            -Requirements (Join-Path $testRoot "requirements.lock")
     )
     $expectedRuntimePython = Join-Path $runtimeRoot "Scripts\python.exe"
     if ($runtimeResult.Count -ne 1 -or
