@@ -28,8 +28,9 @@ def test_public_docs_and_server_examples_do_not_name_maintainer_operated_domains
 def test_ci_has_read_only_permissions_pinned_actions_and_security_gates() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "permissions:\n  contents: read" in workflow
-    assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in workflow
-    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in workflow
+    assert "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in workflow
+    assert "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97" in workflow
+    assert "actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c" in workflow
     assert "python -m pip_audit ." in workflow
     assert "bandit -c pyproject.toml -r src tools" in workflow
     assert "python tools/check_public_repository.py" in workflow
