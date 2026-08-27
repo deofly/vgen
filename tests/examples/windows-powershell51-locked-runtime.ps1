@@ -78,7 +78,9 @@ print(digest(console))
 print(digest(target.with_name("pythonw.exe")))
 print(digest(windowed))
 '@
-$launcherHashes = @(& $BootstrapPython -I -B -S -c $launcherHashCode $expectedPython)
+$launcherHashes = @(
+    $launcherHashCode | & $BootstrapPython -I -B -S - $expectedPython
+)
 Assert-Condition ($LASTEXITCODE -eq 0 -and $launcherHashes.Count -eq 4) `
     "The trusted CPython venv launcher hashes could not be inspected."
 Assert-Condition ($launcherHashes[0] -ceq $launcherHashes[1]) `
