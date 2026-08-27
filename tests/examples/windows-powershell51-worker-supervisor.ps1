@@ -276,6 +276,12 @@ while ($true) {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
     Assert-Equal $task.TaskPath "\" "Scheduled task path"
     Assert-Equal ([string]$task.State) "Ready" "Scheduled task state after Install"
+    Assert-Equal ([string]$task.Principal.LogonType) "Interactive" `
+        "Scheduled task principal logon type"
+    Assert-Equal ([string]$task.Principal.RunLevel) "Limited" `
+        "Scheduled task principal run level"
+    Assert-Equal ([string]$task.Settings.MultipleInstances) "IgnoreNew" `
+        "Scheduled task multiple-instance policy"
     Assert-True (Test-Path -LiteralPath $managedSupervisor -PathType Leaf) `
         "Managed supervisor installation"
 
@@ -295,14 +301,25 @@ while ($true) {
         (Get-XmlText $taskXml $namespaces "//t:Principals/t:Principal/t:LogonType" "logon type") `
         "InteractiveToken" `
         "Scheduled task logon type"
-    Assert-Equal `
-        (Get-XmlText $taskXml $namespaces "//t:Principals/t:Principal/t:RunLevel" "run level") `
-        "LeastPrivilege" `
-        "Scheduled task run level"
-    Assert-Equal `
-        (Get-XmlText $taskXml $namespaces "//t:Settings/t:MultipleInstancesPolicy" "instance policy") `
-        "IgnoreNew" `
-        "Scheduled task multiple-instance policy"
+    # Windows may omit optional or default-valued task properties on export.
+    # The CIM object above is authoritative; if these XML nodes are emitted,
+    # they must describe the same least-privilege, single-instance contract.
+    $runLevelNode = $taskXml.SelectSingleNode(
+        "//t:Principals/t:Principal/t:RunLevel",
+        $namespaces
+    )
+    if ($null -ne $runLevelNode) {
+        Assert-Equal ([string]$runLevelNode.InnerText) "LeastPrivilege" `
+            "Scheduled task XML run level"
+    }
+    $multipleInstancesNode = $taskXml.SelectSingleNode(
+        "//t:Settings/t:MultipleInstancesPolicy",
+        $namespaces
+    )
+    if ($null -ne $multipleInstancesNode) {
+        Assert-Equal ([string]$multipleInstancesNode.InnerText) "IgnoreNew" `
+            "Scheduled task XML multiple-instance policy"
+    }
     Assert-Equal `
         ([Xml.XmlConvert]::ToTimeSpan((Get-XmlText $taskXml $namespaces "//t:Settings/t:ExecutionTimeLimit" "execution time limit"))) `
         ([TimeSpan]::Zero) `
