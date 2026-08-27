@@ -1167,6 +1167,7 @@ class WorkerMaintenanceController:
                 "node_pack_ref": node_pack_ref,
                 "artifact_sha256": artifact_sha256,
                 "error_code": code,
+                "reason_code": reason,
             },
         )
         return MaintenanceOutcome(

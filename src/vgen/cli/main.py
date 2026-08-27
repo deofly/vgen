@@ -1908,6 +1908,13 @@ def _raise_for_unsuccessful_maintenance(job: Mapping[str, Any]) -> None:
     if state == "succeeded":
         return
     result = job.get("result")
+    reason_code = result.get("reason_code") if isinstance(result, Mapping) else None
+    if (
+        isinstance(reason_code, str)
+        and reason_code.startswith("NODE_PACK_")
+        and reason_code.replace("_", "").isalnum()
+    ):
+        print(f"维护任务失败原因：{reason_code}", file=sys.stderr)
     raw_code = result.get("error_code") if isinstance(result, Mapping) else None
     if isinstance(raw_code, int) and not isinstance(raw_code, bool):
         code = raw_code

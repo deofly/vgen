@@ -11,6 +11,7 @@ from vgen.gateway.schemas import (
     ArtifactPrepare,
     CapabilityInstallMaintenanceResult,
     CapabilityInstallSpec,
+    NodePackInstallMaintenanceResult,
     OutputArtifact,
     RateProposal,
     TaskPreflight,
@@ -77,6 +78,35 @@ def test_capability_install_result_allows_not_ready_but_separates_failure_fields
     with pytest.raises(ValidationError):
         CapabilityInstallMaintenanceResult(
             **identifiers, status="activated", ready=False, error_code=None
+        )
+
+
+def test_node_pack_failure_exposes_only_a_fixed_machine_reason() -> None:
+    identifiers = {
+        "kind": "node_pack_install",
+        "node_pack_ref": "vgen/comfyui-gguf@1.0.1",
+        "artifact_sha256": "a" * 64,
+    }
+    failed = NodePackInstallMaintenanceResult(
+        **identifiers,
+        status="failed",
+        error_code=340004,
+        reason_code="NODE_PACK_TARGET_UNSAFE",
+    )
+    assert failed.reason_code == "NODE_PACK_TARGET_UNSAFE"
+
+    with pytest.raises(ValidationError):
+        NodePackInstallMaintenanceResult(
+            **identifiers,
+            status="failed",
+            error_code=340004,
+        )
+    with pytest.raises(ValidationError):
+        NodePackInstallMaintenanceResult(
+            **identifiers,
+            status="failed",
+            error_code=340004,
+            reason_code="C:\\Users\\private",
         )
 
 

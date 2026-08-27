@@ -793,15 +793,29 @@ class NodePackInstallMaintenanceResult(WireModel):
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     loaded: bool | None = Field(default=None, strict=True)
     error_code: int | None = Field(default=None, ge=100000, le=999999, strict=True)
+    reason_code: str | None = Field(
+        default=None,
+        pattern=r"^NODE_PACK_[A-Z0-9_]{1,96}$",
+    )
 
     @model_validator(mode="after")
     def success_and_failure_fields_are_disjoint(
         self,
     ) -> NodePackInstallMaintenanceResult:
         if self.status == "failed":
-            if self.loaded is not None or self.error_code is None:
-                raise ValueError("failed Node Pack installs require only an error code")
-        elif self.loaded is not True or self.error_code is not None:
+            if (
+                self.loaded is not None
+                or self.error_code is None
+                or self.reason_code is None
+            ):
+                raise ValueError(
+                    "failed Node Pack installs require an error and fixed reason code"
+                )
+        elif (
+            self.loaded is not True
+            or self.error_code is not None
+            or self.reason_code is not None
+        ):
             raise ValueError("successful Node Pack installs require loaded=true")
         return self
 

@@ -1716,6 +1716,18 @@
             "title": "Node Pack Ref",
             "type": "string"
           },
+          "reason_code": {
+            "anyOf": [
+              {
+                "pattern": "^NODE_PACK_[A-Z0-9_]{1,96}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason Code"
+          },
           "status": {
             "enum": [
               "installed",
