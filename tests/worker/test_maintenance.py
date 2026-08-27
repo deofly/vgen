@@ -211,6 +211,32 @@ def model_fixture() -> tuple[dict[str, Any], WorkerCredentials, Any]:
     return job, credentials, pin
 
 
+def test_supported_actions_only_advertise_live_node_pack_installer(tmp_path: Path) -> None:
+    _job, credentials, pin = model_fixture()
+    controller = WorkerMaintenanceController(
+        credentials,
+        FakeGateway(),  # type: ignore[arg-type]
+        FakeExecutor(pin),  # type: ignore[arg-type]
+        work_root=tmp_path,
+        model_root=None,
+    )
+    assert controller.supported_actions == (
+        "worker_update",
+        "model_install",
+        "capability_install",
+    )
+
+    controller = WorkerMaintenanceController(
+        credentials,
+        FakeGateway(),  # type: ignore[arg-type]
+        FakeExecutor(pin),  # type: ignore[arg-type]
+        work_root=tmp_path,
+        model_root=None,
+        node_pack_installer=object(),  # type: ignore[arg-type]
+    )
+    assert controller.supported_actions[-1] == "node_pack_install"
+
+
 def test_node_pack_job_installs_cached_artifact_and_reports_loaded(tmp_path: Path) -> None:
     artifact = b"reviewed node pack"
     digest = hashlib.sha256(artifact).hexdigest()

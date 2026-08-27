@@ -257,6 +257,15 @@ class WorkerMaintenanceController:
         # the pinned owner trust anchor and therefore cannot execute maintenance.
         return self._credentials.owner_root_signing_public_key is not None
 
+    @property
+    def supported_actions(self) -> tuple[str, ...]:
+        if not self.enabled:
+            return ()
+        actions = ["worker_update", "model_install", "capability_install"]
+        if self._node_pack_installer is not None:
+            actions.append("node_pack_install")
+        return tuple(actions)
+
     def recover_pending_update(
         self,
         *,

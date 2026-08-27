@@ -723,7 +723,12 @@ def _enabled_maintenance_actions(
 ) -> tuple[str, ...]:
     if controller is None or not bool(getattr(controller, "enabled", False)):
         return ()
-    return ("worker_update", "model_install", "capability_install", "node_pack_install")
+    actions = getattr(
+        controller,
+        "supported_actions",
+        ("worker_update", "model_install", "capability_install", "node_pack_install"),
+    )
+    return tuple(str(action) for action in actions)
 
 
 def _can_poll_inference(executor: Executor, status: Mapping[str, Any]) -> bool:
