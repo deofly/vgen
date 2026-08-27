@@ -240,3 +240,5 @@ Assert-Condition (-not (Test-LockedWorkerRuntime `
     "An extra installed distribution was accepted."
 
 Write-Host "Windows PowerShell 5.1 locked-runtime checks passed."
+
+exit 0

@@ -42,3 +42,5 @@ finally {
         [System.IO.Directory]::Delete($root, $true)
     }
 }
+
+exit 0

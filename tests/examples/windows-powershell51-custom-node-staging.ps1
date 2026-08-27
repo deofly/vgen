@@ -117,3 +117,5 @@ finally {
     }
     $env:LOCALAPPDATA = $originalLocalAppData
 }
+
+exit 0

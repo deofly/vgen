@@ -18,6 +18,13 @@ MANIFEST = ROOT / "workflows" / "vgen" / "minimax-h3-8step" / "1.0.0" / "manifes
 POLICY = ROOT / "examples" / "comfyui-minimax-h3-policy.yaml"
 
 
+def test_windows_powershell51_contract_scripts_exit_explicitly_on_success() -> None:
+    scripts = sorted((ROOT / "tests" / "examples").glob("windows-powershell51-*.ps1"))
+    assert scripts
+    for script in scripts:
+        assert script.read_text(encoding="utf-8").rstrip().endswith("exit 0"), script
+
+
 def _blocks(text: str, variable: str, next_variable: str) -> list[str]:
     body = text.split(f"${variable} = @(", 1)[1].split(f"${next_variable} = @(", 1)[0]
     return re.findall(r"\[PSCustomObject\]@\{(.*?)\n\s*\}", body, flags=re.DOTALL)

@@ -145,3 +145,5 @@ finally {
         [System.IO.Directory]::Delete($testRoot, $true)
     }
 }
+
+exit 0
