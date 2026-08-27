@@ -61,7 +61,7 @@ def test_worker_gateway_enables_attempt_progress_reporting() -> None:
     assert gateway._report_progress is True
 
 
-def test_maintenance_uses_worker_python_for_pure_node_packs_without_host_pin(
+def test_maintenance_uses_worker_python_for_pure_node_packs_with_stale_host_pin(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -92,7 +92,7 @@ def test_maintenance_uses_worker_python_for_pure_node_packs_without_host_pin(
         SimpleNamespace(
             work_root=tmp_path / "work",
             comfy_custom_nodes_root=custom_nodes,
-            comfy_python_executable=None,
+            comfy_python_executable=tmp_path / "removed-comfy-python.exe",
             comfy_model_root=None,
         ),
         SimpleNamespace(),  # type: ignore[arg-type]

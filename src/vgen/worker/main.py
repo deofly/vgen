@@ -384,6 +384,20 @@ def _worker_work_root(arguments: argparse.Namespace) -> Path:
     ).expanduser()
 
 
+def _safe_configured_python(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    raw = path.expanduser().absolute()
+    try:
+        metadata = raw.lstat()
+        resolved = raw.resolve(strict=True)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or raw.is_symlink() or resolved != raw:
+        return None
+    return resolved
+
+
 def _build_maintenance(
     arguments: argparse.Namespace,
     credentials: WorkerCredentials,
@@ -398,7 +412,7 @@ def _build_maintenance(
     node_probe = getattr(executor, "maintenance_node_classes", None)
     node_pack_installer = None
     if custom_nodes_root is not None and callable(node_probe):
-        configured_python = arguments.comfy_python_executable
+        configured_python = _safe_configured_python(arguments.comfy_python_executable)
         installer_python = configured_python or Path(sys.executable).resolve(strict=True)
         node_pack_installer = NodePackInstaller(
             work_root,
