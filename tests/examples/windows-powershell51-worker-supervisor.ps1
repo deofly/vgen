@@ -637,6 +637,26 @@ exit 0
     Assert-Equal ([IO.File]::ReadAllText($repairMarker)) "-Repair" `
         "Versioned launcher Repair arguments"
 
+    & $env:ComSpec /d /c "`"$(Join-Path $repairPackage 'start-worker.cmd')`" -Unknown"
+    Assert-Equal $LASTEXITCODE 2 "Versioned launcher rejected-argument exit code"
+    Assert-Equal ([IO.File]::ReadAllText($repairMarker)) "-Repair" `
+        "Versioned launcher rejected arguments did not reach enrollment"
+
+    & $env:ComSpec /d /c `
+        "`"$(Join-Path $repairPackage 'start-worker.cmd')`" -Repair -Unexpected"
+    Assert-Equal $LASTEXITCODE 2 "Versioned launcher extra-argument exit code"
+    Assert-Equal ([IO.File]::ReadAllText($repairMarker)) "-Repair" `
+        "Versioned launcher extra arguments did not reach enrollment"
+
+    $failingEnrollment = $fakeEnrollment.Replace("exit 0", "exit 37")
+    [IO.File]::WriteAllText(
+        (Join-Path $repairPackage "enroll-worker.ps1"),
+        $failingEnrollment,
+        $utf8
+    )
+    & $env:ComSpec /d /c "`"$(Join-Path $repairPackage 'start-worker.cmd')`" -Repair"
+    Assert-Equal $LASTEXITCODE 37 "Versioned launcher enrollment failure exit code"
+
     Write-Host "Windows PowerShell 5.1 persistent Worker supervisor checks passed"
 }
 finally {

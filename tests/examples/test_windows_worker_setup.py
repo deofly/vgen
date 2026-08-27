@@ -888,9 +888,17 @@ def test_windows_worker_reinstall_verifies_identity_and_stages_safe_reenrollment
     assert '"%~dp0enroll-worker.ps1" %VGEN_WORKER_SETUP_ARG%' in launcher
     assert "VGen\\supervisor\\supervise-worker.ps1" in launcher
     assert "-Mode Start" in launcher
-    assert "if not errorlevel 1 exit /b 0" in launcher
+    assert "if not errorlevel 1 goto vgen_worker_supervisor_started" in launcher
+    assert ":vgen_worker_supervisor_started" in launcher
+    assert "if not errorlevel 1 exit /b 0" not in launcher
     assert 'if "%ERRORLEVEL%"=="0"' not in launcher
     assert "pause" not in launcher.lower()
+
+    assert '[Console]::Error.WriteLine("[vgen] ERROR: $failureMessage")' in enrollment
+    assert "Write-Error $failureMessage" not in enrollment
+    assert enrollment.index('[Console]::Error.WriteLine("[vgen] ERROR: $failureMessage")') < (
+        enrollment.index("exit 1", enrollment.index("catch {"))
+    )
 
 
 def test_windows_worker_enrollment_secures_acl_before_any_gateway_identity_request() -> None:

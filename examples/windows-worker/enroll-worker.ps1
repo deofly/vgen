@@ -1198,6 +1198,6 @@ catch {
             Write-Warning "The previously installed Worker supervisor also could not be restarted."
         }
     }
-    Write-Error $failureMessage
+    [Console]::Error.WriteLine("[vgen] ERROR: $failureMessage")
     exit 1
 }

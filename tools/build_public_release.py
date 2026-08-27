@@ -1159,24 +1159,14 @@ function Install-VGenWorkerLauncher([string]$InstallRoot) {{
 @echo off
 setlocal
 set "VGEN_WORKER_SETUP_ARG="
-if not "%~1"=="" (
-  if /I "%~1"=="-Reenroll" set "VGEN_WORKER_SETUP_ARG=-Reenroll"
-  if /I "%~1"=="-Repair" set "VGEN_WORKER_SETUP_ARG=-Repair"
-  if not defined VGEN_WORKER_SETUP_ARG (
-    echo [vgen] Only the reviewed -Repair and -Reenroll switches are accepted.
-    exit /b 2
-  )
-  if not "%~2"=="" (
-    echo [vgen] The recovery switch does not accept additional arguments.
-    exit /b 2
-  )
-)
+if "%~1"=="" goto vgen_worker_arguments_checked
+if /I "%~1"=="-Reenroll" set "VGEN_WORKER_SETUP_ARG=-Reenroll"
+if /I "%~1"=="-Repair" set "VGEN_WORKER_SETUP_ARG=-Repair"
+if not defined VGEN_WORKER_SETUP_ARG goto vgen_worker_invalid_switch
+:vgen_worker_arguments_checked
+if not "%~2"=="" goto vgen_worker_extra_arguments
 set "VGEN_WORKER_VERSION_LAUNCHER=%~dp0installer\$installLeaf\start-worker.cmd"
-if not exist "%VGEN_WORKER_VERSION_LAUNCHER%" (
-  echo [vgen] The installed Worker launcher is missing.
-  echo [vgen] Run the public Windows Worker installer again to repair it.
-  exit /b 1
-)
+if not exist "%VGEN_WORKER_VERSION_LAUNCHER%" goto vgen_worker_missing_launcher
 if defined VGEN_WORKER_SETUP_ARG goto vgen_worker_setup
 "%VGEN_WORKER_VERSION_LAUNCHER%"
 exit /b %ERRORLEVEL%
@@ -1184,6 +1174,19 @@ exit /b %ERRORLEVEL%
 :vgen_worker_setup
 "%VGEN_WORKER_VERSION_LAUNCHER%" %VGEN_WORKER_SETUP_ARG%
 exit /b %ERRORLEVEL%
+
+:vgen_worker_invalid_switch
+echo [vgen] Only the reviewed -Repair and -Reenroll switches are accepted.
+exit /b 2
+
+:vgen_worker_extra_arguments
+echo [vgen] The recovery switch does not accept additional arguments.
+exit /b 2
+
+:vgen_worker_missing_launcher
+echo [vgen] The installed Worker launcher is missing.
+echo [vgen] Run the public Windows Worker installer again to repair it.
+exit /b 1
 "@
     $launcherContent = $launcherContent.Replace("`r`n", "`n").Replace("`n", "`r`n")
     $launcherBytes = [Text.Encoding]::ASCII.GetBytes($launcherContent)

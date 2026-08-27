@@ -202,6 +202,17 @@ try {
         "-Repair" `
         "Rejected arguments did not reach the versioned launcher"
 
+    & $env:ComSpec /d /c "`"$stableLauncher`" -Repair -Unexpected"
+    Assert-Equal $LASTEXITCODE 2 "Stable launcher extra-argument exit code"
+    Assert-Equal `
+        ([IO.File]::ReadAllText((Join-Path $firstRoot "invocation.txt")).Trim()) `
+        "-Repair" `
+        "Extra arguments did not reach the versioned launcher"
+
+    Remove-Item -LiteralPath (Join-Path $firstRoot "start-worker.cmd") -Force
+    & $env:ComSpec /d /c "`"$stableLauncher`""
+    Assert-Equal $LASTEXITCODE 1 "Stable launcher missing-target exit code"
+
     $secondRoot = New-TestInstaller "0.9.2" "2" 29
     $secondLauncher = Install-VGenWorkerLauncher $secondRoot
     Assert-Equal $secondLauncher $stableLauncher "Stable launcher path after update"

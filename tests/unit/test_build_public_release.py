@@ -474,6 +474,12 @@ def test_windows_bootstrap_installs_a_stable_launcher_and_desktop_shortcut() -> 
         assert '"%VGEN_WORKER_VERSION_LAUNCHER%" %VGEN_WORKER_SETUP_ARG%' in script
         assert 'set "VGEN_WORKER_SETUP_ARG=-Reenroll"' in script
         assert 'set "VGEN_WORKER_SETUP_ARG=-Repair"' in script
+        assert "goto vgen_worker_invalid_switch" in script
+        assert "goto vgen_worker_extra_arguments" in script
+        assert "goto vgen_worker_missing_launcher" in script
+        assert ":vgen_worker_invalid_switch" in script
+        assert ":vgen_worker_extra_arguments" in script
+        assert ":vgen_worker_missing_launcher" in script
         assert "pause" not in script.lower()
         assert 'call "%VGEN_WORKER_VERSION_LAUNCHER%"' not in script
         assert "Run the public Windows Worker installer again to repair it." in script
