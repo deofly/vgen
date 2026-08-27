@@ -2093,10 +2093,16 @@ class ComfyUIExecutor:
             for dependency in capability.custom_nodes
         }
         root = self._custom_nodes_root
-        if root is None:
+        try:
+            root.lstat()
+        except FileNotFoundError:
             return set(), not dependencies, set()
-        if _is_reparse_point(root) or not root.is_dir():
+        except OSError:
             return set(), False, set()
+        if _is_reparse_point(root):
+            return set(), False, set()
+        if not root.is_dir():
+            return set(), not dependencies, set()
         try:
             # A symlink/junction in any root ancestor changes the code tree
             # after configuration. The isolated root must resolve to itself.

@@ -256,7 +256,11 @@ def test_custom_node_readiness_requires_exact_clean_git_provenance_and_survives_
             custom_nodes_root=root,
         )
 
-    missing = _readiness(executor(None).capabilities())["test/gguf@1.0.0"]
+    assert _readiness(executor(None).capabilities())["test/gguf@1.0.0"]["state"] == "ready"
+
+    empty_root = tmp_path / "empty-custom-nodes"
+    empty_root.mkdir()
+    missing = _readiness(executor(empty_root).capabilities())["test/gguf@1.0.0"]
     assert missing["state"] == "missing_nodes"
     assert missing["missing_node_classes"] == ["UnetLoaderGGUF"]
     assert _readiness(executor(custom_root).capabilities())["test/gguf@1.0.0"]["state"] == "ready"
