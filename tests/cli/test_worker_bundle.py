@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import stat
 import zipfile
@@ -114,7 +115,8 @@ def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Pat
     )
 
     assert result.path == target
-    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    if os.name != "nt":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
     with zipfile.ZipFile(target) as archive:
         names = set(archive.namelist())
         assert names == {
@@ -130,6 +132,12 @@ def test_public_installer_bundle_contains_no_principal_credentials(tmp_path: Pat
             WHEEL_NAME,
             "SHA256SUMS",
         }
+        for info in archive.infolist():
+            mode = info.external_attr >> 16
+            assert info.date_time == (2020, 2, 2, 0, 0, 0)
+            assert info.create_system == 3
+            assert stat.S_IFMT(mode) == stat.S_IFREG
+            assert stat.S_IMODE(mode) == (0o755 if info.filename == "start-worker.cmd" else 0o644)
         assert "worker-credentials.json" not in names
         config = json.loads(archive.read("vgen-worker-bundle.json"))
         assert config["gateway_url"] == "https://gateway.example"

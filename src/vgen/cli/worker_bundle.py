@@ -86,6 +86,14 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _canonical_zip_info(name: str, mode: int) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, (2020, 2, 2, 0, 0, 0))
+    info.create_system = 3
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = (stat.S_IFREG | stat.S_IMODE(mode)) << 16
+    return info
+
+
 def _asset_bytes(name: str) -> bytes:
     packaged = resources.files("vgen").joinpath("assets", "worker", name)
     if packaged.is_file():
@@ -499,9 +507,7 @@ def _installed_wheel_bytes() -> tuple[str, bytes]:
     records: list[list[str]] = []
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, value in sorted(selected):
-            info = zipfile.ZipInfo(name, (2020, 2, 2, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
+            info = _canonical_zip_info(name, 0o644)
             archive.writestr(info, value)
             digest = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).rstrip(b"=").decode()
             records.append([name, f"sha256={digest}", str(len(value))])
@@ -509,9 +515,7 @@ def _installed_wheel_bytes() -> tuple[str, bytes]:
         writer = csv.writer(record_buffer, lineterminator="\n")
         writer.writerows(records)
         writer.writerow([record_name, "", ""])
-        info = zipfile.ZipInfo(record_name, (2020, 2, 2, 0, 0, 0))
-        info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = 0o644 << 16
+        info = _canonical_zip_info(record_name, 0o644)
         archive.writestr(info, record_buffer.getvalue().encode("utf-8"))
     return f"vgen-{__version__}-py3-none-any.whl", buffer.getvalue()
 
@@ -626,9 +630,7 @@ def _write_public_installer_bundle(
         )
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, value, mode in [*entries, ("SHA256SUMS", checksums, 0o644)]:
-                info = zipfile.ZipInfo(name, (2020, 2, 2, 0, 0, 0))
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = mode << 16
+                info = _canonical_zip_info(name, mode)
                 archive.writestr(info, value)
         if target.exists() and not overwrite:
             raise WorkerBundleError(f"Refusing to overwrite existing bundle: {target}")
