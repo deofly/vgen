@@ -1662,9 +1662,13 @@ def create_app(
     ) -> _ValidatedMaintenanceAuthorization:
         if principal.principal_type != "device" or not principal.user_id:
             raise VGenError(ErrorCode.PERMISSION_DENIED)
-        # Optional v2 dependency identifiers are omitted for a legacy v1
-        # maintenance intent so the exact Owner-signed spec remains stable.
-        spec = payload.spec.model_dump(mode="json", exclude_none=True)
+        # Preserve required nullable wire fields such as publisher_key: null:
+        # they are part of the exact Owner-signed specification. Only omit the
+        # optional v2 dependency pair for a legacy v1 capability intent.
+        spec = payload.spec.model_dump(mode="json")
+        if payload.spec.kind == "capability_install" and spec["model_digests"] is None:
+            spec.pop("model_digests")
+            spec.pop("node_classes")
         authorization = payload.authorization.model_dump(mode="json")
         intent_payload = authorization["payload"]
         if (

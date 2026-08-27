@@ -243,6 +243,28 @@ def _capability_spec_v2(artifact: bytes, *, suffix: str = "d") -> dict[str, Any]
     }
 
 
+def test_unsigned_capability_intent_preserves_required_null_publisher_key(tmp_path) -> None:
+    env = _environment(tmp_path)
+    try:
+        spec = _capability_spec(b"unsigned-capability")
+        spec["publisher_key"] = None
+        spec["allow_unsigned_workflow"] = True
+
+        response = _create_job(env, spec)
+
+        assert response.status_code == 200, response.text
+        stored = env.app.state.db.fetchone(
+            "SELECT spec FROM worker_maintenance_jobs WHERE id=?", (response.json()["id"],)
+        )
+        assert stored is not None
+        stored_spec = json.loads(stored["spec"])
+        assert stored_spec["publisher_key"] is None
+        assert "model_digests" not in stored_spec
+        assert "node_classes" not in stored_spec
+    finally:
+        env.client.__exit__(None, None, None)
+
+
 def _authorize_dynamic_workflow(
     env: MaintenanceEnvironment,
     *,

@@ -30,13 +30,14 @@ def _write_pointer(
     previous: Path | None = None,
     pending: bool = False,
     activation_verified: bool = False,
-    active_version: str = "0.13.11",
+    active_version: str | None = None,
 ) -> None:
+    resolved_active_version = active_version or supervisor_module.__version__
     value: dict[str, Any] = {
         "format": "vgen-worker-runtime-pointer",
         "version": 1,
         "active_python": str(active),
-        "active_version": active_version,
+        "active_version": resolved_active_version,
     }
     if pending:
         value.update(
