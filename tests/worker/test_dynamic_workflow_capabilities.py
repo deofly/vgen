@@ -13,6 +13,7 @@ import pytest
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import vgen.executors.comfyui as comfyui_module
 from vgen.artifacts import TransferTicket
 from vgen.crypto import (
     DeviceKeys,
@@ -850,6 +851,21 @@ def test_hardlinked_shared_model_is_hashed_once_per_capability_probe(
 
     assert report["execution_policy"]["models_verified"] == 1
     assert len(reads) == 1
+
+    metadata = first.stat()
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "time_ns",
+        lambda: max(metadata.st_mtime_ns, metadata.st_ctime_ns)
+        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
+    )
+    executor.capabilities()
+
+    assert len(reads) == 2
+
+    executor.capabilities()
+
+    assert len(reads) == 2
 
 
 def test_invalid_dynamic_capability_does_not_suppress_legacy_h3_policy(

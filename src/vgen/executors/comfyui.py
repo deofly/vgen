@@ -61,6 +61,9 @@ _HARD_MAX_EDGES = 4096
 _HARD_MAX_GRAPH_DEPTH = 128
 _HARD_MAX_VALUE_DEPTH = 32
 _HARD_MAX_INPUT_FIELDS = 256
+# FAT-compatible volumes can expose a two-second modification-time tick. A
+# fresh stat identity must settle for that full tick before cross-probe reuse.
+_MODEL_DIGEST_CACHE_SETTLE_NS = 2_000_000_000
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -1941,7 +1944,11 @@ class ComfyUIExecutor:
             capabilities.values()
         )
         all_pins = self.maintenance_model_pins
-        model_digests, model_failures = self._verified_model_digests(all_pins)
+        verified_model_placements: set[tuple[str, str]] = set()
+        model_digests, model_failures = self._verified_model_digests(
+            all_pins,
+            verified_placements=verified_model_placements,
+        )
         gpus, system, vram_bytes, ram_bytes = self._resource_snapshot()
         node_probe = getattr(self._client, "node_classes", None)
         node_classes = node_probe() if callable(node_probe) else None
@@ -1956,7 +1963,7 @@ class ComfyUIExecutor:
                 {
                     f"sha256:{pin.sha256}"
                     for pin in capability.policy.model_files
-                    if f"sha256:{pin.sha256}" not in self._verified_model_digests((pin,))[0]
+                    if (pin.path, pin.sha256) not in verified_model_placements
                 }
             )
             required_nodes = (
@@ -2303,14 +2310,22 @@ class ComfyUIExecutor:
         )
         return gpus, system, vram_bytes, max(0, ram_bytes)
 
-    def _verified_model_digests(self, pins: tuple[ComfyUIModelPin, ...]) -> tuple[list[str], int]:
+    def _verified_model_digests(
+        self,
+        pins: tuple[ComfyUIModelPin, ...],
+        *,
+        verified_placements: set[tuple[str, str]] | None = None,
+    ) -> tuple[list[str], int]:
         verified: list[str] = []
         failures = 0
         total_size = sum(pin.size for pin in pins)
         total_bytes_read = 0
         last_reported_total_percent = -1
+        cache_now_ns = time.time_ns()
         fingerprint_digests: dict[tuple[int, int, int, int, int], str] = {
-            tuple(cached[:5]): cached[5] for cached in self._model_digest_cache.values()
+            tuple(cached[:5]): cached[5]
+            for cached in self._model_digest_cache.values()
+            if cache_now_ns - max(cached[3], cached[4]) >= _MODEL_DIGEST_CACHE_SETTLE_NS
         }
 
         def report(
@@ -2360,7 +2375,18 @@ class ComfyUIExecutor:
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
             )
-            if cached is not None and cached[:5] == fingerprint:
+            metadata_age_ns = cache_now_ns - max(
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            cache_identity_is_stable = metadata_age_ns >= _MODEL_DIGEST_CACHE_SETTLE_NS
+            if cached is not None and (
+                cached[:5] != fingerprint or not cache_identity_is_stable
+            ):
+                # Never let a digest recorded for a fresh or superseded stat
+                # identity become trusted merely because wall time advanced.
+                self._model_digest_cache.pop(candidate, None)
+            if cached is not None and cached[:5] == fingerprint and cache_identity_is_stable:
                 digest = cached[5]
                 total_bytes_read += pin.size
                 report(
@@ -2373,8 +2399,15 @@ class ComfyUIExecutor:
                 # ModelInstaller materializes one verified CAS blob through
                 # hard links. Reuse the digest for the same immutable file
                 # identity instead of rereading tens of gigabytes per placement.
+                # The map is seeded only with settled cross-probe identities;
+                # freshly hashed identities are also safe to share with another
+                # hard-link placement during this single verification probe.
                 digest = fingerprint_digests[fingerprint]
-                self._model_digest_cache[candidate] = (*fingerprint, digest)
+                if (
+                    time.time_ns() - max(metadata.st_mtime_ns, metadata.st_ctime_ns)
+                    >= _MODEL_DIGEST_CACHE_SETTLE_NS
+                ):
+                    self._model_digest_cache[candidate] = (*fingerprint, digest)
                 total_bytes_read += pin.size
                 report(
                     model_index=model_index,
@@ -2407,7 +2440,11 @@ class ComfyUIExecutor:
                     file_bytes_read=file_bytes_read,
                     force=True,
                 )
-                after = candidate.stat()
+                try:
+                    after = candidate.stat()
+                except OSError:
+                    failures += 1
+                    continue
                 if (
                     after.st_dev,
                     after.st_ino,
@@ -2417,11 +2454,21 @@ class ComfyUIExecutor:
                 ) != fingerprint:
                     failures += 1
                     continue
-                self._model_digest_cache[candidate] = (*fingerprint, digest)
                 fingerprint_digests[fingerprint] = digest
+                if (
+                    time.time_ns() - max(after.st_mtime_ns, after.st_ctime_ns)
+                    >= _MODEL_DIGEST_CACHE_SETTLE_NS
+                ):
+                    # Large models commonly take longer than the settle window
+                    # to hash. Cache them immediately when the post-read stat is
+                    # unchanged and old enough; small fresh files are rehashed
+                    # once after settling before cross-probe reuse is allowed.
+                    self._model_digest_cache[candidate] = (*fingerprint, digest)
             if digest != pin.sha256:
                 failures += 1
                 continue
+            if verified_placements is not None:
+                verified_placements.add((pin.path, pin.sha256))
             verified.append(f"sha256:{digest}")
         return sorted(set(verified)), failures
 

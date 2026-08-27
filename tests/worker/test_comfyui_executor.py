@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import websocket
 
+import vgen.executors.comfyui as comfyui_module
 from vgen.artifacts import ArtifactDescriptor
 from vgen.executors import ExecutionContext, ExecutionInput, ExecutionRequest, ExecutorFailure
 from vgen.executors.comfyui import (
@@ -794,6 +795,7 @@ def test_minimax_h3_reference_graph_passes_explicit_builtin_and_custom_policy(
 
 def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output_dir = tmp_path / "outputs"
     model_root = tmp_path / "models"
@@ -802,6 +804,12 @@ def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     model = model_root / "diffusion_models/model.safetensors"
     contents = b"trusted-model"
     model.write_bytes(contents)
+    verified_metadata = model.stat()
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "time_ns",
+        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns) + 1,
+    )
     digest = sha256(contents).hexdigest()
     policy = ComfyUIExecutionPolicy.from_mapping(
         {
@@ -830,6 +838,21 @@ def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     assert capabilities["execution_policy"]["models_verified"] == 1
 
     model.write_bytes(b"altered-model")
+    real_stat = Path.stat
+
+    def coarse_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == model:
+            return verified_metadata
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", coarse_stat)
+    monkeypatch.setattr(
+        comfyui_module.time,
+        "time_ns",
+        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
+        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS
+        + 1,
+    )
     capabilities = executor.capabilities()
     assert capabilities["model_digests"] == []
     assert capabilities["execution_policy"]["models_failed"] == 1
