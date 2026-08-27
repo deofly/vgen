@@ -9,6 +9,7 @@ import os
 import signal
 import stat
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from packaging.version import InvalidVersion, Version
 from platformdirs import user_data_path
 
 from vgen import __version__
@@ -44,6 +46,7 @@ from .credentials import (
 )
 from .gateway import GatewayV1Client
 from .maintenance import MaintenanceOutcome, WorkerMaintenanceController
+from .models import WorkerOutcome
 from .supervisor import (
     EXIT_UPDATE_RESTART,
     EXIT_UPDATE_ROLLBACK,
@@ -59,6 +62,8 @@ EXIT_CONFIG = 2
 EXIT_UNAVAILABLE = 5
 EXIT_EXECUTION_FAILED = 6
 EXIT_CRYPTO = 7
+_SUPERVISOR_BASE_VERSION_ENV = "VGEN_WORKER_SUPERVISOR_BASE_VERSION"
+_STARTUP_ANNOUNCE_INTERVAL_SECONDS = 30.0
 
 ExecutorFactory = Callable[[argparse.Namespace], Executor]
 GatewayFactory = Callable[
@@ -75,6 +80,16 @@ MaintenanceFactory = Callable[
     ],
     WorkerMaintenanceController,
 ]
+
+
+def _newer_supervisor_base_is_waiting() -> bool:
+    raw = os.environ.get(_SUPERVISOR_BASE_VERSION_ENV)
+    if not raw or len(raw) > 64:
+        return False
+    try:
+        return Version(raw) > Version(__version__)
+    except InvalidVersion:
+        return False
 
 
 class WorkerConfigurationError(ValueError):
@@ -130,6 +145,16 @@ def build_parser() -> argparse.ArgumentParser:
             else None
         ),
         help="ComfyUI models root used to verify policy-pinned model files",
+    )
+    common.add_argument(
+        "--comfy-custom-nodes-root",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_COMFYUI_CUSTOM_NODES_ROOT"])
+            if os.environ.get("VGEN_COMFYUI_CUSTOM_NODES_ROOT")
+            else None
+        ),
+        help="isolated ComfyUI custom_nodes root used to verify pinned Git revisions",
     )
     common.add_argument(
         "--comfy-policy-file",
@@ -296,6 +321,7 @@ def _build_executor(arguments: argparse.Namespace) -> Executor:
             policy=policy,
             capability_source=capability_source,
             model_root=arguments.comfy_model_root,
+            custom_nodes_root=arguments.comfy_custom_nodes_root,
             model_verification_progress=(
                 show_model_progress if getattr(arguments, "progress", False) else None
             ),
@@ -342,8 +368,7 @@ def _build_core(
 
 def _worker_work_root(arguments: argparse.Namespace) -> Path:
     return (
-        getattr(arguments, "work_root", None)
-        or (Path(user_data_path("vgen")) / "worker")
+        getattr(arguments, "work_root", None) or (Path(user_data_path("vgen")) / "worker")
     ).expanduser()
 
 
@@ -406,6 +431,58 @@ def _executor_status(executor: Executor) -> dict[str, Any]:
             "capabilities": dict(capabilities),
         },
     }
+
+
+def _starting_executor_status(executor: Executor) -> dict[str, Any]:
+    """Build a fast, fail-closed descriptor before any large model hashing."""
+
+    descriptor = executor.descriptor()
+    return {
+        "ok": False,
+        "executor": {
+            "type": descriptor.executor_type,
+            "version": descriptor.version,
+            "payload_formats": list(descriptor.payload_formats),
+            "operations": list(descriptor.operations),
+            "max_concurrency": descriptor.max_concurrency,
+            "health": "starting",
+            "health_details": {},
+            "capabilities": _fail_closed_executor_capabilities(descriptor.executor_type),
+        },
+    }
+
+
+def _executor_status_with_startup_liveness(
+    executor: Executor,
+    gateway: GatewayV1Client,
+    keepalive_capabilities: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep a cold-starting ComfyUI Worker online during its full model probe."""
+
+    stop = threading.Event()
+
+    def keep_alive() -> None:
+        while not stop.wait(_STARTUP_ANNOUNCE_INTERVAL_SECONDS):
+            try:
+                gateway.announce(keepalive_capabilities)
+            except Exception:
+                # A transient transport failure must not permanently disable
+                # cold-start liveness. The foreground full announce remains the
+                # authoritative error/reporting path after the probe completes.
+                logger.debug("Worker startup liveness announce will retry")
+
+    thread = threading.Thread(
+        target=keep_alive,
+        name="vgen-worker-startup-liveness",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        status = _executor_status(executor)
+    finally:
+        stop.set()
+        thread.join()
+    return status
 
 
 def _fail_closed_executor_capabilities(executor_type: str) -> dict[str, Any]:
@@ -545,6 +622,10 @@ def _announced_capabilities(
         nested = _fail_closed_executor_capabilities("comfyui")
     return {
         "worker_runtime_version": __version__,
+        # Negotiate the signed capability-spec shape explicitly. Published
+        # 0.13.10 builds predate bound dependency receipts, so semver alone is
+        # not evidence that this protocol is implemented.
+        "capability_install_spec_version": 2,
         "maintenance_actions": list(maintenance_actions),
         "executors": [
             {
@@ -557,6 +638,37 @@ def _announced_capabilities(
             }
         ],
     }
+
+
+def _reconcile_gateway_workflow_authorizations(
+    executor: Executor, response: object
+) -> None:
+    """Apply an optional new-Gateway authorization snapshot fail closed.
+
+    Older Gateways omit the field and remain compatible. A malformed snapshot
+    is never interpreted as an empty set, avoiding accidental mass
+    deactivation on protocol corruption.
+    """
+
+    # Test doubles and pre-contract Gateway adapters historically returned no
+    # response body. Treat that exactly like an older Gateway omitting the new
+    # optional field.
+    if response is None:
+        return
+    if not isinstance(response, Mapping):
+        raise WorkerConfigurationError("Gateway workflow authorizations are invalid.")
+    if "workflow_authorizations" not in response:
+        return
+    values = response.get("workflow_authorizations")
+    if not isinstance(values, list):
+        raise WorkerConfigurationError("Gateway workflow authorizations are invalid.")
+    reconcile = getattr(executor, "reconcile_workflow_authorizations", None)
+    if not callable(reconcile):
+        return
+    try:
+        reconcile(values)
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        raise WorkerConfigurationError("Gateway workflow authorizations are invalid.") from exc
 
 
 def _enabled_maintenance_actions(
@@ -645,6 +757,17 @@ def run(
         if arguments.announce and gateway_url is None:
             raise WorkerConfigurationError("--announce requires --gateway-url.")
         credentials = _runtime_credentials(arguments)
+        if credentials is not None and credentials.owner_root_signing_public_key is not None:
+            configure_capability_trust = getattr(
+                executor,
+                "configure_capability_trust",
+                None,
+            )
+            if callable(configure_capability_trust):
+                configure_capability_trust(
+                    credentials.owner_root_signing_public_key,
+                    credentials.worker_id,
+                )
         if gateway_url is not None and credentials is not None and credentials.gateway_url:
             try:
                 selected_gateway = normalize_worker_gateway_origin(gateway_url)
@@ -672,6 +795,7 @@ def run(
             else None
         )
         stopping = False
+        last_announced_capabilities: dict[str, Any] | None = None
 
         def stop(_signum: int, _frame: object) -> None:
             nonlocal stopping
@@ -685,20 +809,34 @@ def run(
             recovered: MaintenanceOutcome | None = None
             recovery_error: Exception | None = None
             activation_status: dict[str, Any] | None = None
+            announced_this_iteration = False
 
-            def announce_activated_runtime() -> None:
+            def probe_activated_runtime() -> dict[str, Any]:
                 nonlocal activation_status
-                activation_status = _executor_status(executor)
+                # Importing the new runtime plus an authenticated fail-closed
+                # announce proves that the Worker control path is usable. A
+                # multi-minute model hash is neither necessary for update
+                # activation nor safe ahead of durable output recovery.
+                activation_status = _starting_executor_status(executor)
+                return _announced_capabilities(
+                    activation_status,
+                    maintenance_actions=_enabled_maintenance_actions(maintenance),
+                )
+
+            def announce_activated_runtime(capabilities: Any) -> None:
+                nonlocal announced_this_iteration, last_announced_capabilities
                 if gateway is None:
                     raise WorkerConfigurationError(
                         "Worker update activation requires a Gateway connection."
                     )
-                gateway.announce(
-                    _announced_capabilities(
-                        activation_status,
-                        maintenance_actions=_enabled_maintenance_actions(maintenance),
+                if not isinstance(capabilities, Mapping):
+                    raise WorkerConfigurationError(
+                        "Worker update activation produced invalid capabilities."
                     )
-                )
+                response = gateway.announce(capabilities)
+                _reconcile_gateway_workflow_authorizations(executor, response)
+                announced_this_iteration = True
+                last_announced_capabilities = dict(capabilities)
 
             if gateway is not None and core is not None and maintenance is not None:
                 try:
@@ -706,7 +844,8 @@ def run(
                     # files. A newly selected runtime must confirm/rollback its
                     # pending activation before any other Worker operation.
                     recovered = maintenance.recover_pending_update(
-                        activation_probe=announce_activated_runtime
+                        activation_probe=probe_activated_runtime,
+                        activation_announce=announce_activated_runtime,
                     )
                 except (
                     GatewayUnavailableError,
@@ -715,11 +854,89 @@ def run(
                     WorkerUpdateError,
                 ) as exc:
                     recovery_error = exc
-            status = activation_status or _executor_status(executor)
+
+            startup_status = activation_status or _starting_executor_status(executor)
+            startup_capabilities = _announced_capabilities(
+                startup_status,
+                maintenance_actions=_enabled_maintenance_actions(maintenance),
+            )
+            startup_resume_checked = False
+            startup_resumed: WorkerOutcome | None = None
+            startup_resume_error: Exception | None = None
+            update_requires_exit = bool(
+                recovered and (recovered.restart_required or recovered.rollback_required)
+            )
+            update_requires_exit = update_requires_exit or bool(
+                recovered
+                and recovered.mode == "maintenance_update_activated"
+                and _newer_supervisor_base_is_waiting()
+            )
+            if (
+                gateway is not None
+                and core is not None
+                and recovery_error is None
+                and not update_requires_exit
+            ):
+                try:
+                    # Restore the control-plane channel and renew any fenced
+                    # upload attempt before ComfyUI hashes large model files.
+                    safe_liveness_capabilities = last_announced_capabilities or startup_capabilities
+                    if not announced_this_iteration:
+                        response = gateway.announce(safe_liveness_capabilities)
+                        _reconcile_gateway_workflow_authorizations(executor, response)
+                        announced_this_iteration = True
+                        last_announced_capabilities = dict(safe_liveness_capabilities)
+                except Exception:
+                    # Ticket renewal below performs its own authenticated
+                    # request. A transient idle-heartbeat failure must not move
+                    # a model scan ahead of a recoverable output attempt.
+                    logger.debug("Initial Worker startup announce will retry")
+                try:
+                    startup_resumed = core.resume_pending(gateway)
+                    startup_resume_checked = True
+                except (
+                    GatewayUnavailableError,
+                    LeaseLostError,
+                    UploadPendingError,
+                    VGenError,
+                ) as exc:
+                    startup_resume_checked = True
+                    startup_resume_error = exc
+
+            status: dict[str, Any]
+            if update_requires_exit:
+                # A non-target or rolled-back runtime must yield to the stable
+                # supervisor immediately; probing ComfyUI here only delays the
+                # required process transition and can hash tens of GiB.
+                status = startup_status
+            elif startup_resumed is not None or startup_resume_error is not None:
+                status = startup_status
+            elif (
+                gateway is not None
+                and core is not None
+                and maintenance is not None
+                and recovery_error is None
+                and not bool(
+                    recovered and (recovered.restart_required or recovered.rollback_required)
+                )
+            ):
+                if startup_status["executor"]["type"] == "comfyui":
+                    keepalive_capabilities = last_announced_capabilities or startup_capabilities
+                    status = _executor_status_with_startup_liveness(
+                        executor,
+                        gateway,
+                        keepalive_capabilities,
+                    )
+                else:
+                    status = _executor_status(executor)
+            else:
+                status = _executor_status(executor)
             if gateway is not None and core is not None:
                 try:
                     if recovery_error is not None:
                         raise recovery_error
+                    if startup_resume_error is not None:
+                        raise startup_resume_error
                     if recovered is not None:
                         _apply_maintenance_outcome(status, recovered)
                         status["gateway"] = {"ok": True, "status": "connected"}
@@ -729,6 +946,16 @@ def run(
                         if recovered.restart_required:
                             _write_status(status, json_output=arguments.json)
                             return EXIT_UPDATE_RESTART
+                        if (
+                            recovered.mode == "maintenance_update_activated"
+                            and _newer_supervisor_base_is_waiting()
+                        ):
+                            # The pending target completed its signed Gateway
+                            # transaction. Yield immediately so the stable
+                            # supervisor can select its newer reviewed base.
+                            status["mode"] = "maintenance_update_superseded"
+                            _write_status(status, json_output=arguments.json)
+                            return EXIT_UPDATE_RESTART
 
                     # Announce a generic descriptor even if ComfyUI is down or
                     # models are missing, so the Gateway can deliver maintenance.
@@ -736,11 +963,18 @@ def run(
                         status,
                         maintenance_actions=_enabled_maintenance_actions(maintenance),
                     )
-                    gateway.announce(announced)
-                    resumed = core.resume_pending(gateway)
+                    if announced != last_announced_capabilities:
+                        response = gateway.announce(announced)
+                        _reconcile_gateway_workflow_authorizations(executor, response)
+                        announced_this_iteration = True
+                        last_announced_capabilities = dict(announced)
+                    resumed = (
+                        startup_resumed if startup_resume_checked else core.resume_pending(gateway)
+                    )
                     if resumed is not None:
                         status["mode"] = "upload_resumed"
                         status["succeeded"] = resumed.succeeded
+                        status["ok"] = resumed.succeeded
                         status["gateway"] = {"ok": True, "status": "connected"}
                         if resumed.failure is not None:
                             status["ok"] = False

@@ -44,6 +44,24 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _WORKFLOW_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ROLLBACK_ENV = "VGEN_WORKER_UPDATE_ROLLBACK"
 _LEASE_RENEW_INTERVAL_SECONDS = 20.0
+_MODEL_ALTERNATIVE_SOURCE_ERRORS = frozenset(
+    {
+        "MODEL_DOWNLOAD_FAILED",
+        "MODEL_GATED_CREDENTIAL_INVALID",
+        "MODEL_GATED_CREDENTIAL_REJECTED",
+        "MODEL_GATED_CREDENTIAL_UNAVAILABLE",
+        "MODEL_GATED_SOURCE_INVALID",
+        "MODEL_INTEGRITY_FAILED",
+        "MODEL_MANUAL_ACTION_REQUIRED",
+        "MODEL_RANGE_INVALID",
+        "MODEL_REDIRECT_INVALID",
+        "MODEL_REDIRECT_LIMIT",
+        "MODEL_SIZE_MISMATCH",
+        "MODEL_SOURCE_INVALID",
+        "MODEL_SOURCE_NOT_PUBLIC",
+        "MODEL_SOURCE_UNAVAILABLE",
+    }
+)
 
 TicketResolver = Callable[[str, int], Iterable[str]]
 
@@ -208,6 +226,14 @@ class WorkerMaintenanceController:
         self._model_root = model_root
         self._model_installer = model_installer
         self._capability_store = capability_store
+        if (
+            self._capability_store is not None
+            and credentials.owner_root_signing_public_key is not None
+        ):
+            self._capability_store.configure_trust(
+                credentials.owner_root_signing_public_key,
+                credentials.worker_id,
+            )
         self._ticket_resolver = ticket_resolver
         self._last_progress_at = 0.0
         self._gateway_lock = threading.Lock()
@@ -222,6 +248,7 @@ class WorkerMaintenanceController:
         self,
         *,
         activation_probe: Callable[[], Any] | None = None,
+        activation_announce: Callable[[Any], Any] | None = None,
     ) -> MaintenanceOutcome | None:
         """Finish or roll back a pointer left by the previous process."""
 
@@ -290,8 +317,21 @@ class WorkerMaintenanceController:
                         gateway_lock=self._gateway_lock,
                         state="restarting",
                     ) as keeper:
-                        activation_probe()
+                        probe_result = activation_probe()
                         keeper.check()
+                        if activation_announce is not None:
+                            # The potentially slow local capability/model probe
+                            # runs without blocking lease renewal. Serialize only
+                            # the actual Gateway call because GatewayV1Client's
+                            # session and token refresh state are mutable.
+                            with self._gateway_lock:
+                                # Renewal can fail while the foreground probe is
+                                # waiting for the shared client lock.  Recheck
+                                # after acquiring it so a fenced-out runtime can
+                                # never announce itself as active.
+                                keeper.check()
+                                activation_announce(probe_result)
+                            keeper.check()
                 pointer = self._updater.mark_activation_verified(pointer)
             except BaseException:
                 # Keep the pending pointer until the previous runtime starts with
@@ -338,9 +378,7 @@ class WorkerMaintenanceController:
             # otherwise a transient Windows file lock would make a healthy
             # target look offline after the Gateway already accepted it.
             logger.debug("Worker activation pointer cleanup remains pending")
-            return MaintenanceOutcome(
-                "maintenance_update_cleanup_pending", True, job_id=job_id
-            )
+            return MaintenanceOutcome("maintenance_update_cleanup_pending", True, job_id=job_id)
         return MaintenanceOutcome("maintenance_update_activated", True, job_id=job_id)
 
     def _complete_verified_update(
@@ -478,11 +516,7 @@ class WorkerMaintenanceController:
             raise _MaintenanceRejected("MAINTENANCE_WORKFLOW_NOT_ALLOWED")
 
         digests = spec.get("model_digests")
-        if (
-            not isinstance(digests, list)
-            or not digests
-            or len(digests) != len(set(digests))
-        ):
+        if not isinstance(digests, list) or not digests or len(digests) != len(set(digests)):
             raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
         resolver = getattr(self._executor, "workflow_model_pins", None)
         workflow_pins = (
@@ -512,11 +546,10 @@ class WorkerMaintenanceController:
         all_preexisting = True
         for raw_digest, placement_pins in requested:
             placement_preexisting = True
-            for pin in placement_pins:
+
+            def install_one(pin: Any) -> Any:
                 self._last_progress_at = 0.0
-                self._heartbeat(
-                    job_id, fencing_token, "downloading", 0, pin.size, ttl_seconds=300
-                )
+                self._heartbeat(job_id, fencing_token, "downloading", 0, pin.size, ttl_seconds=300)
 
                 def progress(completed: int, total: int, *, _job: str = job_id) -> None:
                     keeper.update_progress(completed, total)
@@ -532,31 +565,69 @@ class WorkerMaintenanceController:
                         )
                         self._last_progress_at = now
 
-                try:
-                    with _LeaseKeeper(
-                        self._gateway,
-                        job_id,
-                        fencing_token,
-                        stage="downloading",
-                        gateway_lock=self._gateway_lock,
-                    ) as keeper:
-                        result = self._model_installer.install(pin, progress=progress)
-                        keeper.check()
-                except ModelInstallError as exc:
-                    self._executor.invalidate_model_digest_cache()
-                    raise _ModelInstallJobError(
-                        exc.code,
-                        installed=tuple(installed),
-                        failed_digest=raw_digest,
-                    ) from exc
-                except BaseException:
-                    self._executor.invalidate_model_digest_cache()
-                    raise
-                placement_preexisting = (
-                    placement_preexisting and result.status == "already_installed"
-                )
+                with _LeaseKeeper(
+                    self._gateway,
+                    job_id,
+                    fencing_token,
+                    stage="downloading",
+                    gateway_lock=self._gateway_lock,
+                ) as keeper:
+                    result = self._model_installer.install(pin, progress=progress)
+                    keeper.check()
                 self._heartbeat(job_id, fencing_token, "verifying", result.size, result.size)
-            installed.append(result.digest)
+                return result
+
+            # A digest can have several placements and provenance sources.  Seed
+            # the shared content-addressed cache from an automatic public source
+            # before touching manual or gated alternatives, then materialize all
+            # requested paths from that one verified blob.
+            preferred = sorted(
+                placement_pins,
+                key=lambda pin: (
+                    bool(getattr(pin, "manual_download", False)),
+                    bool(getattr(pin, "gated", False)),
+                    getattr(pin, "source", None) is None,
+                    str(getattr(pin, "path", "")),
+                ),
+            )
+            seed_pin: Any | None = None
+            seed_result: Any | None = None
+            last_source_error: ModelInstallError | None = None
+            try:
+                for candidate in preferred:
+                    try:
+                        seed_result = install_one(candidate)
+                    except ModelInstallError as exc:
+                        if exc.code not in _MODEL_ALTERNATIVE_SOURCE_ERRORS:
+                            raise
+                        last_source_error = exc
+                        continue
+                    seed_pin = candidate
+                    break
+                if seed_pin is None or seed_result is None:
+                    if last_source_error is None:
+                        raise ModelInstallError("MODEL_SOURCE_UNAVAILABLE")
+                    raise last_source_error
+
+                placement_preexisting = seed_result.status == "already_installed"
+                for pin in placement_pins:
+                    if pin is seed_pin:
+                        continue
+                    result = install_one(pin)
+                    placement_preexisting = (
+                        placement_preexisting and result.status == "already_installed"
+                    )
+            except ModelInstallError as exc:
+                self._executor.invalidate_model_digest_cache()
+                raise _ModelInstallJobError(
+                    exc.code,
+                    installed=tuple(installed),
+                    failed_digest=raw_digest,
+                ) from exc
+            except BaseException:
+                self._executor.invalidate_model_digest_cache()
+                raise
+            installed.append(seed_result.digest)
             all_preexisting = all_preexisting and placement_preexisting
 
         self._executor.invalidate_model_digest_cache()
@@ -585,8 +656,11 @@ class WorkerMaintenanceController:
         artifact_sha256 = _required_string(spec, "artifact_sha256").lower()
         artifact_size = _required_positive_int(spec, "artifact_size")
         node_classes_digest = _required_string(spec, "node_classes_digest").lower()
+        raw_model_digests = spec.get("model_digests")
+        raw_node_classes = spec.get("node_classes")
         publisher_key = spec.get("publisher_key")
         allow_unsigned = spec.get("allow_unsigned_workflow")
+        has_bound_identifiers = raw_model_digests is not None or raw_node_classes is not None
         if (
             spec.get("kind") != "capability_install"
             or spec.get("apply") != "on_idle"
@@ -596,6 +670,26 @@ class WorkerMaintenanceController:
             or not isinstance(allow_unsigned, bool)
             or (publisher_key is not None and not isinstance(publisher_key, str))
             or allow_unsigned != (publisher_key is None)
+            or (
+                has_bound_identifiers
+                and (
+                    not isinstance(raw_model_digests, list)
+                    or len(raw_model_digests) > 128
+                    or any(
+                        not isinstance(item, str) or not _WORKFLOW_DIGEST.fullmatch(item)
+                        for item in raw_model_digests
+                    )
+                    or raw_model_digests != sorted(set(raw_model_digests))
+                    or not isinstance(raw_node_classes, list)
+                    or len(raw_node_classes) > 512
+                    or any(
+                        not isinstance(item, str)
+                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", item) is None
+                        for item in raw_node_classes
+                    )
+                    or raw_node_classes != sorted(set(raw_node_classes))
+                )
+            )
         ):
             raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
 
@@ -632,9 +726,7 @@ class WorkerMaintenanceController:
                     self._last_progress_at = now
 
             self._last_progress_at = 0.0
-            self._heartbeat(
-                job_id, fencing_token, "downloading", 0, artifact_size, ttl_seconds=300
-            )
+            self._heartbeat(job_id, fencing_token, "downloading", 0, artifact_size, ttl_seconds=300)
             with _LeaseKeeper(
                 self._gateway,
                 job_id,
@@ -652,36 +744,53 @@ class WorkerMaintenanceController:
         )
         if self._capability_store is None:
             self._capability_store = WorkerCapabilityStore(
-                self._work_root / "capabilities"
+                self._work_root / "capabilities",
+                owner_root_signing_public_key=(self._credentials.owner_root_signing_public_key),
+                worker_id=self._credentials.worker_id,
             )
         validator = getattr(self._executor, "validate_capability_release", None)
-        activation = self._capability_store.activate(
-            archive,
-            workflow_ref=workflow_ref,
-            workflow_digest=workflow_digest,
-            publisher_key=publisher_key,
-            allow_unsigned=allow_unsigned,
-            node_classes_digest=node_classes_digest,
-            validator=validator if callable(validator) else None,
-        )
-        reload_capabilities = getattr(self._executor, "reload_capabilities", None)
-        if callable(reload_capabilities):
-            reload_capabilities()
-        ready = False
-        capability_probe = getattr(self._executor, "capabilities", None)
-        if callable(capability_probe):
-            try:
-                report = capability_probe()
-                readiness = report.get("workflow_readiness", [])
-                ready = any(
-                    isinstance(item, Mapping)
-                    and item.get("workflow_ref") == workflow_ref
-                    and item.get("workflow_digest") == workflow_digest
-                    and item.get("state") == "ready"
-                    for item in readiness
-                )
-            except Exception:
-                ready = False
+        with _LeaseKeeper(
+            self._gateway,
+            job_id,
+            fencing_token,
+            stage="activating",
+            gateway_lock=self._gateway_lock,
+        ) as keeper:
+            activation = self._capability_store.activate(
+                archive,
+                workflow_ref=workflow_ref,
+                workflow_digest=workflow_digest,
+                publisher_key=publisher_key,
+                allow_unsigned=allow_unsigned,
+                node_classes_digest=node_classes_digest,
+                model_digests=(
+                    tuple(raw_model_digests) if isinstance(raw_model_digests, list) else None
+                ),
+                node_classes=(
+                    tuple(raw_node_classes) if isinstance(raw_node_classes, list) else None
+                ),
+                authorization=_required_mapping(job, "authorization"),
+                validator=validator if callable(validator) else None,
+            )
+            reload_capabilities = getattr(self._executor, "reload_capabilities", None)
+            if callable(reload_capabilities):
+                reload_capabilities()
+            ready = False
+            capability_probe = getattr(self._executor, "capabilities", None)
+            if callable(capability_probe):
+                try:
+                    report = capability_probe()
+                    readiness = report.get("workflow_readiness", [])
+                    ready = any(
+                        isinstance(item, Mapping)
+                        and item.get("workflow_ref") == workflow_ref
+                        and item.get("workflow_digest") == workflow_digest
+                        and item.get("state") == "ready"
+                        for item in readiness
+                    )
+                except Exception:
+                    ready = False
+            keeper.check()
         self._gateway.complete_maintenance(
             job_id,
             fencing_token=fencing_token,

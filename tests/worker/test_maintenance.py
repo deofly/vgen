@@ -202,6 +202,122 @@ def test_model_job_requires_signed_exact_local_workflow_and_model_pin(tmp_path: 
     assert gateway.completions[-1]["result"]["status"] == "installed"
 
 
+def test_shared_model_uses_public_source_before_manual_placement(tmp_path: Path) -> None:
+    digest = "d" * 64
+    manual = SimpleNamespace(
+        path="text_encoders/shared-manual.safetensors",
+        sha256=digest,
+        size=12,
+        source="https://models.example.test/manual-info",
+        revision="rev",
+        license=None,
+        license_url=None,
+        gated=False,
+        manual_download=True,
+    )
+    public = SimpleNamespace(
+        **{
+            **vars(manual),
+            "path": "clip/shared-public.safetensors",
+            "source": "https://models.example.test/rev/shared",
+            "manual_download": False,
+        }
+    )
+    spec = {
+        "kind": "model_install",
+        "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
+        "workflow_digest": "sha256:" + "b" * 64,
+        "model_digests": ["sha256:" + digest],
+    }
+    job, credentials = signed_job(spec)
+
+    class CacheAwareInstaller:
+        def __init__(self) -> None:
+            self.pins: list[Any] = []
+            self.cached = False
+
+        def install(self, pin: Any, *, progress: Any = None) -> ModelInstallResult:
+            self.pins.append(pin)
+            if pin.manual_download and not self.cached:
+                raise ModelInstallError("MODEL_MANUAL_ACTION_REQUIRED")
+            status = "already_installed" if self.cached else "installed"
+            self.cached = True
+            if progress is not None:
+                progress(pin.size, pin.size)
+            return ModelInstallResult("sha256:" + pin.sha256, status, pin.size)
+
+    installer = CacheAwareInstaller()
+    outcome = WorkerMaintenanceController(
+        credentials,
+        FakeGateway(job),  # type: ignore[arg-type]
+        FakeExecutor((manual, public)),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=tmp_path,
+        model_installer=installer,  # type: ignore[arg-type]
+    ).run_one()
+
+    assert outcome is not None and outcome.succeeded
+    assert installer.pins == [public, manual]
+
+
+def test_shared_model_falls_back_to_second_public_source(tmp_path: Path) -> None:
+    digest = "e" * 64
+    first = SimpleNamespace(
+        path="clip/a-first.safetensors",
+        sha256=digest,
+        size=12,
+        source="https://first.example.test/model",
+        revision="first-revision",
+        license=None,
+        license_url=None,
+        gated=False,
+        manual_download=False,
+    )
+    second = SimpleNamespace(
+        **{
+            **vars(first),
+            "path": "text_encoders/b-second.safetensors",
+            "source": "https://second.example.test/model",
+            "revision": "second-revision",
+        }
+    )
+    spec = {
+        "kind": "model_install",
+        "workflow_ref": "vgen/minimax-h3-8step@1.0.0",
+        "workflow_digest": "sha256:" + "b" * 64,
+        "model_digests": ["sha256:" + digest],
+    }
+    job, credentials = signed_job(spec)
+
+    class FallbackInstaller:
+        def __init__(self) -> None:
+            self.pins: list[Any] = []
+            self.cached = False
+
+        def install(self, pin: Any, *, progress: Any = None) -> ModelInstallResult:
+            self.pins.append(pin)
+            if pin is first and not self.cached:
+                raise ModelInstallError("MODEL_DOWNLOAD_FAILED", retryable=True)
+            status = "already_installed" if self.cached else "installed"
+            self.cached = True
+            if progress is not None:
+                progress(pin.size, pin.size)
+            return ModelInstallResult("sha256:" + pin.sha256, status, pin.size)
+
+    installer = FallbackInstaller()
+    outcome = WorkerMaintenanceController(
+        credentials,
+        FakeGateway(job),  # type: ignore[arg-type]
+        FakeExecutor((first, second)),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=tmp_path,
+        model_installer=installer,  # type: ignore[arg-type]
+    ).run_one()
+
+    assert outcome is not None and outcome.succeeded
+    assert installer.pins == [first, second, first]
+
+
 def test_tampered_job_is_rejected_before_model_files_change(tmp_path: Path) -> None:
     job, credentials, pin = model_fixture()
     job["spec"] = {**job["spec"], "workflow_digest": "sha256:" + "d" * 64}
@@ -236,9 +352,7 @@ def test_tampered_job_is_rejected_before_model_files_change(tmp_path: Path) -> N
         ("MODEL_PIN_INVALID", ErrorCode.MANIFEST_UNTRUSTED),
     ],
 )
-def test_model_failures_use_dedicated_maintenance_codes(
-    reason: str, expected: ErrorCode
-) -> None:
+def test_model_failures_use_dedicated_maintenance_codes(reason: str, expected: ErrorCode) -> None:
     assert _model_error_code(reason) == int(expected)
 
 
@@ -277,9 +391,7 @@ def test_capability_failures_use_dedicated_maintenance_codes(
         ("WORKER_UPDATE_TICKET_INVALID", ErrorCode.MAINTENANCE_POLICY_DENIED),
     ],
 )
-def test_update_failures_use_dedicated_maintenance_codes(
-    reason: str, expected: ErrorCode
-) -> None:
+def test_update_failures_use_dedicated_maintenance_codes(reason: str, expected: ErrorCode) -> None:
     assert _update_error_code(reason) == int(expected)
 
 
@@ -453,9 +565,7 @@ def test_completed_activation_retries_transient_pointer_cleanup_without_reprobe(
     )
     probes: list[str] = []
 
-    first = controller.recover_pending_update(
-        activation_probe=lambda: probes.append("announced")
-    )
+    first = controller.recover_pending_update(activation_probe=lambda: probes.append("announced"))
     second = controller.recover_pending_update(
         activation_probe=lambda: pytest.fail("verified activation must not be reprobed")
     )
@@ -679,6 +789,98 @@ def test_target_activation_renews_restarting_lease_during_slow_probe(
     assert gateway.heartbeats[1]["progress"]["stage"] == "activating"
     assert "adopt_restart_session" not in gateway.heartbeats[1]
     assert gateway.completions[-1]["succeeded"] is True
+
+
+def test_target_activation_announce_is_serialized_and_precedes_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pointer = {
+        "pending_job_id": "mtn_test",
+        "pending_fencing_token": 4,
+        "active_version": "0.2.0",
+        "artifact_sha256": "a" * 64,
+    }
+    updater = FakeUpdater(tmp_path, pointer)
+    _, credentials = signed_job(
+        {
+            "kind": "worker_update",
+            "target_version": "0.2.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": 1,
+            "apply": "on_idle",
+        }
+    )
+
+    class SerializedGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.guard = threading.Lock()
+            self.active_calls = 0
+            self.maximum_calls = 0
+            self.renewed = threading.Event()
+            self.events: list[str] = []
+
+        def _enter(self, event: str) -> None:
+            with self.guard:
+                self.active_calls += 1
+                self.maximum_calls = max(self.maximum_calls, self.active_calls)
+                self.events.append(event)
+            time.sleep(0.002)
+
+        def _exit(self) -> None:
+            with self.guard:
+                self.active_calls -= 1
+
+        def heartbeat_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            self._enter("heartbeat")
+            try:
+                response = super().heartbeat_maintenance(job_id, **value)
+                if len(self.heartbeats) >= 2:
+                    self.renewed.set()
+                return response
+            finally:
+                self._exit()
+
+        def complete_maintenance(self, job_id: str, **value: Any) -> dict[str, Any]:
+            self._enter("complete")
+            try:
+                return super().complete_maintenance(job_id, **value)
+            finally:
+                self._exit()
+
+    gateway = SerializedGateway()
+    announced: list[Any] = []
+    sentinel = {"executor": "verified"}
+    monkeypatch.setattr("vgen.worker.maintenance._LEASE_RENEW_INTERVAL_SECONDS", 0.001)
+
+    def slow_probe() -> Any:
+        assert gateway.renewed.wait(timeout=1)
+        return sentinel
+
+    def announce(value: Any) -> None:
+        gateway._enter("announce")
+        try:
+            announced.append(value)
+        finally:
+            gateway._exit()
+
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=tmp_path / "work",
+        model_root=None,
+        updater=updater,  # type: ignore[arg-type]
+    ).recover_pending_update(
+        activation_probe=slow_probe,
+        activation_announce=announce,
+    )
+
+    assert outcome is not None and outcome.succeeded
+    assert announced == [sentinel]
+    assert gateway.maximum_calls == 1
+    assert gateway.events.count("announce") == 1
+    assert gateway.events.index("announce") < gateway.events.index("complete")
 
 
 @pytest.mark.parametrize("failure", ["cancelled", "lease_lost"])

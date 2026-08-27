@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import vgen.worker.main as worker_main_module
 from vgen.crypto import DeviceKeys, b64url_encode
 from vgen.executors import ExecutorDescriptor, ExecutorHealth
 from vgen.worker import LeaseReference, WorkerCredentials, save_worker_credentials_file
@@ -187,12 +189,11 @@ def test_serve_once_claims_and_executes_one_authenticated_lease(
     assert gateway.announced["executors"][0]["type"] == "fake"
     assert gateway.announced["executors"][0]["capabilities"] == {"gpu_count": 1}
     assert gateway.announced["worker_runtime_version"]
+    assert gateway.announced["capability_install_spec_version"] == 2
     assert gateway.announced["maintenance_actions"] == []
 
 
-def test_worker_refuses_credentials_pinned_to_another_gateway(
-    tmp_path: Path, capsys: Any
-) -> None:
+def test_worker_refuses_credentials_pinned_to_another_gateway(tmp_path: Path, capsys: Any) -> None:
     credential_file = tmp_path / "worker-credentials.json"
     save_worker_credentials_file(
         credential_file,
@@ -308,7 +309,12 @@ def test_authenticated_policyless_serve_starts_in_maintenance_only_mode(
     )
 
     assert exit_code == EXIT_OK
-    assert events == ["recover_update", "announce", "resume_upload", "maintenance"]
+    assert events == [
+        "recover_update",
+        "announce",
+        "resume_upload",
+        "maintenance",
+    ]
     assert gateway.announced is not None
     assert gateway.announced["maintenance_actions"] == [
         "worker_update",
@@ -348,6 +354,173 @@ def test_comfyui_capability_probe_failure_keeps_v2_fail_closed() -> None:
     assert invalid_status["ok"] is False
     assert invalid_status["executor"]["health"] == "capability_probe_failed"
     assert invalid_status["executor"]["capabilities"]["capability_schema_version"] == 2
+
+
+def test_cold_comfyui_worker_stays_online_while_model_probe_is_blocked(
+    tmp_path: Path,
+    capsys: Any,
+    monkeypatch: Any,
+) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+    )
+    renewed = threading.Event()
+    announcements: list[dict[str, Any]] = []
+    announce_attempts = 0
+
+    class SlowComfyExecutor(FakeExecutor):
+        requires_execution_policy = True
+        execution_policy_configured = False
+
+        def descriptor(self) -> ExecutorDescriptor:
+            return ExecutorDescriptor("comfyui", "1.2.0", ("comfyui-api-graph/v1",), ("t2v",))
+
+        def capabilities(self) -> dict[str, Any]:
+            assert renewed.wait(timeout=1), "startup liveness was not renewed"
+            return {
+                "capability_schema_version": 2,
+                "model_digests": ["sha256:" + "a" * 64],
+                "ready_workflow_digests": [],
+                "workflow_readiness": [],
+            }
+
+    class FakeGateway:
+        def announce(self, capabilities: dict[str, Any]) -> None:
+            nonlocal announce_attempts
+            announce_attempts += 1
+            if announce_attempts == 1:
+                raise RuntimeError("transient startup transport failure")
+            announcements.append(capabilities)
+            if announcements:
+                renewed.set()
+
+    class FakeCore:
+        def resume_pending(self, _gateway: Any) -> None:
+            return None
+
+    class FakeMaintenance:
+        enabled = True
+
+        def recover_pending_update(self, **_kwargs: Any) -> None:
+            return None
+
+        def run_one(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_main_module, "_STARTUP_ANNOUNCE_INTERVAL_SECONDS", 0.001)
+
+    exit_code = run(
+        [
+            "serve",
+            "--once",
+            "--json",
+            "--gateway-url",
+            "https://gateway.example.test",
+            "--credentials-file",
+            str(credential_file),
+        ],
+        executor_factory=lambda _arguments: SlowComfyExecutor(),
+        gateway_factory=lambda *_arguments: FakeGateway(),  # type: ignore[arg-type,return-value]
+        core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
+        maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
+    )
+
+    assert exit_code == EXIT_OK
+    assert announce_attempts >= 3
+    assert len(announcements) >= 2
+    assert announcements[0]["executors"][0]["capabilities"] == {
+        "capability_schema_version": 2,
+        "model_digests": [],
+        "ready_workflow_digests": [],
+        "workflow_readiness": [],
+    }
+    assert announcements[-1]["executors"][0]["capabilities"]["model_digests"] == [
+        "sha256:" + "a" * 64
+    ]
+    assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_only"
+
+
+def test_ready_snapshot_is_not_replaced_by_empty_readiness_on_next_loop(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+    )
+    stop_handler: list[Any] = []
+    monkeypatch.setattr(
+        worker_main_module.signal,
+        "signal",
+        lambda _signal, handler: stop_handler.append(handler),
+    )
+    executor = FakeExecutor()
+    executor.requires_execution_policy = True
+    executor.execution_policy_configured = False
+    executor.descriptor = lambda: ExecutorDescriptor(
+        "comfyui", "1.2.0", ("comfyui-api-graph/v1",), ("t2v",)
+    )
+    ready_digest = "sha256:" + "a" * 64
+    executor.capabilities = lambda: {
+        "capability_schema_version": 2,
+        "model_digests": [ready_digest],
+        "ready_workflow_digests": [ready_digest],
+        "workflow_readiness": [
+            {
+                "workflow_ref": "vgen/test@1.0.0",
+                "workflow_digest": ready_digest,
+                "state": "ready",
+                "missing_model_digests": [],
+                "missing_node_classes": [],
+            }
+        ],
+    }
+    announcements: list[dict[str, Any]] = []
+
+    class FakeGateway:
+        def announce(self, capabilities: dict[str, Any]) -> None:
+            announcements.append(capabilities)
+            if len(announcements) == 3:
+                stop_handler[-1](0, None)
+
+    class FakeCore:
+        def resume_pending(self, _gateway: Any) -> None:
+            return None
+
+    class FakeMaintenance:
+        enabled = True
+
+        def recover_pending_update(self, **_kwargs: Any) -> None:
+            return None
+
+        def run_one(self) -> None:
+            return None
+
+    exit_code = run(
+        [
+            "serve",
+            "--json",
+            "--interval",
+            "0.001",
+            "--gateway-url",
+            "https://gateway.example.test",
+            "--credentials-file",
+            str(credential_file),
+        ],
+        executor_factory=lambda _arguments: executor,
+        gateway_factory=lambda *_arguments: FakeGateway(),  # type: ignore[arg-type,return-value]
+        core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
+        maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
+    )
+
+    assert exit_code == EXIT_OK
+    reported = [item["executors"][0]["capabilities"] for item in announcements]
+    assert reported[0]["workflow_readiness"] == []
+    assert reported[1]["ready_workflow_digests"] == [ready_digest]
+    assert reported[2]["ready_workflow_digests"] == [ready_digest]
 
 
 def test_serve_retries_spooled_upload_before_polling_new_lease(tmp_path: Path, capsys: Any) -> None:
@@ -467,7 +640,12 @@ def test_unhealthy_executor_still_announces_and_runs_maintenance(
     )
 
     assert exit_code == EXIT_UNAVAILABLE
-    assert events == ["recover_update", "announce", "resume_upload", "maintenance"]
+    assert events == [
+        "recover_update",
+        "announce",
+        "resume_upload",
+        "maintenance",
+    ]
     status = json.loads(capsys.readouterr().out)
     assert status["mode"] == "maintenance_models_installed"
     assert status["maintenance_succeeded"] is True
@@ -516,9 +694,119 @@ def test_pending_update_requests_supervisor_restart_before_other_work(
     assert json.loads(capsys.readouterr().out)["mode"] == "maintenance_update_restart"
 
 
-def test_pending_update_cleanup_does_not_block_worker_announce(
+def test_completed_old_target_yields_to_newer_supervisor_base(
+    tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+    )
+    events: list[str] = []
+
+    class FakeMaintenance:
+        def recover_pending_update(self, **_kwargs: Any) -> MaintenanceOutcome:
+            events.append("recover_update")
+            return MaintenanceOutcome("maintenance_update_activated", True, job_id="mtn_test")
+
+    class FakeCore:
+        def resume_pending(self, _gateway: Any) -> None:
+            raise AssertionError("the newer base must start before other work")
+
+    monkeypatch.setattr(worker_main_module, "__version__", "0.13.9")
+    monkeypatch.setenv("VGEN_WORKER_SUPERVISOR_BASE_VERSION", "0.13.10")
+
+    assert (
+        run(
+            [
+                "serve",
+                "--once",
+                "--json",
+                "--gateway-url",
+                "https://gateway.example.test",
+                "--credentials-file",
+                str(credential_file),
+            ],
+            executor_factory=lambda _arguments: FakeExecutor(),
+            gateway_factory=lambda *_arguments: SimpleNamespace(),  # type: ignore[arg-type,return-value]
+            core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
+            maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
+        )
+        == EXIT_UPDATE_RESTART
+    )
+    assert events == ["recover_update"]
+    status = json.loads(capsys.readouterr().out)
+    assert status["mode"] == "maintenance_update_superseded"
+    assert status["maintenance_succeeded"] is True
+
+
+def test_pending_activation_uses_main_gateway_announce_callback(
     tmp_path: Path, capsys: Any
 ) -> None:
+    credential_file = tmp_path / "worker-credentials.json"
+    save_worker_credentials_file(
+        credential_file,
+        WorkerCredentials("wrk_test", DeviceKeys.generate(), "short-session"),
+    )
+    executor = FakeExecutor()
+    executor.requires_execution_policy = True
+    executor.execution_policy_configured = False
+    executor.descriptor = lambda: ExecutorDescriptor(
+        "comfyui", "1.2.0", ("comfyui-api-graph/v1",), ("t2v",)
+    )
+    executor.capabilities = lambda: {
+        "capability_schema_version": 2,
+        "model_digests": ["sha256:" + "a" * 64],
+        "ready_workflow_digests": [],
+        "workflow_readiness": [],
+    }
+    announcements: list[dict[str, Any]] = []
+
+    class FakeGateway:
+        def announce(self, capabilities: dict[str, Any]) -> None:
+            announcements.append(capabilities)
+
+    class FakeCore:
+        def resume_pending(self, _gateway: Any) -> None:
+            return None
+
+    class FakeMaintenance:
+        enabled = True
+
+        def recover_pending_update(self, **callbacks: Any) -> MaintenanceOutcome:
+            capabilities = callbacks["activation_probe"]()
+            callbacks["activation_announce"](capabilities)
+            return MaintenanceOutcome("maintenance_update_activated", True, job_id="mtn_test")
+
+        def run_one(self) -> None:
+            return None
+
+    exit_code = run(
+        [
+            "serve",
+            "--once",
+            "--json",
+            "--gateway-url",
+            "https://gateway.example.test",
+            "--credentials-file",
+            str(credential_file),
+        ],
+        executor_factory=lambda _arguments: executor,
+        gateway_factory=lambda *_arguments: FakeGateway(),  # type: ignore[arg-type,return-value]
+        core_factory=lambda *_arguments: FakeCore(),  # type: ignore[arg-type,return-value]
+        maintenance_factory=lambda *_arguments: FakeMaintenance(),  # type: ignore[arg-type,return-value]
+    )
+
+    assert exit_code == EXIT_OK
+    assert len(announcements) == 2
+    assert announcements[0]["executors"][0]["capabilities"]["model_digests"] == []
+    assert announcements[-1]["executors"][0]["capabilities"]["model_digests"] == [
+        "sha256:" + "a" * 64
+    ]
+    assert json.loads(capsys.readouterr().out)["maintenance_succeeded"] is True
+
+
+def test_pending_update_cleanup_does_not_block_worker_announce(tmp_path: Path, capsys: Any) -> None:
     credential_file = tmp_path / "worker-credentials.json"
     save_worker_credentials_file(
         credential_file,
@@ -544,9 +832,7 @@ def test_pending_update_cleanup_does_not_block_worker_announce(
 
         def recover_pending_update(self, **_kwargs: Any) -> MaintenanceOutcome:
             events.append("recover_update")
-            return MaintenanceOutcome(
-                "maintenance_update_cleanup_pending", True, job_id="mtn_test"
-            )
+            return MaintenanceOutcome("maintenance_update_cleanup_pending", True, job_id="mtn_test")
 
         def run_one(self) -> None:
             events.append("maintenance")
@@ -574,6 +860,7 @@ def test_pending_update_cleanup_does_not_block_worker_announce(
         "recover_update",
         "announce",
         "resume_upload",
+        "announce",
         "maintenance",
         "poll",
     ]
@@ -581,9 +868,7 @@ def test_pending_update_cleanup_does_not_block_worker_announce(
     assert status["maintenance_succeeded"] is True
 
 
-def test_failed_target_activation_requests_supervisor_rollback(
-    tmp_path: Path, capsys: Any
-) -> None:
+def test_failed_target_activation_requests_supervisor_rollback(tmp_path: Path, capsys: Any) -> None:
     credential_file = tmp_path / "worker-credentials.json"
     save_worker_credentials_file(
         credential_file,
@@ -617,14 +902,10 @@ def test_failed_target_activation_requests_supervisor_rollback(
         )
         == EXIT_UPDATE_ROLLBACK
     )
-    assert json.loads(capsys.readouterr().out)["mode"] == (
-        "maintenance_update_activation_failed"
-    )
+    assert json.loads(capsys.readouterr().out)["mode"] == ("maintenance_update_activation_failed")
 
 
-def test_foreground_serve_uses_builtin_supervisor(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_foreground_serve_uses_builtin_supervisor(tmp_path: Path, monkeypatch: Any) -> None:
     calls: list[tuple[list[str], Path]] = []
 
     def fake_supervisor(argv: list[str], *, work_root: Path) -> int:
@@ -633,10 +914,5 @@ def test_foreground_serve_uses_builtin_supervisor(
 
     monkeypatch.setattr("vgen.worker.main.supervise_worker", fake_supervisor)
 
-    assert (
-        run_entrypoint(["serve", "--work-root", str(tmp_path), "--json"])
-        == 23
-    )
-    assert calls == [
-        (["serve", "--work-root", str(tmp_path), "--json"], tmp_path)
-    ]
+    assert run_entrypoint(["serve", "--work-root", str(tmp_path), "--json"]) == 23
+    assert calls == [(["serve", "--work-root", str(tmp_path), "--json"], tmp_path)]

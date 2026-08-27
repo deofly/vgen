@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 from collections.abc import Mapping
@@ -43,7 +44,9 @@ from vgen.worker import (
     WorkerCore,
     WorkerFailureReport,
     WorkerResult,
+    WorkerResultArtifact,
 )
+from vgen.worker.spool import UploadJournal
 
 
 class FakeExecutor:
@@ -184,19 +187,60 @@ def test_worker_core_runs_executor_and_preserves_fencing_token(tmp_path: Path) -
     assert core.capabilities()["executors"][0]["type"] == "fake"
 
 
+def test_input_preparation_renews_lease_before_adapter_reports_progress(
+    tmp_path: Path,
+) -> None:
+    background_heartbeat = threading.Event()
+
+    class SlowLocalAdapter(LocalArtifactAdapter):
+        def download(self, ticket: Any, destination: Path, on_progress: Any = None) -> Any:
+            assert background_heartbeat.wait(timeout=1), "input lease was not renewed"
+            return super().download(ticket, destination, on_progress)
+
+    class RenewingGateway(FakeGateway):
+        def heartbeat(
+            self, reference: LeaseReference, progress: ProgressEvent
+        ) -> HeartbeatDirective:
+            directive = super().heartbeat(reference, progress)
+            if sum(name == "heartbeat" for name, _value in self.events) >= 2:
+                background_heartbeat.set()
+            return directive
+
+    core = WorkerCore(
+        ExecutorRegistry(FakeExecutor()),
+        ArtifactAdapterRegistry(SlowLocalAdapter((tmp_path,))),
+        work_root=tmp_path / "work",
+        heartbeat_interval_seconds=0.01,
+    )
+    outcome = core.process(make_lease(tmp_path), RenewingGateway())
+
+    assert outcome.succeeded
+
+
 def test_worker_reports_allowlisted_extension_without_exposing_executor_filename(
     tmp_path: Path,
 ) -> None:
     class PrivateVideoExecutor(FakeExecutor):
-        def execute(
-            self, request: ExecutionRequest, context: ExecutionContext
-        ) -> ExecutionResult:
+        def execute(self, request: ExecutionRequest, context: ExecutionContext) -> ExecutionResult:
             self.executed = True
             assert request.inputs[0].path.read_bytes() == b"input"
             output = context.work_dir / "private-comfy-workflow-prefix-00001.mp4"
             output.write_bytes(b"private-video")
             return ExecutionResult(
-                (ExecutionArtifact("primary", output, "video/mp4"),),
+                (
+                    ExecutionArtifact(
+                        "primary",
+                        output,
+                        "video/mp4",
+                        metadata={
+                            "frames": 81,
+                            "duration_ms": 1.5,
+                            "width": True,
+                            "height": float("nan"),
+                            "denoise_steps": 100_001,
+                        },
+                    ),
+                ),
                 usage=UsageMetrics(gpu_active_ms=25),
             )
 
@@ -216,6 +260,7 @@ def test_worker_reports_allowlisted_extension_without_exposing_executor_filename
     artifact = outcome.result.artifacts[0]
     assert artifact.filename == "output-00.mp4"
     assert artifact.media_type == "video/mp4"
+    assert artifact.metadata == {"frames": 81}
     assert "private-comfy-workflow-prefix" not in repr(outcome.result)
 
 
@@ -546,7 +591,11 @@ def test_pending_encrypted_upload_resumes_without_reexecuting(tmp_path: Path) ->
             output.write_bytes(b"private generated output")
             return ExecutionResult(
                 (ExecutionArtifact("primary", output),),
-                usage=UsageMetrics(gpu_active_ms=50),
+                usage=UsageMetrics(
+                    gpu_active_ms=50,
+                    native={"private prompt native key": 1},
+                ),
+                executor_run_id="private prompt run handle",
             )
 
         def cancel(self, handle: str | None = None) -> None:
@@ -609,6 +658,8 @@ def test_pending_encrypted_upload_resumes_without_reexecuting(tmp_path: Path) ->
     manifest_text = manifest.read_text(encoding="utf-8")
     assert "private prompt" not in manifest_text
     assert "must-not-be-journaled" not in manifest_text
+    assert "native" not in manifest_text
+    assert "executor_run_id" not in manifest_text
     ciphertext = next(manifest.parent.glob("*.ciphertext")).read_bytes()
     assert b"private generated output" not in ciphertext
 
@@ -644,3 +695,304 @@ def test_pending_encrypted_upload_resumes_without_reexecuting(tmp_path: Path) ->
             ),
         )
     assert plaintext.read_bytes() == b"private generated output"
+
+
+def _save_test_upload(
+    journal: UploadJournal,
+    *,
+    attempt_id: str,
+    content: bytes,
+) -> tuple[LeaseReference, Path]:
+    reference = LeaseReference(
+        f"lea_{attempt_id}",
+        f"tsk_{attempt_id}",
+        attempt_id,
+        "wrk_spool",
+        1,
+    )
+    artifact_id = f"art_{attempt_id}"
+    path = journal.output_path(reference, artifact_id)
+    path.write_bytes(content)
+    artifact = WorkerResultArtifact(
+        artifact_id=artifact_id,
+        name="primary",
+        filename="output.vgen",
+        media_type="application/octet-stream",
+        size_bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    journal.save(
+        reference,
+        WorkerResult(
+            artifacts=(artifact,),
+            usage=UsageMetrics(output_bytes=len(content)),
+            executor_type="fake",
+            executor_version="1.0",
+        ),
+        {artifact_id: path},
+    )
+    return reference, path
+
+
+def test_corrupt_oldest_upload_is_quarantined_without_hiding_next_attempt(
+    tmp_path: Path,
+) -> None:
+    journal = UploadJournal(tmp_path / "upload-spool")
+    bad_reference, bad_path = _save_test_upload(
+        journal,
+        attempt_id="atm_bad",
+        content=b"durable ciphertext one",
+    )
+    good_reference, _good_path = _save_test_upload(
+        journal,
+        attempt_id="atm_good",
+        content=b"durable ciphertext two",
+    )
+    bad_path.write_bytes(b"truncated")
+
+    pending = journal.list_pending()
+
+    assert [item.reference.attempt_id for item in pending] == [good_reference.attempt_id]
+    assert not journal._directory(bad_reference.attempt_id).exists()
+    quarantined = list((tmp_path / "upload-spool-quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "upload-manifest.json").is_file()
+
+
+def test_invalid_upload_manifest_is_quarantined_instead_of_crashing_worker(
+    tmp_path: Path,
+) -> None:
+    journal = UploadJournal(tmp_path / "upload-spool")
+    reference, _path = _save_test_upload(
+        journal,
+        attempt_id="atm_invalid_manifest",
+        content=b"durable ciphertext",
+    )
+    manifest = journal._directory(reference.attempt_id) / "upload-manifest.json"
+    manifest.write_text("{not valid json", encoding="utf-8")
+
+    assert journal.list_pending() == ()
+    assert not journal._directory(reference.attempt_id).exists()
+    assert len(list((tmp_path / "upload-spool-quarantine").iterdir())) == 1
+
+
+def test_legacy_spool_drops_non_integer_media_probes_before_resume(tmp_path: Path) -> None:
+    journal = UploadJournal(tmp_path / "upload-spool")
+    reference, _path = _save_test_upload(
+        journal,
+        attempt_id="atm_legacy_metadata",
+        content=b"durable ciphertext",
+    )
+    manifest = journal._directory(reference.attempt_id) / "upload-manifest.json"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["result"]["artifacts"][0]["metadata"] = {
+        "frames": 81,
+        "duration_ms": 1.5,
+        "width": True,
+        "denoise_steps": 100_001,
+    }
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    pending = journal.load(reference.attempt_id)
+
+    assert pending.result.artifacts[0].metadata == {"frames": 81}
+
+
+def test_orphaned_pre_manifest_directory_is_quarantined_before_next_attempt(
+    tmp_path: Path,
+) -> None:
+    journal = UploadJournal(tmp_path / "upload-spool")
+    orphan = LeaseReference("lea_orphan", "tsk_orphan", "atm_orphan", "wrk_spool", 1)
+    journal.output_path(orphan, "art_orphan").write_bytes(b"unfinished ciphertext")
+    good_reference, _path = _save_test_upload(
+        journal,
+        attempt_id="atm_after_orphan",
+        content=b"durable ciphertext",
+    )
+
+    pending = journal.list_pending()
+
+    assert [item.reference.attempt_id for item in pending] == [good_reference.attempt_id]
+    assert not journal._directory(orphan.attempt_id).exists()
+    assert len(list((tmp_path / "upload-spool-quarantine").iterdir())) == 1
+
+
+def test_resume_renews_lease_while_adapter_prepares_large_upload(tmp_path: Path) -> None:
+    work_root = tmp_path / "worker-work"
+    journal = UploadJournal(work_root / "upload-spool")
+    reference, _path = _save_test_upload(
+        journal,
+        attempt_id="atm_slow_resume",
+        content=b"durable ciphertext",
+    )
+    destination = tmp_path / "resumed.bin"
+    background_heartbeat = threading.Event()
+
+    class SlowLocalAdapter(LocalArtifactAdapter):
+        def upload(self, ticket: Any, source: Path, on_progress: Any = None) -> Any:
+            assert background_heartbeat.wait(timeout=1), "resume lease was not renewed"
+            return super().upload(ticket, source, on_progress)
+
+    class ResumableGateway(FakeGateway):
+        def renew_output_tickets(
+            self,
+            actual_reference: LeaseReference,
+            artifact_ids: frozenset[str],
+        ) -> Mapping[str, TransferTicket]:
+            assert actual_reference == reference
+            assert artifact_ids == frozenset({"art_atm_slow_resume"})
+            return {"art_atm_slow_resume": TransferTicket(destination.as_uri(), "PUT")}
+
+        def heartbeat(
+            self, actual_reference: LeaseReference, progress: ProgressEvent
+        ) -> HeartbeatDirective:
+            directive = super().heartbeat(actual_reference, progress)
+            if sum(name == "heartbeat" for name, _value in self.events) >= 2:
+                background_heartbeat.set()
+            return directive
+
+    core = WorkerCore(
+        ExecutorRegistry(FakeExecutor()),
+        ArtifactAdapterRegistry(SlowLocalAdapter((tmp_path,))),
+        work_root=work_root,
+        heartbeat_interval_seconds=0.01,
+    )
+    resumed = core.resume_pending(ResumableGateway())
+
+    assert resumed is not None and resumed.succeeded
+    assert destination.read_bytes() == b"durable ciphertext"
+
+
+def test_resume_missing_renewal_ticket_keeps_durable_spool_for_retry(tmp_path: Path) -> None:
+    work_root = tmp_path / "worker-work"
+    journal = UploadJournal(work_root / "upload-spool")
+    reference, _path = _save_test_upload(
+        journal,
+        attempt_id="atm_missing_renewal",
+        content=b"durable ciphertext",
+    )
+
+    class MissingTicketGateway(FakeGateway):
+        def renew_output_tickets(
+            self,
+            actual_reference: LeaseReference,
+            artifact_ids: frozenset[str],
+        ) -> Mapping[str, TransferTicket]:
+            assert actual_reference == reference
+            assert artifact_ids == frozenset({"art_atm_missing_renewal"})
+            return {}
+
+    core = WorkerCore(
+        ExecutorRegistry(FakeExecutor()),
+        ArtifactAdapterRegistry(LocalArtifactAdapter((tmp_path,))),
+        work_root=work_root,
+        heartbeat_interval_seconds=0.01,
+    )
+
+    with pytest.raises(UploadPendingError):
+        core.resume_pending(MissingTicketGateway())
+
+    assert journal.oldest_pending() is not None
+    assert journal.oldest_pending().reference == reference
+
+
+def test_resume_serializes_gateway_calls_and_stops_heartbeat_before_complete(
+    tmp_path: Path,
+) -> None:
+    work_root = tmp_path / "worker-work"
+    journal = UploadJournal(work_root / "upload-spool")
+    reference, _path = _save_test_upload(
+        journal,
+        attempt_id="atm_serialized_resume",
+        content=b"durable ciphertext",
+    )
+    destination = tmp_path / "serialized-resume.bin"
+    upload_active = threading.Event()
+    heartbeat_during_upload = threading.Event()
+
+    class SlowLocalAdapter(LocalArtifactAdapter):
+        def upload(self, ticket: Any, source: Path, on_progress: Any = None) -> Any:
+            upload_active.set()
+            try:
+                assert heartbeat_during_upload.wait(timeout=1), "upload lease was not renewed"
+                return super().upload(ticket, source, on_progress)
+            finally:
+                upload_active.clear()
+
+    class SerializedGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self._state_lock = threading.Lock()
+            self._active_calls: set[str] = set()
+            self.overlaps: list[tuple[str, str]] = []
+            self.complete_returned = threading.Event()
+            self.heartbeats_after_complete = 0
+
+        def _enter(self, name: str) -> None:
+            with self._state_lock:
+                self.overlaps.extend((active, name) for active in self._active_calls)
+                self._active_calls.add(name)
+
+        def _leave(self, name: str) -> None:
+            with self._state_lock:
+                self._active_calls.remove(name)
+
+        def heartbeat(
+            self, actual_reference: LeaseReference, progress: ProgressEvent
+        ) -> HeartbeatDirective:
+            self._enter("heartbeat")
+            try:
+                if self.complete_returned.is_set():
+                    self.heartbeats_after_complete += 1
+                if upload_active.is_set():
+                    heartbeat_during_upload.set()
+                time.sleep(0.001)
+                return super().heartbeat(actual_reference, progress)
+            finally:
+                self._leave("heartbeat")
+
+        def renew_output_tickets(
+            self,
+            actual_reference: LeaseReference,
+            artifact_ids: frozenset[str],
+        ) -> Mapping[str, TransferTicket]:
+            self._enter("renew")
+            try:
+                assert actual_reference == reference
+                assert artifact_ids == frozenset({"art_atm_serialized_resume"})
+                time.sleep(0.03)
+                return {
+                    "art_atm_serialized_resume": TransferTicket(
+                        destination.as_uri(),
+                        "PUT",
+                    )
+                }
+            finally:
+                self._leave("renew")
+
+        def complete(self, actual_reference: LeaseReference, result: WorkerResult) -> None:
+            self._enter("complete")
+            try:
+                time.sleep(0.03)
+                super().complete(actual_reference, result)
+            finally:
+                self._leave("complete")
+            self.complete_returned.set()
+
+    gateway = SerializedGateway()
+    core = WorkerCore(
+        ExecutorRegistry(FakeExecutor()),
+        ArtifactAdapterRegistry(SlowLocalAdapter((tmp_path,))),
+        work_root=work_root,
+        heartbeat_interval_seconds=0.005,
+    )
+
+    resumed = core.resume_pending(gateway)
+    time.sleep(0.02)
+
+    assert resumed is not None and resumed.succeeded
+    assert destination.read_bytes() == b"durable ciphertext"
+    assert heartbeat_during_upload.is_set()
+    assert gateway.overlaps == []
+    assert gateway.heartbeats_after_complete == 0
+    assert [name for name, _value in gateway.events][-1] == "complete"

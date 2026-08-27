@@ -19,12 +19,14 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from packaging.version import InvalidVersion, Version
+from packaging.version import Version
 
 from vgen import __version__
 
@@ -44,10 +46,12 @@ class WorkerRuntimeState:
     previous_python: Path | None
     pending: bool
     active_available: bool = True
+    activation_verified: bool = False
+    superseded_pending: bool = False
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_VERSION = re.compile(r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$")
+_VERSION = re.compile(r"^(?:0|[1-9]\d{0,8})\.(?:0|[1-9]\d{0,8})\.(?:0|[1-9]\d{0,8})$")
 _POINTER_FORMAT = "vgen-worker-runtime-pointer"
 _POINTER_VERSION = 1
 _MAX_WHEEL_ENTRIES = 4096
@@ -59,8 +63,7 @@ def _isolated_subprocess_environment() -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith(("PIP_", "PYTHON"))
-        and key.upper() != "VIRTUAL_ENV"
+        if not key.upper().startswith(("PIP_", "PYTHON")) and key.upper() != "VIRTUAL_ENV"
     }
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PIP_NO_INPUT"] = "1"
@@ -122,6 +125,7 @@ class RuntimeUpdater:
         self.releases_root = self.work_root / "runtime-releases"
         self.download_root = self.work_root / "maintenance-downloads"
         self.pointer_path = self.work_root / "runtime-active.json"
+        self.pointer_lock_path = self.work_root / ".runtime-active.lock"
         self.current_python = (current_python or Path(sys.executable)).resolve()
         self.current_version = current_version
         self.source_runtime = (source_runtime or Path(sys.prefix)).resolve()
@@ -145,7 +149,7 @@ class RuntimeUpdater:
         try:
             target = Version(target_version)
             current = Version(self.current_version)
-        except InvalidVersion as exc:
+        except ValueError as exc:
             raise WorkerUpdateError("WORKER_UPDATE_VERSION_INVALID") from exc
         if target <= current:
             raise WorkerUpdateError("WORKER_UPDATE_DOWNGRADE_DENIED")
@@ -301,7 +305,7 @@ class RuntimeUpdater:
             "artifact_sha256": digest,
             "switched_at": int(time.time()),
         }
-        self._write_pointer(pointer)
+        self._write_pending_pointer(pointer)
         return pointer
 
     def pending_activation(self) -> dict[str, Any] | None:
@@ -329,38 +333,59 @@ class RuntimeUpdater:
     def mark_activation_verified(self, pointer: dict[str, Any]) -> dict[str, Any]:
         """Persist target health before attempting the idempotent Gateway commit."""
 
-        value = dict(pointer)
-        value["activation_verified_at"] = int(time.time())
-        self._write_pointer(value)
-        return value
+        with self._pointer_lock():
+            current = self._read_pointer()
+            if current is None or _pointer_identity(current) != _pointer_identity(pointer):
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_STALE")
+            verified_at = current.get("activation_verified_at")
+            if verified_at is not None:
+                if type(verified_at) is int and verified_at >= 1:
+                    return current
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+            if current != pointer:
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_STALE")
+            current["activation_verified_at"] = int(time.time())
+            self._write_pointer_unlocked(current)
+            return current
 
     def mark_activation_succeeded(self, pointer: dict[str, Any]) -> None:
-        value = dict(pointer)
-        for key in (
-            "activation_verified_at",
-            "pending_job_id",
-            "pending_fencing_token",
-            "previous_python",
-            "previous_version",
-        ):
-            value.pop(key, None)
-        value["last_verified_at"] = int(time.time())
-        self._write_pointer(value)
+        def succeeded(value: dict[str, Any]) -> dict[str, Any]:
+            for key in (
+                "activation_verified_at",
+                "pending_job_id",
+                "pending_fencing_token",
+                "previous_python",
+                "previous_version",
+            ):
+                value.pop(key, None)
+            value["last_verified_at"] = int(time.time())
+            return value
+
+        self._transition_pointer(pointer, succeeded)
 
     def mark_activation_rolled_back(self, pointer: dict[str, Any]) -> None:
-        previous_python = pointer.get("previous_python")
-        previous_version = pointer.get("previous_version")
-        if not isinstance(previous_python, str) or not previous_python:
-            raise WorkerUpdateError("WORKER_UPDATE_ROLLBACK_UNAVAILABLE")
-        value = {
-            "format": _POINTER_FORMAT,
-            "version": _POINTER_VERSION,
-            "active_python": previous_python,
-            "active_version": str(previous_version or "unknown"),
-            "rolled_back_job_id": pointer.get("pending_job_id"),
-            "rolled_back_at": int(time.time()),
-        }
-        self._write_pointer(value)
+        trusted_fallback = self.current_python.resolve()
+        base_version = _release_version(
+            self.current_version,
+            error_code="WORKER_UPDATE_VERSION_INVALID",
+        )
+
+        def rolled_back(value: dict[str, Any]) -> dict[str, Any]:
+            previous_python, previous_version = self._pending_rollback_runtime(
+                value,
+                trusted_fallback,
+                base_version,
+            )
+            return {
+                "format": _POINTER_FORMAT,
+                "version": _POINTER_VERSION,
+                "active_python": str(previous_python),
+                "active_version": previous_version,
+                "rolled_back_job_id": value.get("pending_job_id"),
+                "rolled_back_at": int(time.time()),
+            }
+
+        self._transition_pointer(pointer, rolled_back)
 
     def active_python(self, *, fallback: Path | None = None) -> Path:
         value = self._read_pointer()
@@ -379,26 +404,80 @@ class RuntimeUpdater:
         pending = isinstance(value.get("pending_job_id"), str) and bool(
             value["pending_job_id"].strip()
         )
+        activation_verified = self.activation_verified(value) if pending else False
         rolled_back = isinstance(value.get("rolled_back_job_id"), str) and bool(
             value["rolled_back_job_id"].strip()
         )
-        # A newer reviewed installer may use a different immutable base runtime
-        # than the one recorded by an already completed rollback. Never launch
-        # that stale path; a terminal rollback has no activation left to recover,
-        # so resume from the installer's trusted fallback instead.
-        if rolled_back and not pending:
+        active_version = _release_version(
+            value.get("active_version"),
+            error_code="WORKER_UPDATE_POINTER_INVALID",
+        )
+        base_version = _release_version(
+            self.current_version,
+            error_code="WORKER_UPDATE_VERSION_INVALID",
+        )
+        if rolled_back and not pending and active_version <= base_version:
+            # A terminal rollback can point at an old immutable installer path.
+            # If the current reviewed base is at least as new, ignore that path
+            # entirely. A newer in-store rollback remains authoritative.
             return WorkerRuntimeState(trusted_fallback, None, False)
         active, active_available = self._supervisor_python(
             value.get("active_python"),
             trusted_fallback,
-            allow_missing=pending,
+            allow_missing=pending or active_version <= base_version,
         )
+        if not pending:
+            # Completed remote activations remain authoritative unless a newer
+            # reviewed installer supplied the immutable base runtime. Compare
+            # before resolving an older path so a removed superseded runtime
+            # cannot prevent the trusted newer base from starting.
+            if active_version < base_version:
+                return WorkerRuntimeState(trusted_fallback, None, False)
+            if not active_available:
+                if active_version == base_version:
+                    return WorkerRuntimeState(trusted_fallback, None, False)
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
         previous = None
         if pending:
-            previous, _previous_available = self._supervisor_python(
-                value.get("previous_python"), trusted_fallback
+            previous, _previous_version = self._pending_rollback_runtime(
+                value,
+                trusted_fallback,
+                base_version,
             )
-        return WorkerRuntimeState(active, previous, pending, active_available)
+        return WorkerRuntimeState(
+            active,
+            previous,
+            pending,
+            active_available,
+            activation_verified,
+            pending and active_version < base_version,
+        )
+
+    def _pending_rollback_runtime(
+        self,
+        pointer: dict[str, Any],
+        trusted_fallback: Path,
+        base_version: Version,
+    ) -> tuple[Path, str]:
+        """Select a rollback which remains trusted after an installer takeover.
+
+        A pending remote activation may name the immutable base directory from
+        the installer which started it. A newer installer has a different base
+        path, so that old path is outside its current trust roots. If the new
+        reviewed base is at least as new, it is the safe rollback; a newer
+        previous runtime must still resolve inside the private release store.
+        """
+
+        previous_version = _release_version(
+            pointer.get("previous_version"),
+            error_code="WORKER_UPDATE_POINTER_INVALID",
+        )
+        if previous_version <= base_version:
+            return trusted_fallback, str(base_version)
+        previous, _available = self._supervisor_python(
+            pointer.get("previous_python"), trusted_fallback
+        )
+        return previous, str(previous_version)
 
     def _supervisor_python(
         self,
@@ -411,10 +490,18 @@ class RuntimeUpdater:
             raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
         try:
             raw_candidate = Path(raw)
-            if _is_reparse(raw_candidate):
+            if not raw_candidate.is_absolute():
                 raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
-            candidate = raw_candidate.resolve()
-            releases_root = self.releases_root.resolve()
+            lexical_candidate = Path(os.path.abspath(raw_candidate))
+            lexical_fallback = Path(os.path.abspath(trusted_fallback))
+            lexical_releases_root = Path(os.path.abspath(self.releases_root))
+            if lexical_candidate != lexical_fallback:
+                if not lexical_candidate.is_relative_to(lexical_releases_root):
+                    raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+                if _has_reparse_component(lexical_candidate, self.work_root):
+                    raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+            candidate = lexical_candidate.resolve()
+            releases_root = lexical_releases_root.resolve()
             in_releases = candidate.is_relative_to(releases_root)
         except WorkerUpdateError:
             raise
@@ -469,9 +556,85 @@ class RuntimeUpdater:
             or value.get("version") != _POINTER_VERSION
         ):
             raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        _validate_pointer_schema(value)
         return value
 
     def _write_pointer(self, value: dict[str, Any]) -> None:
+        with self._pointer_lock():
+            self._write_pointer_unlocked(value)
+
+    def _write_pending_pointer(self, value: dict[str, Any]) -> None:
+        with self._pointer_lock():
+            current = self._read_pointer()
+            if (
+                current is not None
+                and isinstance(current.get("pending_job_id"), str)
+                and current["pending_job_id"]
+                and current != value
+            ):
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_BUSY")
+            self._write_pointer_unlocked(value)
+
+    def _transition_pointer(
+        self,
+        expected: dict[str, Any],
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically transition only the pending activation the caller observed."""
+
+        expected_identity = _pointer_identity(expected)
+        if (
+            not isinstance(expected_identity[0], str)
+            or not expected_identity[0]
+            or type(expected_identity[1]) is not int
+            or expected_identity[1] < 1
+        ):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        with self._pointer_lock():
+            current = self._read_pointer()
+            if current is None or current != expected:
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_STALE")
+            value = transform(dict(current))
+            self._write_pointer_unlocked(value)
+            return value
+
+    @contextmanager
+    def _pointer_lock(self) -> Iterator[None]:
+        if _is_reparse(self.pointer_lock_path):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        try:
+            descriptor = os.open(self.pointer_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_LOCK_UNAVAILABLE") from exc
+        with os.fdopen(descriptor, "a+b", buffering=0) as lock_file:
+            try:
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"0")
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise WorkerUpdateError("WORKER_UPDATE_POINTER_LOCK_UNAVAILABLE") from exc
+            try:
+                yield
+            finally:
+                try:
+                    lock_file.seek(0)
+                    if os.name == "nt":
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError as exc:
+                    raise WorkerUpdateError("WORKER_UPDATE_POINTER_LOCK_UNAVAILABLE") from exc
+
+    def _write_pointer_unlocked(self, value: dict[str, Any]) -> None:
         self.pointer_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".runtime-active-", suffix=".tmp", dir=self.pointer_path.parent
@@ -499,6 +662,120 @@ def _is_reparse(path: Path) -> bool:
     attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return path.is_symlink() or bool(attributes & reparse_flag)
+
+
+def _has_reparse_component(candidate: Path, boundary: Path) -> bool:
+    """Check the complete trusted path, including a reparse-point root."""
+
+    try:
+        candidate.relative_to(boundary)
+    except ValueError:
+        return True
+    current = candidate
+    while True:
+        if _is_reparse(current):
+            return True
+        if current == boundary:
+            return False
+        parent = current.parent
+        if parent == current:
+            return True
+        current = parent
+
+
+def _release_version(value: object, *, error_code: str) -> Version:
+    if not isinstance(value, str) or not _VERSION.fullmatch(value):
+        raise WorkerUpdateError(error_code)
+    try:
+        return Version(value)
+    except ValueError as exc:
+        raise WorkerUpdateError(error_code) from exc
+
+
+def _pointer_identity(value: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        value.get("pending_job_id"),
+        value.get("pending_fencing_token"),
+        value.get("active_python"),
+        value.get("active_version"),
+        value.get("artifact_sha256"),
+    )
+
+
+def _validate_pointer_schema(value: dict[str, Any]) -> None:
+    """Reject partial state-machine records before supervisor interpretation."""
+
+    active_python = value.get("active_python")
+    active_version = value.get("active_version")
+    if (
+        not isinstance(active_python, str)
+        or not active_python
+        or any(character in active_python for character in ("\x00", "\r", "\n"))
+        or not isinstance(active_version, str)
+        or _VERSION.fullmatch(active_version) is None
+    ):
+        raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+
+    pending_keys = {
+        "pending_job_id",
+        "pending_fencing_token",
+        "previous_python",
+        "previous_version",
+        "activation_verified_at",
+    }
+    pending = bool(pending_keys & value.keys())
+    rollback_keys = {"rolled_back_job_id", "rolled_back_at"}
+    rolled_back = bool(rollback_keys & value.keys())
+    if pending and rolled_back:
+        raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+    if pending:
+        job_id = value.get("pending_job_id")
+        fencing_token = value.get("pending_fencing_token")
+        previous_python = value.get("previous_python")
+        previous_version = value.get("previous_version")
+        artifact_sha256 = value.get("artifact_sha256")
+        if (
+            not isinstance(job_id, str)
+            or not 1 <= len(job_id) <= 256
+            or not job_id.strip()
+            or any(character in job_id for character in ("\x00", "\r", "\n"))
+            or type(fencing_token) is not int
+            or fencing_token < 1
+            or not isinstance(previous_python, str)
+            or not previous_python.strip()
+            or any(character in previous_python for character in ("\x00", "\r", "\n"))
+            or not isinstance(previous_version, str)
+            or _VERSION.fullmatch(previous_version) is None
+            or not isinstance(artifact_sha256, str)
+            or _DIGEST.fullmatch(artifact_sha256) is None
+        ):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+        verified_at = value.get("activation_verified_at")
+        if verified_at is not None and (type(verified_at) is not int or verified_at < 1):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+
+    if rolled_back:
+        rolled_back_job_id = value.get("rolled_back_job_id")
+        rolled_back_at = value.get("rolled_back_at")
+        if (
+            not isinstance(rolled_back_job_id, str)
+            or not 1 <= len(rolled_back_job_id) <= 256
+            or not rolled_back_job_id.strip()
+            or any(character in rolled_back_job_id for character in ("\x00", "\r", "\n"))
+            or type(rolled_back_at) is not int
+            or rolled_back_at < 1
+        ):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+
+    for field in ("last_verified_at", "switched_at"):
+        timestamp = value.get(field)
+        if timestamp is not None and (type(timestamp) is not int or timestamp < 1):
+            raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
+    artifact_sha256 = value.get("artifact_sha256")
+    if artifact_sha256 is not None and (
+        not isinstance(artifact_sha256, str) or _DIGEST.fullmatch(artifact_sha256) is None
+    ):
+        raise WorkerUpdateError("WORKER_UPDATE_POINTER_INVALID")
 
 
 __all__ = ["RuntimeUpdater", "WorkerRuntimeState", "WorkerUpdateError"]

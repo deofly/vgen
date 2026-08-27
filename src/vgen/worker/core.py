@@ -7,6 +7,7 @@ ComfyUI or cloud-provider fields.
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import threading
 import time
@@ -33,6 +34,7 @@ from vgen.executors import (
     UsageMetrics,
 )
 from vgen.protocol import ErrorCode, VGenError, get_error_spec
+from vgen.protocol.media import canonical_media_probes
 
 from .models import (
     ExecutionLease,
@@ -43,7 +45,9 @@ from .models import (
     WorkerResult,
     WorkerResultArtifact,
 )
-from .spool import UploadJournal
+from .spool import UploadJournal, UploadJournalError
+
+logger = logging.getLogger("vgen.worker.core")
 
 
 class LeaseLostError(Exception):
@@ -102,6 +106,8 @@ class UploadRenewingGateway(Protocol):
 
     def complete(self, reference: LeaseReference, result: WorkerResult) -> None: ...
 
+    def fail(self, reference: LeaseReference, failure: WorkerFailureReport) -> None: ...
+
 
 class WorkerCore:
     def __init__(
@@ -152,20 +158,71 @@ class WorkerCore:
             return None
         if not isinstance(gateway, UploadRenewingGateway):
             raise TypeError("gateway does not support output ticket renewal")
-        pending_values = self._upload_journal.list_pending()
-        if not pending_values:
+        pending = self._upload_journal.oldest_pending()
+        if pending is None:
             return None
-        pending = pending_values[0]
+        heartbeat_lock = threading.Lock()
+        heartbeat_stop = threading.Event()
+        heartbeat_error: list[Exception] = []
+        last_progress = ProgressEvent(0.90, "resuming_output_upload")
+
+        def report(event: ProgressEvent) -> None:
+            nonlocal last_progress
+            with heartbeat_lock:
+                if heartbeat_error:
+                    raise heartbeat_error[0]
+                gateway.heartbeat(pending.reference, event)
+                last_progress = event
+
+        def keep_lease_alive() -> None:
+            while not heartbeat_stop.wait(self._heartbeat_interval_seconds):
+                try:
+                    with heartbeat_lock:
+                        gateway.heartbeat(pending.reference, last_progress)
+                except Exception as exc:
+                    heartbeat_error.append(exc)
+                    heartbeat_stop.set()
+                    return
+
+        heartbeat_thread: threading.Thread | None = None
+
+        def stop_heartbeat() -> None:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
+                heartbeat_thread.join()
+
         try:
-            tickets = (
-                gateway.renew_output_tickets(
-                    pending.reference,
-                    pending.pending_artifact_ids,
-                )
-                if pending.pending_artifact_ids
-                else {}
+            # Renew before any adapter performs its potentially long digest
+            # pass, then keep the fenced attempt alive through hashing, upload,
+            # and receipt verification.  Every call shares the heartbeat lock
+            # because authenticated Gateway clients may own non-thread-safe
+            # sessions and token-refresh state.
+            report(last_progress)
+            heartbeat_thread = threading.Thread(
+                target=keep_lease_alive,
+                name=f"vgen-resume-heartbeat-{pending.reference.attempt_id}",
+                daemon=True,
             )
-            if set(tickets) != set(pending.pending_artifact_ids):
+            heartbeat_thread.start()
+            with heartbeat_lock:
+                if heartbeat_error:
+                    raise heartbeat_error[0]
+                tickets = (
+                    gateway.renew_output_tickets(
+                        pending.reference,
+                        pending.pending_artifact_ids,
+                    )
+                    if pending.pending_artifact_ids
+                    else {}
+                )
+            renewed_ids = set(tickets)
+            if not renewed_ids.issubset(pending.pending_artifact_ids):
+                raise ArtifactTransferError(
+                    "renew",
+                    "The Gateway returned an unexpected output ticket.",
+                    retryable=False,
+                )
+            if renewed_ids != set(pending.pending_artifact_ids):
                 raise ArtifactTransferError(
                     "renew",
                     "The Gateway did not renew every pending output ticket.",
@@ -178,28 +235,57 @@ class WorkerCore:
                 receipt = self._artifacts.upload(
                     tickets[artifact_id],
                     pending.files[artifact_id],
-                    on_progress=lambda consumed, size, current=index: gateway.heartbeat(
-                        pending.reference,
+                    on_progress=lambda consumed, size, current=index: report(
                         ProgressEvent(
                             0.90 + _transfer_fraction(current, total, consumed, size, 0.10),
                             "resuming_output_upload",
-                        ),
+                        )
                     ),
                 )
                 if receipt.size_bytes != artifact.size_bytes or receipt.sha256 != artifact.sha256:
-                    raise ArtifactTransferError(
-                        "verify",
-                        "Resumed output upload verification failed.",
-                        retryable=True,
+                    try:
+                        self._upload_journal.quarantine(pending.reference.attempt_id)
+                    except UploadJournalError:
+                        logger.exception("Could not quarantine a corrupt output spool attempt.")
+                    failure = WorkerFailureReport(
+                        code=ErrorCode.ARTIFACT_INTEGRITY_FAILED,
+                        name="ARTIFACT_INTEGRITY_FAILED",
+                        message="A durable output failed integrity verification.",
+                        retry_action=RetryAction.NONE,
+                        responsibility="platform",
+                        occurred_after_start=True,
+                        usage=pending.result.usage,
                     )
+                    stop_heartbeat()
+                    return _report_failure(gateway, pending.reference, failure)
                 self._upload_journal.mark_uploaded(pending.reference.attempt_id, artifact_id)
-            gateway.complete(pending.reference, pending.result)
-            self._upload_journal.remove(pending.reference.attempt_id)
+            # The terminal mutation is serialized after the keeper exits.  A
+            # heartbeat sent after completion could race a reused fencing token
+            # or a client-side credential refresh.
+            stop_heartbeat()
+            with heartbeat_lock:
+                if heartbeat_error:
+                    raise heartbeat_error[0]
+                gateway.complete(pending.reference, pending.result)
+            self._discard_pending_attempt(pending.reference.attempt_id)
             return WorkerOutcome(result=pending.result)
         except ArtifactTransferError as exc:
-            raise UploadPendingError(pending.reference.attempt_id) from exc
+            if exc.retryable:
+                raise UploadPendingError(pending.reference.attempt_id) from exc
+            self._discard_pending_attempt(pending.reference.attempt_id)
+            failure = WorkerFailureReport(
+                code=ErrorCode.OUTPUT_UPLOAD_FAILED,
+                name="OUTPUT_UPLOAD_FAILED",
+                message="A durable output cannot be uploaded with the renewed capability.",
+                retry_action=RetryAction.NONE,
+                responsibility="platform",
+                occurred_after_start=True,
+                usage=pending.result.usage,
+            )
+            stop_heartbeat()
+            return _report_failure(gateway, pending.reference, failure)
         except LeaseLostError:
-            self._upload_journal.remove(pending.reference.attempt_id)
+            self._discard_pending_attempt(pending.reference.attempt_id)
             return WorkerOutcome(
                 failure=WorkerFailureReport(
                     code=ErrorCode.LEASE_LOST,
@@ -210,6 +296,25 @@ class WorkerCore:
                     occurred_after_start=True,
                 )
             )
+        except GatewayRequestError:
+            # A deterministic Gateway rejection cannot become an infinite
+            # lease-renewing spool loop. The server transaction is atomic; let
+            # its normal lease recovery decide whether the task is retried.
+            self._discard_pending_attempt(pending.reference.attempt_id)
+            raise
+        finally:
+            stop_heartbeat()
+
+    def _discard_pending_attempt(self, attempt_id: str) -> None:
+        if self._upload_journal is None:
+            return
+        try:
+            self._upload_journal.remove(attempt_id)
+        except UploadJournalError:
+            try:
+                self._upload_journal.quarantine(attempt_id)
+            except UploadJournalError:
+                logger.exception("Could not discard one terminal output spool attempt.")
 
     def process(self, lease: ExecutionLease, gateway: WorkerGateway) -> WorkerOutcome:
         """Process one already-decrypted lease and report exactly one terminal event."""
@@ -223,6 +328,13 @@ class WorkerCore:
         input_bytes = 0
         heartbeat_stop: threading.Event | None = None
         heartbeat_thread: threading.Thread | None = None
+
+        def stop_heartbeat_keeper() -> None:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
+                heartbeat_thread.join()
+
         try:
             if lease.expires_at is not None and time.time() >= lease.expires_at:
                 raise ExecutorFailure(
@@ -266,6 +378,36 @@ class WorkerCore:
                     cancelled = cancelled or directive.cancelled
 
             report(ProgressEvent(0.0, "preparing"))
+            heartbeat_stop = threading.Event()
+            heartbeat_interval = self._heartbeat_interval_seconds
+            if lease.expires_at is not None:
+                heartbeat_interval = min(
+                    heartbeat_interval,
+                    max(0.25, (lease.expires_at - time.time()) / 3),
+                )
+
+            def keep_lease_alive() -> None:
+                nonlocal cancelled
+                while not heartbeat_stop.wait(heartbeat_interval):
+                    try:
+                        with heartbeat_lock:
+                            directive = gateway.heartbeat(
+                                lease.reference,
+                                last_progress,
+                            )
+                            cancelled = cancelled or directive.cancelled
+                    except Exception as exc:
+                        heartbeat_error.append(exc)
+                        cancelled = True
+                        heartbeat_stop.set()
+                        return
+
+            heartbeat_thread = threading.Thread(
+                target=keep_lease_alive,
+                name=f"vgen-heartbeat-{lease.reference.attempt_id}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             with tempfile.TemporaryDirectory(
                 prefix=f"vgen-{lease.reference.attempt_id}-",
                 dir=str(self._work_root) if self._work_root else None,
@@ -317,8 +459,11 @@ class WorkerCore:
                         responsibility="consumer",
                     )
 
-                start_directive = gateway.mark_started(lease.reference)
-                cancelled = cancelled or start_directive.cancelled
+                with heartbeat_lock:
+                    if heartbeat_error:
+                        raise heartbeat_error[0]
+                    start_directive = gateway.mark_started(lease.reference)
+                    cancelled = cancelled or start_directive.cancelled
                 if cancelled:
                     raise ExecutorFailure(
                         ErrorCode.EXECUTION_CANCELLED,
@@ -330,36 +475,6 @@ class WorkerCore:
                 phase = "executing"
                 wall_started = time.monotonic()
                 execution_started_monotonic = wall_started
-                heartbeat_stop = threading.Event()
-                heartbeat_interval = self._heartbeat_interval_seconds
-                if lease.expires_at is not None:
-                    heartbeat_interval = min(
-                        heartbeat_interval,
-                        max(0.25, (lease.expires_at - time.time()) / 3),
-                    )
-
-                def keep_lease_alive() -> None:
-                    nonlocal cancelled
-                    while not heartbeat_stop.wait(heartbeat_interval):
-                        try:
-                            with heartbeat_lock:
-                                directive = gateway.heartbeat(
-                                    lease.reference,
-                                    last_progress,
-                                )
-                                cancelled = cancelled or directive.cancelled
-                        except Exception as exc:
-                            heartbeat_error.append(exc)
-                            cancelled = True
-                            heartbeat_stop.set()
-                            return
-
-                heartbeat_thread = threading.Thread(
-                    target=keep_lease_alive,
-                    name=f"vgen-heartbeat-{lease.reference.attempt_id}",
-                    daemon=True,
-                )
-                heartbeat_thread.start()
                 result = executor.execute(
                     ExecutionRequest(
                         task_id=lease.reference.task_id,
@@ -458,6 +573,7 @@ class WorkerCore:
                         occurred_after_start=True,
                         usage=usage,
                     )
+                    stop_heartbeat_keeper()
                     return _report_failure(gateway, lease.reference, failure)
                 normalized = WorkerResult(
                     artifacts=tuple(normalized_artifacts),
@@ -496,11 +612,7 @@ class WorkerCore:
                         receipt.size_bytes != artifact.size_bytes
                         or receipt.sha256 != artifact.sha256
                     ):
-                        raise ArtifactTransferError(
-                            "verify",
-                            "Output upload verification failed.",
-                            retryable=True,
-                        )
+                        raise VGenError(ErrorCode.ARTIFACT_INTEGRITY_FAILED)
                     if journaled and self._upload_journal is not None:
                         self._upload_journal.mark_uploaded(
                             lease.reference.attempt_id,
@@ -512,7 +624,7 @@ class WorkerCore:
                     cancelled_after_upload = cancelled
                 if cancelled_after_upload:
                     if journaled and self._upload_journal is not None:
-                        self._upload_journal.remove(lease.reference.attempt_id)
+                        self._discard_pending_attempt(lease.reference.attempt_id)
                         journaled = False
                     failure = WorkerFailureReport(
                         code=ErrorCode.EXECUTION_CANCELLED,
@@ -523,20 +635,24 @@ class WorkerCore:
                         occurred_after_start=True,
                         usage=usage,
                     )
+                    stop_heartbeat_keeper()
                     return _report_failure(gateway, lease.reference, failure)
+                stop_heartbeat_keeper()
                 gateway.complete(lease.reference, normalized)
                 if journaled and self._upload_journal is not None:
-                    self._upload_journal.remove(lease.reference.attempt_id)
+                    self._discard_pending_attempt(lease.reference.attempt_id)
                 return WorkerOutcome(result=normalized)
         except GatewayUnavailableError:
             # The daemon journal must retry the exact heartbeat/terminal call;
             # translating it to task failure would risk duplicate execution.
             raise
         except GatewayRequestError:
+            if journaled and self._upload_journal is not None:
+                self._discard_pending_attempt(lease.reference.attempt_id)
             raise
         except LeaseLostError:
             if journaled and self._upload_journal is not None:
-                self._upload_journal.remove(lease.reference.attempt_id)
+                self._discard_pending_attempt(lease.reference.attempt_id)
             failure = WorkerFailureReport(
                 code=ErrorCode.LEASE_LOST,
                 name="LEASE_LOST",
@@ -549,8 +665,11 @@ class WorkerCore:
             return WorkerOutcome(failure=failure)
         except ArtifactTransferError as exc:
             is_upload = phase == "uploading"
-            if is_upload and journaled:
+            if is_upload and journaled and exc.retryable:
                 raise UploadPendingError(lease.reference.attempt_id) from exc
+            if is_upload and journaled:
+                self._discard_pending_attempt(lease.reference.attempt_id)
+                journaled = False
             failure = WorkerFailureReport(
                 code=(
                     ErrorCode.OUTPUT_UPLOAD_FAILED if is_upload else ErrorCode.INPUT_DOWNLOAD_FAILED
@@ -570,9 +689,13 @@ class WorkerCore:
                     "retryable": exc.retryable,
                 },
             )
+            stop_heartbeat_keeper()
             return _report_failure(gateway, lease.reference, failure)
         except VGenError as exc:
             spec = get_error_spec(exc.code)
+            if journaled and exc.code == ErrorCode.ARTIFACT_INTEGRITY_FAILED:
+                self._discard_pending_attempt(lease.reference.attempt_id)
+                journaled = False
             failure = WorkerFailureReport(
                 code=exc.code,
                 name=exc.code.name,
@@ -586,6 +709,7 @@ class WorkerCore:
                 occurred_after_start=started,
                 details=exc.details,
             )
+            stop_heartbeat_keeper()
             return _report_failure(gateway, lease.reference, failure)
         except ExecutorFailure as exc:
             usage = UsageMetrics()
@@ -606,6 +730,7 @@ class WorkerCore:
                 details=exc.details,
                 usage=usage,
             )
+            stop_heartbeat_keeper()
             return _report_failure(gateway, lease.reference, failure)
         except Exception as exc:  # Never expose exception text or payload/ticket secrets.
             failure = WorkerFailureReport(
@@ -617,16 +742,13 @@ class WorkerCore:
                 occurred_after_start=started,
                 details={"error_type": type(exc).__name__, "phase": phase},
             )
+            stop_heartbeat_keeper()
             return _report_failure(gateway, lease.reference, failure)
         finally:
-            # Keep the fenced lease alive through output encryption, hashing,
-            # upload and the terminal mutation.  Large video ciphertext can
-            # take longer than the original lease TTL even after inference has
-            # finished.
-            if heartbeat_stop is not None:
-                heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join()
+            # Keep the fenced lease alive from input preflight through output
+            # encryption/upload, then serialize the terminal mutation after the
+            # keeper has stopped.
+            stop_heartbeat_keeper()
 
 
 def _transfer_fraction(
@@ -687,23 +809,7 @@ def _report_failure(
         )
 
 
-_PUBLIC_METADATA_KEYS = frozenset(
-    {
-        "width",
-        "height",
-        "frames",
-        "duration_ms",
-        "denoise_steps",
-        "output_count",
-    }
-)
-
-
 def _public_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Prevent executor-private payload data from entering Gateway metadata."""
 
-    return {
-        key: value
-        for key, value in metadata.items()
-        if key in _PUBLIC_METADATA_KEYS and (value is None or isinstance(value, (bool, int, float)))
-    }
+    return canonical_media_probes(metadata)

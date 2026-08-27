@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from vgen.artifacts import ArtifactDescriptor, TransferTicket
+from vgen.artifacts.names import MEDIA_TYPE_EXTENSIONS
 from vgen.crypto import (
     HpkeCiphertext,
     PayloadCiphertext,
@@ -26,7 +27,14 @@ from vgen.crypto import (
     unwrap_task_key,
 )
 from vgen.executors import ProgressEvent, RetryAction, UsageMetrics
-from vgen.protocol import ErrorCode, VGenError, get_error_spec
+from vgen.protocol import (
+    ErrorCode,
+    VGenError,
+    canonical_task_failure_details_for_code,
+    canonical_task_progress,
+    get_error_spec,
+)
+from vgen.protocol.media import canonical_media_probes
 
 from .core import GatewayRequestError, GatewayUnavailableError, LeaseLostError
 from .credentials import WorkerCredentials
@@ -44,6 +52,7 @@ from .models import (
 
 _FINISH_SIGNATURE_CONTEXT = b"vgen-worker-finish-v1"
 _MAINTENANCE_ACTIONS_REPROBE_SECONDS = 60.0
+_PUBLIC_OUTPUT_MEDIA_TYPES = frozenset({*MEDIA_TYPE_EXTENSIONS, "application/octet-stream"})
 
 
 def _canonical_failure_responsibility(code: ErrorCode | int) -> str:
@@ -133,9 +142,7 @@ class GatewayV1Client:
             self._pending_maintenance_idempotency = (
                 "worker-maintenance-claim-" + secrets.token_urlsafe(24)
             )
-            supports_action_negotiation = (
-                time.monotonic() >= self._maintenance_actions_retry_at
-            )
+            supports_action_negotiation = time.monotonic() >= self._maintenance_actions_retry_at
             self._pending_maintenance_claim_body = {"ttl_seconds": ttl_seconds}
             if supports_action_negotiation:
                 self._pending_maintenance_claim_body["supported_actions"] = [
@@ -486,10 +493,11 @@ class GatewayV1Client:
             "ttl_seconds": self._lease_ttl_seconds,
         }
         if progress is not None and self._report_progress:
-            payload["progress"] = {
-                "fraction": progress.fraction,
-                "stage": progress.stage[:64],
-            }
+            canonical_progress = canonical_task_progress(
+                {"fraction": progress.fraction, "stage": progress.stage}
+            )
+            if canonical_progress is not None:
+                payload["progress"] = canonical_progress
         value = self._request(
             "POST",
             f"/api/v1/attempts/{reference.attempt_id}/heartbeat",
@@ -500,6 +508,9 @@ class GatewayV1Client:
     def complete(self, reference: LeaseReference, result: WorkerResult) -> None:
         output_artifacts: list[dict[str, Any]] = []
         for artifact in result.artifacts:
+            media_metadata = canonical_media_probes(artifact.metadata)
+            if artifact.media_type.casefold() in _PUBLIC_OUTPUT_MEDIA_TYPES:
+                media_metadata["media_type"] = artifact.media_type.casefold()
             output_artifacts.append(
                 {
                     "artifact_id": artifact.artifact_id,
@@ -508,11 +519,10 @@ class GatewayV1Client:
                     "object_ref": artifact.object_ref,
                     "content_digest": artifact.sha256,
                     "encrypted_size": artifact.size_bytes,
-                    "media_metadata": {
-                        "media_type": artifact.media_type,
-                        "filename": artifact.filename,
-                        **dict(artifact.metadata),
-                    },
+                    # Keep the executor filename private. The Gateway accepts
+                    # this media type only if it is one of the reviewed protocol
+                    # constants used to restore a safe download extension.
+                    "media_metadata": media_metadata,
                 }
             )
         body = {
@@ -536,31 +546,73 @@ class GatewayV1Client:
             # The Gateway validates this assertion against its immutable error
             # registry; derive it here rather than trusting executor metadata.
             "responsibility": _canonical_failure_responsibility(failure.code),
-            "safe_failure_details": dict(failure.details),
+            "safe_failure_details": canonical_task_failure_details_for_code(
+                failure.details,
+                failure.code,
+            ),
         }
         self._finish(reference, body)
 
     def _finish(self, reference: LeaseReference, body: dict[str, Any]) -> None:
+        request_body = self._signed_finish_body(reference, body)
+        path = f"/api/v1/attempts/{reference.attempt_id}/finish"
+        idempotency_key = f"worker-finish-{reference.attempt_id}-{reference.fencing_token}"
+        try:
+            self._request(
+                "POST",
+                path,
+                request_body,
+                idempotency_key=idempotency_key,
+            )
+        except GatewayRequestError as exc:
+            if not (
+                body.get("failure_code") == int(ErrorCode.SYSTEM_OUT_OF_MEMORY)
+                and exc.code is ErrorCode.USAGE_REPORT_INVALID
+                and exc.details.get("reason") == "failure_code_unregistered"
+            ):
+                raise
+            # SYSTEM_OUT_OF_MEMORY was added after the initial v1 Gateway.
+            # An older Gateway definitively rejects it before committing a
+            # terminal state, so retry the same failure as the long-standing
+            # platform INTERNAL_ERROR. This preserves rolling upgrades without
+            # weakening current Gateways or making a failed task billable.
+            legacy_body = {
+                **body,
+                "failure_code": int(ErrorCode.INTERNAL_ERROR),
+                "responsibility": _canonical_failure_responsibility(ErrorCode.INTERNAL_ERROR),
+                "safe_failure_details": canonical_task_failure_details_for_code(
+                    body.get("safe_failure_details"),
+                    ErrorCode.INTERNAL_ERROR,
+                ),
+            }
+            self._request(
+                "POST",
+                path,
+                self._signed_finish_body(reference, legacy_body),
+                idempotency_key=idempotency_key,
+            )
+        self._output_commits.pop(reference.attempt_id, None)
+
+    def _signed_finish_body(
+        self, reference: LeaseReference, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        unsigned = {key: value for key, value in body.items() if key != "worker_signature"}
         signed = {
             "attempt_id": reference.attempt_id,
             "task_id": reference.task_id,
             "worker_id": reference.worker_id,
-            **body,
+            **unsigned,
         }
-        body["worker_signature"] = b64url_encode(
-            sign_message(
-                self._credentials.device_keys.signing_private_key,
-                canonical_json(signed),
-                context=_FINISH_SIGNATURE_CONTEXT,
-            )
-        )
-        self._request(
-            "POST",
-            f"/api/v1/attempts/{reference.attempt_id}/finish",
-            body,
-            idempotency_key=(f"worker-finish-{reference.attempt_id}-{reference.fencing_token}"),
-        )
-        self._output_commits.pop(reference.attempt_id, None)
+        return {
+            **unsigned,
+            "worker_signature": b64url_encode(
+                sign_message(
+                    self._credentials.device_keys.signing_private_key,
+                    canonical_json(signed),
+                    context=_FINISH_SIGNATURE_CONTEXT,
+                )
+            ),
+        }
 
     def _request(
         self,
@@ -670,15 +722,23 @@ def _raise_gateway_error(response: requests.Response) -> None:
         raw_error = value.get("error", {}) if isinstance(value, Mapping) else {}
         code = ErrorCode(int(raw_error.get("code", ErrorCode.INTERNAL_ERROR)))
         request_id = raw_error.get("request_id")
+        details = raw_error.get("details")
+        details = dict(details) if isinstance(details, Mapping) else {}
         retry = raw_error.get("retry")
         retry_after = retry.get("after_ms") if isinstance(retry, Mapping) else None
     except (TypeError, ValueError, json.JSONDecodeError):
         code = ErrorCode.INTERNAL_ERROR
         request_id = response.headers.get("X-Request-ID")
+        details = {}
         retry_after = None
     if code in {ErrorCode.LEASE_LOST, ErrorCode.FENCING_TOKEN_STALE}:
         raise LeaseLostError()
-    raise GatewayRequestError(code, request_id=request_id, retry_after_ms=retry_after)
+    raise GatewayRequestError(
+        code,
+        request_id=request_id,
+        details=details,
+        retry_after_ms=retry_after,
+    )
 
 
 def _response_error_code(response: requests.Response) -> ErrorCode | None:
@@ -852,8 +912,6 @@ def _usage_metrics(usage: UsageMetrics) -> dict[str, Any]:
         item = getattr(usage, name)
         if item is not None:
             value[name] = item
-    if usage.native:
-        value["native"] = dict(usage.native)
     return value
 
 

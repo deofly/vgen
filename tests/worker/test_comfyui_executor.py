@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import websocket
 
 from vgen.artifacts import ArtifactDescriptor
 from vgen.executors import ExecutionContext, ExecutionInput, ExecutionRequest, ExecutorFailure
@@ -16,9 +17,11 @@ from vgen.executors.comfyui import (
     COMFYUI_PAYLOAD_FORMAT,
     ComfyOutput,
     ComfyRunResult,
+    ComfyUIClient,
     ComfyUIExecutionPolicy,
     ComfyUIExecutor,
     ComfyUIPolicyError,
+    _ComfyProtocolError,
     _probe_media,
 )
 from vgen.market.builder import build_comfy_graph
@@ -74,6 +77,36 @@ class FakeComfyClient:
         self.interrupted = True
 
 
+class _PromptResponse:
+    def __init__(self, status_code: int, body: Any) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> Any:
+        return self._body
+
+
+class _PromptSession:
+    def __init__(self, response: _PromptResponse) -> None:
+        self._response = response
+
+    def post(self, *_args: Any, **_kwargs: Any) -> _PromptResponse:
+        return self._response
+
+
+class _MessageWebSocket:
+    def __init__(self, *messages: str | bytes) -> None:
+        self._messages = list(messages)
+
+    def recv(self) -> str | bytes:
+        return self._messages.pop(0)
+
+
+class _ClosedWebSocket:
+    def recv(self) -> str:
+        raise websocket.WebSocketConnectionClosedException()
+
+
 def _policy(
     *classes: str,
     custom: tuple[str, ...] = (),
@@ -98,6 +131,235 @@ def _request(payload: bytes, *, digest: str = "a" * 64) -> ExecutionRequest:
         payload,
         timeout_seconds=30,
     )
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "message", "reason", "code"),
+    [
+        (
+            "torch.OutOfMemoryError",
+            "CUDA out of memory",
+            "gpu_out_of_memory",
+            ErrorCode.GPU_OUT_OF_MEMORY,
+        ),
+        (
+            "RuntimeError",
+            "The size of tensor a must match the size of tensor b",
+            "tensor_shape_mismatch",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
+            "RuntimeError",
+            "DefaultCPUAllocator: cannot allocate memory",
+            "system_out_of_memory",
+            ErrorCode.SYSTEM_OUT_OF_MEMORY,
+        ),
+        (
+            "MemoryError",
+            "allocation failed",
+            "system_out_of_memory",
+            ErrorCode.SYSTEM_OUT_OF_MEMORY,
+        ),
+        (
+            "RuntimeError",
+            "std::bad_alloc",
+            "system_out_of_memory",
+            ErrorCode.SYSTEM_OUT_OF_MEMORY,
+        ),
+        (
+            "ModuleNotFoundError",
+            "No module named custom_dependency",
+            "python_dependency_missing",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
+            "SafetensorError",
+            "invalid header while loading checkpoint",
+            "model_load_incompatible",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
+            "RuntimeError",
+            "kernel launch failed",
+            "node_runtime_error",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+    ],
+)
+def test_comfyui_execution_errors_are_fixed_classifications_without_upstream_leaks(
+    exception_type: str,
+    message: str,
+    reason: str,
+    code: ErrorCode,
+) -> None:
+    secret = "private prompt token=super-secret C:/Users/private/model.gguf"
+    raw = json.dumps(
+        {
+            "type": "execution_error",
+            "data": {
+                "prompt_id": "prompt_1",
+                "node_id": "405:344",
+                "node_type": "SamplerCustomAdvanced",
+                "exception_type": exception_type,
+                "exception_message": f"{message}; {secret}",
+                "traceback": [secret],
+                "current_inputs": {"prompt": secret},
+                "current_outputs": {"path": secret},
+            },
+        }
+    )
+    client = ComfyUIClient("http://127.0.0.1:8188")
+
+    with pytest.raises(_ComfyProtocolError) as raised:
+        client._wait(_MessageWebSocket(raw), "prompt_1", lambda *_args: None, lambda: False, 5)
+
+    protocol_error = raised.value
+    failure = ComfyUIExecutor._map_protocol_error(protocol_error)
+    assert failure.code == code
+    assert dict(failure.details) == {
+        "reason": reason,
+        "component": "sampler",
+    }
+    if reason == "system_out_of_memory":
+        assert failure.retry_action.value == "another_worker"
+    assert secret not in str(protocol_error)
+    assert secret not in str(failure)
+    assert secret not in json.dumps(vars(protocol_error), default=str)
+    assert secret not in json.dumps(dict(failure.details))
+
+
+@pytest.mark.parametrize(
+    ("node_id", "node_type", "expected_component"),
+    [
+        ("405:344\nprivate", "SamplerCustomAdvanced", "sampler"),
+        ("C:/Users/private/token", "PrivateSecret", None),
+        ("U0VDUkVUX1BST01QVA", "EncodedSecret", None),
+        ("x" * 200, "ModelLoaderWithPrivateSuffix", "model_loader"),
+    ],
+)
+def test_comfyui_execution_error_exposes_only_a_fixed_component_role(
+    node_id: str,
+    node_type: str,
+    expected_component: str | None,
+) -> None:
+    secret = "private"
+    raw = json.dumps(
+        {
+            "type": "execution_error",
+            "data": {
+                "prompt_id": "prompt_1",
+                "node_id": node_id,
+                "node_type": node_type,
+                "exception_type": "RuntimeError",
+                "exception_message": f"kernel failure {secret}",
+            },
+        }
+    )
+    client = ComfyUIClient("http://127.0.0.1:8188")
+
+    with pytest.raises(_ComfyProtocolError) as raised:
+        client._wait(_MessageWebSocket(raw), "prompt_1", lambda *_args: None, lambda: False, 5)
+
+    details = raised.value.safe_details()
+    assert "node_id" not in details
+    assert "node_type" not in details
+    assert details.get("component") == expected_component
+    assert secret not in json.dumps(details)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_reason"),
+    [
+        (
+            {
+                "type": "value_not_in_list",
+                "message": "Value not in list",
+                "extra_info": {"input_name": "model_name"},
+            },
+            "model_not_found",
+        ),
+        (
+            {"type": "required_input_missing", "message": "Required input is missing"},
+            "node_validation_failed",
+        ),
+        (
+            {"type": "invalid_node", "message": "Node does not exist"},
+            "node_class_missing",
+        ),
+    ],
+)
+def test_comfyui_http_400_node_errors_are_safely_classified(
+    error: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    secret = "private prompt https://example.invalid/?token=super-secret C:/private"
+    body = {
+        "error": {"type": "prompt_outputs_failed_validation", "message": secret},
+        "node_errors": {
+            "405:371": {
+                "class_type": "LatentUpscaleModelLoader",
+                "errors": [{**error, "details": secret}],
+            }
+        },
+    }
+    client = ComfyUIClient(
+        "http://127.0.0.1:8188", session=_PromptSession(_PromptResponse(400, body))
+    )
+
+    with pytest.raises(_ComfyProtocolError) as raised:
+        client._submit({"1": {"inputs": {"prompt": secret}}}, "client_1")
+
+    failure = ComfyUIExecutor._map_protocol_error(raised.value)
+    assert failure.code == ErrorCode.DEPENDENCY_MISSING
+    assert failure.retry_action.value == "same_worker"
+    assert dict(failure.details) == {
+        "reason": expected_reason,
+        "component": "model_loader",
+    }
+    assert secret not in str(raised.value)
+    assert secret not in json.dumps(vars(raised.value), default=str)
+    assert secret not in json.dumps(dict(failure.details))
+
+
+@pytest.mark.parametrize("closed_message", [None, "", b""])
+def test_comfyui_websocket_disconnect_history_fallback_surfaces_execution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    closed_message: str | bytes | None,
+) -> None:
+    secret = "private prompt token=super-secret C:/private/model.gguf"
+    history = {
+        "status": {
+            "status_str": "error",
+            "completed": False,
+            "messages": [
+                [
+                    "execution_error",
+                    {
+                        "node_id": "405:344",
+                        "node_type": "SamplerCustomAdvanced",
+                        "exception_type": "RuntimeError",
+                        "exception_message": f"shape mismatch; {secret}",
+                        "traceback": [secret],
+                        "current_inputs": {"prompt": secret},
+                    },
+                ]
+            ],
+        },
+        "outputs": {},
+    }
+    client = ComfyUIClient("http://127.0.0.1:8188")
+    monkeypatch.setattr(client, "_history", lambda _prompt_id: history)
+    ws = _MessageWebSocket(closed_message) if closed_message is not None else _ClosedWebSocket()
+
+    with pytest.raises(_ComfyProtocolError) as raised:
+        client._wait(ws, "prompt_1", lambda *_args: None, lambda: False, 5)
+
+    assert raised.value.safe_details() == {
+        "reason": "tensor_shape_mismatch",
+        "component": "sampler",
+    }
+    assert secret not in str(raised.value)
+    assert secret not in json.dumps(vars(raised.value), default=str)
 
 
 def test_media_probe_uses_opencv_when_ffprobe_is_unavailable(
@@ -230,6 +492,9 @@ def test_comfyui_executor_requires_local_policy_before_parsing_remote_graph(
     with pytest.raises(ExecutorFailure) as raised:
         executor.execute(_request(private), ExecutionContext(tmp_path / "work"))
 
+    assert raised.value.code == ErrorCode.EXECUTOR_UNAVAILABLE
+    assert raised.value.responsibility == "provider"
+    assert raised.value.retry_action.value == "same_worker"
     assert raised.value.details == {"reason": "policy_required"}
     assert "secret" not in str(raised.value)
     assert client.workflow is None
@@ -239,6 +504,48 @@ def test_comfyui_executor_requires_local_policy_before_parsing_remote_graph(
         "models_verified": 0,
         "models_failed": 0,
     }
+
+
+def test_comfyui_executor_maps_local_memory_error_to_system_oom(tmp_path: Path) -> None:
+    class MemoryFailingClient(FakeComfyClient):
+        def run(self, *args: Any, **kwargs: Any) -> ComfyRunResult:
+            raise MemoryError
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        output_dir,
+        client=MemoryFailingClient(output_dir / "result.mp4"),
+        policy=_policy("SafeNode"),
+    )
+    payload = json.dumps({"workflow": {"1": {"class_type": "SafeNode", "inputs": {}}}}).encode()
+
+    with pytest.raises(ExecutorFailure) as raised:
+        executor.execute(_request(payload), ExecutionContext(tmp_path / "work"))
+
+    assert raised.value.code == ErrorCode.SYSTEM_OUT_OF_MEMORY
+    assert raised.value.responsibility == "provider"
+    assert raised.value.retry_action.value == "another_worker"
+    assert raised.value.details == {"reason": "system_out_of_memory"}
+
+
+def test_comfyui_output_escape_is_a_provider_environment_failure(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    executor = ComfyUIExecutor(
+        "http://127.0.0.1:8188",
+        output_dir,
+        client=FakeComfyClient(output_dir / "result.mp4"),
+    )
+
+    with pytest.raises(ExecutorFailure) as raised:
+        executor._resolve_output(ComfyOutput("secret.mp4", "../outside", "output"))
+
+    assert raised.value.code == ErrorCode.EXECUTOR_UNAVAILABLE
+    assert raised.value.responsibility == "provider"
+    assert raised.value.retry_action.value == "same_worker"
+    assert raised.value.details == {"reason": "output_path_outside_root"}
 
 
 def test_comfyui_executor_rejects_unknown_dangerous_node_without_leaking_class(
@@ -482,6 +789,7 @@ def test_minimax_h3_reference_graph_passes_explicit_builtin_and_custom_policy(
     assert client.workflow is not None
     assert len(client.workflow) == 12
     assert "MiniMaxH3AudioConditioningT8" in policy.allowed_custom_node_classes
+    assert "LoraLoaderBypassModelOnly" in policy.allowed_node_classes
 
 
 def test_comfyui_model_pins_are_verified_before_advertising_or_execution(

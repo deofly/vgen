@@ -76,6 +76,30 @@ class RecordingSession:
         raise AssertionError(f"unexpected path: {path}")
 
 
+class LegacyFinishSession(RecordingSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finish_count = 0
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        path = urlparse(url).path
+        if not path.endswith("/finish"):
+            return super().request(method, url, **kwargs)
+        self.requests.append((method, url, kwargs))
+        self.finish_count += 1
+        if self.finish_count == 1:
+            return response(
+                422,
+                {
+                    "error": {
+                        "code": int(ErrorCode.USAGE_REPORT_INVALID),
+                        "details": {"reason": "failure_code_unregistered"},
+                    }
+                },
+            )
+        return response(200, {"state": "failed"})
+
+
 class FakeEncryptedExecutor:
     def descriptor(self) -> ExecutorDescriptor:
         return ExecutorDescriptor("fake", "1.0.0", ("opaque/v1",), ("i2v",))
@@ -238,7 +262,9 @@ def test_gateway_wire_is_decrypted_only_in_worker_and_results_are_reencrypted(
     assert finish_body["fencing_token"] == 9
     assert finish_body["metrics"]["gpu_active_ms"] == 1250
     assert finish_body["output_artifacts"][0]["object_ref"] == "objects/result-contract"
-    assert finish_body["output_artifacts"][0]["media_metadata"]["filename"] == "result.bin"
+    assert finish_body["output_artifacts"][0]["media_metadata"] == {
+        "media_type": "application/octet-stream"
+    }
     assert finish_body["worker_signature"]
 
 
@@ -297,6 +323,101 @@ def test_cancel_failure_signs_measured_usage_for_gateway_billing() -> None:
         b64url_decode(signature, expected_length=64),
         context=b"vgen-worker-finish-v1",
     )
+
+
+def test_worker_binds_system_oom_diagnostics_and_drops_native_usage() -> None:
+    keys = DeviceKeys.generate()
+    session = RecordingSession()
+    client = GatewayV1Client(
+        "https://gateway.example.test",
+        WorkerCredentials("wrk_contract", keys, "short-session"),
+        session=session,  # type: ignore[arg-type]
+    )
+    reference = LeaseReference("lea_oom", "tsk_oom", "atm_oom", "wrk_contract", 12)
+    client.fail(
+        reference,
+        WorkerFailureReport(
+            code=ErrorCode.SYSTEM_OUT_OF_MEMORY,
+            name="SYSTEM_OUT_OF_MEMORY",
+            message="System memory exhausted.",
+            retry_action=RetryAction.ANOTHER_WORKER,
+            responsibility="provider",
+            occurred_after_start=True,
+            details={
+                "reason": "system_out_of_memory",
+                "component": "sampler",
+                "phase": "executing",
+                "status_code": 507,
+                "prompt": "private prompt",
+            },
+            usage=UsageMetrics(native={"private_prompt_bits": 12345}),
+        ),
+    )
+
+    finish_body = json.loads(session.requests[-1][2]["data"])
+    assert finish_body["failure_code"] == int(ErrorCode.SYSTEM_OUT_OF_MEMORY)
+    assert finish_body["responsibility"] == "provider"
+    assert finish_body["safe_failure_details"] == {
+        "reason": "system_out_of_memory",
+        "component": "sampler",
+    }
+    assert "native" not in finish_body["metrics"]
+
+
+def test_system_oom_finish_falls_back_only_for_a_legacy_gateway_registry() -> None:
+    keys = DeviceKeys.generate()
+    session = LegacyFinishSession()
+    client = GatewayV1Client(
+        "https://gateway.example.test",
+        WorkerCredentials("wrk_contract", keys, "short-session"),
+        session=session,  # type: ignore[arg-type]
+    )
+    reference = LeaseReference("lea_oom", "tsk_oom", "atm_oom", "wrk_contract", 12)
+
+    client.fail(
+        reference,
+        WorkerFailureReport(
+            code=ErrorCode.SYSTEM_OUT_OF_MEMORY,
+            name="SYSTEM_OUT_OF_MEMORY",
+            message="System memory exhausted.",
+            retry_action=RetryAction.ANOTHER_WORKER,
+            responsibility="provider",
+            occurred_after_start=True,
+            details={"reason": "system_out_of_memory", "component": "sampler"},
+            usage=UsageMetrics(executor_wall_ms=42),
+        ),
+    )
+
+    assert session.finish_count == 2
+    first = json.loads(session.requests[0][2]["data"])
+    fallback = json.loads(session.requests[1][2]["data"])
+    assert first["failure_code"] == int(ErrorCode.SYSTEM_OUT_OF_MEMORY)
+    assert first["responsibility"] == "provider"
+    assert fallback["failure_code"] == int(ErrorCode.INTERNAL_ERROR)
+    assert fallback["responsibility"] == "platform"
+    assert fallback["safe_failure_details"] == {}
+    assert (
+        session.requests[0][2]["headers"]["Idempotency-Key"]
+        == (session.requests[1][2]["headers"]["Idempotency-Key"])
+    )
+    for request_body in (first, fallback):
+        signature = request_body.pop("worker_signature")
+        assert verify_message(
+            keys.signing_public_key,
+            json.dumps(
+                {
+                    "attempt_id": reference.attempt_id,
+                    "task_id": reference.task_id,
+                    "worker_id": reference.worker_id,
+                    **request_body,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
+            b64url_decode(signature, expected_length=64),
+            context=b"vgen-worker-finish-v1",
+        )
 
 
 def test_retry_unwraps_for_current_attempt_but_decrypts_original_content(

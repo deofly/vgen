@@ -12,9 +12,10 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -28,8 +29,10 @@ from packaging.version import InvalidVersion, Version
 
 from vgen.market.builder import WorkflowBuildError, build_comfy_graph
 from vgen.market.capabilities import WorkflowCapabilityError, comfyui_capability_facts
+from vgen.market.paths import canonical_package_path, package_path_key
 from vgen.market.registry import InstallResult
 from vgen.protocol import ErrorCode
+from vgen.protocol.diagnostics import SAFE_TASK_FAILURE_COMPONENTS
 
 from .base import (
     ExecutionArtifact,
@@ -89,6 +92,39 @@ _MEDIA_FIELD_TOKENS = ("audio", "image", "images", "mask", "video")
 _TEXT_FIELD_TOKENS = ("caption", "description", "prompt", "text")
 
 
+def _is_reparse_point(path: Path) -> bool:
+    """Return true for symlinks and Windows junction/reparse entries."""
+
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return path.is_symlink() or bool(attributes & reparse_flag)
+
+_PROTOCOL_FAILURE_REASONS = frozenset(
+    {
+        "gpu_out_of_memory",
+        "history_missing",
+        "input_upload_rejected",
+        "invalid_input_upload_response",
+        "invalid_prompt_response",
+        "local_execution_failed",
+        "model_load_incompatible",
+        "model_not_found",
+        "no_output",
+        "node_class_missing",
+        "node_runtime_error",
+        "node_validation_failed",
+        "python_dependency_missing",
+        "system_out_of_memory",
+        "tensor_shape_mismatch",
+        "workflow_rejected",
+    }
+)
+
+
 class ComfyUIPolicyError(ValueError):
     """A safe, operator-facing local policy configuration error."""
 
@@ -135,6 +171,16 @@ class ComfyUIModelPin:
 
 
 @dataclass(frozen=True)
+class ComfyUICustomNodePin:
+    """Executable dependency whose exact local Git checkout must be proven."""
+
+    name: str
+    source: str
+    revision: str
+    node_types: frozenset[str]
+
+
+@dataclass(frozen=True)
 class ComfyUIWorkflowCapability:
     workflow_ref: str
     workflow_digest: str
@@ -147,6 +193,7 @@ class ComfyUIWorkflowCapability:
     parameter_schema: dict[str, Any] | None = None
     min_vram_bytes: int | None = None
     min_ram_bytes: int | None = None
+    custom_nodes: tuple[ComfyUICustomNodePin, ...] = ()
 
 
 class CapabilitySource:
@@ -185,6 +232,7 @@ class ComfyUIExecutionPolicy:
     allowed_workflow_digests: frozenset[str] = frozenset()
     maintenance_workflows: tuple[tuple[str, str], ...] = ()
     model_files: tuple[ComfyUIModelPin, ...] = ()
+    custom_nodes: tuple[ComfyUICustomNodePin, ...] = ()
     max_payload_bytes: int = 1024 * 1024
     max_nodes: int = 64
     max_edges: int = 256
@@ -233,6 +281,7 @@ class ComfyUIExecutionPolicy:
             "allowed_workflow_digests",
             "maintenance_workflows",
             "models",
+            "custom_nodes",
             "max_payload_bytes",
             "max_nodes",
             "max_edges",
@@ -262,6 +311,14 @@ class ComfyUIExecutionPolicy:
             pattern=_SHA256_DIGEST,
         )
         model_files = _policy_model_pins(value.get("models", []))
+        custom_nodes = _policy_custom_node_pins(value.get("custom_nodes", []))
+        pinned_node_types = {
+            node_type for dependency in custom_nodes for node_type in dependency.node_types
+        }
+        if not pinned_node_types <= custom:
+            raise ComfyUIPolicyError(
+                "ComfyUI policy custom-node pins must reference approved custom node classes."
+            )
         maintenance_workflows = _policy_maintenance_workflows(
             value.get("maintenance_workflows", {})
         )
@@ -271,6 +328,7 @@ class ComfyUIExecutionPolicy:
             allowed_workflow_digests=frozenset(digests),
             maintenance_workflows=maintenance_workflows,
             model_files=model_files,
+            custom_nodes=custom_nodes,
             max_payload_bytes=_policy_limit(
                 value, "max_payload_bytes", 1024 * 1024, _HARD_MAX_PAYLOAD_BYTES
             ),
@@ -518,7 +576,7 @@ def _policy_model_pins(value: Any) -> tuple[ComfyUIModelPin, ...]:
         raise ComfyUIPolicyError("ComfyUI policy models must be a bounded list.")
     pins: list[ComfyUIModelPin] = []
     seen_paths: set[str] = set()
-    seen_digests: set[str] = set()
+    digest_sizes: dict[str, int] = {}
     for item in value:
         required_fields = {"path", "sha256", "size"}
         optional_fields = {
@@ -540,16 +598,16 @@ def _policy_model_pins(value: Any) -> tuple[ComfyUIModelPin, ...]:
         raw_size = item.get("size")
         if not isinstance(raw_path, str):
             raise ComfyUIPolicyError("ComfyUI policy model path is invalid.")
-        normalized_path = raw_path.replace("\\", "/")
-        path = PurePosixPath(normalized_path)
-        if (
-            not normalized_path
-            or normalized_path.startswith("/")
-            or _URI_SCHEME.match(normalized_path)
-            or PureWindowsPath(raw_path).drive
-            or any(part in {"", ".", ".."} for part in path.parts)
-        ):
-            raise ComfyUIPolicyError("ComfyUI policy model path must stay under the model root.")
+        try:
+            normalized_path = canonical_package_path(
+                raw_path,
+                label="ComfyUI policy model path",
+                allow_backslash=True,
+            )
+        except ValueError as exc:
+            raise ComfyUIPolicyError(
+                "ComfyUI policy model path must stay under the model root."
+            ) from exc
         if not isinstance(raw_digest, str) or not _SHA256_DIGEST.fullmatch(raw_digest):
             raise ComfyUIPolicyError("ComfyUI policy model sha256 is invalid.")
         if (
@@ -559,7 +617,9 @@ def _policy_model_pins(value: Any) -> tuple[ComfyUIModelPin, ...]:
             or raw_size > 1024**5
         ):
             raise ComfyUIPolicyError("ComfyUI policy model size is invalid.")
-        if normalized_path in seen_paths or raw_digest in seen_digests:
+        path_key = package_path_key(normalized_path, label="ComfyUI policy model path")
+        previous_size = digest_sizes.get(raw_digest)
+        if path_key in seen_paths or (previous_size is not None and previous_size != raw_size):
             raise ComfyUIPolicyError("ComfyUI policy model pins must be unique.")
         source = _optional_policy_https_url(item.get("source"), "source")
         license_url = _optional_policy_https_url(item.get("license_url"), "license URL")
@@ -573,15 +633,13 @@ def _policy_model_pins(value: Any) -> tuple[ComfyUIModelPin, ...]:
             raise ComfyUIPolicyError(
                 "A downloadable ComfyUI policy model needs an immutable revision."
             )
-        if manual_download and (source is None or license_id is None or license_url is None):
-            raise ComfyUIPolicyError(
-                "A manual ComfyUI model download needs source and license metadata."
-            )
-        seen_paths.add(normalized_path)
-        seen_digests.add(raw_digest)
+        if manual_download and source is None:
+            raise ComfyUIPolicyError("A manual ComfyUI model download needs a provenance source.")
+        seen_paths.add(path_key)
+        digest_sizes[raw_digest] = raw_size
         pins.append(
             ComfyUIModelPin(
-                path=path.as_posix(),
+                path=normalized_path,
                 sha256=raw_digest.removeprefix("sha256:"),
                 size=raw_size,
                 source=source,
@@ -590,6 +648,54 @@ def _policy_model_pins(value: Any) -> tuple[ComfyUIModelPin, ...]:
                 license_url=license_url,
                 gated=gated,
                 manual_download=manual_download,
+            )
+        )
+    return tuple(pins)
+
+
+def _policy_custom_node_pins(value: Any) -> tuple[ComfyUICustomNodePin, ...]:
+    if not isinstance(value, list) or len(value) > 8:
+        raise ComfyUIPolicyError("ComfyUI policy custom_nodes must be a bounded list.")
+    pins: list[ComfyUICustomNodePin] = []
+    identities: set[tuple[str, str]] = set()
+    claimed_node_types: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {
+            "name",
+            "source",
+            "revision",
+            "node_types",
+        }:
+            raise ComfyUIPolicyError("ComfyUI policy custom-node pin is invalid.")
+        name = item.get("name")
+        source = item.get("source")
+        revision = item.get("revision")
+        node_types = item.get("node_types")
+        if (
+            not isinstance(name, str)
+            or not 1 <= len(name) <= 120
+            or not isinstance(source, str)
+            or not source.startswith("https://")
+            or len(source) > 512
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+            or not isinstance(node_types, list)
+            or not 1 <= len(node_types) <= 128
+            or any(not isinstance(node, str) or not _SAFE_IDENTIFIER.fullmatch(node) for node in node_types)
+            or len(node_types) != len(set(node_types))
+        ):
+            raise ComfyUIPolicyError("ComfyUI policy custom-node pin is invalid.")
+        identity = (source, revision)
+        if identity in identities or claimed_node_types & set(node_types):
+            raise ComfyUIPolicyError("ComfyUI policy custom-node pins must be unique.")
+        identities.add(identity)
+        claimed_node_types.update(node_types)
+        pins.append(
+            ComfyUICustomNodePin(
+                name=name,
+                source=source,
+                revision=revision,
+                node_types=frozenset(node_types),
             )
         )
     return tuple(pins)
@@ -676,35 +782,26 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
         )
 
     declared_custom = {
-        node_type
-        for dependency in variant.custom_nodes
-        for node_type in dependency.node_types
+        node_type for dependency in variant.custom_nodes for node_type in dependency.node_types
     }
     custom = node_classes & declared_custom
     builtin = node_classes - custom
     seen_model_paths: set[str] = set()
-    model_metadata: dict[str, tuple[object, ...]] = {}
+    model_sizes: dict[str, int] = {}
     for model in variant.models:
         model_path = f"{model.folder}/{model.filename}"
-        metadata = (
-            model.size,
-            model.source,
-            model.revision,
-            model.license,
-            model.gated,
-            model.manual_download,
-        )
-        if model.size < 1 or model_path in seen_model_paths:
+        model_path_key = package_path_key(model_path)
+        if model.size < 1 or model_path_key in seen_model_paths:
             raise ComfyUIPolicyError(
                 "An active workflow capability has duplicate or empty model pins."
             )
-        previous = model_metadata.get(model.sha256)
-        if previous is not None and previous != metadata:
+        previous_size = model_sizes.get(model.sha256)
+        if previous_size is not None and previous_size != model.size:
             raise ComfyUIPolicyError(
-                "An active workflow capability has conflicting shared model metadata."
+                "An active workflow capability has conflicting shared model sizes."
             )
-        seen_model_paths.add(model_path)
-        model_metadata[model.sha256] = metadata
+        seen_model_paths.add(model_path_key)
+        model_sizes[model.sha256] = model.size
     models = tuple(
         ComfyUIModelPin(
             path=f"{model.folder}/{model.filename}",
@@ -718,9 +815,7 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
         )
         for model in variant.models
     )
-    expected_model_references = {
-        model.filename.replace("\\", "/") for model in variant.models
-    }
+    expected_model_references = {model.filename.replace("\\", "/") for model in variant.models}
     actual_model_references = _model_references(graph)
     if actual_model_references != expected_model_references:
         raise ComfyUIPolicyError(
@@ -747,7 +842,9 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
         allowed_workflow_digests=frozenset({workflow_digest}),
         maintenance_workflows=((workflow_ref, workflow_digest),),
         model_files=models,
-        max_payload_bytes=min(_HARD_MAX_PAYLOAD_BYTES, max(1024 * 1024, len(json.dumps(graph)) * 2)),
+        max_payload_bytes=min(
+            _HARD_MAX_PAYLOAD_BYTES, max(1024 * 1024, len(json.dumps(graph)) * 2)
+        ),
         max_nodes=min(_HARD_MAX_NODES, max(64, len(graph))),
         max_edges=min(_HARD_MAX_EDGES, max(256, edge_count * 2)),
         max_graph_depth=32,
@@ -766,6 +863,15 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
         parameter_schema=parameter_schema,
         min_vram_bytes=variant.min_vram_bytes,
         min_ram_bytes=variant.min_ram_bytes,
+        custom_nodes=tuple(
+            ComfyUICustomNodePin(
+                name=dependency.name,
+                source=dependency.source,
+                revision=dependency.revision,
+                node_types=frozenset(dependency.node_types),
+            )
+            for dependency in variant.custom_nodes
+        ),
     )
     # Compile every declared topology through the same package binding used at
     # execution time. Optional image nodes are therefore removed (or retained)
@@ -787,6 +893,57 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
         bindings = _capability_expected_bindings(sample_graph, mapping, effective)
         policy.authorize_graph(sample_graph, bindings)
     return capability
+
+
+def _conflicting_model_placement_digests(
+    capabilities: Iterable[ComfyUIWorkflowCapability],
+    *,
+    static_policy: ComfyUIExecutionPolicy | None,
+) -> set[str]:
+    """Return dynamic releases that disagree on machine-wide model paths.
+
+    The local machine-admin policy is represented by a ``None`` owner and is
+    always authoritative.  Grouping all identities before deciding conflicts
+    also handles three-way collisions deterministically instead of depending
+    on activation or dictionary order.
+    """
+
+    placements: dict[
+        str,
+        dict[tuple[str, int], set[str | None]],
+    ] = {}
+    digest_sizes: dict[str, dict[int, set[str | None]]] = {}
+
+    def add(pin: ComfyUIModelPin, owner: str | None) -> None:
+        key = package_path_key(pin.path, label="ComfyUI model path")
+        identities = placements.setdefault(key, {})
+        identities.setdefault((pin.sha256, pin.size), set()).add(owner)
+        digest_sizes.setdefault(pin.sha256, {}).setdefault(pin.size, set()).add(owner)
+
+    if static_policy is not None:
+        for pin in static_policy.model_files:
+            add(pin, None)
+    for capability in capabilities:
+        for pin in capability.policy.model_files:
+            add(pin, capability.workflow_digest)
+
+    placement_conflicts = {
+        owner
+        for identities in placements.values()
+        if len(identities) > 1
+        for owners in identities.values()
+        for owner in owners
+        if owner is not None
+    }
+    size_conflicts = {
+        owner
+        for sizes in digest_sizes.values()
+        if len(sizes) > 1
+        for owners in sizes.values()
+        for owner in owners
+        if owner is not None
+    }
+    return placement_conflicts | size_conflicts
 
 
 def _capability_mapping_target(
@@ -824,13 +981,10 @@ def _capability_mapping_target(
         matches = [
             candidate_id
             for candidate_id, node in graph.items()
-            if isinstance(node, dict)
-            and (node.get("_meta") or {}).get("title") == title_selector
+            if isinstance(node, dict) and (node.get("_meta") or {}).get("title") == title_selector
         ]
         if len(matches) != 1:
-            raise ComfyUIPolicyError(
-                f"Workflow parameter mapping {name!r} must select one node."
-            )
+            raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} must select one node.")
         node_id = matches[0]
     node = graph.get(node_id)
     inputs = node.get("inputs") if isinstance(node, dict) else None
@@ -842,8 +996,7 @@ def _capability_mapping_target(
         or not candidates
         or len(candidates) > 16
         or any(
-            not isinstance(candidate, str)
-            or not _SAFE_IDENTIFIER.fullmatch(candidate)
+            not isinstance(candidate, str) or not _SAFE_IDENTIFIER.fullmatch(candidate)
             for candidate in candidates
         )
         or len(candidates) != len(set(candidates))
@@ -855,9 +1008,7 @@ def _capability_mapping_target(
         raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} has no input.")
     field = fields[0]
     if _looks_like_connection(inputs[field]) and not allow_connection:
-        raise ComfyUIPolicyError(
-            f"Workflow parameter mapping {name!r} targets a connected input."
-        )
+        raise ComfyUIPolicyError(f"Workflow parameter mapping {name!r} targets a connected input.")
     optional = rule.get("optional_connection")
     if optional is not None:
         if name not in {"image", "last_image"} or not isinstance(optional, dict):
@@ -902,9 +1053,7 @@ def _model_references(value: Any) -> set[str]:
     return set()
 
 
-def _sample_operation_parameters(
-    operation: str, mapping: Mapping[str, Any]
-) -> dict[str, Any]:
+def _sample_operation_parameters(operation: str, mapping: Mapping[str, Any]) -> dict[str, Any]:
     parameters: dict[str, Any] = {}
     if operation in {"i2v", "i2i", "flf"} and "image" in mapping:
         parameters["image"] = "vgen-input.png"
@@ -946,11 +1095,7 @@ def _normalized_bindings(
                 or (isinstance(node, dict) and (node.get("_meta") or {}).get("title") == node_title)
             )
         ]
-        if (
-            not isinstance(input_name, str)
-            or not isinstance(field, str)
-            or len(matches) != 1
-        ):
+        if not isinstance(input_name, str) or not isinstance(field, str) or len(matches) != 1:
             raise _policy_denied("workflow_bindings_mismatch")
         normalized.append((input_name, matches[0], field))
     return tuple(sorted(normalized))
@@ -961,6 +1106,18 @@ def _policy_denied(reason: str) -> ExecutorFailure:
         ErrorCode.UNSUPPORTED_PAYLOAD,
         "UNSUPPORTED_PAYLOAD",
         "The decrypted ComfyUI workflow is not authorized by this Worker.",
+        details={"reason": reason},
+    )
+
+
+def _provider_environment_failure(reason: str, message: str) -> ExecutorFailure:
+    """Return a fixed provider-side error for local Worker misconfiguration."""
+
+    return ExecutorFailure(
+        ErrorCode.EXECUTOR_UNAVAILABLE,
+        "EXECUTOR_UNAVAILABLE",
+        message,
+        retry_action=RetryAction.SAME_WORKER,
         details={"reason": reason},
     )
 
@@ -1022,11 +1179,199 @@ def _validate_local_relative_path(value: str) -> None:
         raise _policy_denied("unsafe_local_path")
 
 
+def _diagnostic_text(*values: Any) -> str:
+    """Build bounded, local-only text used solely for fixed error classification."""
+
+    return " ".join(value[:4096].casefold() for value in values if isinstance(value, str) and value)
+
+
+def _classify_execution_failure(exception_type: Any, exception_message: Any) -> str:
+    diagnostic = _diagnostic_text(exception_type, exception_message)
+    compact = re.sub(r"[^a-z0-9]+", "", diagnostic)
+
+    out_of_memory = (
+        "outofmemory" in compact
+        or "memoryerror" in compact
+        or "stdbadalloc" in compact
+        or "cannot allocate memory" in diagnostic
+        or "memory allocation failed" in diagnostic
+        or "defaultcpuallocator" in compact
+    )
+    gpu_memory = any(
+        marker in compact for marker in ("cuda", "cublas", "cudnn", "hipoutofmemory", "rocm")
+    )
+    if out_of_memory and gpu_memory:
+        return "gpu_out_of_memory"
+    if out_of_memory:
+        return "system_out_of_memory"
+    if (
+        "modulenotfounderror" in compact
+        or "importerror" in compact
+        or "no module named" in diagnostic
+        or "cannot import name" in diagnostic
+        or "dll load failed while importing" in diagnostic
+    ):
+        return "python_dependency_missing"
+    if any(
+        marker in diagnostic
+        for marker in (
+            "shape mismatch",
+            "shapes cannot be multiplied",
+            "size mismatch",
+            "must match the size",
+            "dimension out of range",
+            "invalid for input of size",
+        )
+    ):
+        return "tensor_shape_mismatch"
+    if any(
+        marker in compact for marker in ("safetensorerror", "gguferror", "modelloaderror")
+    ) or any(
+        marker in diagnostic
+        for marker in (
+            "invalid header",
+            "header too large",
+            "state_dict",
+            "state dict",
+            "unsupported model format",
+            "unsupported checkpoint",
+        )
+    ):
+        return "model_load_incompatible"
+    return "node_runtime_error"
+
+
+def _diagnostic_component(node_type: Any) -> str | None:
+    """Map a local node class to a fixed, non-encoding diagnostic role."""
+
+    if not isinstance(node_type, str):
+        return None
+    tokens = {
+        token.casefold()
+        for token in re.findall(
+            r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|[0-9]+",
+            node_type,
+        )
+    }
+    if "loader" in tokens:
+        return "model_loader"
+    if "sampler" in tokens:
+        return "sampler"
+    if "decode" in tokens or "decoder" in tokens:
+        return "decoder"
+    if "encode" in tokens or "encoder" in tokens:
+        return "encoder"
+    if tokens & {"combine", "output", "preview", "save"}:
+        return "output"
+    return None
+
+
+def _is_model_validation_error(error: Mapping[str, Any]) -> bool:
+    error_type = _diagnostic_text(error.get("type"))
+    extra_info = error.get("extra_info")
+    input_name = extra_info.get("input_name") if isinstance(extra_info, dict) else None
+    diagnostic = _diagnostic_text(
+        error.get("message"),
+        error.get("details"),
+        input_name,
+    )
+    normalized_input = (
+        input_name.casefold().replace("-", "_") if isinstance(input_name, str) else ""
+    )
+    model_input = any(token in normalized_input for token in _MODEL_FIELD_TOKENS)
+    names_model_file = any(extension in diagnostic for extension in MODEL_EXTENSIONS)
+    explicit_missing_model = any(
+        marker in error_type
+        for marker in ("model_not_found", "missing_model", "checkpoint_not_found")
+    )
+    return explicit_missing_model or (
+        "value_not_in_list" in error_type and (model_input or names_model_file)
+    )
+
+
+def _classify_validation_failure(
+    node_errors: Any,
+    global_error: Any,
+) -> tuple[str, str | None]:
+    """Classify an HTTP prompt rejection without retaining upstream prose."""
+
+    candidates: list[tuple[str | None, Mapping[str, Any]]] = []
+    if isinstance(node_errors, dict):
+        for raw_node in node_errors.values():
+            if not isinstance(raw_node, dict):
+                continue
+            component = _diagnostic_component(raw_node.get("class_type"))
+            errors = raw_node.get("errors")
+            if isinstance(errors, list):
+                for error in errors:
+                    if isinstance(error, dict):
+                        candidates.append((component, error))
+            if not isinstance(errors, list) or not errors:
+                candidates.append((component, {}))
+
+    global_mapping = global_error if isinstance(global_error, dict) else {}
+    global_diagnostic = _diagnostic_text(
+        global_mapping.get("type"),
+        global_mapping.get("message"),
+        global_mapping.get("details"),
+    )
+    if "node" in global_diagnostic and any(
+        marker in global_diagnostic for marker in ("does not exist", "not found")
+    ):
+        return "node_class_missing", None
+
+    priority = {"model_not_found": 0, "node_class_missing": 1, "node_validation_failed": 10}
+    best: tuple[int, str, str | None] | None = None
+    for component, error in candidates:
+        if _is_model_validation_error(error):
+            reason = "model_not_found"
+        else:
+            diagnostic = _diagnostic_text(
+                error.get("type"), error.get("message"), error.get("details")
+            )
+            reason = (
+                "node_class_missing"
+                if "node" in diagnostic
+                and any(marker in diagnostic for marker in ("does not exist", "not found"))
+                else "node_validation_failed"
+            )
+        candidate = (priority[reason], reason, component)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    if best is not None:
+        return best[1], best[2]
+
+    return "node_validation_failed", None
+
+
 class _ComfyProtocolError(Exception):
-    def __init__(self, reason: str, *, status_code: int | None = None) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.status_code = status_code
+    """A protocol failure containing only bounded, publishable diagnostics."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        status_code: int | None = None,
+        component: Any = None,
+    ) -> None:
+        safe_reason = reason if reason in _PROTOCOL_FAILURE_REASONS else "local_execution_failed"
+        safe_status = (
+            status_code if isinstance(status_code, int) and 100 <= status_code <= 599 else None
+        )
+        super().__init__(safe_reason)
+        self.reason = safe_reason
+        self.status_code = safe_status
+        self.component = (
+            component
+            if isinstance(component, str) and component in SAFE_TASK_FAILURE_COMPONENTS
+            else None
+        )
+
+    def safe_details(self) -> dict[str, str]:
+        details = {"reason": self.reason}
+        if self.component is not None:
+            details["component"] = self.component
+        return details
 
 
 class _ComfyTimeout(Exception):
@@ -1035,6 +1380,61 @@ class _ComfyTimeout(Exception):
 
 class _ComfyCancelled(Exception):
     pass
+
+
+def _execution_protocol_error(data: Any) -> _ComfyProtocolError:
+    payload = data if isinstance(data, dict) else {}
+    return _ComfyProtocolError(
+        _classify_execution_failure(
+            payload.get("exception_type"),
+            payload.get("exception_message"),
+        ),
+        component=_diagnostic_component(payload.get("node_type")),
+    )
+
+
+def _history_failure(entry: Any) -> _ComfyProtocolError | _ComfyCancelled | None:
+    if not isinstance(entry, dict):
+        return None
+    status = entry.get("status")
+    if not isinstance(status, dict):
+        return None
+    messages = status.get("messages")
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if not isinstance(message, (list, tuple)) or len(message) != 2:
+                continue
+            kind, data = message
+            if kind == "execution_error":
+                return _execution_protocol_error(data)
+            if kind == "execution_interrupted":
+                return _ComfyCancelled()
+    status_str = status.get("status_str")
+    if isinstance(status_str, str) and status_str.casefold() in {
+        "error",
+        "failed",
+        "failure",
+    }:
+        return _ComfyProtocolError("node_runtime_error")
+    return None
+
+
+def _history_succeeded(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    status = entry.get("status")
+    if isinstance(status, dict):
+        status_str = status.get("status_str")
+        if isinstance(status_str, str) and status_str.casefold() in {
+            "success",
+            "succeeded",
+            "completed",
+        }:
+            return True
+        if status.get("completed") is True:
+            return True
+    outputs = entry.get("outputs")
+    return isinstance(outputs, dict) and bool(outputs)
 
 
 @dataclass(frozen=True)
@@ -1222,14 +1622,34 @@ class ComfyUIClient:
             json={"prompt": workflow, "client_id": client_id},
             timeout=60,
         )
+        body: dict[str, Any] | None = None
+        try:
+            value = response.json()
+            if isinstance(value, dict):
+                body = value
+        except (ValueError, TypeError):
+            pass
         if response.status_code >= 400:
+            if body is not None and body.get("node_errors"):
+                reason, component = _classify_validation_failure(
+                    body.get("node_errors"), body.get("error")
+                )
+                raise _ComfyProtocolError(
+                    reason,
+                    status_code=response.status_code,
+                    component=component,
+                )
             raise _ComfyProtocolError("workflow_rejected", status_code=response.status_code)
         try:
-            body = response.json()
+            if body is None:
+                raise TypeError
             if body.get("node_errors"):
-                raise _ComfyProtocolError("node_validation_failed")
+                reason, component = _classify_validation_failure(
+                    body.get("node_errors"), body.get("error")
+                )
+                raise _ComfyProtocolError(reason, component=component)
             return str(body["prompt_id"])
-        except (ValueError, KeyError, TypeError) as exc:
+        except (KeyError, TypeError) as exc:
             raise _ComfyProtocolError("invalid_prompt_response") from exc
 
     def _wait(
@@ -1256,7 +1676,11 @@ class ComfyUIClient:
 
             raw: str | bytes | None
             if websocket_closed:
-                if self._history(prompt_id) is not None:
+                history = self._history(prompt_id)
+                history_failure = _history_failure(history)
+                if history_failure is not None:
+                    raise history_failure
+                if _history_succeeded(history):
                     on_progress(1.0, "sampled")
                     return
                 time.sleep(1)
@@ -1270,6 +1694,9 @@ class ComfyUIClient:
                     logger.warning("ComfyUI websocket closed; falling back to history polling")
                     websocket_closed = True
                     raw = None
+                if raw in ("", b""):
+                    logger.warning("ComfyUI websocket closed; falling back to history polling")
+                    websocket_closed = True
 
             now = time.monotonic()
             if now - last_tick >= 1.0:
@@ -1282,8 +1709,12 @@ class ComfyUIClient:
                 message = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(message, dict):
+                continue
             kind = message.get("type")
             data = message.get("data") or {}
+            if not isinstance(data, dict):
+                continue
             if data.get("prompt_id") not in (None, prompt_id):
                 continue
             if kind == "execution_start":
@@ -1292,14 +1723,13 @@ class ComfyUIClient:
                 if data.get("node") is None and data.get("prompt_id") == prompt_id:
                     on_progress(1.0, "sampled")
                     return
-                stage = f"node:{data.get('node')}"
+                stage = "processing"
             elif kind == "progress":
                 total = data.get("max") or 1
                 fraction = min(float(data.get("value", 0)) / float(total), 1.0)
                 stage = "sampling"
             elif kind == "execution_error":
-                error_type = str(data.get("exception_type") or "execution_error")
-                raise _ComfyProtocolError(error_type)
+                raise _execution_protocol_error(data)
             elif kind == "execution_interrupted":
                 raise _ComfyCancelled()
             elif kind == "execution_success":
@@ -1320,6 +1750,9 @@ class ComfyUIClient:
             time.sleep(2)
         if entry is None:
             raise _ComfyProtocolError("history_missing")
+        history_failure = _history_failure(entry)
+        if history_failure is not None:
+            raise history_failure
 
         outputs: list[ComfyOutput] = []
         for node_output in (entry.get("outputs") or {}).values():
@@ -1354,6 +1787,7 @@ class ComfyUIExecutor:
         policy: ComfyUIExecutionPolicy | None = None,
         capability_source: CapabilitySource | None = None,
         model_root: Path | None = None,
+        custom_nodes_root: Path | None = None,
         model_verification_progress: Callable[[ModelVerificationProgress], None] | None = None,
     ) -> None:
         self._client = client or ComfyUIClient(base_url)
@@ -1366,6 +1800,11 @@ class ComfyUIExecutor:
             model_root.expanduser().resolve()
             if model_root is not None
             else (self._output_dir.parent / "models").resolve()
+        )
+        self._custom_nodes_root = (
+            custom_nodes_root.expanduser().absolute()
+            if custom_nodes_root is not None
+            else None
         )
         self._model_digest_cache: dict[Path, tuple[int, int, int, int, int, str]] = {}
         self._model_verification_progress = model_verification_progress
@@ -1429,11 +1868,56 @@ class ComfyUIExecutor:
         self._capability_generation = object()
         self._reload_capabilities()
 
-    @staticmethod
-    def validate_capability_release(installed: InstallResult) -> None:
-        """Compile one staged release before its active index is changed."""
+    def reconcile_workflow_authorizations(
+        self, authorizations: Iterable[Mapping[str, Any]]
+    ) -> tuple[tuple[str, str], ...]:
+        """Atomically deactivate releases absent from the Gateway grant set."""
 
-        _workflow_capability(installed)
+        reconcile = getattr(self._capability_source, "reconcile_authorizations", None)
+        if not callable(reconcile):
+            return ()
+        removed = tuple(reconcile(authorizations))
+        if removed:
+            self.reload_capabilities()
+        return removed
+
+    def configure_capability_trust(
+        self,
+        owner_root_signing_public_key: str,
+        worker_id: str,
+    ) -> None:
+        """Give the dynamic source the authenticated local Worker trust anchor."""
+
+        configure = getattr(self._capability_source, "configure_trust", None)
+        if callable(configure):
+            configure(owner_root_signing_public_key, worker_id)
+            self.reload_capabilities()
+
+    def validate_capability_release(self, installed: InstallResult) -> None:
+        """Compile a staged release and reject destructive model placements.
+
+        Model bytes are shared machine-wide by ComfyUI.  A workflow therefore
+        cannot claim a path that an already-active workflow or the local admin
+        policy binds to different immutable bytes.
+        """
+
+        candidate = _workflow_capability(installed)
+        self._reload_capabilities()
+        prospective = dict(self._dynamic_capabilities)
+        existing = prospective.get(candidate.workflow_digest)
+        if existing is not None and existing.workflow_ref != candidate.workflow_ref:
+            raise ComfyUIPolicyError(
+                "An active workflow capability digest has conflicting identities."
+            )
+        prospective[candidate.workflow_digest] = candidate
+        if candidate.workflow_digest in _conflicting_model_placement_digests(
+            prospective.values(),
+            static_policy=self._policy,
+        ):
+            raise ComfyUIPolicyError(
+                "An active workflow capability model path or digest is already bound "
+                "to different bytes."
+            )
 
     def descriptor(self) -> ExecutorDescriptor:
         return ExecutorDescriptor(
@@ -1453,6 +1937,9 @@ class ComfyUIExecutor:
 
     def capabilities(self) -> Mapping[str, Any]:
         capabilities = self._workflow_capabilities()
+        verified_custom_nodes, custom_node_root_closed = self._verified_custom_node_state(
+            capabilities.values()
+        )
         all_pins = self.maintenance_model_pins
         model_digests, model_failures = self._verified_model_digests(all_pins)
         gpus, system, vram_bytes, ram_bytes = self._resource_snapshot()
@@ -1469,8 +1956,7 @@ class ComfyUIExecutor:
                 {
                     f"sha256:{pin.sha256}"
                     for pin in capability.policy.model_files
-                    if f"sha256:{pin.sha256}"
-                    not in self._verified_model_digests((pin,))[0]
+                    if f"sha256:{pin.sha256}" not in self._verified_model_digests((pin,))[0]
                 }
             )
             required_nodes = (
@@ -1482,6 +1968,24 @@ class ComfyUIExecutor:
                 if isinstance(node_classes, set)
                 else sorted(required_nodes)
             )
+            # ComfyUI exposes class names globally, without provider identity.
+            # Require every executable root entry to be one of the currently
+            # pinned exact checkouts, then require the class to be visible. This
+            # is intentionally phrased as two independent facts: true
+            # class-to-provider binding needs Node Pack / Host Protocol v2.
+            provenance_failures = self._unverified_custom_node_classes(
+                capability, verified_custom_nodes
+            )
+            if not custom_node_root_closed:
+                # Any unreviewed executable entry can register or replace a
+                # globally named class, including a class otherwise treated as
+                # core. Do not let an unrelated workflow remain ready while
+                # the shared custom-node import root is outside the closed set.
+                provenance_failures.update(required_nodes)
+            missing_nodes = sorted(
+                set(missing_nodes)
+                | provenance_failures
+            )
             runtime_compatible = _minimum_version_satisfied(
                 runtime_version, capability.runtime_min_version
             )
@@ -1492,15 +1996,9 @@ class ComfyUIExecutor:
                 state = "executor_incompatible"
             elif not runtime_compatible:
                 state = "runtime_incompatible"
-            elif (
-                capability.min_vram_bytes is not None
-                and vram_bytes < capability.min_vram_bytes
-            ):
+            elif capability.min_vram_bytes is not None and vram_bytes < capability.min_vram_bytes:
                 state = "insufficient_vram"
-            elif (
-                capability.min_ram_bytes is not None
-                and ram_bytes < capability.min_ram_bytes
-            ):
+            elif capability.min_ram_bytes is not None and ram_bytes < capability.min_ram_bytes:
                 state = "insufficient_ram"
             elif missing_nodes:
                 state = "missing_nodes" if node_classes is not None else "node_probe_unavailable"
@@ -1523,9 +2021,7 @@ class ComfyUIExecutor:
             "model_digests": model_digests,
             "capability_schema_version": 2,
             "ready_workflow_digests": [
-                item["workflow_digest"]
-                for item in workflow_readiness
-                if item["state"] == "ready"
+                item["workflow_digest"] for item in workflow_readiness if item["state"] == "ready"
             ],
             "workflow_readiness": workflow_readiness,
             "gpus": gpus,
@@ -1540,6 +2036,248 @@ class ComfyUIExecutor:
                 "models_failed": model_failures,
             },
         }
+
+    def _unverified_custom_node_classes(
+        self,
+        capability: ComfyUIWorkflowCapability,
+        verified: set[tuple[str, str]],
+    ) -> set[str]:
+        pinned_node_types = {
+            node_type
+            for dependency in capability.custom_nodes
+            for node_type in dependency.node_types
+        }
+        return set(capability.policy.allowed_custom_node_classes - pinned_node_types) | {
+            node_type
+            for dependency in capability.custom_nodes
+            if (dependency.source, dependency.revision) not in verified
+            for node_type in dependency.node_types
+        }
+
+    def _verified_custom_node_state(
+        self,
+        capabilities: Iterable[ComfyUIWorkflowCapability],
+    ) -> tuple[set[tuple[str, str]], bool]:
+        dependencies = {
+            dependency
+            for capability in capabilities
+            for dependency in capability.custom_nodes
+        }
+        root = self._custom_nodes_root
+        if root is None:
+            return set(), not dependencies
+        if _is_reparse_point(root) or not root.is_dir():
+            return set(), False
+        try:
+            # A symlink/junction in any root ancestor changes the code tree
+            # after configuration. The isolated root must resolve to itself.
+            if root.resolve(strict=True) != root:
+                return set(), False
+        except (OSError, RuntimeError):
+            return set(), False
+
+        expected = {(dependency.source, dependency.revision) for dependency in dependencies}
+        # One heartbeat has a strict global probe budget. An oversized policy
+        # or directory fails closed instead of multiplying Git processes or
+        # making root enumeration an unbounded operation.
+        if len(dependencies) > 32 or len(expected) > 32:
+            return set(), False
+        repositories: list[Path] = []
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if len(repositories) >= 32:
+                        return set(), False
+                    repository = root / entry.name
+                    if (
+                        _is_reparse_point(repository)
+                        or not entry.is_dir(follow_symlinks=False)
+                    ):
+                        # ComfyUI can import top-level Python files as custom
+                        # nodes. Unknown files, links and non-repository
+                        # directories are therefore executable attack surface,
+                        # not harmless metadata.
+                        return set(), False
+                    repositories.append(repository)
+        except OSError:
+            return set(), False
+
+        deadline = time.monotonic() + 5.0
+        verified: set[tuple[str, str]] = set()
+        for repository in sorted(repositories, key=lambda item: str(item).casefold()):
+            identity = self._verified_custom_node_repository(repository, deadline=deadline)
+            if identity is None or identity not in expected or identity in verified:
+                return set(), False
+            verified.add(identity)
+        return verified, verified == expected
+
+    @staticmethod
+    def _verified_custom_node_repository(
+        repository: Path, *, deadline: float
+    ) -> tuple[str, str] | None:
+        # This is a bounded attestation of the current on-disk checkout. It is
+        # not an isolation boundary against the same OS user changing files
+        # after this probe; Worker deployment must still restrict that user.
+        if _is_reparse_point(repository) or not repository.is_dir():
+            return None
+        try:
+            repository = repository.resolve(strict=True)
+        except OSError:
+            return None
+        git_directory = repository / ".git"
+        if (
+            not git_directory.is_dir()
+            or _is_reparse_point(git_directory)
+            or git_directory.resolve() != git_directory
+        ):
+            return None
+        git_location = shutil.which("git")
+        if not git_location or not Path(git_location).is_absolute():
+            return None
+        try:
+            git_executable = Path(git_location).resolve(strict=True)
+            git_metadata = git_executable.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(git_metadata.st_mode) or _is_reparse_point(git_executable):
+            return None
+        git_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
+        git_environment["GIT_OPTIONAL_LOCKS"] = "0"
+
+        def git(*arguments: str, raw: bool = False) -> str | None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            process: subprocess.Popen[bytes] | None = None
+            output = bytearray()
+            overflow = threading.Event()
+
+            def read_bounded() -> None:
+                if process is None or process.stdout is None:
+                    overflow.set()
+                    return
+                while True:
+                    block = process.stdout.read(4096)
+                    if not block:
+                        return
+                    if len(output) + len(block) > 16_384:
+                        overflow.set()
+                        process.kill()
+                        return
+                    output.extend(block)
+
+            try:
+                process = subprocess.Popen(  # noqa: S603 - fixed local Git executable
+                    [
+                        str(git_executable),
+                        "-c",
+                        f"core.hooksPath={'NUL' if os.name == 'nt' else '/dev/null'}",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-C",
+                        str(repository),
+                        *arguments,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=git_environment,
+                )
+                reader = threading.Thread(target=read_bounded, daemon=True)
+                reader.start()
+                try:
+                    return_code = process.wait(timeout=min(1.5, remaining))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+                    return None
+                reader.join(timeout=2)
+                if reader.is_alive():
+                    process.kill()
+                    return None
+            except (OSError, subprocess.SubprocessError):
+                if process is not None:
+                    process.kill()
+                return None
+            if return_code != 0 or overflow.is_set():
+                return None
+            try:
+                decoded = output.decode("utf-8", errors="strict")
+            except UnicodeError:
+                return None
+            return decoded if raw else decoded.strip()
+
+        source = git("remote", "get-url", "origin")
+        if source is None:
+            return None
+        top_level = git("rev-parse", "--show-toplevel")
+        if top_level is None:
+            return None
+        absolute_git_directory = git("rev-parse", "--absolute-git-dir")
+        if absolute_git_directory is None:
+            return None
+        try:
+            if Path(top_level).resolve(strict=True) != repository:
+                return None
+            if Path(absolute_git_directory).resolve(strict=True) != git_directory:
+                return None
+        except OSError:
+            return None
+        revision = git("rev-parse", "--verify", "HEAD^{commit}")
+        if revision is None:
+            return None
+        index_flags = git("ls-files", "-v", "-z", raw=True)
+        if index_flags is None:
+            return None
+        flag_records = [record for record in index_flags.split("\x00") if record]
+        if any(not record.startswith("H ") for record in flag_records):
+            # Reject skip-worktree, assume-unchanged and non-cached entries;
+            # all can hide bytes from an otherwise clean status result.
+            return None
+        staged = git("ls-files", "--stage", "-z", raw=True)
+        if staged is None:
+            return None
+        for record in (item for item in staged.split("\x00") if item):
+            metadata, separator, raw_path = record.partition("\t")
+            fields = metadata.split(" ")
+            if (
+                separator != "\t"
+                or len(fields) != 3
+                or fields[0] not in {"100644", "100755"}
+                or fields[2] != "0"
+                or not raw_path
+                or "\\" in raw_path
+            ):
+                # In particular, reject tracked symlinks (120000) and
+                # submodules/gitlinks (160000).
+                return None
+            relative = PurePosixPath(raw_path)
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                return None
+            current = repository
+            for part in relative.parts:
+                current /= part
+                if _is_reparse_point(current):
+                    return None
+            try:
+                if not stat.S_ISREG(current.lstat().st_mode):
+                    return None
+            except OSError:
+                return None
+        status = git(
+            "status",
+            "--ignored=matching",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        if not source or not revision or status is None or status:
+            return None
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            return None
+        return source, revision
 
     def _resource_snapshot(self) -> tuple[list[dict[str, Any]], dict[str, Any], int, int]:
         gpus = self._client.gpu_info()
@@ -1565,14 +2303,15 @@ class ComfyUIExecutor:
         )
         return gpus, system, vram_bytes, max(0, ram_bytes)
 
-    def _verified_model_digests(
-        self, pins: tuple[ComfyUIModelPin, ...]
-    ) -> tuple[list[str], int]:
+    def _verified_model_digests(self, pins: tuple[ComfyUIModelPin, ...]) -> tuple[list[str], int]:
         verified: list[str] = []
         failures = 0
         total_size = sum(pin.size for pin in pins)
         total_bytes_read = 0
         last_reported_total_percent = -1
+        fingerprint_digests: dict[tuple[int, int, int, int, int], str] = {
+            tuple(cached[:5]): cached[5] for cached in self._model_digest_cache.values()
+        }
 
         def report(
             *,
@@ -1584,9 +2323,7 @@ class ComfyUIExecutor:
             nonlocal last_reported_total_percent
             if self._model_verification_progress is None:
                 return
-            total_percent = (
-                100 if total_size == 0 else int(total_bytes_read * 100 / total_size)
-            )
+            total_percent = 100 if total_size == 0 else int(total_bytes_read * 100 / total_size)
             if not force and total_percent <= last_reported_total_percent:
                 return
             last_reported_total_percent = total_percent
@@ -1625,6 +2362,26 @@ class ComfyUIExecutor:
             )
             if cached is not None and cached[:5] == fingerprint:
                 digest = cached[5]
+                total_bytes_read += pin.size
+                report(
+                    model_index=model_index,
+                    pin=pin,
+                    file_bytes_read=pin.size,
+                    force=True,
+                )
+            elif fingerprint in fingerprint_digests:
+                # ModelInstaller materializes one verified CAS blob through
+                # hard links. Reuse the digest for the same immutable file
+                # identity instead of rereading tens of gigabytes per placement.
+                digest = fingerprint_digests[fingerprint]
+                self._model_digest_cache[candidate] = (*fingerprint, digest)
+                total_bytes_read += pin.size
+                report(
+                    model_index=model_index,
+                    pin=pin,
+                    file_bytes_read=pin.size,
+                    force=True,
+                )
             else:
                 hasher = hashlib.sha256()
                 file_bytes_read = 0
@@ -1661,6 +2418,7 @@ class ComfyUIExecutor:
                     failures += 1
                     continue
                 self._model_digest_cache[candidate] = (*fingerprint, digest)
+                fingerprint_digests[fingerprint] = digest
             if digest != pin.sha256:
                 failures += 1
                 continue
@@ -1712,14 +2470,21 @@ class ComfyUIExecutor:
                 had_errors = True
                 loaded.pop(capability.workflow_digest, None)
                 invalid_digests.add(capability.workflow_digest)
-                logger.error(
-                    "Ignoring conflicting dynamic workflow capability digest."
-                )
+                logger.error("Ignoring conflicting dynamic workflow capability digest.")
                 continue
             loaded[capability.workflow_digest] = capability
-        had_errors = had_errors or bool(
-            getattr(self._capability_source, "active_errors", 0)
+        had_errors = had_errors or bool(getattr(self._capability_source, "active_errors", 0))
+        conflicting_digests = _conflicting_model_placement_digests(
+            loaded.values(),
+            static_policy=self._policy,
         )
+        if conflicting_digests:
+            had_errors = True
+            for digest in conflicting_digests:
+                loaded.pop(digest, None)
+            logger.error(
+                "Ignoring dynamic workflow capabilities with conflicting model placements."
+            )
         self._dynamic_capabilities = loaded
         # Keep retrying a partially invalid generation so an administrator can
         # repair one release without rewriting active.json. Healthy releases
@@ -1735,6 +2500,7 @@ class ComfyUIExecutor:
                     workflow_ref,
                     workflow_digest,
                     self._policy,
+                    custom_nodes=self._policy.custom_nodes,
                 )
         for digest, capability in self._dynamic_capabilities.items():
             existing = values.get(digest)
@@ -1757,12 +2523,13 @@ class ComfyUIExecutor:
                     parameter_schema=capability.parameter_schema,
                     min_vram_bytes=capability.min_vram_bytes,
                     min_ram_bytes=capability.min_ram_bytes,
+                    custom_nodes=tuple(
+                        dict.fromkeys((*existing.custom_nodes, *capability.custom_nodes))
+                    ),
                 )
         return values
 
-    def _capability_for_digest(
-        self, workflow_digest: str
-    ) -> ComfyUIWorkflowCapability | None:
+    def _capability_for_digest(self, workflow_digest: str) -> ComfyUIWorkflowCapability | None:
         capability = self._workflow_capabilities().get(workflow_digest)
         if capability is not None:
             return capability
@@ -1802,10 +2569,7 @@ class ComfyUIExecutor:
             capability.min_vram_bytes is not None or capability.min_ram_bytes is not None
         ):
             _gpus, _system, vram_bytes, ram_bytes = self._resource_snapshot()
-            if (
-                capability.min_vram_bytes is not None
-                and vram_bytes < capability.min_vram_bytes
-            ):
+            if capability.min_vram_bytes is not None and vram_bytes < capability.min_vram_bytes:
                 raise ExecutorFailure(
                     ErrorCode.GPU_OUT_OF_MEMORY,
                     "GPU_OUT_OF_MEMORY",
@@ -1813,13 +2577,10 @@ class ComfyUIExecutor:
                     retry_action=RetryAction.ANOTHER_WORKER,
                     details={"reason": "insufficient_vram"},
                 )
-            if (
-                capability.min_ram_bytes is not None
-                and ram_bytes < capability.min_ram_bytes
-            ):
+            if capability.min_ram_bytes is not None and ram_bytes < capability.min_ram_bytes:
                 raise ExecutorFailure(
-                    ErrorCode.DEPENDENCY_MISSING,
-                    "DEPENDENCY_MISSING",
+                    ErrorCode.SYSTEM_OUT_OF_MEMORY,
+                    "SYSTEM_OUT_OF_MEMORY",
                     "This Worker does not meet the workflow system-memory requirement.",
                     retry_action=RetryAction.ANOTHER_WORKER,
                     details={"reason": "insufficient_ram"},
@@ -1836,7 +2597,10 @@ class ComfyUIExecutor:
                 )
 
         if policy is None:
-            raise _policy_denied("policy_required")
+            raise _provider_environment_failure(
+                "policy_required",
+                "The ComfyUI executor has no local workflow policy configured.",
+            )
         policy.authorize_digest(request.workflow_digest)
         if len(request.payload) > policy.max_payload_bytes:
             raise _policy_denied("payload_size_limit")
@@ -1870,6 +2634,14 @@ class ComfyUIExecutor:
                 "EXECUTION_TIMEOUT",
                 "ComfyUI execution exceeded its deadline.",
                 retry_action=RetryAction.ANOTHER_WORKER,
+            ) from exc
+        except MemoryError as exc:
+            raise ExecutorFailure(
+                ErrorCode.SYSTEM_OUT_OF_MEMORY,
+                "SYSTEM_OUT_OF_MEMORY",
+                "ComfyUI ran out of system memory.",
+                retry_action=RetryAction.ANOTHER_WORKER,
+                details={"reason": "system_out_of_memory"},
             ) from exc
         except (requests.RequestException, websocket.WebSocketException, OSError) as exc:
             raise ExecutorFailure(
@@ -1994,9 +2766,7 @@ class ComfyUIExecutor:
             raise _policy_denied("workflow_operation_mismatch")
         if expected_graph != workflow:
             raise _policy_denied("workflow_graph_mismatch")
-        expected_bindings = _capability_expected_bindings(
-            expected_graph, mapping, effective
-        )
+        expected_bindings = _capability_expected_bindings(expected_graph, mapping, effective)
         if _normalized_bindings(workflow, bindings) != _normalized_bindings(
             expected_graph, expected_bindings
         ):
@@ -2065,9 +2835,8 @@ class ComfyUIExecutor:
     def _resolve_output(self, output: ComfyOutput) -> Path:
         candidate = (self._output_dir / output.subfolder / output.filename).resolve()
         if not _is_relative_to(candidate, self._output_dir):
-            raise ExecutorFailure(
-                ErrorCode.UNSUPPORTED_PAYLOAD,
-                "UNSUPPORTED_PAYLOAD",
+            raise _provider_environment_failure(
+                "output_path_outside_root",
                 "ComfyUI returned an output path outside its configured directory.",
             )
         if candidate.is_file():
@@ -2086,20 +2855,23 @@ class ComfyUIExecutor:
 
     @staticmethod
     def _map_protocol_error(error: _ComfyProtocolError) -> ExecutorFailure:
-        reason = error.reason.lower()
-        if "outofmemory" in reason or "out_of_memory" in reason or "cuda" in reason:
+        reason = error.reason
+        details = error.safe_details()
+        if reason == "gpu_out_of_memory":
             return ExecutorFailure(
                 ErrorCode.GPU_OUT_OF_MEMORY,
                 "GPU_OUT_OF_MEMORY",
                 "ComfyUI ran out of GPU memory.",
                 retry_action=RetryAction.ANOTHER_WORKER,
+                details=details,
             )
-        if reason in {"workflow_rejected", "node_validation_failed", "invalid_prompt_response"}:
+        if reason == "system_out_of_memory":
             return ExecutorFailure(
-                ErrorCode.UNSUPPORTED_PAYLOAD,
-                "UNSUPPORTED_PAYLOAD",
-                "ComfyUI rejected the workflow payload.",
-                details={"reason": reason, "status_code": error.status_code},
+                ErrorCode.SYSTEM_OUT_OF_MEMORY,
+                "SYSTEM_OUT_OF_MEMORY",
+                "ComfyUI ran out of system memory.",
+                retry_action=RetryAction.ANOTHER_WORKER,
+                details=details,
             )
         if reason in {"no_output", "history_missing"}:
             return ExecutorFailure(
@@ -2107,14 +2879,14 @@ class ComfyUIExecutor:
                 "DEPENDENCY_MISSING",
                 "ComfyUI did not produce an accessible output artifact.",
                 retry_action=RetryAction.SAME_WORKER,
-                details={"reason": reason},
+                details=details,
             )
         return ExecutorFailure(
             ErrorCode.DEPENDENCY_MISSING,
             "DEPENDENCY_MISSING",
             "ComfyUI execution failed because its local environment is incomplete.",
             retry_action=RetryAction.SAME_WORKER,
-            details={"reason": "local_execution_failed", "status_code": error.status_code},
+            details=details,
         )
 
 

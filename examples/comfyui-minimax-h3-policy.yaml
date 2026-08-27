@@ -17,12 +17,28 @@ allowed_node_classes:
   - RandomNoise
   - SamplerCustomAdvanced
   - LoadImage
-allowed_custom_node_classes:
   - LoraLoaderBypassModelOnly
+allowed_custom_node_classes:
   - MiniMaxH3AudioConditioningT8
   - MiniMaxH3DualClockSamplerT8
   - MiniMaxH3AVDecodeT8
   - VHS_VideoCombine
+# A class name in /object_info is not provenance. The Worker verifies these
+# isolated Git repositories still have the exact reviewed origin, commit, and
+# clean worktree before reporting H3 ready.
+custom_nodes:
+  - name: MiniMax H3 Audio T8
+    source: https://github.com/T8mars/comfyui-minimax-h3-audio-T8
+    revision: 1c754fd6688697f9d36545a7d922e485ab92b515
+    node_types:
+      - MiniMaxH3AudioConditioningT8
+      - MiniMaxH3DualClockSamplerT8
+      - MiniMaxH3AVDecodeT8
+  - name: ComfyUI Video Helper Suite
+    source: https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+    revision: 4ee72c065db22c9d96c2427954dc69e7b908444b
+    node_types:
+      - VHS_VideoCombine
 # These paths are relative to the local ComfyUI models directory. The Worker
 # advertises a model digest only after it verifies both the exact size and
 # SHA-256 on disk; missing or changed files fail execution closed.
