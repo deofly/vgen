@@ -119,6 +119,16 @@ server {
     alias ${RELEASE_ROOT}/\$vgen_release_version/\$vgen_release_file;
     add_header Cache-Control "public, max-age=31536000, immutable" always;
   }
+  location = /marketplace/index.json {
+    alias /var/www/vgen-marketplace/index.json;
+    default_type application/json;
+    add_header Cache-Control "public, max-age=0, must-revalidate" always;
+  }
+  location ~ "^/marketplace/(?<vgen_market_kind>workflows|node-packs)/(?<vgen_market_namespace>[a-z0-9][a-z0-9._-]{0,63})/(?<vgen_market_name>[a-z0-9][a-z0-9._-]{0,127})/(?<vgen_market_version>[0-9]+(?:\.[0-9]+){2})/(?<vgen_market_file>[A-Za-z0-9][A-Za-z0-9._+-]{0,191})\$" {
+    alias /var/www/vgen-marketplace/\$vgen_market_kind/\$vgen_market_namespace/\$vgen_market_name/\$vgen_market_version/\$vgen_market_file;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+  }
+  location /marketplace/ { return 404; }
   location / { return 404; }
 }
 EOF

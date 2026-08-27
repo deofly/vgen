@@ -181,6 +181,8 @@ class ComfyUICustomNodePin:
     source: str
     revision: str
     node_types: frozenset[str]
+    node_pack: str | None = None
+    node_pack_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -872,6 +874,8 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
                 source=dependency.source,
                 revision=dependency.revision,
                 node_types=frozenset(dependency.node_types),
+                node_pack=dependency.node_pack,
+                node_pack_sha256=dependency.node_pack_sha256,
             )
             for dependency in variant.custom_nodes
         ),
@@ -1823,6 +1827,13 @@ class ComfyUIExecutor:
         return self._policy is not None or bool(self._dynamic_capabilities)
 
     @property
+    def maintenance_custom_nodes_root(self) -> Path | None:
+        return self._custom_nodes_root
+
+    def maintenance_node_classes(self) -> set[str] | None:
+        return self._client.node_classes()
+
+    @property
     def maintenance_model_pins(self) -> tuple[ComfyUIModelPin, ...]:
         """Return only locally authorized model pins to the maintenance runtime.
 
@@ -1947,9 +1958,11 @@ class ComfyUIExecutor:
 
     def capabilities(self) -> Mapping[str, Any]:
         capabilities = self._workflow_capabilities()
-        verified_custom_nodes, custom_node_root_closed = self._verified_custom_node_state(
-            capabilities.values()
-        )
+        (
+            verified_custom_nodes,
+            custom_node_root_closed,
+            node_pack_digests,
+        ) = self._verified_custom_node_state(capabilities.values())
         all_pins = self.maintenance_model_pins
         self._prune_model_digest_state(all_pins)
         verified_model_placements: set[tuple[str, str]] = set()
@@ -2034,6 +2047,7 @@ class ComfyUIExecutor:
             "executor_type": "comfyui",
             "payload_formats": [COMFYUI_PAYLOAD_FORMAT],
             "model_digests": model_digests,
+            "node_pack_digests": sorted(f"sha256:{item}" for item in node_pack_digests),
             "capability_schema_version": 2,
             "ready_workflow_digests": [
                 item["workflow_digest"] for item in workflow_readiness if item["state"] == "ready"
@@ -2072,7 +2086,7 @@ class ComfyUIExecutor:
     def _verified_custom_node_state(
         self,
         capabilities: Iterable[ComfyUIWorkflowCapability],
-    ) -> tuple[set[tuple[str, str]], bool]:
+    ) -> tuple[set[tuple[str, str]], bool, set[str]]:
         dependencies = {
             dependency
             for capability in capabilities
@@ -2080,29 +2094,29 @@ class ComfyUIExecutor:
         }
         root = self._custom_nodes_root
         if root is None:
-            return set(), not dependencies
+            return set(), not dependencies, set()
         if _is_reparse_point(root) or not root.is_dir():
-            return set(), False
+            return set(), False, set()
         try:
             # A symlink/junction in any root ancestor changes the code tree
             # after configuration. The isolated root must resolve to itself.
             if root.resolve(strict=True) != root:
-                return set(), False
+                return set(), False, set()
         except (OSError, RuntimeError):
-            return set(), False
+            return set(), False, set()
 
         expected = {(dependency.source, dependency.revision) for dependency in dependencies}
         # One heartbeat has a strict global probe budget. An oversized policy
         # or directory fails closed instead of multiplying Git processes or
         # making root enumeration an unbounded operation.
         if len(dependencies) > 32 or len(expected) > 32:
-            return set(), False
+            return set(), False, set()
         repositories: list[Path] = []
         try:
             with os.scandir(root) as entries:
                 for entry in entries:
                     if len(repositories) >= 32:
-                        return set(), False
+                        return set(), False, set()
                     repository = root / entry.name
                     if (
                         _is_reparse_point(repository)
@@ -2112,19 +2126,156 @@ class ComfyUIExecutor:
                         # nodes. Unknown files, links and non-repository
                         # directories are therefore executable attack surface,
                         # not harmless metadata.
-                        return set(), False
+                        return set(), False, set()
                     repositories.append(repository)
         except OSError:
-            return set(), False
+            return set(), False, set()
 
         deadline = time.monotonic() + 5.0
         verified: set[tuple[str, str]] = set()
+        node_pack_digests: set[str] = set()
         for repository in sorted(repositories, key=lambda item: str(item).casefold()):
-            identity = self._verified_custom_node_repository(repository, deadline=deadline)
+            managed_identity = self._verified_node_pack_repository(
+                repository,
+                dependencies=dependencies,
+                deadline=deadline,
+            )
+            if managed_identity is None:
+                identity = self._verified_custom_node_repository(repository, deadline=deadline)
+            else:
+                identity = managed_identity[:2]
+                node_pack_digests.add(managed_identity[2])
             if identity is None or identity not in expected or identity in verified:
-                return set(), False
+                return set(), False, set()
             verified.add(identity)
-        return verified, verified == expected
+        return verified, verified == expected, node_pack_digests
+
+    @staticmethod
+    def _verified_node_pack_repository(
+        repository: Path,
+        *,
+        dependencies: set[ComfyUICustomNodePin],
+        deadline: float,
+    ) -> tuple[str, str, str] | None:
+        """Verify every activated byte against a Worker-generated Node Pack receipt."""
+
+        marker = repository / ".vgen-node-pack.json"
+        if _is_reparse_point(repository) or _is_reparse_point(marker):
+            return None
+        try:
+            marker_metadata = marker.lstat()
+            if (
+                not stat.S_ISREG(marker_metadata.st_mode)
+                or marker_metadata.st_size <= 0
+                or marker_metadata.st_size > 2 * 1024 * 1024
+            ):
+                return None
+            value = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            return None
+        if not isinstance(value, dict) or set(value) != {
+            "format",
+            "version",
+            "node_pack_id",
+            "node_pack_version",
+            "artifact_sha256",
+            "source",
+            "revision",
+            "node_classes",
+            "files",
+        }:
+            return None
+        node_pack_id = value.get("node_pack_id")
+        node_pack_version = value.get("node_pack_version")
+        artifact_sha256 = value.get("artifact_sha256")
+        source = value.get("source")
+        revision = value.get("revision")
+        node_classes = value.get("node_classes")
+        files = value.get("files")
+        if (
+            value.get("format") != "vgen-node-pack-activation"
+            or value.get("version") != 1
+            or not isinstance(node_pack_id, str)
+            or not isinstance(node_pack_version, str)
+            or not isinstance(artifact_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
+            or not isinstance(source, str)
+            or not isinstance(revision, str)
+            or not isinstance(node_classes, list)
+            or any(not isinstance(item, str) for item in node_classes)
+            or not isinstance(files, list)
+            or not 1 <= len(files) <= 8192
+        ):
+            return None
+        node_pack_ref = f"{node_pack_id}@{node_pack_version}"
+        matching = [
+            dependency
+            for dependency in dependencies
+            if dependency.node_pack == node_pack_ref
+            and dependency.node_pack_sha256 == artifact_sha256
+            and dependency.source == source
+            and dependency.revision == revision
+            and dependency.node_types == frozenset(node_classes)
+        ]
+        if len(matching) != 1:
+            return None
+
+        declared: dict[str, tuple[int, str]] = {}
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {"path", "sha256", "size"}:
+                return None
+            raw_path = item.get("path")
+            digest = item.get("sha256")
+            size = item.get("size")
+            if (
+                not isinstance(raw_path, str)
+                or len(raw_path) > 512
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or type(size) is not int
+                or size < 0
+            ):
+                return None
+            try:
+                canonical = canonical_package_path(raw_path, label="Node Pack active file")
+                key = package_path_key(canonical)
+            except ValueError:
+                return None
+            if canonical != raw_path or key in declared or key == ".vgen-node-pack.json":
+                return None
+            declared[key] = (size, digest)
+
+        observed: set[str] = set()
+        try:
+            for path in repository.rglob("*"):
+                if time.monotonic() >= deadline:
+                    return None
+                relative = path.relative_to(repository).as_posix()
+                if relative == ".vgen-node-pack.json":
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISDIR(metadata.st_mode) and not path.is_symlink():
+                    continue
+                if not stat.S_ISREG(metadata.st_mode) or _is_reparse_point(path):
+                    return None
+                key = package_path_key(relative)
+                expected_file = declared.get(key)
+                if expected_file is None or metadata.st_size != expected_file[0]:
+                    return None
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                        if time.monotonic() >= deadline:
+                            return None
+                if digest.hexdigest() != expected_file[1]:
+                    return None
+                observed.add(key)
+        except (OSError, ValueError):
+            return None
+        if observed != set(declared):
+            return None
+        return source, revision, artifact_sha256
 
     @staticmethod
     def _verified_custom_node_repository(

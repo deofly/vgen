@@ -149,6 +149,7 @@ class GatewayV1Client:
                     "worker_update",
                     "model_install",
                     "capability_install",
+                    "node_pack_install",
                 ]
         elif self._pending_maintenance_claim_body is None:
             raise RuntimeError("pending maintenance claim has no bound request body")

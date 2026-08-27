@@ -20,6 +20,7 @@ from .credentials import (
     save_worker_credentials_keyring,
 )
 from .gateway import GatewayV1Client
+from .host_control import ComfyUIHostControl, ComfyUIHostControlError
 from .models import (
     ArtifactInput,
     ArtifactOutputTarget,
@@ -33,6 +34,7 @@ from .models import (
     WorkerResult,
     WorkerResultArtifact,
 )
+from .node_packs import NodePackInstaller, NodePackInstallError, NodePackInstallResult
 from .spool import PendingUpload, UploadJournal, UploadJournalError
 
 __all__ = [
@@ -43,6 +45,11 @@ __all__ = [
     "GatewayUnavailableError",
     "GatewayRequestError",
     "GatewayV1Client",
+    "ComfyUIHostControl",
+    "ComfyUIHostControlError",
+    "NodePackInstallError",
+    "NodePackInstallResult",
+    "NodePackInstaller",
     "HeartbeatDirective",
     "LeaseCryptoContext",
     "LeaseLostError",

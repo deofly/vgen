@@ -18,6 +18,7 @@ from vgen.cli.main import (
     _apply_worker_update,
     _apply_workflow_install,
     _broker_command,
+    _install_workflow_node_packs,
     _is_trusted_bundled_workflow_release,
     _maintenance_intent_owns_job,
     _reject_known_insufficient_workflow_resources,
@@ -29,7 +30,8 @@ from vgen.cli.main import (
     main,
 )
 from vgen.crypto import verify_maintenance_intent
-from vgen.market.models import WorkflowManifest
+from vgen.market.models import CustomNodeRequirement, WorkflowManifest, WorkflowVariant
+from vgen.market.node_packs import build_node_pack_archive
 from vgen.market.registry import (
     RegistryError,
     WorkflowRegistry,
@@ -116,6 +118,7 @@ class MaintenanceClient:
         uploads_artifact = values["spec"]["kind"] in {
             "worker_update",
             "capability_install",
+            "node_pack_install",
         }
         response = {
             "id": "mtn_example",
@@ -176,6 +179,105 @@ def test_maintenance_job_ownership_is_fail_closed_for_legacy_or_invalid_metadata
         )
 
 
+def test_workflow_node_pack_is_verified_uploaded_and_installed_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    archive = tmp_path / "node-pack.zip"
+    _manifest, digest = build_node_pack_archive(
+        source,
+        archive,
+        node_pack_id="vgen/comfyui-gguf",
+        version="1.0.0",
+        directory="ComfyUI-GGUF",
+        source="https://github.com/city96/ComfyUI-GGUF",
+        revision="6ea2651e7df66d7585f6ffee804b20e92fb38b8a",
+        node_classes=["UnetLoaderGGUF"],
+    )
+    variant = WorkflowVariant(
+        name="comfyui",
+        executor_type="comfyui",
+        payload_format="comfyui-api-graph/v1",
+        payload="workflow.json",
+        operations=["t2v"],
+        custom_nodes=[
+            CustomNodeRequirement(
+                name="ComfyUI-GGUF",
+                source="https://github.com/city96/ComfyUI-GGUF",
+                revision="6ea2651e7df66d7585f6ffee804b20e92fb38b8a",
+                node_types=["UnetLoaderGGUF"],
+                node_pack="vgen/comfyui-gguf@1.0.0",
+                node_pack_source="https://market.example/node-pack.zip",
+                node_pack_sha256=digest,
+                manual_install=False,
+            )
+        ],
+    )
+    worker = _worker()
+    worker["gateway_protocol_features"] = {
+        "capability_install_spec_version": 2,
+        "node_pack_install_spec_version": 1,
+    }
+    worker["capabilities"] = {
+        "capability_install_spec_version": 2,
+        "node_pack_install_spec_version": 1,
+        "maintenance_actions": [
+            "worker_update",
+            "model_install",
+            "capability_install",
+            "node_pack_install",
+        ],
+        "executors": [],
+    }
+    client = MaintenanceClient(
+        worker,
+        terminal_job={
+            "id": "mtn_example",
+            "state": "succeeded",
+            "result": {
+                "kind": "node_pack_install",
+                "status": "installed",
+                "loaded": True,
+            },
+        },
+    )
+    adapter = RecordingArtifactAdapter()
+    monkeypatch.setattr(
+        "vgen.cli.main._profile_and_identity",
+        lambda _: (client.profile, _identity()),
+    )
+    monkeypatch.setattr("vgen.cli.main.HttpArtifactAdapter", lambda: adapter)
+
+    def fetch(_source: str, output: Path, *, expected_sha256: str) -> Path:
+        assert expected_sha256 == digest
+        output.write_bytes(archive.read_bytes())
+        return output
+
+    monkeypatch.setattr("vgen.cli.main.fetch_node_pack", fetch)
+
+    results = _install_workflow_node_packs(
+        client,
+        argparse.Namespace(interval=0.01, timeout=1),
+        broker_id="brk_home",
+        worker=worker,
+        variant=variant,
+    )
+
+    assert results[0]["result"]["status"] == "installed"
+    assert client.created[0]["spec"] == {
+        "kind": "node_pack_install",
+        "node_pack_ref": "vgen/comfyui-gguf@1.0.0",
+        "artifact_sha256": digest,
+        "artifact_size": archive.stat().st_size,
+        "node_classes": ["UnetLoaderGGUF"],
+        "apply": "on_idle",
+    }
+    assert adapter.contents == [archive.read_bytes()]
+
+
 def test_shared_model_placements_become_one_signed_download_request() -> None:
     shared = {
         "sha256": "a" * 64,
@@ -217,6 +319,65 @@ def test_ltx_release_is_installed_from_digest_pinned_cli_bundle(
     assert manifest.version == "1.0.0"
     assert digest == "d782e1a99b360198f288f745932a23ac86a01b0357ec4728de8852b7754547fb"
     assert path.is_relative_to(registry.root)
+
+
+def test_exact_external_workflow_is_discovered_without_a_cli_code_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = (
+        Path(__file__).parents[2]
+        / "workflows/vgen/ltx-2.5-gguf-q4-t2v/1.0.4"
+    )
+    manifest, digest, _signed = validate_package(package, allow_unsigned=True)
+    source = (
+        "https://market.example.test/workflows/vgen/"
+        "ltx-2.5-gguf-q4-t2v/1.0.4/workflow.zip"
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class ExternalRegistry:
+        def installed(self) -> list[object]:
+            return []
+
+        def search_index(self, index: str, query: str) -> list[dict[str, str]]:
+            assert index == "https://vgen.zcbiz.com/marketplace/index.json"
+            assert query == manifest.id
+            return [
+                {
+                    "id": manifest.id,
+                    "version": manifest.version,
+                    "source": source,
+                    "digest": f"sha256:{digest}",
+                }
+            ]
+
+        def install(self, value: str, **kwargs: Any) -> object:
+            calls.append((value, kwargs))
+            return SimpleNamespace(
+                manifest=manifest,
+                path=package,
+                digest=digest,
+            )
+
+    monkeypatch.setattr("vgen.cli.main.WorkflowRegistry", ExternalRegistry)
+    resolved, path, resolved_digest = _resolve_workflow(
+        "vgen/ltx-2.5-gguf-q4-t2v@1.0.4"
+    )
+
+    assert resolved is manifest
+    assert path == package
+    assert resolved_digest == digest
+    assert calls == [
+        (
+            source,
+            {
+                "allow_unsigned": True,
+                "expected_digest": f"sha256:{digest}",
+                "expected_workflow_id": manifest.id,
+                "expected_version": manifest.version,
+            },
+        )
+    ]
 
 
 def test_workflow_resolution_fails_closed_when_custom_can_shadow_market(

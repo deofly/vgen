@@ -3084,7 +3084,7 @@ def create_app(
         require_worker(principal, worker_id)
         require_scope(principal, "worker:maintenance:report")
         data = payload.model_dump(mode="json")
-        if payload.result.kind == "capability_install":
+        if payload.result.kind in {"capability_install", "node_pack_install"}:
             data["result"] = payload.result.model_dump(mode="json", exclude_none=True)
         return repository.complete_worker_maintenance(
             job_id=job_id,

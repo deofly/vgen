@@ -179,6 +179,65 @@ def model_fixture() -> tuple[dict[str, Any], WorkerCredentials, Any]:
     return job, credentials, pin
 
 
+def test_node_pack_job_installs_cached_artifact_and_reports_loaded(tmp_path: Path) -> None:
+    artifact = b"reviewed node pack"
+    digest = hashlib.sha256(artifact).hexdigest()
+    spec = {
+        "kind": "node_pack_install",
+        "node_pack_ref": "vgen/comfyui-gguf@1.0.0",
+        "artifact_sha256": digest,
+        "artifact_size": len(artifact),
+        "node_classes": ["UnetLoaderGGUF"],
+        "apply": "on_idle",
+    }
+    job, credentials = signed_job(spec)
+    job["ticket"] = TransferTicket(
+        "https://gateway.example.test/node-pack",
+        "GET",
+        expected_size=len(artifact),
+        expected_sha256=digest,
+    )
+    work = tmp_path / "work"
+    downloads = work / "node-pack-downloads"
+    downloads.mkdir(parents=True)
+    archive = downloads / f"{digest}.zip"
+    archive.write_bytes(artifact)
+    calls: list[dict[str, Any]] = []
+
+    class FakeNodePackInstaller:
+        def install(self, path: Path, **kwargs: Any) -> Any:
+            calls.append({"path": path, **kwargs})
+            return SimpleNamespace(status="installed")
+
+    gateway = FakeGateway(job)
+    outcome = WorkerMaintenanceController(
+        credentials,
+        gateway,  # type: ignore[arg-type]
+        FakeExecutor(SimpleNamespace()),  # type: ignore[arg-type]
+        work_root=work,
+        model_root=None,
+        node_pack_installer=FakeNodePackInstaller(),  # type: ignore[arg-type]
+        ticket_resolver=lambda _host, _port: ("93.184.216.34",),
+    ).run_one()
+
+    assert outcome is not None and outcome.succeeded
+    assert calls == [
+        {
+            "path": archive,
+            "expected_sha256": digest,
+            "expected_node_pack_ref": "vgen/comfyui-gguf@1.0.0",
+            "expected_node_classes": ("UnetLoaderGGUF",),
+        }
+    ]
+    assert gateway.completions[-1]["result"] == {
+        "kind": "node_pack_install",
+        "status": "installed",
+        "node_pack_ref": "vgen/comfyui-gguf@1.0.0",
+        "artifact_sha256": digest,
+        "loaded": True,
+    }
+
+
 def test_model_job_requires_signed_exact_local_workflow_and_model_pin(tmp_path: Path) -> None:
     job, credentials, pin = model_fixture()
     gateway = FakeGateway(job)

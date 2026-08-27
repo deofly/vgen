@@ -139,6 +139,10 @@ class ErrorCode(IntEnum):
     CAPABILITY_RELEASE_INVALID = 340017
     CAPABILITY_COMPILE_INVALID = 340018
     CAPABILITY_GRAPH_INVALID = 340019
+    NODE_PACK_ARCHIVE_INVALID = 340020
+    NODE_PACK_DEPENDENCY_INSTALL_FAILED = 340021
+    NODE_PACK_ACTIVATION_FAILED = 340022
+    NODE_PACK_ROLLBACK_FAILED = 340023
 
     # 40xxxx: crypto / key envelope
     DECRYPTION_FAILED = 400001
@@ -708,6 +712,34 @@ _ERROR_SPECS = (
         422,
         ErrorOrigin.WORKER,
         responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.NODE_PACK_ARCHIVE_INVALID,
+        "The reviewed Node Pack archive is invalid or does not match its manifest.",
+        422,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.NODE_PACK_DEPENDENCY_INSTALL_FAILED,
+        "The Node Pack offline dependencies are incompatible with the ComfyUI runtime.",
+        422,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.CONSUMER,
+    ),
+    _spec(
+        ErrorCode.NODE_PACK_ACTIVATION_FAILED,
+        "ComfyUI did not load the reviewed Node Pack and the previous nodes were restored.",
+        500,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.PROVIDER,
+    ),
+    _spec(
+        ErrorCode.NODE_PACK_ROLLBACK_FAILED,
+        "The previous ComfyUI node directory could not be restored automatically.",
+        500,
+        ErrorOrigin.WORKER,
+        responsibility=Responsibility.PROVIDER,
     ),
     _spec(
         ErrorCode.DECRYPTION_FAILED,

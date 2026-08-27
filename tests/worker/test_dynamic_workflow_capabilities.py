@@ -267,6 +267,84 @@ def test_custom_node_readiness_requires_exact_clean_git_provenance_and_survives_
     assert changed["missing_node_classes"] == ["UnetLoaderGGUF"]
 
 
+def test_managed_node_pack_receipt_makes_workflow_ready_and_detects_tampering(
+    tmp_path: Path,
+) -> None:
+    source = "https://github.com/city96/ComfyUI-GGUF"
+    revision = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+    artifact_sha256 = "7f0ecc0e4ae8d020547a211772136f2adb0e4ab7572e917697a1a5a13880354f"
+    package = tmp_path / "package"
+    manifest = _write_workflow(
+        package,
+        workflow_id="test/managed-gguf",
+        node_class="UnetLoaderGGUF",
+        custom_nodes=[
+            {
+                "name": "ComfyUI-GGUF",
+                "source": source,
+                "revision": revision,
+                "node_types": ["UnetLoaderGGUF"],
+                "node_pack": "vgen/comfyui-gguf@1.0.0",
+                "node_pack_source": (
+                    "https://vgen.example.invalid/marketplace/node-packs/"
+                    "vgen/comfyui-gguf/1.0.0/node-pack.zip"
+                ),
+                "node_pack_sha256": artifact_sha256,
+                "manual_install": False,
+            }
+        ],
+    )
+    write_checksums(package)
+    release = InstallResult(manifest, package, package_digest(package), False)
+
+    custom_root = tmp_path / "custom_nodes"
+    repository = custom_root / "ComfyUI-GGUF"
+    repository.mkdir(parents=True)
+    source_file = repository / "__init__.py"
+    source_file.write_bytes(b"NODE_CLASS_MAPPINGS = {}\n")
+    marker = {
+        "format": "vgen-node-pack-activation",
+        "version": 1,
+        "node_pack_id": "vgen/comfyui-gguf",
+        "node_pack_version": "1.0.0",
+        "artifact_sha256": artifact_sha256,
+        "source": source,
+        "revision": revision,
+        "node_classes": ["UnetLoaderGGUF"],
+        "files": [
+            {
+                "path": "__init__.py",
+                "sha256": hashlib.sha256(source_file.read_bytes()).hexdigest(),
+                "size": source_file.stat().st_size,
+            }
+        ],
+    }
+    (repository / ".vgen-node-pack.json").write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    def capabilities() -> dict[str, Any]:
+        executor = ComfyUIExecutor(
+            "http://127.0.0.1:8188",
+            tmp_path / "outputs",
+            client=_ComfyClient({"UnetLoaderGGUF"}),  # type: ignore[arg-type]
+            capability_source=_CapabilitySource((release,)),
+            model_root=tmp_path / "models",
+            custom_nodes_root=custom_root,
+        )
+        return dict(executor.capabilities())
+
+    report = capabilities()
+    assert report["node_pack_digests"] == [f"sha256:{artifact_sha256}"]
+    assert _readiness(report)["test/managed-gguf@1.0.0"]["state"] == "ready"
+
+    source_file.write_bytes(b"NODE_CLASS_MAPPINGS = {'tampered': object()}\n")
+    tampered = capabilities()
+    assert tampered["node_pack_digests"] == []
+    assert _readiness(tampered)["test/managed-gguf@1.0.0"]["state"] == "missing_nodes"
+
+
 def test_custom_node_readiness_rejects_extra_provider_repository_or_root_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -97,7 +97,7 @@ class ModelRequirement(BaseModel):
 
 
 class CustomNodeRequirement(BaseModel):
-    """Pinned executable dependency which VGen never installs automatically."""
+    """Pinned executable dependency, optionally fulfilled by a reviewed Node Pack."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -106,7 +106,10 @@ class CustomNodeRequirement(BaseModel):
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     license: str | None = Field(default=None, min_length=1, max_length=120)
     node_types: list[str] = Field(min_length=1, max_length=128)
-    manual_install: Literal[True] = True
+    node_pack: str | None = None
+    node_pack_source: str | None = None
+    node_pack_sha256: str | None = None
+    manual_install: bool = True
 
     @field_validator("source")
     @classmethod
@@ -123,6 +126,53 @@ class CustomNodeRequirement(BaseModel):
         if len(value) != len(set(value)):
             raise ValueError("custom node types must be unique")
         return value
+
+    @field_validator("node_pack")
+    @classmethod
+    def valid_node_pack_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        node_pack_id, separator, version = value.partition("@")
+        if not separator or "@" in version:
+            raise ValueError("Node Pack reference must be id@version")
+        validate_workflow_id(node_pack_id)
+        validate_workflow_version(version)
+        return value
+
+    @field_validator("node_pack_sha256")
+    @classmethod
+    def valid_node_pack_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.removeprefix("sha256:").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("Node Pack sha256 must contain exactly 64 hexadecimal characters")
+        return normalized
+
+    @field_validator("node_pack_source")
+    @classmethod
+    def secure_node_pack_source(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("https://"):
+            raise ValueError("Node Pack artifact source must use HTTPS")
+        return value
+
+    @model_validator(mode="after")
+    def coherent_install_source(self) -> CustomNodeRequirement:
+        managed = any(
+            item is not None
+            for item in (self.node_pack, self.node_pack_source, self.node_pack_sha256)
+        )
+        if managed != (
+            self.node_pack is not None
+            and self.node_pack_source is not None
+            and self.node_pack_sha256 is not None
+        ):
+            raise ValueError(
+                "managed custom nodes require a Node Pack reference, source, and digest"
+            )
+        if managed == self.manual_install:
+            raise ValueError("custom node must use exactly one manual or managed install source")
+        return self
 
 
 class WorkflowVariant(BaseModel):

@@ -190,6 +190,7 @@ def test_serve_once_claims_and_executes_one_authenticated_lease(
     assert gateway.announced["executors"][0]["capabilities"] == {"gpu_count": 1}
     assert gateway.announced["worker_runtime_version"]
     assert gateway.announced["capability_install_spec_version"] == 2
+    assert gateway.announced["node_pack_install_spec_version"] == 1
     assert gateway.announced["maintenance_actions"] == []
 
 
@@ -320,6 +321,7 @@ def test_authenticated_policyless_serve_starts_in_maintenance_only_mode(
         "worker_update",
         "model_install",
         "capability_install",
+        "node_pack_install",
     ]
     assert gateway.announced["executors"][0]["capabilities"] == {
         "capability_schema_version": 2,
@@ -596,6 +598,7 @@ def test_unhealthy_executor_still_announces_and_runs_maintenance(
                 "worker_update",
                 "model_install",
                 "capability_install",
+                "node_pack_install",
             ]
             assert capabilities["executors"][0]["capabilities"] == {
                 "capability_schema_version": 2,

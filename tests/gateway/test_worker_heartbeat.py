@@ -98,7 +98,10 @@ def test_direct_comfyui_registration_persists_only_the_authorized_projection(tmp
             capabilities=forged_capabilities,
         )
 
-        assert worker["gateway_protocol_features"] == {"capability_install_spec_version": 2}
+        assert worker["gateway_protocol_features"] == {
+            "capability_install_spec_version": 2,
+            "node_pack_install_spec_version": 1,
+        }
         assert forged_digest not in json.dumps(worker["capabilities"])
         row = app.state.db.fetchone(
             "SELECT capabilities,capability_auth_enforced_at FROM workers WHERE id=?",

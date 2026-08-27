@@ -1,0 +1,114 @@
+schema_version: 1
+id: vgen/ltx-2.5-gguf-q4-t2v
+version: 1.0.4
+title: LTX-2.5 distilled GGUF Q4 text-to-video
+summary: Experimental 24 GB VRAM LTX-2.5 text-to-video workflow using a Q4_K_M transformer and synchronized audio.
+license: MIT
+provenance: market
+publisher:
+  id: vgen
+  public_key: null
+homepage: https://huggingface.co/Abiray/LTX-2.5-Distilled-GGUF
+source: https://github.com/Comfy-Org/workflow_templates/blob/2ded761bde3af3b4c8e905e162f45551cbec12ea/templates/video_ltx2_5_t2v.json
+parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - prompt
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+    seed:
+      type: integer
+      minimum: -1
+      default: -1
+    duration:
+      type: integer
+      minimum: 1
+      default: 1
+      description: Clip length in whole seconds. Frame count is duration * fps + 1.
+    width:
+      type: integer
+      minimum: 256
+      multipleOf: 32
+      default: 512
+    height:
+      type: integer
+      minimum: 256
+      multipleOf: 32
+      default: 288
+    fps:
+      type: integer
+      minimum: 8
+      multipleOf: 8
+      default: 24
+variants:
+  - name: comfyui-gguf-q4
+    executor_type: comfyui
+    payload_format: comfyui-api-graph/v1
+    payload: workflow.json
+    mapping: mapping.json
+    operations:
+      - t2v
+    executor_min_version: 1.2.0
+    runtime_min_version: 0.33.0
+    models:
+      - filename: LTX-2.5-Distilled-Q4_K_M.gguf
+        folder: diffusion_models
+        source: https://hf-mirror.com/Abiray/LTX-2.5-Distilled-GGUF/resolve/d103d88cd8bfcc8d68de809d9efe028e96479365/LTX-2.5-Distilled-Q4_K_M.gguf
+        revision: d103d88cd8bfcc8d68de809d9efe028e96479365
+        sha256: 0f51eb0d82b19bddbfb3b0371a65217844ea03750f27dd733528f22152e0e0d0
+        size: 15687639488
+        license: LicenseRef-LTX-2.x-Community
+        gated: false
+        manual_download: false
+      - filename: gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot-v2.safetensors
+        folder: text_encoders
+        source: https://hf-mirror.com/mcmonkey/swarm-models/resolve/dc57a0895f14e1856360d6e8d33e4b3bc0c45eab/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot-v2.safetensors
+        revision: dc57a0895f14e1856360d6e8d33e4b3bc0c45eab
+        sha256: 6ce688a0aa98a5fa36a9f1e6c3f42152a498cc2b53ee8c15674c64244f91487f
+        size: 15372969374
+        license: LicenseRef-LTX-2.x-Community
+        gated: false
+        manual_download: false
+      - filename: ltx-2.5-video-vae-bf16.safetensors
+        folder: vae
+        source: https://hf-mirror.com/comfyicu/LTX-2.5/resolve/1026e00f808dbd9601911479b22d65b760737dc8/vae/ltx-2.5-video-vae-bf16.safetensors
+        revision: 1026e00f808dbd9601911479b22d65b760737dc8
+        sha256: 847e14ca7f3355debca0cea4eaa24ac0fbcdf0061da054ac89ca638a869ddba3
+        size: 1472223346
+        license: LicenseRef-LTX-2.x-Community
+        gated: false
+        manual_download: false
+      - filename: ltx-2.5-audio-vae-bf16.safetensors
+        folder: vae
+        source: https://hf-mirror.com/comfyicu/LTX-2.5/resolve/1026e00f808dbd9601911479b22d65b760737dc8/vae/ltx-2.5-audio-vae-bf16.safetensors
+        revision: 1026e00f808dbd9601911479b22d65b760737dc8
+        sha256: c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5
+        size: 364866540
+        license: LicenseRef-LTX-2.x-Community
+        gated: false
+        manual_download: false
+      - filename: ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
+        folder: latent_upscale_models
+        source: https://hf-mirror.com/comfyicu/LTX-2.5/resolve/1026e00f808dbd9601911479b22d65b760737dc8/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
+        revision: 1026e00f808dbd9601911479b22d65b760737dc8
+        sha256: eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8
+        size: 995778752
+        license: LicenseRef-LTX-2.x-Community
+        gated: false
+        manual_download: false
+    custom_nodes:
+      - name: ComfyUI-GGUF
+        source: https://github.com/city96/ComfyUI-GGUF
+        revision: 6ea2651e7df66d7585f6ffee804b20e92fb38b8a
+        license: Apache-2.0
+        node_types:
+          - UnetLoaderGGUF
+        node_pack: vgen/comfyui-gguf@1.0.1
+        node_pack_source: https://vgen.zcbiz.com/marketplace/node-packs/vgen/comfyui-gguf/1.0.1/node-pack.zip
+        node_pack_sha256: ce4c328247358fefd74f745c12d50f4f4d357d07adba810b83cee4f88682cb82
+        manual_install: false
+    min_vram_bytes: 24000000000
+    min_ram_bytes: 32000000000

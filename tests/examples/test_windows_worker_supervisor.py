@@ -47,6 +47,21 @@ def test_supervisor_starts_worker_before_comfy_and_restarts_them_independently()
     assert "$forcedDeadline = [DateTimeOffset]::Now.AddSeconds(10)" in text
 
 
+def test_supervisor_pauses_only_comfyui_for_expiring_worker_maintenance() -> None:
+    text = SUPERVISOR.read_text(encoding="utf-8")
+    assert '"comfyui-pause.request"' in text
+    assert '"comfyui-pause.ack"' in text
+    assert '"vgen-comfyui-pause-request"' in text
+    assert '"vgen-comfyui-pause-ack"' in text
+    assert "$expiresAt -gt ($now + 900)" in text
+    pause = text.index('Stop-OwnedProcessTree $comfyProcess "ComfyUI"')
+    acknowledge = text.index("Write-ComfyPauseAcknowledgement", pause)
+    resume = text.index("Resuming ComfyUI after reviewed Worker maintenance", acknowledge)
+    assert pause < acknowledge < resume
+    assert "Paused ComfyUI for reviewed Worker maintenance" in text
+    assert "Stop-OwnedProcessTree $workerProcess" not in text[pause:resume]
+
+
 def test_setup_persists_closed_launch_config_then_hands_off_to_task() -> None:
     text = SETUP.read_text(encoding="utf-8")
     config_write = text.index("Write-WorkerLaunchConfig")

@@ -36,6 +36,7 @@ from vgen.protocol import ErrorCode, VGenError
 from .capabilities import CapabilityInstallError, WorkerCapabilityStore
 from .credentials import WorkerCredentials
 from .model_installer import ModelInstaller, ModelInstallError
+from .node_packs import NodePackInstaller, NodePackInstallError
 from .updater import RuntimeUpdater, WorkerUpdateError
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,7 @@ class WorkerMaintenanceController:
         updater: RuntimeUpdater | None = None,
         model_installer: ModelInstaller | None = None,
         capability_store: WorkerCapabilityStore | None = None,
+        node_pack_installer: NodePackInstaller | None = None,
         ticket_resolver: TicketResolver = _default_ticket_resolver,
     ) -> None:
         self._credentials = credentials
@@ -226,6 +228,7 @@ class WorkerMaintenanceController:
         self._model_root = model_root
         self._model_installer = model_installer
         self._capability_store = capability_store
+        self._node_pack_installer = node_pack_installer
         if (
             self._capability_store is not None
             and credentials.owner_root_signing_public_key is not None
@@ -443,6 +446,7 @@ class WorkerMaintenanceController:
                 "worker_update",
                 "model_install",
                 "capability_install",
+                "node_pack_install",
             }:
                 raise _MaintenanceRejected("MAINTENANCE_JOB_INVALID")
             if spec.get("kind") != kind:
@@ -461,6 +465,8 @@ class WorkerMaintenanceController:
                 return self._install_models(job_id, fencing_token, spec)
             if kind == "capability_install":
                 return self._install_capability(job, job_id, fencing_token, spec)
+            if kind == "node_pack_install":
+                return self._install_node_pack(job, job_id, fencing_token, spec)
             return self._stage_update(job, job_id, fencing_token, spec)
         except VGenError:
             # Gateway availability errors are not finalized: the same leased
@@ -469,6 +475,8 @@ class WorkerMaintenanceController:
         except ArtifactTransferError:
             if job.get("kind") == "capability_install":
                 return self._complete_capability_failure(job, "CAPABILITY_DOWNLOAD_FAILED")
+            if job.get("kind") == "node_pack_install":
+                return self._complete_node_pack_failure(job, "NODE_PACK_DOWNLOAD_FAILED")
             return self._complete_update_failure(job, "WORKER_UPDATE_DOWNLOAD_FAILED")
         except _MaintenanceCancelled:
             return MaintenanceOutcome(
@@ -489,9 +497,13 @@ class WorkerMaintenanceController:
             return self._complete_model_failure(job, exc.code)
         except CapabilityInstallError as exc:
             return self._complete_capability_failure(job, exc.code)
+        except NodePackInstallError as exc:
+            return self._complete_node_pack_failure(job, exc.code)
         except WorkerUpdateError as exc:
             if job.get("kind") == "capability_install":
                 return self._complete_capability_failure(job, exc.code)
+            if job.get("kind") == "node_pack_install":
+                return self._complete_node_pack_failure(job, exc.code)
             return self._complete_update_failure(job, exc.code)
         except (OSError, ValueError, TypeError, KeyError):
             kind = job.get("kind")
@@ -499,6 +511,8 @@ class WorkerMaintenanceController:
                 return self._complete_model_failure(job, "MAINTENANCE_INTERNAL_ERROR")
             if kind == "capability_install":
                 return self._complete_capability_failure(job, "MAINTENANCE_INTERNAL_ERROR")
+            if kind == "node_pack_install":
+                return self._complete_node_pack_failure(job, "MAINTENANCE_INTERNAL_ERROR")
             return self._complete_update_failure(job, "MAINTENANCE_INTERNAL_ERROR")
 
     def _install_models(
@@ -806,6 +820,121 @@ class WorkerMaintenanceController:
         )
         return MaintenanceOutcome("maintenance_capability_activated", True, job_id=job_id)
 
+    def _install_node_pack(
+        self,
+        job: Mapping[str, Any],
+        job_id: str,
+        fencing_token: int,
+        spec: Mapping[str, Any],
+    ) -> MaintenanceOutcome:
+        node_pack_ref = _required_string(spec, "node_pack_ref")
+        artifact_sha256 = _required_string(spec, "artifact_sha256").lower()
+        artifact_size = _required_positive_int(spec, "artifact_size")
+        raw_node_classes = spec.get("node_classes")
+        if (
+            spec.get("kind") != "node_pack_install"
+            or spec.get("apply") != "on_idle"
+            or re.fullmatch(
+                r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@"
+                r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+                r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
+                node_pack_ref,
+            )
+            is None
+            or not _DIGEST.fullmatch(artifact_sha256)
+            or not isinstance(raw_node_classes, list)
+            or not raw_node_classes
+            or len(raw_node_classes) > 512
+            or raw_node_classes != sorted(set(raw_node_classes))
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", item) is None
+                for item in raw_node_classes
+            )
+        ):
+            raise _MaintenanceRejected("MAINTENANCE_SPEC_INVALID")
+        if self._node_pack_installer is None:
+            raise NodePackInstallError("NODE_PACK_RUNTIME_UNAVAILABLE")
+
+        ticket = self._gateway.maintenance_artifact_ticket(job)
+        self._validate_update_ticket(ticket, artifact_size, artifact_sha256)
+        download_root = self._work_root / "node-pack-downloads"
+        download_root.mkdir(parents=True, exist_ok=True)
+        archive = download_root / f"{artifact_sha256}.zip"
+        if not _matches_file(archive, artifact_size, artifact_sha256):
+            try:
+                free = shutil.disk_usage(download_root).free
+            except OSError as exc:
+                raise NodePackInstallError("NODE_PACK_DISK_UNAVAILABLE") from exc
+            if free < artifact_size + 256 * 1024 * 1024:
+                raise NodePackInstallError("NODE_PACK_DISK_FULL")
+            adapter = (
+                OssStsArtifactAdapter()
+                if ticket.url.startswith("oss://")
+                else HttpArtifactAdapter(self._session)
+            )
+
+            def progress(completed: int, total: int | None) -> None:
+                keeper.update_progress(completed, total)
+                now = time.monotonic()
+                if completed == total or now - self._last_progress_at >= 10:
+                    self._heartbeat(
+                        job_id,
+                        fencing_token,
+                        "downloading",
+                        completed,
+                        total,
+                        ttl_seconds=300,
+                    )
+                    self._last_progress_at = now
+
+            self._last_progress_at = 0.0
+            self._heartbeat(
+                job_id, fencing_token, "downloading", 0, artifact_size, ttl_seconds=300
+            )
+            with _LeaseKeeper(
+                self._gateway,
+                job_id,
+                fencing_token,
+                stage="downloading",
+                gateway_lock=self._gateway_lock,
+            ) as keeper:
+                adapter.download(ticket, archive, progress)
+                keeper.check()
+        if not _matches_file(archive, artifact_size, artifact_sha256):
+            raise NodePackInstallError("NODE_PACK_ARTIFACT_DIGEST_MISMATCH")
+
+        self._heartbeat(
+            job_id, fencing_token, "activating", artifact_size, artifact_size, ttl_seconds=300
+        )
+        with _LeaseKeeper(
+            self._gateway,
+            job_id,
+            fencing_token,
+            stage="activating",
+            gateway_lock=self._gateway_lock,
+        ) as keeper:
+            installed = self._node_pack_installer.install(
+                archive,
+                expected_sha256=artifact_sha256,
+                expected_node_pack_ref=node_pack_ref,
+                expected_node_classes=tuple(raw_node_classes),
+            )
+            keeper.check()
+        self._gateway.complete_maintenance(
+            job_id,
+            fencing_token=fencing_token,
+            succeeded=True,
+            result={
+                "kind": "node_pack_install",
+                "status": installed.status,
+                "node_pack_ref": node_pack_ref,
+                "artifact_sha256": artifact_sha256,
+                "loaded": True,
+            },
+        )
+        return MaintenanceOutcome("maintenance_node_pack_installed", True, job_id=job_id)
+
     def _stage_update(
         self,
         job: Mapping[str, Any],
@@ -950,6 +1079,8 @@ class WorkerMaintenanceController:
             return self._complete_model_failure(job, "MAINTENANCE_REJECTED")
         if job.get("kind") == "capability_install":
             return self._complete_capability_failure(job, "MAINTENANCE_REJECTED")
+        if job.get("kind") == "node_pack_install":
+            return self._complete_node_pack_failure(job, "MAINTENANCE_REJECTED")
         return self._complete_update_failure(job, "MAINTENANCE_REJECTED")
 
     def _complete_model_failure(
@@ -1015,6 +1146,31 @@ class WorkerMaintenanceController:
         )
         return MaintenanceOutcome(
             "maintenance_capability_failed", False, job_id=job_id, error_code=code
+        )
+
+    def _complete_node_pack_failure(
+        self, job: Mapping[str, Any], reason: str
+    ) -> MaintenanceOutcome:
+        job_id = _required_string(job, "id")
+        fencing_token = _required_positive_int(job, "fencing_token")
+        spec = _required_mapping(job, "spec")
+        node_pack_ref = _required_string(spec, "node_pack_ref")
+        artifact_sha256 = _required_string(spec, "artifact_sha256")
+        code = _node_pack_error_code(reason)
+        self._gateway.complete_maintenance(
+            job_id,
+            fencing_token=fencing_token,
+            succeeded=False,
+            result={
+                "kind": "node_pack_install",
+                "status": "failed",
+                "node_pack_ref": node_pack_ref,
+                "artifact_sha256": artifact_sha256,
+                "error_code": code,
+            },
+        )
+        return MaintenanceOutcome(
+            "maintenance_node_pack_failed", False, job_id=job_id, error_code=code
         )
 
     def _complete_update_failure(self, job: Mapping[str, Any], reason: str) -> MaintenanceOutcome:
@@ -1273,6 +1429,28 @@ def _update_error_code(reason: str) -> int:
         return int(ErrorCode.MANIFEST_UNTRUSTED)
     if any(item in reason for item in ("TICKET_INVALID", "REJECTED", "INTENT_INVALID")):
         return int(ErrorCode.MAINTENANCE_POLICY_DENIED)
+    return int(ErrorCode.INTERNAL_ERROR)
+
+
+def _node_pack_error_code(reason: str) -> int:
+    if "ROLLBACK" in reason:
+        return int(ErrorCode.NODE_PACK_ROLLBACK_FAILED)
+    if "DEPENDENCY_INSTALL" in reason:
+        return int(ErrorCode.NODE_PACK_DEPENDENCY_INSTALL_FAILED)
+    if any(item in reason for item in ("ACTIVATION", "NODE_VALIDATION", "HOST_")):
+        return int(ErrorCode.NODE_PACK_ACTIVATION_FAILED)
+    if "DISK" in reason:
+        return int(ErrorCode.DISK_SPACE_INSUFFICIENT)
+    if "DOWNLOAD" in reason:
+        return int(ErrorCode.DOWNLOAD_INTERRUPTED)
+    if any(item in reason for item in ("DIGEST", "INTEGRITY")):
+        return int(ErrorCode.DIGEST_MISMATCH)
+    if any(item in reason for item in ("ROOT", "TARGET", "PATH", "RUNTIME_UNAVAILABLE")):
+        return int(ErrorCode.PATH_CONFLICT)
+    if any(item in reason for item in ("REJECTED", "INTENT", "TICKET", "SPEC")):
+        return int(ErrorCode.MAINTENANCE_POLICY_DENIED)
+    if any(item in reason for item in ("ARCHIVE", "MANIFEST", "MEMBER", "SOURCE")):
+        return int(ErrorCode.NODE_PACK_ARCHIVE_INVALID)
     return int(ErrorCode.INTERNAL_ERROR)
 
 

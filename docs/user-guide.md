@@ -550,15 +550,27 @@ any package byte removes that exception. Custom and local development packages
 still require explicit review, while a marketplace publication should use an
 independent publication trust chain.
 
-The existing `ltx-2.5-gguf-q4-t2v@1.0.0` through `1.0.2` directories are
-immutable historical capability packages. Their README references to a
-ComfyUI-GGUF bootstrap do not mean that the current public one-click installer
-installs that node by default. Starting with 0.13.11, the GGUF node and Python
-dependencies are provisioned only when the Windows host explicitly enables
-`-InstallLtxGguf`; the public one-click path leaves it disabled. Without that
-reviewed host dependency these workflows must remain `missing_nodes`. Correct
-the package documentation or dependency contract only in a new workflow
-SemVer, never by rewriting the old package bytes.
+The existing `ltx-2.5-gguf-q4-t2v@1.0.0` through `1.0.3` directories are
+immutable historical capability packages. Release `1.0.4` replaces their
+manual host bootstrap with the reviewed `vgen/comfyui-gguf@1.0.1` Node Pack.
+On a compatible Worker, the same `workflow-install` command downloads the exact
+Node Pack once, installs its offline wheels into the node's private dependency
+directory, safely restarts ComfyUI, verifies `/object_info`, and rolls back on
+failure. Later workflows that pin the same Node Pack digest reuse it.
+
+```bash
+vgen broker workflow-install vgen/ltx-2.5-gguf-q4-t2v@1.0.4 \
+  --worker "Windows GPU Worker" \
+  --approve-nodes \
+  --allow-unsigned \
+  --wait
+```
+
+The exact workflow release is discovered from the external static Marketplace,
+so publishing another workflow does not require a VGen code release. The flags
+approve executable node classes and the unsigned preview publication; there is
+no VGen license-acceptance state. Model sources remain digest-pinned HTTPS URLs.
+An `HF_TOKEN` is needed only for a model whose upstream repository is gated.
 
 The official base workflow requires at least 32 GB VRAM and 32 GB system RAM.
 A 24 GB RTX 3090 is intentionally not eligible: `workflow-install` rejects it

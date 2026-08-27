@@ -239,10 +239,10 @@ payload, dependency pins, read-only license metadata, and checksum-pinned metada
 overwrite a market package.
 
 Workflow installation verifies structure, digest, signature policy, operation
-mapping, and dependency declarations. It does not download model weights,
-install custom-node code, or execute setup scripts. Model acquisition is an
-explicit Broker maintenance job with revision, size,
-and SHA-256 checks.
+mapping, and dependency declarations. Model weights and executable custom-node
+code remain separate artifacts and maintenance jobs. A managed custom node must
+reference an exact Node Pack archive containing reviewed source and exact
+offline wheels; arbitrary setup scripts are never executed.
 
 `workflow-install` binds the release ref/digest, archive SHA-256/size, publisher
 pin (or explicit unsigned authorization), and reviewed node-class digest into a
@@ -260,17 +260,22 @@ the old directory aside and replacing it with the newly verified staged copy;
 other active workflows remain available throughout validation.
 At execution it rebuilds the graph from the package mapping and validated
 effective parameters, then requires an exact operation, topology, binding, and
-model-loader-path match. Third-party custom-node code remains a separate
-machine-administrator boundary.
+model-loader-path match. For a managed Node Pack, the Worker stages source and
+private dependencies, pauses only ComfyUI while keeping its remote channel
+alive, atomically activates the directory, validates the declared classes
+through `/object_info`, and rolls back on failure. The activation receipt covers
+every installed file and is rechecked on heartbeat. Historical manual
+custom-node checkouts remain a separate machine-administrator boundary.
 
 Published workflow directories are content-addressed and immutable. The H3
 `1.0.0` manifest retains the historical planned
 `github.com/vgen-project/vgen` provenance URL, while the current source and
 support repository is `github.com/deofly/vgen`. Correct it only in a new
 workflow SemVer together with the matching bootstrap-authorization digest;
-never rewrite `1.0.0`. The LTX GGUF `1.0.0` through `1.0.2` README bootstrap
-wording is likewise historical package content. The 0.13.11 public installer
-does not enable `-InstallLtxGguf` by default.
+never rewrite `1.0.0`. The LTX GGUF `1.0.0` through `1.0.3` README bootstrap
+wording is likewise historical package content. Release `1.0.4` declares the
+managed `vgen/comfyui-gguf@1.0.1` Node Pack and can be installed from the
+external Marketplace without a VGen source release.
 
 Models use a Worker-local digest-addressed content store. Shared T5, VAE, and
 other weights download once and are materialized as read-only hard links in

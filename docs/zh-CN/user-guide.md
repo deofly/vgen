@@ -639,12 +639,24 @@ vgen broker workflow-install vgen/ltx-2.5-distilled-t2v@1.0.0 \
 未签名状态；只要文件发生变化，这个例外就失效。自定义或本地开发包仍必须经过显式审核，
 正式市场发布则应使用独立的发布信任链。
 
-仓库中的 `ltx-2.5-gguf-q4-t2v@1.0.0` 至 `1.0.2` 是不可变的历史能力包。
-其中 README 所称的 ComfyUI-GGUF bootstrap 不代表当前公开一键安装器会默认安装该节点。
-从 0.13.11 起，GGUF 节点和 Python 依赖只在 Windows host 明确启用
-`-InstallLtxGguf` 时安装；公开一键路径不启用这个开关。没有已审核的 ComfyUI-GGUF host
-依赖时，这些 GGUF 工作流必须保持 `missing_nodes`，不能当作远程一键安装成功。旧包字节不会
-原地修改；未来修正文档或依赖契约必须发布新的工作流 SemVer。
+仓库中的 `ltx-2.5-gguf-q4-t2v@1.0.0` 至 `1.0.3` 是不可变的历史能力包。新发布的
+`1.0.4` 使用已审核的 `vgen/comfyui-gguf@1.0.1` Node Pack，不再要求登录 Windows 手工
+安装节点。兼容 Worker 会自动下载一次固定摘要的节点包，把离线 wheel 安装到节点自己的依赖
+目录，安全重启 ComfyUI，通过 `/object_info` 验证后才成功；失败会回滚。其他工作流固定相同
+Node Pack 摘要时直接复用，不会重复安装。
+
+```bash
+vgen broker workflow-install vgen/ltx-2.5-gguf-q4-t2v@1.0.4 \
+  --worker "Windows GPU Worker" \
+  --approve-nodes \
+  --allow-unsigned \
+  --wait
+```
+
+CLI 从独立的静态 Marketplace 精确发现此版本；以后发布新工作流不需要发布 VGen 代码版本。
+两个开关分别表示批准可执行节点清单和允许当前 preview 包未签名，并不存在 VGen 的 license
+接受状态。模型可以来自任意固定 SHA-256 的 HTTPS 地址；只有上游仓库本身受限时才需要
+Worker 本机的 `HF_TOKEN`。
 
 官方基础图要求至少 32 GB 显存、32 GB 内存和足够的模型/缓存空间。24 GB RTX 3090 不会被
 此工作流调度；`workflow-install` 会在上传能力包和下载五个模型前直接拒绝。不要通过降低

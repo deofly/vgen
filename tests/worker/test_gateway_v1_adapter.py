@@ -746,11 +746,12 @@ def test_maintenance_claim_falls_back_for_legacy_gateway_and_reprobes() -> None:
     assert client.claim_maintenance(ttl_seconds=60) is None
     assert [json.loads(item[2]["data"]) for item in session.requests] == [
         {
-            "supported_actions": [
-                "worker_update",
-                "model_install",
-                "capability_install",
-            ],
+                "supported_actions": [
+                    "worker_update",
+                    "model_install",
+                    "capability_install",
+                    "node_pack_install",
+                ],
             "ttl_seconds": 60,
         },
         {"ttl_seconds": 60},

@@ -115,8 +115,12 @@ _MAINTENANCE_ACTIVE_STATES = frozenset(
 _MAINTENANCE_SCHEDULING_BLOCK_STATES = frozenset({"queued", "leased", "running", "restarting"})
 _MAINTENANCE_LEASE_STATES = frozenset({"leased", "running", "restarting"})
 _MAINTENANCE_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "expired"})
-_MAINTENANCE_KINDS = frozenset({"worker_update", "model_install", "capability_install"})
-_ARTIFACT_MAINTENANCE_KINDS = frozenset({"worker_update", "capability_install"})
+_MAINTENANCE_KINDS = frozenset(
+    {"worker_update", "model_install", "capability_install", "node_pack_install"}
+)
+_ARTIFACT_MAINTENANCE_KINDS = frozenset(
+    {"worker_update", "capability_install", "node_pack_install"}
+)
 _WORKER_ENROLLMENT_CONTEXT = b"vgen-worker-enrollment-v1"
 _EXECUTOR_VERSION_MAX_LENGTH = 120
 _EXECUTOR_VERSION_CHARACTERS = frozenset(
@@ -159,7 +163,12 @@ class GatewayRepository:
             actions = value.get("maintenance_actions", []) if isinstance(value, dict) else []
             safe_actions = [
                 action
-                for action in ("worker_update", "model_install", "capability_install")
+                for action in (
+                    "worker_update",
+                    "model_install",
+                    "capability_install",
+                    "node_pack_install",
+                )
                 if isinstance(actions, list) and action in actions
             ]
             return {"maintenance_actions": safe_actions, "executors": []}
@@ -475,6 +484,7 @@ class GatewayRepository:
         # advertise the contract explicitly during a rolling upgrade.
         value["gateway_protocol_features"] = {
             "capability_install_spec_version": 2,
+            "node_pack_install_spec_version": 1,
         }
         return value
 
@@ -4917,6 +4927,7 @@ class GatewayRepository:
                     "worker_update",
                     "model_install",
                     "capability_install",
+                    "node_pack_install",
                 )
                 canonical_capabilities = {
                     "maintenance_actions": [
@@ -5527,7 +5538,7 @@ class GatewayRepository:
         # not mint workflow/model grants, so they may still safely converge on
         # one active immutable artifact job.
         dedupe_key = spec_digest
-        if kind in {"capability_install", "model_install"}:
+        if kind in {"capability_install", "model_install", "node_pack_install"}:
             dedupe_key = "sha256:" + hashlib.sha256(
                 canonical_json(
                     {
@@ -5959,7 +5970,8 @@ class GatewayRepository:
         allowed_actions = tuple(
             action
             for action in supported_actions
-            if action in {"worker_update", "model_install", "capability_install"}
+            if action
+            in {"worker_update", "model_install", "capability_install", "node_pack_install"}
         )
         if not allowed_actions or len(allowed_actions) != len(set(allowed_actions)):
             raise RepositoryError(
@@ -6023,7 +6035,8 @@ class GatewayRepository:
                    WHERE worker_id=? AND state='queued' AND expires_at>?
                      AND ((kind='worker_update' AND ?=1)
                        OR (kind='model_install' AND ?=1)
-                       OR (kind='capability_install' AND ?=1))
+                       OR (kind='capability_install' AND ?=1)
+                       OR (kind='node_pack_install' AND ?=1))
                    ORDER BY created_at LIMIT 1""",
                 (
                     worker_id,
@@ -6031,6 +6044,7 @@ class GatewayRepository:
                     int("worker_update" in allowed_actions),
                     int("model_install" in allowed_actions),
                     int("capability_install" in allowed_actions),
+                    int("node_pack_install" in allowed_actions),
                 ),
             ).fetchone()
             if job is None:
@@ -6298,6 +6312,25 @@ class GatewayRepository:
                         )
                     )
                 )
+            elif row["kind"] == "node_pack_install":
+                success_status = status in {"installed", "already_installed"}
+                valid = (
+                    result.get("node_pack_ref") == spec.get("node_pack_ref")
+                    and result.get("artifact_sha256") == spec.get("artifact_sha256")
+                    and succeeded == success_status
+                    and (
+                        (
+                            success_status
+                            and result.get("loaded") is True
+                            and result.get("error_code") is None
+                        )
+                        or (
+                            status == "failed"
+                            and result.get("loaded") is None
+                            and type(result.get("error_code")) is int
+                        )
+                    )
+                )
             else:  # model_install
                 requested = set(spec.get("model_digests", []))
                 installed = set(result.get("installed_model_digests", []))
@@ -6308,7 +6341,11 @@ class GatewayRepository:
                     and succeeded == (status in {"installed", "already_installed"})
                     and (not succeeded or installed == requested)
                 )
-            if valid and succeeded and row["kind"] in {"capability_install", "model_install"}:
+            if valid and succeeded and row["kind"] in {
+                "capability_install",
+                "model_install",
+                "node_pack_install",
+            }:
                 valid = self._maintenance_intent_is_historically_valid(conn, row, spec)
             if not valid:
                 raise RepositoryError(
@@ -6595,6 +6632,14 @@ class GatewayRepository:
                     "status": "failed",
                     "workflow_ref": job_spec["workflow_ref"],
                     "workflow_digest": job_spec["workflow_digest"],
+                    "artifact_sha256": job_spec["artifact_sha256"],
+                    "error_code": int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
+                }
+            elif maintenance["kind"] == "node_pack_install":
+                failure_result = {
+                    "kind": "node_pack_install",
+                    "status": "failed",
+                    "node_pack_ref": job_spec["node_pack_ref"],
                     "artifact_sha256": job_spec["artifact_sha256"],
                     "error_code": int(ErrorCode.ARTIFACT_INTEGRITY_FAILED),
                 }

@@ -390,6 +390,73 @@ function Write-AtomicUtf8Json {
     }
 }
 
+function Remove-SafeControlFile {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The ComfyUI host control path is unsafe."
+    }
+    Remove-Item -LiteralPath $item.FullName -Force
+}
+
+function Read-ComfyPauseRequest {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $item.Length -le 0 -or $item.Length -gt 4096) {
+        throw "The ComfyUI pause request is unsafe."
+    }
+    try {
+        $request = [IO.File]::ReadAllText($item.FullName) | ConvertFrom-Json
+    }
+    catch {
+        throw "The ComfyUI pause request is invalid."
+    }
+    $propertyNames = @($request.PSObject.Properties.Name | Sort-Object)
+    $expectedNames = @("expires_at", "format", "nonce", "requested_at", "version")
+    if (($propertyNames -join ",") -cne ($expectedNames -join ",") -or
+        $request.format -cne "vgen-comfyui-pause-request" -or
+        $request.version -ne 1 -or
+        [string]$request.nonce -cnotmatch '^[0-9a-f]{48}$' -or
+        (($request.requested_at -isnot [Int32]) -and
+            ($request.requested_at -isnot [Int64])) -or
+        (($request.expires_at -isnot [Int32]) -and
+            ($request.expires_at -isnot [Int64]))) {
+        throw "The ComfyUI pause request is invalid."
+    }
+    $requestedAt = [Int64]$request.requested_at
+    $expiresAt = [Int64]$request.expires_at
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($expiresAt -le $requestedAt -or $requestedAt -gt ($now + 300) -or
+        $expiresAt -gt ($now + 900)) {
+        throw "The ComfyUI pause request lifetime is invalid."
+    }
+    if ($expiresAt -le $now) {
+        Remove-SafeControlFile $item.FullName
+        return $null
+    }
+    return [PSCustomObject]@{
+        Nonce = [string]$request.nonce
+        ExpiresAt = $expiresAt
+    }
+}
+
+function Write-ComfyPauseAcknowledgement {
+    param([string]$Path, [string]$Nonce)
+
+    Write-AtomicUtf8Json $Path ([ordered]@{
+        format = "vgen-comfyui-pause-ack"
+        version = 1
+        nonce = $Nonce
+        paused_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    })
+}
+
 function Install-ManagedSupervisorScript {
     param([string]$Source, [string]$Destination)
 
@@ -612,18 +679,58 @@ switch ($Mode) {
         try {
             $config = Read-SupervisorConfig $configPath $vgenRoot
             $launch = Read-LaunchConfig $config.LaunchConfig
+            $pauseRequest = Join-Path $launch.Worker.WorkingDirectory "comfyui-pause.request"
+            $pauseAcknowledgement = Join-Path $launch.Worker.WorkingDirectory "comfyui-pause.ack"
             $workerFailures = 0
             $comfyFailures = 0
             $workerNextStart = [DateTimeOffset]::Now
             $comfyNextStart = [DateTimeOffset]::Now
             $workerStartedAt = $null
             $comfyStartedAt = $null
+            $comfyPausedNonce = $null
             while ($true) {
                 if (Test-Path -LiteralPath $stopRequest -PathType Leaf) {
                     Write-SupervisorLog $logPath "A reviewed repair requested a clean supervisor stop."
                     break
                 }
                 $now = [DateTimeOffset]::Now
+                $pause = $null
+                try {
+                    $pause = Read-ComfyPauseRequest $pauseRequest
+                }
+                catch {
+                    Write-SupervisorLog $logPath "Rejected an invalid ComfyUI pause request."
+                }
+                if ($null -ne $pause) {
+                    try {
+                        if ($null -ne $comfyProcess) {
+                            Stop-OwnedProcessTree $comfyProcess "ComfyUI"
+                            $comfyProcess.Dispose()
+                            $comfyProcess = $null
+                        }
+                        if ($comfyPausedNonce -cne $pause.Nonce) {
+                            Write-ComfyPauseAcknowledgement $pauseAcknowledgement $pause.Nonce
+                            $comfyPausedNonce = $pause.Nonce
+                            Write-SupervisorLog $logPath "Paused ComfyUI for reviewed Worker maintenance."
+                        }
+                    }
+                    catch {
+                        Write-SupervisorLog $logPath "Could not pause ComfyUI for Worker maintenance."
+                    }
+                    Start-Sleep -Milliseconds 200
+                    continue
+                }
+                if ($null -ne $comfyPausedNonce) {
+                    try {
+                        Remove-SafeControlFile $pauseAcknowledgement
+                    }
+                    catch {
+                        Write-SupervisorLog $logPath "Could not remove a ComfyUI pause acknowledgement."
+                    }
+                    $comfyPausedNonce = $null
+                    $comfyNextStart = $now
+                    Write-SupervisorLog $logPath "Resuming ComfyUI after reviewed Worker maintenance."
+                }
                 if ($null -ne $workerProcess -and $workerProcess.HasExited) {
                     $exitCode = $workerProcess.ExitCode
                     $runtime = $now - $workerStartedAt

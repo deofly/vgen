@@ -330,7 +330,9 @@ Package manifest 描述公共参数 schema、Executor variant、payload format�
 
 市场安装必须先校验安全相对路径、entry 数量、解压大小、checksums、package digest 和发布者签名。
 首次远程安装还必须从独立渠道 pin publisher key。未签名包只能显式 `--allow-unsigned` 安装，
-并保持 unsigned provenance。工作流安装绝不静默安装可执行插件或模型权重。
+并保持 unsigned provenance。模型和可执行节点始终是独立 artifact 与维护任务；受管 custom
+node 必须固定 Node Pack ref、归档摘要、源码 commit、class 清单和离线 wheel，Worker 不执行
+包内任意安装脚本。
 
 Broker 的 `workflow-install` 把普通 release ZIP 的文件 SHA-256/size、workflow ref/digest、
 publisher pin（或明确 unsigned 授权）以及审核过的 node-class digest 一并写入 Device 签名的
@@ -344,8 +346,10 @@ maintenance intent。Worker 在私有 staging 中重新验证这些绑定，只�
 验证期间其他工作流保持可用。执行时 Worker
 会用包内 mapping 和校验后的
 有效参数重建 graph，并要求 operation、拓扑、输入绑定及模型 loader 路径精确一致。一个 release
-验证失败不会移除旧 H3 policy 或其他已激活工作流。第三方 custom-node 代码仍是单独的机器管理员
-边界，当前不会远程自动安装。
+验证失败不会移除旧 H3 policy 或其他已激活工作流。对受管 Node Pack，Worker 在隔离目录安装
+私有依赖，仅暂停 ComfyUI 而保持远程通道在线，原子激活后通过 `/object_info` 验证；失败自动
+回滚。激活回执覆盖每一个文件并在 heartbeat 时重新校验。历史手工 custom node 仍属于单独的
+机器管理员边界。
 
 模型在 manifest 中记录 source、immutable revision、SHA-256、size、`gated`、
 `manual_download`，并可保留 license 作为只读发布元数据。VGen 不收集或验证用户的许可证
@@ -391,8 +395,10 @@ Gateway 和未签名的远程指令都不能指定任意可执行文件路径。
 已发布工作流目录按内容摘要视为不可变。H3 `1.0.0` manifest 中的
 `github.com/vgen-project/vgen` 是保留的历史计划地址，当前源码和支持仓库是
 `github.com/deofly/vgen`。修正该 provenance 必须发布新的工作流版本并同步更新 bootstrap
-授权摘要，不能改写 `1.0.0`。LTX GGUF `1.0.0` 至 `1.0.2` README 中的自动 bootstrap
-描述同样属于历史包字节；0.13.11 的公开安装器不会默认启用 `-InstallLtxGguf`。
+授权摘要，不能改写 `1.0.0`。LTX GGUF `1.0.0` 至 `1.0.3` README 中的自动 bootstrap
+描述同样属于历史包字节。`1.0.4` 改为声明受管的
+`vgen/comfyui-gguf@1.0.1` Node Pack，可由独立 Marketplace 发布和远程安装，不依赖 VGen
+源码版本发布。
 
 ## 6. 开发环境
 

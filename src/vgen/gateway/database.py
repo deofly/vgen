@@ -21,7 +21,7 @@ from typing import Any
 
 from vgen.protocol.ids import new_id as protocol_new_id
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 WORKER_ONLINE_WINDOW_SECONDS = 120.0
 TRANSFER_TICKET_REPLAY_RETENTION_SECONDS = 7_200.0
 
@@ -314,7 +314,9 @@ CREATE TABLE IF NOT EXISTS worker_maintenance_jobs (
     broker_id TEXT NOT NULL REFERENCES brokers(id),
     issued_by_user_id TEXT NOT NULL REFERENCES users(id),
     issued_by_device_id TEXT NOT NULL REFERENCES devices(id),
-    kind TEXT NOT NULL CHECK(kind IN ('worker_update','model_install','capability_install')),
+    kind TEXT NOT NULL CHECK(kind IN (
+        'worker_update','model_install','capability_install','node_pack_install'
+    )),
     spec TEXT NOT NULL,
     spec_digest TEXT NOT NULL,
     authorization TEXT NOT NULL,
@@ -360,7 +362,9 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_intent_receipts_expiry
 CREATE TABLE IF NOT EXISTS maintenance_artifacts (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL UNIQUE REFERENCES worker_maintenance_jobs(id),
-    kind TEXT NOT NULL CHECK(kind IN ('worker_update','capability_install')),
+    kind TEXT NOT NULL CHECK(kind IN (
+        'worker_update','capability_install','node_pack_install'
+    )),
     store_type TEXT NOT NULL,
     object_ref TEXT NOT NULL,
     expected_size INTEGER NOT NULL CHECK(expected_size > 0),
@@ -740,6 +744,8 @@ class GatewayDatabase:
                 self._conn.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
             elif int(row["version"]) == 1:
                 self._migrate_schema_v1_to_v2()
+            elif int(row["version"]) == 2:
+                self._migrate_schema_v2_to_v3()
             elif int(row["version"]) != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported gateway schema version {row['version']}; expected {SCHEMA_VERSION}"
@@ -774,7 +780,7 @@ class GatewayDatabase:
                     issued_by_user_id TEXT NOT NULL REFERENCES users(id),
                     issued_by_device_id TEXT NOT NULL REFERENCES devices(id),
                     kind TEXT NOT NULL CHECK(kind IN (
-                        'worker_update','model_install','capability_install'
+                        'worker_update','model_install','capability_install','node_pack_install'
                     )),
                     spec TEXT NOT NULL,
                     spec_digest TEXT NOT NULL,
@@ -804,7 +810,9 @@ class GatewayDatabase:
                 """CREATE TABLE maintenance_artifacts (
                     id TEXT PRIMARY KEY,
                     job_id TEXT NOT NULL UNIQUE REFERENCES worker_maintenance_jobs(id),
-                    kind TEXT NOT NULL CHECK(kind IN ('worker_update','capability_install')),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'worker_update','capability_install','node_pack_install'
+                    )),
                     store_type TEXT NOT NULL,
                     object_ref TEXT NOT NULL,
                     expected_size INTEGER NOT NULL CHECK(expected_size > 0),
@@ -857,7 +865,132 @@ class GatewayDatabase:
             violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("gateway schema v1 to v2 migration violated foreign keys")
-            self._conn.execute("UPDATE schema_meta SET version=2")
+            self._conn.execute("UPDATE schema_meta SET version=3")
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_schema_v2_to_v3(self) -> None:
+        """Add executable Node Pack maintenance without weakening old rows."""
+
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("DROP INDEX IF EXISTS idx_maintenance_artifacts_job")
+            self._conn.execute("DROP INDEX IF EXISTS idx_worker_maintenance_poll")
+            self._conn.execute("DROP INDEX IF EXISTS idx_worker_maintenance_active_dedupe")
+            self._conn.execute("DROP INDEX IF EXISTS idx_maintenance_intent_receipts_expiry")
+            self._conn.execute(
+                "ALTER TABLE maintenance_intent_receipts "
+                "RENAME TO _v2_maintenance_intent_receipts"
+            )
+            self._conn.execute(
+                "ALTER TABLE maintenance_artifacts RENAME TO _v2_maintenance_artifacts"
+            )
+            self._conn.execute(
+                "ALTER TABLE worker_maintenance_jobs RENAME TO _v2_worker_maintenance_jobs"
+            )
+            self._conn.execute(
+                """CREATE TABLE worker_maintenance_jobs (
+                    id TEXT PRIMARY KEY,
+                    worker_id TEXT NOT NULL REFERENCES workers(id),
+                    broker_id TEXT NOT NULL REFERENCES brokers(id),
+                    issued_by_user_id TEXT NOT NULL REFERENCES users(id),
+                    issued_by_device_id TEXT NOT NULL REFERENCES devices(id),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'worker_update','model_install','capability_install','node_pack_install'
+                    )),
+                    spec TEXT NOT NULL,
+                    spec_digest TEXT NOT NULL,
+                    authorization TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'awaiting_upload','queued','leased','running','restarting',
+                        'succeeded','failed','cancelled','expired'
+                    )),
+                    progress TEXT NOT NULL DEFAULT '{}',
+                    result TEXT,
+                    fencing_token INTEGER NOT NULL DEFAULT 0,
+                    lease_session_id TEXT REFERENCES sessions(id),
+                    lease_expires_at REAL,
+                    heartbeat_at REAL,
+                    expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL
+                )"""
+            )
+            self._conn.execute(
+                "INSERT INTO worker_maintenance_jobs SELECT * FROM _v2_worker_maintenance_jobs"
+            )
+            self._conn.execute(
+                """CREATE TABLE maintenance_artifacts (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL UNIQUE REFERENCES worker_maintenance_jobs(id),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'worker_update','capability_install','node_pack_install'
+                    )),
+                    store_type TEXT NOT NULL,
+                    object_ref TEXT NOT NULL,
+                    expected_size INTEGER NOT NULL CHECK(expected_size > 0),
+                    expected_sha256 TEXT NOT NULL,
+                    observed_size INTEGER,
+                    observed_sha256 TEXT,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'pending','uploaded','available','failed','deleted'
+                    )),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                "INSERT INTO maintenance_artifacts SELECT * FROM _v2_maintenance_artifacts"
+            )
+            self._conn.execute(
+                """CREATE TABLE maintenance_intent_receipts (
+                    device_id TEXT NOT NULL REFERENCES devices(id),
+                    nonce TEXT NOT NULL,
+                    authorization_digest TEXT NOT NULL,
+                    job_id TEXT NOT NULL REFERENCES worker_maintenance_jobs(id),
+                    expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(device_id, nonce)
+                )"""
+            )
+            self._conn.execute(
+                "INSERT INTO maintenance_intent_receipts "
+                "SELECT * FROM _v2_maintenance_intent_receipts"
+            )
+            self._conn.execute("DROP TABLE _v2_maintenance_intent_receipts")
+            self._conn.execute("DROP TABLE _v2_maintenance_artifacts")
+            self._conn.execute("DROP TABLE _v2_worker_maintenance_jobs")
+            self._conn.execute(
+                """CREATE INDEX idx_worker_maintenance_poll
+                   ON worker_maintenance_jobs(worker_id, state, created_at)"""
+            )
+            self._conn.execute(
+                """CREATE UNIQUE INDEX idx_worker_maintenance_active_dedupe
+                   ON worker_maintenance_jobs(worker_id, dedupe_key)
+                   WHERE state IN (
+                       'awaiting_upload','queued','leased','running','restarting'
+                   )"""
+            )
+            self._conn.execute(
+                """CREATE INDEX idx_maintenance_artifacts_job
+                   ON maintenance_artifacts(job_id, state)"""
+            )
+            self._conn.execute(
+                """CREATE INDEX idx_maintenance_intent_receipts_expiry
+                   ON maintenance_intent_receipts(expires_at)"""
+            )
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("gateway schema v2 to v3 migration violated foreign keys")
+            self._conn.execute("UPDATE schema_meta SET version=3")
             self._conn.execute("COMMIT")
         except Exception:
             if self._conn.in_transaction:

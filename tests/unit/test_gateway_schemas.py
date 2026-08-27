@@ -80,13 +80,13 @@ def test_capability_install_result_allows_not_ready_but_separates_failure_fields
         )
 
 
-def test_v1_maintenance_tables_rebuild_to_v2_without_losing_rows(tmp_path) -> None:
+def test_v1_maintenance_tables_rebuild_to_v3_without_losing_rows(tmp_path) -> None:
     path = tmp_path / "legacy-maintenance-v1.db"
     legacy_schema = SCHEMA.replace(
-        "CHECK(kind IN ('worker_update','model_install','capability_install'))",
+        "CHECK(kind IN (\n        'worker_update','model_install','capability_install','node_pack_install'\n    ))",
         "CHECK(kind IN ('worker_update','model_install'))",
     ).replace(
-        "CHECK(kind IN ('worker_update','capability_install'))",
+        "CHECK(kind IN (\n        'worker_update','capability_install','node_pack_install'\n    ))",
         "CHECK(kind='worker_update')",
     )
     legacy = sqlite3.connect(path)
@@ -128,7 +128,7 @@ def test_v1_maintenance_tables_rebuild_to_v2_without_losing_rows(tmp_path) -> No
 
     database = GatewayDatabase(str(path))
     try:
-        assert database.fetchone("SELECT version FROM schema_meta")["version"] == 2
+        assert database.fetchone("SELECT version FROM schema_meta")["version"] == 3
         assert (
             database.fetchone(
                 "SELECT kind,state FROM worker_maintenance_jobs WHERE id='mtj_existing'"
@@ -142,6 +142,22 @@ def test_v1_maintenance_tables_rebuild_to_v2_without_losing_rows(tmp_path) -> No
             == "uploaded"
         )
         assert database.fetchall("PRAGMA foreign_key_check") == []
+        database.execute(
+            """INSERT INTO worker_maintenance_jobs
+               (id,worker_id,broker_id,issued_by_user_id,issued_by_device_id,kind,spec,
+                spec_digest,authorization,dedupe_key,state,expires_at,created_at,updated_at)
+               VALUES ('mtj_node_pack','wrk_gpu','brk_home','usr_owner','dev_owner',
+                       'node_pack_install','{}','sha256:pack','{}','dedupe-pack',
+                       'awaiting_upload',100,3,3)"""
+        )
+        database.execute(
+            """INSERT INTO maintenance_artifacts
+               (id,job_id,kind,store_type,object_ref,expected_size,expected_sha256,state,
+                created_at,updated_at)
+               VALUES ('art_node_pack','mtj_node_pack','node_pack_install','local',
+                       'art_node_pack',10,?,'pending',3,3)""",
+            ("d" * 64,),
+        )
         assert database.fetchone("PRAGMA foreign_keys")[0] == 1
 
         database.execute(
@@ -239,7 +255,7 @@ def test_v2_capability_authorizations_migrate_to_independent_sources(tmp_path) -
 
     database = GatewayDatabase(str(path))
     try:
-        assert database.fetchone("SELECT version FROM schema_meta")["version"] == 2
+        assert database.fetchone("SELECT version FROM schema_meta")["version"] == 3
         workflow_columns = {
             row["name"]
             for row in database.fetchall("PRAGMA table_info(worker_workflow_authorizations)")

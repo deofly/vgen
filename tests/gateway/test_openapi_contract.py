@@ -124,6 +124,7 @@ def test_openapi_describes_v1_headers_security_and_error_envelope(tmp_path) -> N
     }
     gateway_features = schema["components"]["schemas"]["GatewayProtocolFeatures"]
     assert gateway_features["properties"]["capability_install_spec_version"]["const"] == 2
+    assert gateway_features["properties"]["node_pack_install_spec_version"]["const"] == 1
 
     worker_heartbeat = schema["paths"]["/api/v1/workers/{worker_id}/heartbeat"]["post"]
     assert worker_heartbeat["x-vgen-idempotency-supported"] is False

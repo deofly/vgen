@@ -3954,7 +3954,7 @@ try {
     }
 
     Write-Step "Running fail-closed Worker doctor"
-    $doctorOutput = & $workerExecutable doctor --comfy-url $ComfyUrl --comfy-output-dir $outputRoot --comfy-model-root $modelsRoot --comfy-custom-nodes-root $customNodesRoot --comfy-policy-file $policyPath --progress --json
+    $doctorOutput = & $workerExecutable doctor --comfy-url $ComfyUrl --comfy-output-dir $outputRoot --comfy-model-root $modelsRoot --comfy-custom-nodes-root $customNodesRoot --comfy-python-executable $comfyPython --comfy-policy-file $policyPath --progress --json
     $doctorExit = $LASTEXITCODE
     try {
         $doctor = (($doctorOutput | ForEach-Object { [string]$_ }) -join "`n") | ConvertFrom-Json
@@ -3990,6 +3990,7 @@ try {
         "--comfy-output-dir", $outputRoot,
         "--comfy-model-root", $modelsRoot,
         "--comfy-custom-nodes-root", $customNodesRoot,
+        "--comfy-python-executable", $comfyPython,
         "--comfy-policy-file", $policyPath,
         "--work-root", $workRoot,
         "--interval", "2",

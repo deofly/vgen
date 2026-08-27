@@ -29,7 +29,7 @@ from .identity import (
 MAINTENANCE_INTENT_CONTEXT = b"vgen-worker-maintenance-intent-v1"
 MAINTENANCE_INTENT_KIND = "vgen-worker-maintenance-intent"
 MAINTENANCE_ACTIONS = frozenset(
-    {"worker_update", "model_install", "capability_install"}
+    {"worker_update", "model_install", "capability_install", "node_pack_install"}
 )
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")

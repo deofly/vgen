@@ -72,6 +72,7 @@ _MAINTENANCE_ACTIONS = (
     "worker_update",
     "model_install",
     "capability_install",
+    "node_pack_install",
 )
 _PAYLOAD_FORMATS = (
     "comfyui-api-graph/v1",
@@ -275,6 +276,11 @@ def canonical_worker_capabilities(
         if type(version) is not int or version != 2:
             raise PublicMetadataError("capabilities", "invalid_capability_install_spec_version")
         result["capability_install_spec_version"] = version
+    if "node_pack_install_spec_version" in raw:
+        version = raw["node_pack_install_spec_version"]
+        if type(version) is not int or version != 1:
+            raise PublicMetadataError("capabilities", "invalid_node_pack_install_spec_version")
+        result["node_pack_install_spec_version"] = version
 
     actions = raw.get("maintenance_actions", [])
     if not isinstance(actions, list) or len(actions) > len(_MAINTENANCE_ACTIONS):
@@ -404,6 +410,9 @@ def _canonical_executor_capabilities(value: Mapping[str, Any]) -> dict[str, Any]
 
     result["model_digests"] = _canonical_digest_list(
         value.get("model_digests", []), field="model_digests", maximum=1024
+    )
+    result["node_pack_digests"] = _canonical_digest_list(
+        value.get("node_pack_digests", []), field="node_pack_digests", maximum=256
     )
     readiness = _canonical_workflow_readiness(value.get("workflow_readiness", []))
     result["workflow_readiness"] = readiness

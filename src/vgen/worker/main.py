@@ -45,8 +45,10 @@ from .credentials import (
     normalize_worker_gateway_origin,
 )
 from .gateway import GatewayV1Client
+from .host_control import ComfyUIHostControl
 from .maintenance import MaintenanceOutcome, WorkerMaintenanceController
 from .models import WorkerOutcome
+from .node_packs import NodePackInstaller
 from .supervisor import (
     EXIT_UPDATE_RESTART,
     EXIT_UPDATE_ROLLBACK,
@@ -155,6 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
             else None
         ),
         help="isolated ComfyUI custom_nodes root used to verify pinned Git revisions",
+    )
+    common.add_argument(
+        "--comfy-python-executable",
+        type=Path,
+        default=(
+            Path(os.environ["VGEN_COMFYUI_PYTHON_EXECUTABLE"])
+            if os.environ.get("VGEN_COMFYUI_PYTHON_EXECUTABLE")
+            else None
+        ),
+        help="verified ComfyUI Python used for offline Node Pack dependencies",
     )
     common.add_argument(
         "--comfy-policy-file",
@@ -379,11 +391,29 @@ def _build_maintenance(
     executor: Executor,
     _session: requests.Session,
 ) -> WorkerMaintenanceController:
+    work_root = _worker_work_root(arguments)
+    custom_nodes_root = arguments.comfy_custom_nodes_root or getattr(
+        executor, "maintenance_custom_nodes_root", None
+    )
+    node_probe = getattr(executor, "maintenance_node_classes", None)
+    node_pack_installer = None
+    if (
+        custom_nodes_root is not None
+        and arguments.comfy_python_executable is not None
+        and callable(node_probe)
+    ):
+        node_pack_installer = NodePackInstaller(
+            work_root,
+            custom_nodes_root,
+            arguments.comfy_python_executable,
+            ComfyUIHostControl(work_root),
+            node_probe,
+        )
     return WorkerMaintenanceController(
         credentials,
         gateway,
         executor,  # type: ignore[arg-type]
-        work_root=_worker_work_root(arguments),
+        work_root=work_root,
         model_root=(
             arguments.comfy_model_root or getattr(executor, "maintenance_model_root", None)
         ),
@@ -391,6 +421,7 @@ def _build_maintenance(
         # the Gateway client. requests.Session is not a concurrency contract,
         # so maintenance artifacts use a separate connection pool.
         session=requests.Session(),
+        node_pack_installer=node_pack_installer,
     )
 
 
@@ -626,6 +657,7 @@ def _announced_capabilities(
         # 0.13.10 builds predate bound dependency receipts, so semver alone is
         # not evidence that this protocol is implemented.
         "capability_install_spec_version": 2,
+        "node_pack_install_spec_version": 1,
         "maintenance_actions": list(maintenance_actions),
         "executors": [
             {
@@ -676,7 +708,7 @@ def _enabled_maintenance_actions(
 ) -> tuple[str, ...]:
     if controller is None or not bool(getattr(controller, "enabled", False)):
         return ()
-    return ("worker_update", "model_install", "capability_install")
+    return ("worker_update", "model_install", "capability_install", "node_pack_install")
 
 
 def _can_poll_inference(executor: Executor, status: Mapping[str, Any]) -> bool:

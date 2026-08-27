@@ -312,9 +312,21 @@ class WorkflowRegistry:
                 if not signed or publisher_key != expected_publisher_key:
                     raise RegistryError("workflow publisher key does not match the trusted pin")
             parsed_source = urllib.parse.urlsplit(str(source))
-            if parsed_source.scheme in {"http", "https"} and expected_publisher_key is None:
+            digest_bound_unsigned_remote = (
+                allow_unsigned
+                and bool(normalized_expected)
+                and expected_workflow_id is not None
+                and expected_version is not None
+            )
+            if (
+                parsed_source.scheme in {"http", "https"}
+                and expected_publisher_key is None
+                and not digest_bound_unsigned_remote
+            ):
                 raise RegistryError(
-                    "remote workflow install requires an out-of-band --publisher-key pin"
+                    "remote workflow install requires an out-of-band publisher-key pin or "
+                    "an exact official "
+                    "index digest, id, and version binding"
                 )
             namespace, name = manifest.id.split("/", 1)
             target = self.root / manifest.provenance / namespace / name / manifest.version

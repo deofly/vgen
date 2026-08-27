@@ -270,6 +270,7 @@ class WorkerCreate(WireModel):
 
 class GatewayProtocolFeatures(WireModel):
     capability_install_spec_version: Literal[2]
+    node_pack_install_spec_version: Literal[1]
 
 
 class WorkerWorkflowReadiness(WireModel):
@@ -292,6 +293,7 @@ class WorkerWorkflowReadiness(WireModel):
 class WorkerExecutorCapabilityFacts(WireModel):
     capability_schema_version: Literal[2] | None = None
     model_digests: list[str] = Field(default_factory=list)
+    node_pack_digests: list[str] = Field(default_factory=list)
     workflow_readiness: list[WorkerWorkflowReadiness] = Field(default_factory=list)
     ready_workflow_digests: list[str] = Field(default_factory=list)
     vram_bytes: int | None = Field(default=None, ge=0)
@@ -313,8 +315,9 @@ class WorkerExecutorCapability(WireModel):
 class WorkerCapabilities(WireModel):
     worker_runtime_version: str | None = None
     capability_install_spec_version: Literal[2] | None = None
+    node_pack_install_spec_version: Literal[1] | None = None
     maintenance_actions: list[
-        Literal["worker_update", "model_install", "capability_install"]
+        Literal["worker_update", "model_install", "capability_install", "node_pack_install"]
     ] = Field(default_factory=list)
     executors: list[WorkerExecutorCapability] = Field(default_factory=list)
 
@@ -539,8 +542,33 @@ class CapabilityInstallSpec(WireModel):
         return self
 
 
+class NodePackInstallSpec(WireModel):
+    kind: Literal["node_pack_install"]
+    node_pack_ref: str = Field(
+        min_length=1,
+        max_length=512,
+        pattern=_WORKFLOW_RELEASE_REF_PATTERN,
+    )
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_size: int = Field(ge=1, le=1024**3, strict=True)
+    node_classes: list[
+        Annotated[
+            str,
+            Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"),
+        ]
+    ] = Field(min_length=1, max_length=512)
+    apply: Literal["on_idle"] = "on_idle"
+
+    @field_validator("node_classes")
+    @classmethod
+    def node_classes_are_sorted_and_unique(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("Node Pack classes must be sorted and unique")
+        return value
+
+
 WorkerMaintenanceSpec = Annotated[
-    WorkerUpdateSpec | ModelInstallSpec | CapabilityInstallSpec,
+    WorkerUpdateSpec | ModelInstallSpec | CapabilityInstallSpec | NodePackInstallSpec,
     Field(discriminator="kind"),
 ]
 
@@ -548,7 +576,9 @@ WorkerMaintenanceSpec = Annotated[
 class MaintenanceIntentPayload(WireModel):
     version: Literal[1]
     kind: Literal["vgen-worker-maintenance-intent"]
-    action: Literal["worker_update", "model_install", "capability_install"]
+    action: Literal[
+        "worker_update", "model_install", "capability_install", "node_pack_install"
+    ]
     worker_id: str = Field(min_length=1, max_length=120)
     broker_id: str = Field(min_length=1, max_length=120)
     device_id: str = Field(min_length=1, max_length=120)
@@ -629,11 +659,13 @@ class WorkerMaintenanceCancel(WireModel):
 
 class WorkerMaintenanceClaim(WireModel):
     ttl_seconds: int = Field(default=60, ge=15, le=300)
-    supported_actions: list[Literal["worker_update", "model_install", "capability_install"]] = (
+    supported_actions: list[
+        Literal["worker_update", "model_install", "capability_install", "node_pack_install"]
+    ] = (
         Field(
             default_factory=lambda: ["worker_update", "model_install"],
             min_length=1,
-            max_length=3,
+            max_length=4,
         )
     )
 
@@ -750,10 +782,35 @@ class CapabilityInstallMaintenanceResult(WireModel):
         return self
 
 
+class NodePackInstallMaintenanceResult(WireModel):
+    kind: Literal["node_pack_install"]
+    status: Literal["installed", "already_installed", "failed"]
+    node_pack_ref: str = Field(
+        min_length=1,
+        max_length=512,
+        pattern=_WORKFLOW_RELEASE_REF_PATTERN,
+    )
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    loaded: bool | None = Field(default=None, strict=True)
+    error_code: int | None = Field(default=None, ge=100000, le=999999, strict=True)
+
+    @model_validator(mode="after")
+    def success_and_failure_fields_are_disjoint(
+        self,
+    ) -> NodePackInstallMaintenanceResult:
+        if self.status == "failed":
+            if self.loaded is not None or self.error_code is None:
+                raise ValueError("failed Node Pack installs require only an error code")
+        elif self.loaded is not True or self.error_code is not None:
+            raise ValueError("successful Node Pack installs require loaded=true")
+        return self
+
+
 WorkerMaintenanceResult = Annotated[
     WorkerUpdateMaintenanceResult
     | ModelInstallMaintenanceResult
-    | CapabilityInstallMaintenanceResult,
+    | CapabilityInstallMaintenanceResult
+    | NodePackInstallMaintenanceResult,
     Field(discriminator="kind"),
 ]
 

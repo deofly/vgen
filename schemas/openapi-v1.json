@@ -1277,10 +1277,16 @@
             "const": 2,
             "title": "Capability Install Spec Version",
             "type": "integer"
+          },
+          "node_pack_install_spec_version": {
+            "const": 1,
+            "title": "Node Pack Install Spec Version",
+            "type": "integer"
           }
         },
         "required": [
-          "capability_install_spec_version"
+          "capability_install_spec_version",
+          "node_pack_install_spec_version"
         ],
         "title": "GatewayProtocolFeatures",
         "type": "object"
@@ -1497,7 +1503,8 @@
             "enum": [
               "worker_update",
               "model_install",
-              "capability_install"
+              "capability_install",
+              "node_pack_install"
             ],
             "title": "Action",
             "type": "string"
@@ -1663,6 +1670,124 @@
           "model_digests"
         ],
         "title": "ModelInstallSpec",
+        "type": "object"
+      },
+      "NodePackInstallMaintenanceResult": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Artifact Sha256",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maximum": 999999.0,
+                "minimum": 100000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "kind": {
+            "const": "node_pack_install",
+            "title": "Kind",
+            "type": "string"
+          },
+          "loaded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loaded"
+          },
+          "node_pack_ref": {
+            "maxLength": 512,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+            "title": "Node Pack Ref",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "installed",
+              "already_installed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "status",
+          "node_pack_ref",
+          "artifact_sha256"
+        ],
+        "title": "NodePackInstallMaintenanceResult",
+        "type": "object"
+      },
+      "NodePackInstallSpec": {
+        "additionalProperties": false,
+        "properties": {
+          "apply": {
+            "const": "on_idle",
+            "default": "on_idle",
+            "title": "Apply",
+            "type": "string"
+          },
+          "artifact_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Artifact Sha256",
+            "type": "string"
+          },
+          "artifact_size": {
+            "maximum": 1073741824.0,
+            "minimum": 1.0,
+            "title": "Artifact Size",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "node_pack_install",
+            "title": "Kind",
+            "type": "string"
+          },
+          "node_classes": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+              "type": "string"
+            },
+            "maxItems": 512,
+            "minItems": 1,
+            "title": "Node Classes",
+            "type": "array"
+          },
+          "node_pack_ref": {
+            "maxLength": 512,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+            "title": "Node Pack Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "node_pack_ref",
+          "artifact_sha256",
+          "artifact_size",
+          "node_classes"
+        ],
+        "title": "NodePackInstallSpec",
         "type": "object"
       },
       "OutputArtifact": {
@@ -2618,6 +2743,10 @@
               340017,
               340018,
               340019,
+              340020,
+              340021,
+              340022,
+              340023,
               400001,
               400002,
               400003,
@@ -2716,6 +2845,10 @@
               "CAPABILITY_RELEASE_INVALID",
               "CAPABILITY_COMPILE_INVALID",
               "CAPABILITY_GRAPH_INVALID",
+              "NODE_PACK_ARCHIVE_INVALID",
+              "NODE_PACK_DEPENDENCY_INSTALL_FAILED",
+              "NODE_PACK_ACTIVATION_FAILED",
+              "NODE_PACK_ROLLBACK_FAILED",
               "DECRYPTION_FAILED",
               "KEY_VERSION_UNAVAILABLE",
               "KEY_MANIFEST_INVALID",
@@ -2892,12 +3025,25 @@
               "enum": [
                 "worker_update",
                 "model_install",
-                "capability_install"
+                "capability_install",
+                "node_pack_install"
               ],
               "type": "string"
             },
             "title": "Maintenance Actions",
             "type": "array"
+          },
+          "node_pack_install_spec_version": {
+            "anyOf": [
+              {
+                "const": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Pack Install Spec Version"
           },
           "worker_runtime_version": {
             "anyOf": [
@@ -3206,6 +3352,13 @@
             "title": "Model Digests",
             "type": "array"
           },
+          "node_pack_digests": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Node Pack Digests",
+            "type": "array"
+          },
           "ram_bytes": {
             "anyOf": [
               {
@@ -3377,11 +3530,12 @@
               "enum": [
                 "worker_update",
                 "model_install",
-                "capability_install"
+                "capability_install",
+                "node_pack_install"
               ],
               "type": "string"
             },
-            "maxItems": 3,
+            "maxItems": 4,
             "minItems": 1,
             "title": "Supported Actions",
             "type": "array"
@@ -3416,6 +3570,7 @@
               "mapping": {
                 "capability_install": "#/components/schemas/CapabilityInstallMaintenanceResult",
                 "model_install": "#/components/schemas/ModelInstallMaintenanceResult",
+                "node_pack_install": "#/components/schemas/NodePackInstallMaintenanceResult",
                 "worker_update": "#/components/schemas/WorkerUpdateMaintenanceResult"
               },
               "propertyName": "kind"
@@ -3429,6 +3584,9 @@
               },
               {
                 "$ref": "#/components/schemas/CapabilityInstallMaintenanceResult"
+              },
+              {
+                "$ref": "#/components/schemas/NodePackInstallMaintenanceResult"
               }
             ],
             "title": "Result"
@@ -3457,6 +3615,7 @@
               "mapping": {
                 "capability_install": "#/components/schemas/CapabilityInstallSpec",
                 "model_install": "#/components/schemas/ModelInstallSpec",
+                "node_pack_install": "#/components/schemas/NodePackInstallSpec",
                 "worker_update": "#/components/schemas/WorkerUpdateSpec"
               },
               "propertyName": "kind"
@@ -3470,6 +3629,9 @@
               },
               {
                 "$ref": "#/components/schemas/CapabilityInstallSpec"
+              },
+              {
+                "$ref": "#/components/schemas/NodePackInstallSpec"
               }
             ],
             "title": "Spec"

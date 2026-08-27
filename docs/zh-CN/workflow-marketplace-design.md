@@ -236,13 +236,13 @@ Custom node 是可执行 Python 代码，不能塞回惰性 workflow capability�
 
 安装包不得携带任意安装脚本；复制、依赖安装和探测由 VGen 的固定状态机执行。TUF 只能证明“下载的是审核过的代码”，不能替代隔离和回滚。
 
-当前 Worker 在过渡期只作两项独立的 fail-closed 证明：一是隔离的 `custom_nodes` 根目录中，每个顶层可执行入口都是当前 policy/capability 精确固定的 Git origin + commit，根目录中出现额外 repository、Python 文件、链接/reparse point 或未跟踪内容时一律不 ready；二是工作流所需 class 在 ComfyUI 全局 `/object_info` 中可见。这只能表述为“exact checkout present + class visible”。`/object_info` 不返回 class 的 provider identity，因此这两项事实不能证明该 class 一定由所固定的 repository 提供。真正的 class→provider 绑定必须由 Node Pack 与 Host Protocol v2 提供 pack digest、隔离 staging 和逐 class 的受签名加载回执。
+Node Pack v1 已实现独立的内容寻址归档、离线 wheel、隔离 staging、Supervisor 暂停/恢复、原子激活、`/object_info` 验证和失败回滚。Worker 为激活目录内每个文件写入并持续校验 SHA-256 回执；workflow capability 还必须固定 Node Pack ref、归档摘要、源码 origin、commit 和 node class 清单，任一项不符都保持 `missing_nodes`。历史手工 Git 节点仍只证明“exact checkout present + class visible”，不应与受管 Node Pack 的回执混为一谈。
 
 当前 Supervisor、ComfyUI 和 Worker 使用同一个 Windows 用户。Custom node 因而可能读取该用户可读的 Worker credential。Node Pack v1 只能定义为“Owner/Marketplace 审核过的可信代码”，不能宣称是安全沙箱。进一步隔离需要独立 OS identity、ACL、进程边界和凭据代理。
 
-现有远程 `worker_update` 只切换 Worker Python runtime，不能更新 PowerShell host，也不能可靠地单独停启 ComfyUI。首次引入 Host Protocol v2 仍需要一次受管 Windows host bundle 迁移；迁移后新 workflow 和受支持 Node Pack 才能只从 Mac 远程安装。Host 更新、Node Pack 更新和 Workflow 更新必须是三个独立协议，互不冒充成功。
+`worker_update`、`node_pack_install` 和 `capability_install` 是三个独立维护协议，分别报告结果。受管 Supervisor 通过带 nonce 和期限的本机控制文件只暂停 ComfyUI，Worker 远程通道保持在线，因此节点安装不再依赖前台窗口或人工重启。
 
-第一阶段 stable 只允许 `custom_nodes: []`。含第三方节点的 release 可标记为 `host_dependency_required` 或 preview；只有 Worker 已上报精确、受管的 node pack digest 时才允许激活，不能伪装成通用一键安装。
+含第三方节点的 release 只有在 Worker 已完成精确 Node Pack 安装并上报受管摘要后才允许 ready。未经 Node Pack 审核的任意 custom node 仍不得伪装成通用一键安装。
 
 ## 10. LTX-2.5 发布策略
 
