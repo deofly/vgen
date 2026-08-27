@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import shutil
+import socket
 import stat
 import tempfile
 import urllib.parse
@@ -19,13 +21,19 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from platformdirs import user_data_path
 
-from .models import SEMVER_RE, WORKFLOW_ID_RE, WorkflowManifest
+from .models import (
+    RESERVED_WORKFLOW_ROOT_FILES,
+    WorkflowManifest,
+    validate_workflow_id,
+    validate_workflow_version,
+)
+from .paths import canonical_package_path, package_path_key
 
-IGNORED_DIGEST_FILES = {"checksums.sha256", "artifact.sig", "workflow.lock"}
 MAX_PACKAGE_FILES = 2_048
 MAX_ARCHIVE_BYTES = 64 * 1024**2
 MAX_UNCOMPRESSED_BYTES = 256 * 1024**2
 MAX_INDEX_BYTES = 8 * 1024**2
+MAX_REDIRECTS = 5
 
 
 class RegistryError(RuntimeError):
@@ -43,11 +51,27 @@ class InstallResult:
 def package_files(directory: Path) -> list[Path]:
     files: list[Path] = []
     total = 0
+    seen: dict[str, str] = {}
     for path in directory.rglob("*"):
         if path.is_symlink():
             raise RegistryError("workflow packages cannot contain symbolic links")
-        if not path.is_file() or path.name in IGNORED_DIGEST_FILES:
+        relative = path.relative_to(directory).as_posix()
+        try:
+            canonical = canonical_package_path(relative, label="workflow package path")
+            key = package_path_key(canonical)
+        except ValueError as exc:
+            raise RegistryError("workflow package contains a non-portable path") from exc
+        previous = seen.setdefault(key, canonical)
+        if previous != canonical:
+            raise RegistryError("workflow package contains cross-platform path collisions")
+        if key in RESERVED_WORKFLOW_ROOT_FILES:
+            if canonical != key:
+                raise RegistryError("workflow package metadata names must use canonical spelling")
             continue
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise RegistryError("workflow package contains an unsupported filesystem entry")
         files.append(path)
         total += path.stat().st_size
         if len(files) > MAX_PACKAGE_FILES or total > MAX_UNCOMPRESSED_BYTES:
@@ -170,18 +194,33 @@ def build_archive(
     """Build a deterministic zip suitable for a static workflow registry."""
 
     validate_package(directory, allow_unsigned=allow_unsigned)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for path in sorted(
+    source_root = directory.resolve()
+    output_path = output.resolve()
+    if output_path.is_relative_to(source_root):
+        raise RegistryError("workflow archive output must be outside the package directory")
+    archive_files = sorted(
+        (
             item
             for item in directory.rglob("*")
-            if item.is_file() and item.name != "workflow.lock"
-        ):
-            relative = path.relative_to(directory).as_posix()
-            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o100644 << 16
-            archive.writestr(info, path.read_bytes())
+            if item.is_file()
+            and package_path_key(item.relative_to(directory).as_posix()) != "workflow.lock"
+        ),
+        key=lambda path: path.relative_to(directory).as_posix().encode("utf-8"),
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".vgen-archive-", dir=output.parent) as temp:
+        staged = Path(temp) / output.name
+        with zipfile.ZipFile(
+            staged, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as archive:
+            for path in archive_files:
+                relative = path.relative_to(directory).as_posix()
+                info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                info.create_system = 3
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, path.read_bytes())
+        staged.replace(output)
     return output
 
 
@@ -249,10 +288,16 @@ class WorkflowRegistry:
         *,
         expected_digest: str | None = None,
         expected_publisher_key: str | None = None,
+        expected_workflow_id: str | None = None,
+        expected_version: str | None = None,
     ) -> InstallResult:
         with tempfile.TemporaryDirectory(prefix="vgen-workflow-") as temp:
             unpacked = self._materialize(source, Path(temp))
             manifest, digest, signed = validate_package(unpacked, allow_unsigned=allow_unsigned)
+            if expected_workflow_id is not None and manifest.id != expected_workflow_id:
+                raise RegistryError("workflow package id does not match the requested target")
+            if expected_version is not None and manifest.version != expected_version:
+                raise RegistryError("workflow package version does not match the requested target")
             normalized_expected = (expected_digest or "").removeprefix("sha256:")
             if normalized_expected and normalized_expected != digest:
                 raise RegistryError("market index digest does not match the signed package")
@@ -267,31 +312,23 @@ class WorkflowRegistry:
                 if not signed or publisher_key != expected_publisher_key:
                     raise RegistryError("workflow publisher key does not match the trusted pin")
             parsed_source = urllib.parse.urlsplit(str(source))
-            if (
-                manifest.provenance == "market"
-                and signed
-                and parsed_source.scheme in {"http", "https"}
-                and expected_publisher_key is None
-            ):
+            if parsed_source.scheme in {"http", "https"} and expected_publisher_key is None:
                 raise RegistryError(
-                    "remote market install requires an out-of-band --publisher-key pin"
+                    "remote workflow install requires an out-of-band --publisher-key pin"
                 )
             namespace, name = manifest.id.split("/", 1)
             target = self.root / manifest.provenance / namespace / name / manifest.version
             if target.exists():
-                installed_manifest, installed_digest, installed_signed = validate_package(
-                    target, allow_unsigned=True
+                return self._existing_install(
+                    target,
+                    digest,
+                    require_signed=signed,
+                    expected_publisher_key=expected_publisher_key,
                 )
-                if installed_digest != digest:
-                    raise RegistryError(
-                        "same workflow version already exists with a different digest; publish a new version"
-                    )
-                return InstallResult(installed_manifest, target, installed_digest, installed_signed)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(unpacked, target)
             lock: dict[str, Any] = {
                 "schema_version": 1,
-                "source": str(source),
+                "source": self._lock_source(source),
                 "id": manifest.id,
                 "version": manifest.version,
                 "digest": f"sha256:{digest}",
@@ -299,10 +336,97 @@ class WorkflowRegistry:
                 "publisher_key": publisher_key,
                 "signed": signed,
             }
-            (target / "workflow.lock").write_text(
-                yaml.safe_dump(lock, sort_keys=False), encoding="utf-8"
-            )
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=f".{manifest.version}.vgen-staging-",
+                    dir=target.parent,
+                ) as staging_text:
+                    staging = Path(staging_text)
+                    shutil.copytree(unpacked, staging, dirs_exist_ok=True)
+                    staged_manifest, staged_digest, staged_signed = validate_package(
+                        staging, allow_unsigned=allow_unsigned
+                    )
+                    if (
+                        staged_digest != digest
+                        or staged_manifest.id != manifest.id
+                        or staged_manifest.version != manifest.version
+                        or staged_manifest.provenance != manifest.provenance
+                        or staged_signed != signed
+                    ):
+                        raise RegistryError("workflow source changed while it was being installed")
+                    (staging / "workflow.lock").write_text(
+                        yaml.safe_dump(lock, sort_keys=False), encoding="utf-8"
+                    )
+                    final_manifest, final_digest, final_signed = validate_package(
+                        staging, allow_unsigned=allow_unsigned
+                    )
+                    if (
+                        final_digest != digest
+                        or final_manifest.id != manifest.id
+                        or final_manifest.version != manifest.version
+                        or final_signed != signed
+                    ):
+                        raise RegistryError(
+                            "workflow changed while installation metadata was finalized"
+                        )
+                    try:
+                        staging.rename(target)
+                    except OSError as exc:
+                        if target.exists():
+                            return self._existing_install(
+                                target,
+                                digest,
+                                require_signed=signed,
+                                expected_publisher_key=expected_publisher_key,
+                            )
+                        raise RegistryError("workflow could not be activated atomically") from exc
+            except RegistryError:
+                raise
+            except (OSError, shutil.Error) as exc:
+                raise RegistryError("workflow could not be staged safely") from exc
             return InstallResult(manifest, target, digest, signed)
+
+    @staticmethod
+    def _existing_install(
+        target: Path,
+        expected_digest: str,
+        *,
+        require_signed: bool,
+        expected_publisher_key: str | None,
+    ) -> InstallResult:
+        installed_manifest, installed_digest, installed_signed = validate_package(
+            target, allow_unsigned=True
+        )
+        if installed_digest != expected_digest:
+            raise RegistryError(
+                "same workflow version already exists with a different digest; publish a new version"
+            )
+        if require_signed and not installed_signed:
+            raise RegistryError("existing workflow is missing its required publisher signature")
+        if expected_publisher_key is not None and (
+            not installed_signed
+            or installed_manifest.publisher.public_key != expected_publisher_key
+        ):
+            raise RegistryError("existing workflow does not match the trusted publisher key")
+        return InstallResult(installed_manifest, target, installed_digest, installed_signed)
+
+    @staticmethod
+    def _lock_source(source: str | Path) -> str:
+        """Persist provenance without retaining URL credentials or capabilities."""
+
+        value = str(source)
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme not in {"http", "https"}:
+            return value
+        try:
+            hostname = parsed.hostname or ""
+            port = parsed.port
+        except ValueError:
+            return f"{parsed.scheme}://<invalid>"
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        if port is not None:
+            authority += f":{port}"
+        return urllib.parse.urlunsplit((parsed.scheme, authority, "", "", ""))
 
     def remove(
         self,
@@ -311,10 +435,11 @@ class WorkflowRegistry:
         *,
         provenance: str | None = None,
     ) -> None:
-        if not WORKFLOW_ID_RE.fullmatch(workflow_id):
-            raise RegistryError("workflow id must be namespace/name using lowercase characters")
-        if not SEMVER_RE.fullmatch(version):
-            raise RegistryError("workflow version must be SemVer")
+        try:
+            validate_workflow_id(workflow_id)
+            validate_workflow_version(version)
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
         if provenance not in {None, "market", "custom"}:
             raise RegistryError("workflow provenance must be market or custom")
         namespace, _, name = workflow_id.partition("/")
@@ -358,39 +483,61 @@ class WorkflowRegistry:
             raise RegistryError("workflow source must be a directory or zip archive")
         destination = temp / "unpacked"
         destination.mkdir()
-        with zipfile.ZipFile(local_path) as archive:
-            members = archive.infolist()
-            if len(members) > MAX_PACKAGE_FILES:
-                raise RegistryError("workflow archive contains too many files")
-            seen: set[str] = set()
-            total = 0
-            for info in members:
-                member_name = info.filename
-                if info.flag_bits & 0x1:
-                    raise RegistryError("encrypted workflow archives are not supported")
-                if (
-                    not member_name
-                    or "\\" in member_name
-                    or "\x00" in member_name
-                    or member_name.startswith("/")
-                    or (
-                        len(member_name) >= 2 and member_name[0].isalpha() and member_name[1] == ":"
-                    )
-                ):
-                    raise RegistryError("workflow archive contains an invalid path")
-                if member_name in seen:
-                    raise RegistryError("workflow archive contains duplicate paths")
-                seen.add(member_name)
-                target = (destination / member_name).resolve()
-                if not target.is_relative_to(destination.resolve()):
-                    raise RegistryError("workflow archive contains a path traversal")
-                mode = info.external_attr >> 16
-                if stat.S_ISLNK(mode):
-                    raise RegistryError("workflow archive contains a symbolic link")
-                total += info.file_size
-                if total > MAX_UNCOMPRESSED_BYTES:
-                    raise RegistryError("workflow archive exceeds the uncompressed size limit")
-            archive.extractall(destination)
+        try:
+            with zipfile.ZipFile(local_path) as archive:
+                members = archive.infolist()
+                if len(members) > MAX_PACKAGE_FILES:
+                    raise RegistryError("workflow archive contains too many files")
+                seen: set[str] = set()
+                required_directories: set[str] = set()
+                files: set[str] = set()
+                total = 0
+                for info in members:
+                    member_name = info.filename
+                    directory_entry = info.is_dir()
+                    path_text = member_name[:-1] if directory_entry else member_name
+                    try:
+                        canonical = canonical_package_path(
+                            path_text,
+                            label="workflow archive path",
+                        )
+                        key = package_path_key(canonical)
+                    except ValueError as exc:
+                        raise RegistryError("workflow archive contains an invalid path") from exc
+                    if canonical != path_text:
+                        raise RegistryError("workflow archive path is not canonical")
+                    if key in RESERVED_WORKFLOW_ROOT_FILES and canonical != key:
+                        raise RegistryError("workflow archive metadata name is not canonical")
+                    if info.flag_bits & 0x1:
+                        raise RegistryError("encrypted workflow archives are not supported")
+                    if key in seen:
+                        raise RegistryError("workflow archive contains duplicate paths")
+                    parents = canonical.split("/")[:-1]
+                    parent_key = ""
+                    for part in parents:
+                        parent_key = f"{parent_key}/{part.casefold()}".lstrip("/")
+                        if parent_key in files:
+                            raise RegistryError("workflow archive has a file-directory conflict")
+                        required_directories.add(parent_key)
+                    if not directory_entry and key in required_directories:
+                        raise RegistryError("workflow archive has a file-directory conflict")
+                    seen.add(key)
+                    if not directory_entry:
+                        files.add(key)
+                    target = (destination / canonical).resolve()
+                    if not target.is_relative_to(destination.resolve()):
+                        raise RegistryError("workflow archive contains a path traversal")
+                    mode = info.external_attr >> 16
+                    if stat.S_ISLNK(mode):
+                        raise RegistryError("workflow archive contains a symbolic link")
+                    total += info.file_size
+                    if total > MAX_UNCOMPRESSED_BYTES:
+                        raise RegistryError("workflow archive exceeds the uncompressed size limit")
+                archive.extractall(destination)
+        except RegistryError:
+            raise
+        except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            raise RegistryError("workflow archive is invalid or unreadable") from exc
         manifests = list(destination.glob("**/manifest.yaml"))
         if len(manifests) != 1:
             raise RegistryError("workflow archive must contain exactly one manifest.yaml")
@@ -398,34 +545,106 @@ class WorkflowRegistry:
 
     @staticmethod
     def _download(url: str, *, max_bytes: int, timeout: float) -> bytes:
-        parsed = urllib.parse.urlsplit(url)
-        loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+        initial = WorkflowRegistry._remote_origin(url)
+        current = url
+        try:
+            for redirect_count in range(MAX_REDIRECTS + 1):
+                with httpx.stream(
+                    "GET",
+                    current,
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as response:
+                    WorkflowRegistry._validate_response_peer(response)
+                    if 300 <= response.status_code < 400:
+                        if redirect_count >= MAX_REDIRECTS:
+                            raise RegistryError("remote workflow redirect limit exceeded")
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise RegistryError("remote workflow redirect has no location")
+                        redirected = urllib.parse.urljoin(current, location)
+                        if WorkflowRegistry._remote_origin(redirected) != initial:
+                            raise RegistryError("remote workflow redirect changed origin")
+                        current = redirected
+                        continue
+
+                    response.raise_for_status()
+                    chunks: list[bytes] = []
+                    size = 0
+                    content_length = response.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            declared_size = int(content_length)
+                        except ValueError as exc:
+                            raise RegistryError(
+                                "remote workflow response has an invalid size"
+                            ) from exc
+                        if declared_size < 0 or declared_size > max_bytes:
+                            raise RegistryError("remote workflow response exceeds the size limit")
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise RegistryError("remote workflow response exceeds the size limit")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+        except RegistryError:
+            raise
+        except httpx.HTTPError as exc:
+            raise RegistryError("remote workflow download failed") from exc
+        raise RegistryError("remote workflow redirect limit exceeded")
+
+    @staticmethod
+    def _remote_origin(url: str) -> tuple[str, str, int]:
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            hostname = (parsed.hostname or "").casefold()
+            port = parsed.port
+        except ValueError as exc:
+            raise RegistryError("remote workflow URL is invalid") from exc
+        if parsed.scheme != "https":
             raise RegistryError("remote workflow URLs must use HTTPS")
-        if parsed.username or parsed.password or not parsed.hostname:
+        if parsed.username or parsed.password or not hostname or parsed.fragment:
             raise RegistryError("remote workflow URL is invalid")
-        chunks: list[bytes] = []
-        size = 0
-        with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
-            response.raise_for_status()
-            final = urllib.parse.urlsplit(str(response.url))
-            final_loopback = final.hostname in {"localhost", "127.0.0.1", "::1"}
-            if final_loopback != loopback or (
-                final.scheme != "https"
-                and not (final.scheme == "http" and loopback and final_loopback)
-            ):
-                raise RegistryError("remote workflow redirect left the trusted HTTPS origin class")
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                try:
-                    declared_size = int(content_length)
-                except ValueError as exc:
-                    raise RegistryError("remote workflow response has an invalid size") from exc
-                if declared_size < 0 or declared_size > max_bytes:
-                    raise RegistryError("remote workflow response exceeds the size limit")
-            for chunk in response.iter_bytes():
-                size += len(chunk)
-                if size > max_bytes:
-                    raise RegistryError("remote workflow response exceeds the size limit")
-                chunks.append(chunk)
-        return b"".join(chunks)
+        effective_port = port if port is not None else (443 if parsed.scheme == "https" else 80)
+        WorkflowRegistry._validate_public_host(hostname, effective_port)
+        return parsed.scheme, hostname, effective_port
+
+    @staticmethod
+    def _resolve_remote(host: str, port: int) -> tuple[str, ...]:
+        try:
+            values = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise RegistryError("remote workflow host is unavailable") from exc
+        return tuple(dict.fromkeys(str(item[4][0]) for item in values))
+
+    @staticmethod
+    def _validate_public_host(host: str, port: int) -> None:
+        addresses = WorkflowRegistry._resolve_remote(host, port)
+        if not addresses:
+            raise RegistryError("remote workflow host is unavailable")
+        try:
+            if any(not ipaddress.ip_address(address).is_global for address in addresses):
+                raise RegistryError("remote workflow URL must resolve to public addresses")
+        except ValueError as exc:
+            raise RegistryError("remote workflow host is invalid") from exc
+
+    @staticmethod
+    def _validate_response_peer(response: Any) -> None:
+        """Recheck the connected peer when the HTTP transport exposes it."""
+
+        extensions = getattr(response, "extensions", None)
+        if not isinstance(extensions, dict):
+            raise RegistryError("remote workflow peer address is unavailable")
+        stream = extensions.get("network_stream")
+        get_extra_info = getattr(stream, "get_extra_info", None)
+        if not callable(get_extra_info):
+            raise RegistryError("remote workflow peer address is unavailable")
+        peer = get_extra_info("server_addr")
+        if not isinstance(peer, tuple) or not peer or not isinstance(peer[0], str):
+            raise RegistryError("remote workflow peer address is unavailable")
+        try:
+            if not ipaddress.ip_address(peer[0]).is_global:
+                raise RegistryError("remote workflow peer is not public")
+        except ValueError as exc:
+            raise RegistryError("remote workflow peer address is invalid") from exc

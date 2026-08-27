@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -53,6 +56,14 @@ def pin(content: bytes, **overrides: Any) -> Any:
 
 def public_resolver(_host: str, _port: int) -> tuple[str, ...]:
     return ("8.8.8.8",)
+
+
+def _wait_for_file(path: Path, *, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {path.name}")
+        time.sleep(0.01)
 
 
 def test_installs_verified_model_without_overwriting(tmp_path: Path) -> None:
@@ -206,6 +217,163 @@ def test_same_digest_is_downloaded_once_and_hardlinked_to_multiple_placements(
     assert not first_path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
     assert not second_path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
     assert not blob.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+
+
+def test_digest_lock_serializes_independent_installers(tmp_path: Path) -> None:
+    content = b"one reviewed digest shared across independent worker processes"
+    digest = hashlib.sha256(content).hexdigest()
+    partial = (
+        tmp_path
+        / ".vgen/artifacts/sha256"
+        / digest[:2]
+        / f".{digest}.vgen.partial"
+    )
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(content)
+    held = tmp_path / "held"
+    release = tmp_path / "release"
+    first_result = tmp_path / "first.result"
+    second_result = tmp_path / "second.result"
+    helper = """
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from vgen.worker.model_installer import ModelInstaller
+
+root, digest, size, target, mode, marker, release, result = sys.argv[1:9]
+root = Path(root)
+marker = Path(marker)
+release = Path(release)
+result = Path(result)
+installer = ModelInstaller(root)
+pin = SimpleNamespace(
+    path=target,
+    sha256=digest,
+    size=int(size),
+    source=None,
+    revision=None,
+    license=None,
+    license_url=None,
+    gated=True,
+    manual_download=True,
+)
+if mode == "hold":
+    with installer._digest_lock(digest):
+        marker.write_text("locked", encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not release.exists():
+            raise SystemExit(3)
+installed = installer.install(pin)
+result.write_text(installed.status, encoding="utf-8")
+"""
+    first = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            helper,
+            str(tmp_path),
+            digest,
+            str(len(content)),
+            "text_encoders/shared.safetensors",
+            "hold",
+            str(held),
+            str(release),
+            str(first_result),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second: subprocess.Popen[str] | None = None
+    try:
+        _wait_for_file(held)
+        second = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                helper,
+                str(tmp_path),
+                digest,
+                str(len(content)),
+                "clip/shared.safetensors",
+                "install",
+                str(tmp_path / "unused"),
+                str(release),
+                str(second_result),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        assert second.poll() is None
+        assert not second_result.exists()
+        release.write_text("release", encoding="utf-8")
+        first_output = first.communicate(timeout=10)
+        second_output = second.communicate(timeout=10)
+        assert first.returncode == 0, first_output
+        assert second.returncode == 0, second_output
+        assert {first_result.read_text(), second_result.read_text()} == {
+            "installed",
+            "already_installed",
+        }
+        assert (tmp_path / "text_encoders/shared.safetensors").read_bytes() == content
+        assert (tmp_path / "clip/shared.safetensors").read_bytes() == content
+        assert not partial.exists()
+    finally:
+        release.touch(exist_ok=True)
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+
+
+def test_alternative_placement_resumes_the_digest_partial_instead_of_redownloading(
+    tmp_path: Path,
+) -> None:
+    content = b"one digest shared by two reviewed mirrors"
+    first_body = content[:-1]
+    session = FakeSession(
+        FakeResponse(200, first_body),
+        FakeResponse(
+            206,
+            content[-1:],
+            {"Content-Range": (f"bytes {len(first_body)}-{len(content) - 1}/{len(content)}")},
+        ),
+    )
+    installer = ModelInstaller(
+        tmp_path,
+        session=session,  # type: ignore[arg-type]
+        resolver=public_resolver,
+    )
+
+    with pytest.raises(ModelInstallError, match="MODEL_SIZE_MISMATCH"):
+        installer.install(
+            pin(
+                content,
+                path="text_encoders/shared.safetensors",
+                source="https://first.example.test/shared.safetensors",
+            )
+        )
+
+    result = installer.install(
+        pin(
+            content,
+            path="clip/shared.safetensors",
+            source="https://second.example.test/shared.safetensors",
+        )
+    )
+    digest = hashlib.sha256(content).hexdigest()
+    partial = tmp_path / ".vgen/artifacts/sha256" / digest[:2] / f".{digest}.vgen.partial"
+
+    assert result.status == "installed"
+    assert session.requests[1]["headers"] == {"Range": f"bytes={len(first_body)}-"}
+    assert sum(len(response) for response in (first_body, content[-1:])) == len(content)
+    assert (tmp_path / "clip/shared.safetensors").read_bytes() == content
+    assert not partial.exists()
 
 
 @pytest.mark.parametrize(

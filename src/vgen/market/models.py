@@ -1,34 +1,56 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .paths import canonical_package_path, package_path_key
 
 WORKFLOW_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$")
 SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
+RESERVED_WORKFLOW_ROOT_FILES = frozenset({"artifact.sig", "checksums.sha256", "workflow.lock"})
+
+
+def validate_workflow_id(value: str) -> str:
+    if not WORKFLOW_ID_RE.fullmatch(value):
+        raise ValueError("workflow id must be namespace/name using lowercase characters")
+    namespace, name = value.split("/", 1)
+    try:
+        canonical_package_path(namespace, label="workflow namespace")
+        canonical_package_path(name, label="workflow name")
+    except ValueError as exc:
+        raise ValueError(
+            "workflow id components must be portable across supported filesystems"
+        ) from exc
+    return value
+
+
+def validate_workflow_version(value: str) -> str:
+    try:
+        canonical_package_path(value, label="workflow version")
+    except ValueError as exc:
+        raise ValueError("workflow version must be a portable SemVer") from exc
+    without_build, _, build = value.partition("+")
+    _core, separator, prerelease = without_build.partition("-")
+    if (
+        not SEMVER_RE.fullmatch(value)
+        or (separator and any(not item for item in prerelease.split(".")))
+        or (build and any(not item for item in build.split(".")))
+    ):
+        raise ValueError("workflow version must be SemVer")
+    return value
 
 
 def _package_relative_path(value: str, *, label: str) -> str:
     """Normalize a package path without accepting another platform's escapes."""
 
-    normalized = value.replace("\\", "/")
-    path = PurePosixPath(normalized)
-    if (
-        not normalized.strip()
-        or "\x00" in normalized
-        or "://" in normalized
-        or normalized.startswith("/")
-        or re.match(r"^[A-Za-z]:", normalized)
-        or any(part in {"", ".", ".."} for part in path.parts)
-    ):
-        raise ValueError(f"{label} must be a non-empty relative package path")
-    return path.as_posix()
+    return canonical_package_path(value, label=label, allow_backslash=True)
 
 
 class ModelRequirement(BaseModel):
@@ -40,7 +62,9 @@ class ModelRequirement(BaseModel):
     revision: str | None = None
     sha256: str
     size: int = Field(ge=0)
-    license: str
+    # Informational provenance only. Installation and scheduling are bound to
+    # immutable bytes, not to a client-side interpretation of license text.
+    license: str | None = None
     gated: bool = False
     manual_download: bool = False
 
@@ -80,7 +104,7 @@ class CustomNodeRequirement(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source: str
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
-    license: str = Field(min_length=1, max_length=120)
+    license: str | None = Field(default=None, min_length=1, max_length=120)
     node_types: list[str] = Field(min_length=1, max_length=128)
     manual_install: Literal[True] = True
 
@@ -111,7 +135,7 @@ class WorkflowVariant(BaseModel):
     mapping: str | None = None
     operations: list[Literal["t2v", "i2v", "flf", "t2i", "i2i"]]
     models: list[ModelRequirement] = Field(default_factory=list)
-    custom_nodes: list[CustomNodeRequirement] = Field(default_factory=list)
+    custom_nodes: list[CustomNodeRequirement] = Field(default_factory=list, max_length=8)
     executor_min_version: str | None = None
     runtime_min_version: str | None = None
     min_vram_bytes: int | None = Field(default=None, ge=0)
@@ -122,7 +146,10 @@ class WorkflowVariant(BaseModel):
     def package_relative_path(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        return _package_relative_path(value, label="workflow file")
+        normalized = _package_relative_path(value, label="workflow file")
+        if package_path_key(normalized) in RESERVED_WORKFLOW_ROOT_FILES:
+            raise ValueError("workflow payload cannot use a reserved package metadata file")
+        return normalized
 
     @field_validator("executor_min_version", "runtime_min_version")
     @classmethod
@@ -130,6 +157,32 @@ class WorkflowVariant(BaseModel):
         if value is not None and not SEMVER_RE.fullmatch(value):
             raise ValueError("executor/runtime minimum version must be SemVer")
         return value
+
+    @model_validator(mode="after")
+    def unambiguous_model_placements(self) -> WorkflowVariant:
+        placements: set[str] = set()
+        graph_names: set[str] = set()
+        digest_sizes: dict[str, int] = {}
+        for model in self.models:
+            placement = package_path_key(f"{model.folder}/{model.filename}")
+            if placement in placements:
+                raise ValueError("model placements must be unique across supported platforms")
+            placements.add(placement)
+
+            # ComfyUI graphs expose loader filenames, while `folder` selects the
+            # model category. Reusing one normalized filename across categories
+            # makes set-based graph authorization ambiguous and is therefore
+            # rejected until loader-specific bindings become part of the schema.
+            graph_name = package_path_key(model.filename)
+            if graph_name in graph_names:
+                raise ValueError("model filenames must be unique within a workflow variant")
+            graph_names.add(graph_name)
+
+            previous_size = digest_sizes.get(model.sha256)
+            if previous_size is not None and previous_size != model.size:
+                raise ValueError("shared model digests must use one byte size")
+            digest_sizes[model.sha256] = model.size
+        return self
 
 
 class Publisher(BaseModel):
@@ -148,7 +201,7 @@ class WorkflowManifest(BaseModel):
     version: str
     title: str
     summary: str
-    license: str
+    license: str | None = None
     provenance: Literal["market", "custom"]
     publisher: Publisher
     homepage: str | None = None
@@ -159,16 +212,12 @@ class WorkflowManifest(BaseModel):
     @field_validator("id")
     @classmethod
     def valid_id(cls, value: str) -> str:
-        if not WORKFLOW_ID_RE.fullmatch(value):
-            raise ValueError("workflow id must be namespace/name using lowercase characters")
-        return value
+        return validate_workflow_id(value)
 
     @field_validator("version")
     @classmethod
     def valid_version(cls, value: str) -> str:
-        if not SEMVER_RE.fullmatch(value):
-            raise ValueError("workflow version must be SemVer")
-        return value
+        return validate_workflow_version(value)
 
     @field_validator("variants")
     @classmethod

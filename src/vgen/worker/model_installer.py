@@ -10,7 +10,8 @@ import re
 import shutil
 import socket
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Protocol
@@ -137,6 +138,16 @@ class ModelInstaller:
         digest = str(pin.sha256).removeprefix("sha256:").lower()
         if not re.fullmatch(r"[0-9a-f]{64}", digest) or not 1 <= int(pin.size) <= 1024**5:
             raise ModelInstallError("MODEL_PIN_INVALID")
+        with self._digest_lock(digest):
+            return self._install_locked(pin, digest=digest, progress=progress)
+
+    def _install_locked(
+        self,
+        pin: ModelPin,
+        *,
+        digest: str,
+        progress: ProgressCallback | None,
+    ) -> ModelInstallResult:
         target = self._safe_target(pin.path)
         blob = self._blob_path(digest)
         if _is_reparse_point(target):
@@ -158,7 +169,9 @@ class ModelInstaller:
             self._link_target(blob, target, pin.size, digest)
             return ModelInstallResult(f"sha256:{digest}", "already_installed", pin.size)
 
-        partial = target.with_name(f".{target.name}.{digest[:16]}.vgen.partial")
+        partial = blob.with_name(f".{digest}.vgen.partial")
+        legacy_partial = target.with_name(f".{target.name}.{digest[:16]}.vgen.partial")
+        self._migrate_legacy_partial(legacy_partial, partial, maximum=pin.size)
         self._assert_partial(partial, maximum=pin.size)
         partial_size = partial.stat().st_size if partial.exists() else 0
         if partial_size == pin.size:
@@ -282,6 +295,69 @@ class ModelInstaller:
         self._make_read_only(blob)
         self._link_target(blob, target, pin.size, digest)
         return ModelInstallResult(f"sha256:{digest}", "installed", pin.size)
+
+    @contextmanager
+    def _digest_lock(self, digest: str) -> Iterator[None]:
+        directory = self._root / ".vgen" / "locks" / "sha256"
+        self._assert_safe_ancestry(directory)
+        lock_path = directory / f"{digest}.lock"
+        if _is_reparse_point(lock_path):
+            raise ModelInstallError("MODEL_CACHE_UNAVAILABLE")
+        try:
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise ModelInstallError("MODEL_CACHE_UNAVAILABLE") from exc
+        with os.fdopen(descriptor, "a+b", buffering=0) as lock_file:
+            try:
+                metadata = os.fstat(lock_file.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or _is_reparse_point(lock_path):
+                    raise ModelInstallError("MODEL_CACHE_UNAVAILABLE")
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"0")
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            except ModelInstallError:
+                raise
+            except OSError as exc:
+                raise ModelInstallError("MODEL_CACHE_UNAVAILABLE") from exc
+            try:
+                yield
+            finally:
+                try:
+                    lock_file.seek(0)
+                    if os.name == "nt":
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError as exc:
+                    raise ModelInstallError("MODEL_CACHE_UNAVAILABLE") from exc
+
+    def _migrate_legacy_partial(
+        self,
+        legacy: Path,
+        partial: Path,
+        *,
+        maximum: int,
+    ) -> None:
+        self._assert_partial(legacy, maximum=maximum)
+        if not legacy.exists():
+            return
+        self._assert_partial(partial, maximum=maximum)
+        try:
+            if partial.exists() and partial.stat().st_size >= legacy.stat().st_size:
+                legacy.unlink()
+            else:
+                os.replace(legacy, partial)
+        except OSError as exc:
+            raise ModelInstallError("MODEL_PARTIAL_UNSAFE") from exc
 
     def _blob_path(self, digest: str) -> Path:
         directory = self._root / ".vgen" / "artifacts" / "sha256" / digest[:2]
