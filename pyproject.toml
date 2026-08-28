@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vgen"
-version = "0.13.23"
+version = "0.13.24"
 description = "Open, encrypted GPU workflow gateway, broker and worker runtime"
 readme = "README.md"
 requires-python = ">=3.11"
