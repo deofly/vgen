@@ -19,6 +19,7 @@ from vgen.cli.main import (
     _apply_workflow_install,
     _broker_command,
     _install_workflow_node_packs,
+    _is_incomplete_provenance_closure,
     _is_trusted_bundled_workflow_release,
     _maintenance_intent_owns_job,
     _reject_known_insufficient_workflow_resources,
@@ -81,6 +82,19 @@ def test_workflow_provenance_failure_requires_exact_package_migration() -> None:
             "state": "missing_nodes",
             "custom_node_provenance_error": "provider_identity_mismatch:VideoHelper",
         }
+    )
+
+
+def test_provenance_closure_failure_keeps_exact_capability_staged() -> None:
+    error = _workflow_readiness_error(
+        "missing_nodes",
+        {"custom_node_provenance_error": "provider_unverified:ComfyUI-GGUF"},
+    )
+
+    assert _is_incomplete_provenance_closure(error)
+    assert not _is_incomplete_provenance_closure(ValueError(str(error)))
+    assert not _is_incomplete_provenance_closure(
+        _workflow_readiness_error("missing_nodes", {"missing_node_classes": ["MissingNode"]})
     )
 
 

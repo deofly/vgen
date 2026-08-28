@@ -2608,15 +2608,22 @@ def _wait_for_workflow_report(
         time.sleep(interval)
 
 
+class _WorkflowReadinessError(ValueError):
+    def __init__(self, message: str, *, state: str, entry: Mapping[str, Any] | None) -> None:
+        super().__init__(message)
+        self.state = state
+        self.entry = dict(entry) if isinstance(entry, Mapping) else None
+
+
 def _workflow_readiness_error(
     state: str,
     entry: Mapping[str, Any] | None,
-) -> ValueError:
+) -> _WorkflowReadinessError:
     """Preserve bounded Worker readiness details across install rollback."""
 
     message = f"Worker cannot activate this workflow: {state}"
     if not isinstance(entry, Mapping):
-        return ValueError(message)
+        return _WorkflowReadinessError(message, state=state, entry=entry)
     details: list[str] = []
     provenance_error = entry.get("custom_node_provenance_error")
     if isinstance(provenance_error, str) and provenance_error:
@@ -2636,11 +2643,26 @@ def _workflow_readiness_error(
         details.append(f"{label}: {', '.join(shown)}{suffix}")
     if details:
         message += "; " + "; ".join(details)
-    return ValueError(message)
+    return _WorkflowReadinessError(message, state=state, entry=entry)
 
 
 def _workflow_needs_provenance_migration(entry: Mapping[str, Any] | None) -> bool:
     return bool(isinstance(entry, Mapping) and entry.get("custom_node_provenance_error"))
+
+
+def _is_incomplete_provenance_closure(error: BaseException) -> bool:
+    """Return whether an exact capability must remain staged for composition.
+
+    ComfyUI loads custom nodes from one process-global root. Two independently
+    reviewed workflows can therefore require each other's exact provider pins
+    to close that root. Keeping the first capability staged is safe because its
+    failed readiness state continues to block scheduling; removing it makes a
+    multi-workflow dependency closure impossible to assemble remotely.
+    """
+
+    return isinstance(error, _WorkflowReadinessError) and _workflow_needs_provenance_migration(
+        error.entry
+    )
 
 
 def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> dict[str, Any]:
@@ -2845,7 +2867,13 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
                 timeout=args.timeout,
             )
         return result
-    except Exception:
+    except Exception as exc:
+        if _is_incomplete_provenance_closure(exc):
+            print(
+                "节点来源依赖尚未闭合；已保留经过校验的工作流能力包，但在依赖补齐前不会参与调度。",
+                file=sys.stderr,
+            )
+            raise
         _attempt_workflow_install_rollback(
             client,
             worker_id=str(worker["id"]),
