@@ -2194,11 +2194,26 @@ class ComfyUIExecutor:
                 == _canonical_git_source(identity[0])
             }
             if len(matching_expected) != 1:
+                same_source = any(
+                    _canonical_git_source(expected_identity[0])
+                    == _canonical_git_source(identity[0])
+                    for expected_identity in expected
+                )
+                same_revision = any(
+                    expected_identity[1] == identity[1] for expected_identity in expected
+                )
+                reason = (
+                    "provider_revision_mismatch"
+                    if same_source
+                    else "provider_source_mismatch"
+                    if same_revision
+                    else "provider_identity_mismatch"
+                )
                 return (
                     set(),
                     False,
                     set(),
-                    _provenance_error("provider_unexpected", repository.name),
+                    _provenance_error(reason, repository.name),
                 )
             verified_identity = next(iter(matching_expected))
             if verified_identity in verified:
