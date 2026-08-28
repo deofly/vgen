@@ -2639,6 +2639,10 @@ def _workflow_readiness_error(
     return ValueError(message)
 
 
+def _workflow_needs_provenance_migration(entry: Mapping[str, Any] | None) -> bool:
+    return bool(isinstance(entry, Mapping) and entry.get("custom_node_provenance_error"))
+
+
 def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> dict[str, Any]:
     broker_id = _maintenance_broker_id(client, args.broker)
     worker = _select_owned_worker(client, args.worker)
@@ -2663,7 +2667,13 @@ def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> 
         workflow_ref=workflow_ref,
         workflow_digest=f"sha256:{digest}",
     )
-    if existing_report is not None:
+    # A legacy machine policy can report the same workflow identity without
+    # carrying the marketplace package's custom-node provenance pins. In that
+    # state, activating the exact package is a metadata migration: the Worker
+    # merges its immutable dependency identities with the machine policy while
+    # preserving the latter's execution and model authority.
+    needs_provenance_migration = _workflow_needs_provenance_migration(existing_report)
+    if existing_report is not None and not needs_provenance_migration:
         rollback_source_ids: list[str] = []
         try:
             model_args = argparse.Namespace(

@@ -26,6 +26,7 @@ from vgen.cli.main import (
     _unique_model_requirements,
     _worker_command,
     _worker_supports_bound_capability_spec,
+    _workflow_needs_provenance_migration,
     _workflow_readiness_error,
     build_parser,
     main,
@@ -65,11 +66,21 @@ def test_workflow_readiness_error_preserves_bounded_missing_details() -> None:
             "missing_model_digests": ["sha256:" + "a" * 64],
         },
     )
-
     assert str(error) == (
         "Worker cannot activate this workflow: missing_nodes; "
         "custom node provenance: provider_unverified:ComfyUI-GGUF; "
         "missing nodes: MissingNode, OtherNode; missing models: sha256:" + "a" * 64
+    )
+
+
+def test_workflow_provenance_failure_requires_exact_package_migration() -> None:
+    assert not _workflow_needs_provenance_migration(None)
+    assert not _workflow_needs_provenance_migration({"state": "ready"})
+    assert _workflow_needs_provenance_migration(
+        {
+            "state": "missing_nodes",
+            "custom_node_provenance_error": "provider_identity_mismatch:VideoHelper",
+        }
     )
 
 
