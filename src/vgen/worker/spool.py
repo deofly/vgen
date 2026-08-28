@@ -85,7 +85,11 @@ class UploadJournal:
             # filesystem. This prevents a durable manifest from pointing at a
             # zero-length or missing file after power loss.
             try:
-                with resolved.open("rb") as stream:
+                # Windows implements fsync with _commit(), which rejects a
+                # read-only descriptor even though POSIX platforms commonly
+                # accept it. Open the already-written ciphertext for update so
+                # the durability barrier has identical semantics everywhere.
+                with resolved.open("rb+") as stream:
                     os.fsync(stream.fileno())
             except OSError as exc:
                 raise UploadJournalError("Spool ciphertext could not be synchronized.") from exc

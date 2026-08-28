@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import threading
 import time
 from collections.abc import Mapping
@@ -732,6 +734,27 @@ def _save_test_upload(
         {artifact_id: path},
     )
     return reference, path
+
+
+def test_upload_journal_syncs_ciphertext_with_a_writable_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[int] = []
+
+    def require_writable_descriptor(descriptor: int) -> None:
+        # A zero-byte write leaves content unchanged but fails with EBADF for
+        # the read-only descriptor that Windows _commit() also rejects.
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            assert os.write(descriptor, b"") == 0
+            observed.append(descriptor)
+
+    monkeypatch.setattr("vgen.worker.spool.os.fsync", require_writable_descriptor)
+    journal = UploadJournal(tmp_path / "upload-spool")
+
+    _save_test_upload(journal, attempt_id="atm_writable_sync", content=b"ciphertext")
+
+    assert observed
 
 
 def test_corrupt_oldest_upload_is_quarantined_without_hiding_next_attempt(
