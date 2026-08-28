@@ -47,6 +47,12 @@ from vgen.worker.capabilities import CapabilityInstallError, WorkerCapabilitySto
 from vgen.worker.maintenance import WorkerMaintenanceController
 
 
+def test_custom_node_probe_budget_scales_with_a_bounded_root() -> None:
+    assert comfyui_module._custom_node_probe_budget(0) == 5.0
+    assert comfyui_module._custom_node_probe_budget(3) == 12.5
+    assert comfyui_module._custom_node_probe_budget(32) == 30.0
+
+
 class _ComfyClient:
     def __init__(self, node_classes: set[str] | None = None) -> None:
         self._node_classes = node_classes or {"SafeNode"}

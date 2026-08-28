@@ -95,6 +95,10 @@ _MEDIA_FIELD_TOKENS = ("audio", "image", "images", "mask", "video")
 _TEXT_FIELD_TOKENS = ("caption", "description", "prompt", "text")
 
 
+def _custom_node_probe_budget(repository_count: int) -> float:
+    return min(30.0, 5.0 + 2.5 * repository_count)
+
+
 def _is_reparse_point(path: Path) -> bool:
     """Return true for symlinks and Windows junction/reparse entries."""
 
@@ -2137,7 +2141,14 @@ class ComfyUIExecutor:
         except OSError:
             return set(), False, set()
 
-        deadline = time.monotonic() + 5.0
+        # Git verification uses several short-lived subprocesses per reviewed
+        # checkout. A fixed five-second budget was enough for two providers on
+        # fast disks, but adding one managed Node Pack made clean Windows roots
+        # fail closed purely from process-startup latency. Scale the shared
+        # budget with the bounded root size while retaining a hard heartbeat
+        # ceiling for unexpectedly large roots.
+        probe_budget = _custom_node_probe_budget(len(repositories))
+        deadline = time.monotonic() + probe_budget
         verified: set[tuple[str, str]] = set()
         node_pack_digests: set[str] = set()
         for repository in sorted(repositories, key=lambda item: str(item).casefold()):
