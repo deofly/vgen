@@ -88,10 +88,9 @@ class ComfyUIHostControl:
         self._remove_regular_file(self.request_path, missing_ok=True)
         deadline = self._monotonic() + timeout
         while self._monotonic() < deadline:
-            if not self.ack_path.exists():
+            if self._read_ack() is None:
                 self._nonce = None
                 return
-            self._read_ack()
             self._sleeper(0.1)
         raise ComfyUIHostControlError("COMFYUI_HOST_RESUME_TIMEOUT")
 
@@ -139,8 +138,6 @@ class ComfyUIHostControl:
                 pass
 
     def _read_ack(self) -> dict[str, object] | None:
-        if not self.ack_path.exists():
-            return None
         try:
             metadata = self.ack_path.lstat()
             if (
@@ -163,6 +160,8 @@ class ComfyUIHostControl:
             ):
                 raise ValueError
             return value
+        except FileNotFoundError:
+            return None
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise ComfyUIHostControlError("COMFYUI_HOST_ACK_INVALID") from exc
 
