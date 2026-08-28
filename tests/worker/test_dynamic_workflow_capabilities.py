@@ -53,6 +53,12 @@ def test_custom_node_probe_budget_scales_with_a_bounded_root() -> None:
     assert comfyui_module._custom_node_probe_budget(32) == 30.0
 
 
+def test_custom_node_git_command_timeout_is_bounded_by_shared_budget() -> None:
+    assert comfyui_module._custom_node_git_command_timeout(12.5) == 5.0
+    assert comfyui_module._custom_node_git_command_timeout(2.25) == 2.25
+    assert comfyui_module._custom_node_git_command_timeout(-1.0) == 0.0
+
+
 def test_git_source_normalization_only_accepts_git_suffix_and_trailing_slash() -> None:
     source = "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
     assert comfyui_module._canonical_git_source(source + ".git") == source

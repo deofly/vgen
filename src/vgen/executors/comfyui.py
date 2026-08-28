@@ -100,6 +100,10 @@ def _custom_node_probe_budget(repository_count: int) -> float:
     return min(30.0, 5.0 + 2.5 * repository_count)
 
 
+def _custom_node_git_command_timeout(remaining_budget: float) -> float:
+    return min(5.0, max(0.0, remaining_budget))
+
+
 def _provenance_error(reason: str, entry: str | None = None) -> str:
     if entry is not None and _SAFE_PROVENANCE_ENTRY.fullmatch(entry):
         return f"{reason}:{entry}"
@@ -2435,7 +2439,12 @@ class ComfyUIExecutor:
                 reader = threading.Thread(target=read_bounded, daemon=True)
                 reader.start()
                 try:
-                    return_code = process.wait(timeout=min(1.5, remaining))
+                    # Large reviewed providers can contain hundreds of tracked
+                    # files. On Windows, the final ignored/untracked scan can
+                    # legitimately exceed 1.5 seconds even on a healthy local
+                    # checkout. Keep a bounded per-command ceiling while the
+                    # shared root deadline remains the authoritative cap.
+                    return_code = process.wait(timeout=_custom_node_git_command_timeout(remaining))
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
