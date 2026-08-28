@@ -1,0 +1,30 @@
+# MiniMax H3 8-step 1.0.1
+
+This patch replaces the historical mutable Git checkout for the MiniMax H3
+Audio T8 provider with the reviewed, content-addressed
+`vgen/minimax-h3-audio-t8@1.0.0` Node Pack. Existing model files and the shared
+Video Helper Suite checkout remain reusable.
+
+This package exposes one ComfyUI API graph through three operations:
+
+- no image: `t2v`;
+- `image`: `i2v`, with the image as the first frame;
+- `image` and `last_image`: `flf`, with first and last frame constraints.
+
+The builder removes both `LoadImage` nodes when no image is supplied, so an
+export-time default image can never silently affect text-to-video generation.
+
+## Runtime dependencies
+
+The manifest pins the five referenced model files to immutable upstream
+revisions, byte sizes and SHA-256 digests. Four base components use the
+MiniMax H3 Community License; the 8-step LoRA is Apache-2.0. Review those terms
+before downloading. VGen records these dependencies for verification and
+scheduling, but never downloads them automatically.
+
+The T8 audio nodes and Video Helper Suite are executable GPL-licensed custom
+nodes pinned to exact Git commits. A Worker machine administrator must review
+and install them locally. The workflow package does not install or execute
+plugin setup code.
+
+Executor or custom-node code is never installed by `vgen workflow install`.
