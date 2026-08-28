@@ -2221,9 +2221,15 @@ class ComfyUIExecutor:
             and dependency.node_pack_sha256 == artifact_sha256
             and dependency.source == source
             and dependency.revision == revision
-            and dependency.node_types == frozenset(node_classes)
         ]
-        if len(matching) != 1:
+        provided_node_classes = frozenset(node_classes)
+        if not matching or any(
+            not dependency.node_types.issubset(provided_node_classes)
+            for dependency in matching
+        ):
+            # A reviewed Node Pack may expose more classes than one workflow
+            # uses. The immutable artifact digest binds that complete provider;
+            # each workflow still authorizes only its declared subset.
             return None
 
         declared: dict[str, tuple[int, str]] = {}

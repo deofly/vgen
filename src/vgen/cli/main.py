@@ -2568,7 +2568,7 @@ def _wait_for_workflow_ready(
             "insufficient_vram",
             "insufficient_ram",
         }:
-            raise ValueError(f"Worker cannot activate this workflow: {state}")
+            raise _workflow_readiness_error(state, entry)
         if time.monotonic() >= deadline:
             raise TimeoutError("workflow readiness wait timed out")
         time.sleep(interval)
@@ -2604,13 +2604,41 @@ def _wait_for_workflow_report(
                 "insufficient_vram",
                 "insufficient_ram",
             }:
-                raise ValueError(f"Worker cannot activate this workflow: {state}")
+                raise _workflow_readiness_error(state, entry)
             if state not in {"ready", "missing_models"}:
                 raise ValueError("Worker reported invalid readiness for the selected workflow")
             return worker, entry
         if time.monotonic() >= deadline:
             raise TimeoutError("workflow activation report timed out")
         time.sleep(interval)
+
+
+def _workflow_readiness_error(
+    state: str,
+    entry: Mapping[str, Any] | None,
+) -> ValueError:
+    """Preserve bounded Worker readiness details across install rollback."""
+
+    message = f"Worker cannot activate this workflow: {state}"
+    if not isinstance(entry, Mapping):
+        return ValueError(message)
+    details: list[str] = []
+    for field, label in (
+        ("missing_node_classes", "missing nodes"),
+        ("missing_model_digests", "missing models"),
+    ):
+        raw = entry.get(field)
+        if not isinstance(raw, list):
+            continue
+        values = [item for item in raw if isinstance(item, str) and item]
+        if not values:
+            continue
+        shown = values[:32]
+        suffix = f", and {len(values) - len(shown)} more" if len(values) > len(shown) else ""
+        details.append(f"{label}: {', '.join(shown)}{suffix}")
+    if details:
+        message += "; " + "; ".join(details)
+    return ValueError(message)
 
 
 def _apply_workflow_install(client: GatewayClient, args: argparse.Namespace) -> dict[str, Any]:

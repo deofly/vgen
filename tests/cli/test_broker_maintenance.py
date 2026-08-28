@@ -26,6 +26,7 @@ from vgen.cli.main import (
     _unique_model_requirements,
     _worker_command,
     _worker_supports_bound_capability_spec,
+    _workflow_readiness_error,
     build_parser,
     main,
 )
@@ -53,6 +54,21 @@ class MemorySecrets:
 
     def delete_password(self, service: str, username: str) -> None:
         self.values.pop((service, username), None)
+
+
+def test_workflow_readiness_error_preserves_bounded_missing_details() -> None:
+    error = _workflow_readiness_error(
+        "missing_nodes",
+        {
+            "missing_node_classes": ["MissingNode", "OtherNode"],
+            "missing_model_digests": ["sha256:" + "a" * 64],
+        },
+    )
+
+    assert str(error) == (
+        "Worker cannot activate this workflow: missing_nodes; "
+        "missing nodes: MissingNode, OtherNode; missing models: sha256:" + "a" * 64
+    )
 
 
 def _test_wheel(directory: Path, *, version: str = "0.2.0") -> Path:

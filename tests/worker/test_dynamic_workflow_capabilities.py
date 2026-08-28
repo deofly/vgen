@@ -314,7 +314,7 @@ def test_managed_node_pack_receipt_makes_workflow_ready_and_detects_tampering(
         "artifact_sha256": artifact_sha256,
         "source": source,
         "revision": revision,
-        "node_classes": ["UnetLoaderGGUF"],
+        "node_classes": ["UnetLoaderGGUF", "UnetLoaderGGUFAdvanced"],
         "files": [
             {
                 "path": "__init__.py",
@@ -342,6 +342,24 @@ def test_managed_node_pack_receipt_makes_workflow_ready_and_detects_tampering(
     report = capabilities()
     assert report["node_pack_digests"] == [f"sha256:{artifact_sha256}"]
     assert _readiness(report)["test/managed-gguf@1.0.0"]["state"] == "ready"
+
+    marker["node_classes"] = ["UnetLoaderGGUFAdvanced"]
+    (repository / ".vgen-node-pack.json").write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    missing_required_class = capabilities()
+    assert missing_required_class["node_pack_digests"] == []
+    assert (
+        _readiness(missing_required_class)["test/managed-gguf@1.0.0"]["state"]
+        == "missing_nodes"
+    )
+
+    marker["node_classes"] = ["UnetLoaderGGUF", "UnetLoaderGGUFAdvanced"]
+    (repository / ".vgen-node-pack.json").write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
     source_file.write_bytes(b"NODE_CLASS_MAPPINGS = {'tampered': object()}\n")
     tampered = capabilities()
