@@ -4089,6 +4089,19 @@
       "WorkerWorkflowReadiness": {
         "additionalProperties": false,
         "properties": {
+          "custom_node_provenance_error": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "pattern": "^[a-z_]+(?::[A-Za-z0-9_.-]{1,128})?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Node Provenance Error"
+          },
           "missing_model_digests": {
             "items": {
               "type": "string"
