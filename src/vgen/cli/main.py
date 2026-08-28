@@ -1768,9 +1768,7 @@ def _workspace_command(args: argparse.Namespace) -> None:
 
 _MAINTENANCE_INTENT_TTL_SECONDS = 24 * 60 * 60
 _MAINTENANCE_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "expired"})
-_DEFAULT_WORKFLOW_MARKET_INDEX = (
-    "https://vgen.zcbiz.com/marketplace/index.json"
-)
+_DEFAULT_WORKFLOW_MARKET_INDEX = "https://vgen.zcbiz.com/marketplace/index.json"
 _BUNDLED_WORKFLOW_DIGESTS = {
     ("vgen/minimax-h3-8step", "1.0.0"): (
         "bd15cace959f6330626b47c07195b6f8a016e334683969c0d5b044b24debcb93"
@@ -2307,10 +2305,7 @@ def _apply_model_install(
     # Expose the exact source before waiting.  A timeout or transport failure
     # can otherwise hide a still-running job from the enclosing workflow
     # installer, leaving it unable to cancel/revoke only this attempt.
-    if (
-        created_authorization_source_ids is not None
-        and _maintenance_intent_owns_job(created)
-    ):
+    if created_authorization_source_ids is not None and _maintenance_intent_owns_job(created):
         created_authorization_source_ids.append(str(created["id"]))
     result = (
         _wait_for_maintenance(
@@ -2623,6 +2618,9 @@ def _workflow_readiness_error(
     if not isinstance(entry, Mapping):
         return ValueError(message)
     details: list[str] = []
+    provenance_error = entry.get("custom_node_provenance_error")
+    if isinstance(provenance_error, str) and provenance_error:
+        details.append(f"custom node provenance: {provenance_error}")
     for field, label in (
         ("missing_node_classes", "missing nodes"),
         ("missing_model_digests", "missing models"),
@@ -2905,9 +2903,7 @@ def _request_workflow_deactivation(
         idempotency_key=f"workflow-deactivate:{worker_id}:{uuid.uuid4().hex}",
     )
     expected_state = (
-        "authorization_source_revoked"
-        if authorization_source_id is not None
-        else "deactivated"
+        "authorization_source_revoked" if authorization_source_id is not None else "deactivated"
     )
     if not isinstance(result, dict) or result.get("state") != expected_state:
         raise ValueError("Gateway returned an invalid workflow deactivation result")
@@ -5256,9 +5252,7 @@ def build_parser() -> argparse.ArgumentParser:
         broker_workflow_deactivate,
         broker_workflow_uninstall,
     ):
-        workflow_lifecycle_parser.add_argument(
-            "workflow", help="installed workflow reference"
-        )
+        workflow_lifecycle_parser.add_argument("workflow", help="installed workflow reference")
         workflow_lifecycle_parser.add_argument(
             "--worker", help="owned Worker name or ID; automatic when unique"
         )

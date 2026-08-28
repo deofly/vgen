@@ -60,6 +60,7 @@ def test_workflow_readiness_error_preserves_bounded_missing_details() -> None:
     error = _workflow_readiness_error(
         "missing_nodes",
         {
+            "custom_node_provenance_error": "provider_unverified:ComfyUI-GGUF",
             "missing_node_classes": ["MissingNode", "OtherNode"],
             "missing_model_digests": ["sha256:" + "a" * 64],
         },
@@ -67,6 +68,7 @@ def test_workflow_readiness_error_preserves_bounded_missing_details() -> None:
 
     assert str(error) == (
         "Worker cannot activate this workflow: missing_nodes; "
+        "custom node provenance: provider_unverified:ComfyUI-GGUF; "
         "missing nodes: MissingNode, OtherNode; missing models: sha256:" + "a" * 64
     )
 
@@ -117,9 +119,7 @@ class MaintenanceClient:
             body = kwargs.get("json_body")
             source_scoped = isinstance(body, dict) and body.get("authorization_source_id")
             return {
-                "state": (
-                    "authorization_source_revoked" if source_scoped else "deactivated"
-                ),
+                "state": ("authorization_source_revoked" if source_scoped else "deactivated"),
                 "scope": "authorization_source" if source_scoped else "workflow",
             }
         raise AssertionError(f"unexpected request: {method} {path}")
@@ -340,15 +340,9 @@ def test_ltx_release_is_installed_from_digest_pinned_cli_bundle(
 def test_exact_external_workflow_is_discovered_without_a_cli_code_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    package = (
-        Path(__file__).parents[2]
-        / "workflows/vgen/ltx-2.5-gguf-q4-t2v/1.0.4"
-    )
+    package = Path(__file__).parents[2] / "workflows/vgen/ltx-2.5-gguf-q4-t2v/1.0.4"
     manifest, digest, _signed = validate_package(package, allow_unsigned=True)
-    source = (
-        "https://market.example.test/workflows/vgen/"
-        "ltx-2.5-gguf-q4-t2v/1.0.4/workflow.zip"
-    )
+    source = "https://market.example.test/workflows/vgen/ltx-2.5-gguf-q4-t2v/1.0.4/workflow.zip"
     calls: list[tuple[str, dict[str, Any]]] = []
 
     class ExternalRegistry:
@@ -376,9 +370,7 @@ def test_exact_external_workflow_is_discovered_without_a_cli_code_release(
             )
 
     monkeypatch.setattr("vgen.cli.main.WorkflowRegistry", ExternalRegistry)
-    resolved, path, resolved_digest = _resolve_workflow(
-        "vgen/ltx-2.5-gguf-q4-t2v@1.0.4"
-    )
+    resolved, path, resolved_digest = _resolve_workflow("vgen/ltx-2.5-gguf-q4-t2v@1.0.4")
 
     assert resolved is manifest
     assert path == package
@@ -400,21 +392,13 @@ def test_workflow_resolution_fails_closed_when_custom_can_shadow_market(
     tmp_path: Path,
 ) -> None:
     registry = WorkflowRegistry(tmp_path / "registry")
-    custom = (
-        registry.root
-        / "custom"
-        / "vgen"
-        / "ltx-2.5-distilled-t2v"
-        / "9.0.0"
-    )
+    custom = registry.root / "custom" / "vgen" / "ltx-2.5-distilled-t2v" / "9.0.0"
     custom.mkdir(parents=True)
     _tiny_ltx_workflow(custom)
     raw = yaml.safe_load((custom / "manifest.yaml").read_text(encoding="utf-8"))
     raw["version"] = "9.0.0"
     raw["provenance"] = "custom"
-    (custom / "manifest.yaml").write_text(
-        yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
-    )
+    (custom / "manifest.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     write_checksums(custom)
 
     with pytest.raises(RegistryError, match="both market and custom workflow releases"):
@@ -795,18 +779,13 @@ def test_model_install_only_sends_missing_digests(
 def test_bundled_workflow_install_uses_exact_cli_digest_as_local_trust_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    package = (
-        Path(__file__).parents[2]
-        / "workflows/vgen/minimax-h3-8step/1.0.0"
-    )
+    package = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-8step/1.0.0"
     manifest, digest, signed = validate_package(package, allow_unsigned=True)
     assert signed is False
     assert _is_trusted_bundled_workflow_release(manifest, digest) is True
 
     workflow_ref = f"{manifest.id}@{manifest.version}"
-    model_digests = [
-        f"sha256:{model.sha256}" for model in manifest.variants[0].models
-    ]
+    model_digests = [f"sha256:{model.sha256}" for model in manifest.variants[0].models]
     worker_after_commit = _worker()
     worker_after_commit["capabilities"] = {
         "capability_install_spec_version": 2,
@@ -893,10 +872,7 @@ def test_bundled_workflow_trust_rejects_custom_legacy_or_changed_digest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    package = (
-        Path(__file__).parents[2]
-        / "workflows/vgen/minimax-h3-8step/1.0.0"
-    )
+    package = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-8step/1.0.0"
     official, digest, _ = validate_package(package, allow_unsigned=True)
     assert _is_trusted_bundled_workflow_release(official, "0" * 64) is False
     assert (
@@ -1110,9 +1086,7 @@ def test_failed_workflow_install_rolls_back_only_its_maintenance_authorization(
         ],
     }
     worker_after_commit = json.loads(json.dumps(worker))
-    worker_after_commit["capabilities"]["executors"][0]["capabilities"][
-        "workflow_readiness"
-    ] = [
+    worker_after_commit["capabilities"]["executors"][0]["capabilities"]["workflow_readiness"] = [
         {
             "workflow_ref": workflow_ref,
             "workflow_digest": f"sha256:{digest}",
@@ -1189,9 +1163,7 @@ def test_failed_legacy_deduplicated_workflow_install_does_not_rollback_shared_jo
         ],
     }
     worker_after_commit = json.loads(json.dumps(worker))
-    worker_after_commit["capabilities"]["executors"][0]["capabilities"][
-        "workflow_readiness"
-    ] = [
+    worker_after_commit["capabilities"]["executors"][0]["capabilities"]["workflow_readiness"] = [
         {
             "workflow_ref": workflow_ref,
             "workflow_digest": f"sha256:{digest}",
@@ -1282,9 +1254,7 @@ def test_final_readiness_failure_rolls_back_succeeded_capability_and_model_sourc
         ],
     }
     after_capability = json.loads(json.dumps(worker))
-    after_capability["capabilities"]["executors"][0]["capabilities"][
-        "workflow_readiness"
-    ] = [
+    after_capability["capabilities"]["executors"][0]["capabilities"]["workflow_readiness"] = [
         {
             "workflow_ref": workflow_ref,
             "workflow_digest": workflow_digest,
@@ -1294,9 +1264,7 @@ def test_final_readiness_failure_rolls_back_succeeded_capability_and_model_sourc
         }
     ]
     after_model = json.loads(json.dumps(after_capability))
-    after_model["capabilities"]["executors"][0]["capabilities"][
-        "workflow_readiness"
-    ] = [
+    after_model["capabilities"]["executors"][0]["capabilities"]["workflow_readiness"] = [
         {
             "workflow_ref": workflow_ref,
             "workflow_digest": workflow_digest,

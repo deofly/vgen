@@ -356,10 +356,9 @@ def test_managed_node_pack_receipt_makes_workflow_ready_and_detects_tampering(
     )
     missing_required_class = capabilities()
     assert missing_required_class["node_pack_digests"] == []
-    assert (
-        _readiness(missing_required_class)["test/managed-gguf@1.0.0"]["state"]
-        == "missing_nodes"
-    )
+    missing_readiness = _readiness(missing_required_class)["test/managed-gguf@1.0.0"]
+    assert missing_readiness["state"] == "missing_nodes"
+    assert missing_readiness["custom_node_provenance_error"] == "provider_unverified:ComfyUI-GGUF"
 
     marker["node_classes"] = ["UnetLoaderGGUF", "UnetLoaderGGUFAdvanced"]
     (repository / ".vgen-node-pack.json").write_text(
@@ -370,7 +369,9 @@ def test_managed_node_pack_receipt_makes_workflow_ready_and_detects_tampering(
     source_file.write_bytes(b"NODE_CLASS_MAPPINGS = {'tampered': object()}\n")
     tampered = capabilities()
     assert tampered["node_pack_digests"] == []
-    assert _readiness(tampered)["test/managed-gguf@1.0.0"]["state"] == "missing_nodes"
+    tampered_readiness = _readiness(tampered)["test/managed-gguf@1.0.0"]
+    assert tampered_readiness["state"] == "missing_nodes"
+    assert tampered_readiness["custom_node_provenance_error"] == "provider_unverified:ComfyUI-GGUF"
 
 
 def test_custom_node_readiness_rejects_extra_provider_repository_or_root_file(
@@ -479,9 +480,7 @@ def test_custom_node_provenance_rejects_hidden_index_flags(tmp_path: Path) -> No
         check=True,
     )
     assert (
-        ComfyUIExecutor._verified_custom_node_repository(
-            repository, deadline=time.monotonic() + 5
-        )
+        ComfyUIExecutor._verified_custom_node_repository(repository, deadline=time.monotonic() + 5)
         is None
     )
     subprocess.run(
@@ -493,9 +492,7 @@ def test_custom_node_provenance_rejects_hidden_index_flags(tmp_path: Path) -> No
         check=True,
     )
     assert (
-        ComfyUIExecutor._verified_custom_node_repository(
-            repository, deadline=time.monotonic() + 5
-        )
+        ComfyUIExecutor._verified_custom_node_repository(repository, deadline=time.monotonic() + 5)
         is None
     )
 
@@ -529,9 +526,7 @@ def test_custom_node_provenance_rejects_ignored_code_and_sanitizes_git_environme
         encoding="utf-8",
     )
     assert (
-        ComfyUIExecutor._verified_custom_node_repository(
-            repository, deadline=time.monotonic() + 5
-        )
+        ComfyUIExecutor._verified_custom_node_repository(repository, deadline=time.monotonic() + 5)
         is None
     )
 
@@ -595,9 +590,7 @@ def test_custom_node_provenance_rejects_gitdir_indirection_and_tracked_links(
     subprocess.run(["git", "-C", str(repository), "add", "node.py"], check=True)
     subprocess.run(["git", "-C", str(repository), "commit", "-qm", "tracked link"], check=True)
     assert (
-        ComfyUIExecutor._verified_custom_node_repository(
-            repository, deadline=time.monotonic() + 5
-        )
+        ComfyUIExecutor._verified_custom_node_repository(repository, deadline=time.monotonic() + 5)
         is None
     )
 

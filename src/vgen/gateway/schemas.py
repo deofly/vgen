@@ -288,6 +288,11 @@ class WorkerWorkflowReadiness(WireModel):
     ]
     missing_model_digests: list[str] = Field(default_factory=list)
     missing_node_classes: list[str] = Field(default_factory=list)
+    custom_node_provenance_error: str | None = Field(
+        default=None,
+        max_length=160,
+        pattern=r"^[a-z_]+(?::[A-Za-z0-9_.-]{1,128})?$",
+    )
 
 
 class WorkerExecutorCapabilityFacts(WireModel):
@@ -576,9 +581,7 @@ WorkerMaintenanceSpec = Annotated[
 class MaintenanceIntentPayload(WireModel):
     version: Literal[1]
     kind: Literal["vgen-worker-maintenance-intent"]
-    action: Literal[
-        "worker_update", "model_install", "capability_install", "node_pack_install"
-    ]
+    action: Literal["worker_update", "model_install", "capability_install", "node_pack_install"]
     worker_id: str = Field(min_length=1, max_length=120)
     broker_id: str = Field(min_length=1, max_length=120)
     device_id: str = Field(min_length=1, max_length=120)
@@ -645,7 +648,7 @@ class WorkerMaintenanceCreateResponse(BaseModel):
         description=(
             "True only when this signed maintenance intent created the job and may use "
             "its ID for automatic cancellation or source-scoped rollback."
-        )
+        ),
     )
 
 
@@ -661,12 +664,10 @@ class WorkerMaintenanceClaim(WireModel):
     ttl_seconds: int = Field(default=60, ge=15, le=300)
     supported_actions: list[
         Literal["worker_update", "model_install", "capability_install", "node_pack_install"]
-    ] = (
-        Field(
-            default_factory=lambda: ["worker_update", "model_install"],
-            min_length=1,
-            max_length=4,
-        )
+    ] = Field(
+        default_factory=lambda: ["worker_update", "model_install"],
+        min_length=1,
+        max_length=4,
     )
 
     @field_validator("supported_actions")
@@ -807,19 +808,9 @@ class NodePackInstallMaintenanceResult(WireModel):
         self,
     ) -> NodePackInstallMaintenanceResult:
         if self.status == "failed":
-            if (
-                self.loaded is not None
-                or self.error_code is None
-                or self.reason_code is None
-            ):
-                raise ValueError(
-                    "failed Node Pack installs require an error and fixed reason code"
-                )
-        elif (
-            self.loaded is not True
-            or self.error_code is not None
-            or self.reason_code is not None
-        ):
+            if self.loaded is not None or self.error_code is None or self.reason_code is None:
+                raise ValueError("failed Node Pack installs require an error and fixed reason code")
+        elif self.loaded is not True or self.error_code is not None or self.reason_code is not None:
             raise ValueError("successful Node Pack installs require loaded=true")
         return self
 

@@ -50,6 +50,7 @@ _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _REPORTED_VERSION = re.compile(r"^(?:0|[1-9][0-9]{0,5})(?:\.(?:0|[1-9][0-9]{0,5})){0,3}$")
 _SHA256 = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
 _FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+_CUSTOM_NODE_PROVENANCE_ERROR = re.compile(r"^[a-z_]+(?::[A-Za-z0-9_.-]{1,128})?$")
 _MEDIA_TYPE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$"
 )
@@ -513,6 +514,13 @@ def _canonical_workflow_readiness(value: object) -> list[dict[str, Any]]:
             field="missing_node_classes",
             maximum=512,
         )
+        provenance_error = raw.get("custom_node_provenance_error")
+        if provenance_error is not None:
+            provenance_error = _protocol_string(
+                provenance_error,
+                pattern=_CUSTOM_NODE_PROVENANCE_ERROR,
+                field="custom_node_provenance_error",
+            )
         # The Gateway may redact dependency identifiers that were not present
         # in an Owner-signed capability specification.  The fixed state still
         # communicates why the workflow is unavailable, while an empty list no
@@ -523,13 +531,14 @@ def _canonical_workflow_readiness(value: object) -> list[dict[str, Any]]:
         if identity in seen:
             raise PublicMetadataError("capabilities", "duplicate_workflow_readiness")
         seen.add(identity)
-        result.append(
-            {
-                "workflow_ref": workflow_ref,
-                "workflow_digest": digests[0],
-                "state": state,
-                "missing_model_digests": missing_models,
-                "missing_node_classes": missing_nodes,
-            }
-        )
+        readiness_entry: dict[str, Any] = {
+            "workflow_ref": workflow_ref,
+            "workflow_digest": digests[0],
+            "state": state,
+            "missing_model_digests": missing_models,
+            "missing_node_classes": missing_nodes,
+        }
+        if provenance_error is not None:
+            readiness_entry["custom_node_provenance_error"] = provenance_error
+        result.append(readiness_entry)
     return result

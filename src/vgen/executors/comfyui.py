@@ -65,6 +65,7 @@ _HARD_MAX_INPUT_FIELDS = 256
 # fresh stat identity must settle for that full tick before cross-probe reuse.
 _MODEL_DIGEST_CACHE_SETTLE_NS = 2_000_000_000
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_PROVENANCE_ENTRY = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _PATH_FIELD_NAMES = frozenset(
@@ -99,6 +100,12 @@ def _custom_node_probe_budget(repository_count: int) -> float:
     return min(30.0, 5.0 + 2.5 * repository_count)
 
 
+def _provenance_error(reason: str, entry: str | None = None) -> str:
+    if entry is not None and _SAFE_PROVENANCE_ENTRY.fullmatch(entry):
+        return f"{reason}:{entry}"
+    return reason
+
+
 def _is_reparse_point(path: Path) -> bool:
     """Return true for symlinks and Windows junction/reparse entries."""
 
@@ -109,6 +116,7 @@ def _is_reparse_point(path: Path) -> bool:
     attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return path.is_symlink() or bool(attributes & reparse_flag)
+
 
 _PROTOCOL_FAILURE_REASONS = frozenset(
     {
@@ -690,7 +698,10 @@ def _policy_custom_node_pins(value: Any) -> tuple[ComfyUICustomNodePin, ...]:
             or re.fullmatch(r"[0-9a-f]{40}", revision) is None
             or not isinstance(node_types, list)
             or not 1 <= len(node_types) <= 128
-            or any(not isinstance(node, str) or not _SAFE_IDENTIFIER.fullmatch(node) for node in node_types)
+            or any(
+                not isinstance(node, str) or not _SAFE_IDENTIFIER.fullmatch(node)
+                for node in node_types
+            )
             or len(node_types) != len(set(node_types))
         ):
             raise ComfyUIPolicyError("ComfyUI policy custom-node pin is invalid.")
@@ -1966,6 +1977,7 @@ class ComfyUIExecutor:
             verified_custom_nodes,
             custom_node_root_closed,
             node_pack_digests,
+            custom_node_provenance_error,
         ) = self._verified_custom_node_state(capabilities.values())
         all_pins = self.maintenance_model_pins
         self._prune_model_digest_state(all_pins)
@@ -2014,10 +2026,7 @@ class ComfyUIExecutor:
                 # core. Do not let an unrelated workflow remain ready while
                 # the shared custom-node import root is outside the closed set.
                 provenance_failures.update(required_nodes)
-            missing_nodes = sorted(
-                set(missing_nodes)
-                | provenance_failures
-            )
+            missing_nodes = sorted(set(missing_nodes) | provenance_failures)
             runtime_compatible = _minimum_version_satisfied(
                 runtime_version, capability.runtime_min_version
             )
@@ -2038,15 +2047,16 @@ class ComfyUIExecutor:
                 state = "missing_models"
             else:
                 state = "ready"
-            workflow_readiness.append(
-                {
-                    "workflow_ref": capability.workflow_ref,
-                    "workflow_digest": capability.workflow_digest,
-                    "state": state,
-                    "missing_model_digests": missing_models,
-                    "missing_node_classes": missing_nodes,
-                }
-            )
+            readiness_entry: dict[str, Any] = {
+                "workflow_ref": capability.workflow_ref,
+                "workflow_digest": capability.workflow_digest,
+                "state": state,
+                "missing_model_digests": missing_models,
+                "missing_node_classes": missing_nodes,
+            }
+            if custom_node_provenance_error is not None:
+                readiness_entry["custom_node_provenance_error"] = custom_node_provenance_error
+            workflow_readiness.append(readiness_entry)
         return {
             "executor_type": "comfyui",
             "payload_formats": [COMFYUI_PAYLOAD_FORMAT],
@@ -2090,56 +2100,58 @@ class ComfyUIExecutor:
     def _verified_custom_node_state(
         self,
         capabilities: Iterable[ComfyUIWorkflowCapability],
-    ) -> tuple[set[tuple[str, str]], bool, set[str]]:
+    ) -> tuple[set[tuple[str, str]], bool, set[str], str | None]:
         dependencies = {
-            dependency
-            for capability in capabilities
-            for dependency in capability.custom_nodes
+            dependency for capability in capabilities for dependency in capability.custom_nodes
         }
         root = self._custom_nodes_root
         try:
             root.lstat()
         except FileNotFoundError:
-            return set(), not dependencies, set()
+            closed = not dependencies
+            return set(), closed, set(), None if closed else "root_missing"
         except OSError:
-            return set(), False, set()
+            return set(), False, set(), "root_unavailable"
         if _is_reparse_point(root):
-            return set(), False, set()
+            return set(), False, set(), "root_unsafe"
         if not root.is_dir():
-            return set(), not dependencies, set()
+            closed = not dependencies
+            return set(), closed, set(), None if closed else "root_not_directory"
         try:
             # A symlink/junction in any root ancestor changes the code tree
             # after configuration. The isolated root must resolve to itself.
             if root.resolve(strict=True) != root:
-                return set(), False, set()
+                return set(), False, set(), "root_unsafe"
         except (OSError, RuntimeError):
-            return set(), False, set()
+            return set(), False, set(), "root_unavailable"
 
         expected = {(dependency.source, dependency.revision) for dependency in dependencies}
         # One heartbeat has a strict global probe budget. An oversized policy
         # or directory fails closed instead of multiplying Git processes or
         # making root enumeration an unbounded operation.
         if len(dependencies) > 32 or len(expected) > 32:
-            return set(), False, set()
+            return set(), False, set(), "provider_limit_exceeded"
         repositories: list[Path] = []
         try:
             with os.scandir(root) as entries:
                 for entry in entries:
                     if len(repositories) >= 32:
-                        return set(), False, set()
+                        return set(), False, set(), "provider_limit_exceeded"
                     repository = root / entry.name
-                    if (
-                        _is_reparse_point(repository)
-                        or not entry.is_dir(follow_symlinks=False)
-                    ):
+                    if _is_reparse_point(repository) or not entry.is_dir(follow_symlinks=False):
                         # ComfyUI can import top-level Python files as custom
                         # nodes. Unknown files, links and non-repository
                         # directories are therefore executable attack surface,
                         # not harmless metadata.
-                        return set(), False, set()
+                        return (
+                            set(),
+                            False,
+                            set(),
+                            _provenance_error("unexpected_entry", entry.name),
+                        )
                     repositories.append(repository)
         except OSError:
-            return set(), False, set()
+            return set(), False, set(), "root_unavailable"
 
         # Git verification uses several short-lived subprocesses per reviewed
         # checkout. A fixed five-second budget was enough for two providers on
@@ -2162,10 +2174,30 @@ class ComfyUIExecutor:
             else:
                 identity = managed_identity[:2]
                 node_pack_digests.add(managed_identity[2])
-            if identity is None or identity not in expected or identity in verified:
-                return set(), False, set()
+            if identity is None:
+                return (
+                    set(),
+                    False,
+                    set(),
+                    _provenance_error("provider_unverified", repository.name),
+                )
+            if identity not in expected:
+                return (
+                    set(),
+                    False,
+                    set(),
+                    _provenance_error("provider_unexpected", repository.name),
+                )
+            if identity in verified:
+                return set(), False, set(), "provider_duplicate"
             verified.add(identity)
-        return verified, verified == expected, node_pack_digests
+        closed = verified == expected
+        return (
+            verified,
+            closed,
+            node_pack_digests,
+            None if closed else "provider_missing",
+        )
 
     @staticmethod
     def _verified_node_pack_repository(
@@ -2235,8 +2267,7 @@ class ComfyUIExecutor:
         ]
         provided_node_classes = frozenset(node_classes)
         if not matching or any(
-            not dependency.node_types.issubset(provided_node_classes)
-            for dependency in matching
+            not dependency.node_types.issubset(provided_node_classes) for dependency in matching
         ):
             # A reviewed Node Pack may expose more classes than one workflow
             # uses. The immutable artifact digest binds that complete provider;
@@ -2331,9 +2362,7 @@ class ComfyUIExecutor:
         if not stat.S_ISREG(git_metadata.st_mode) or _is_reparse_point(git_executable):
             return None
         git_environment = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.upper().startswith("GIT_")
+            key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
         }
         git_environment["GIT_OPTIONAL_LOCKS"] = "0"
 
@@ -2579,9 +2608,7 @@ class ComfyUIExecutor:
                 metadata_age_ns >= _MODEL_DIGEST_CACHE_SETTLE_NS
                 or observation_age_ns >= _MODEL_DIGEST_CACHE_SETTLE_NS
             )
-            if cached is not None and (
-                cached[:5] != fingerprint or not cache_identity_is_stable
-            ):
+            if cached is not None and (cached[:5] != fingerprint or not cache_identity_is_stable):
                 # Never let a digest recorded for a fresh or superseded stat
                 # identity become trusted merely because wall time advanced.
                 self._model_digest_cache.pop(candidate, None)
