@@ -102,14 +102,23 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
         "probing_nodes",
     ]
     assert (target / ".vgen-deps/gguf.py").is_file()
-    assert (target / "__init__.py").read_text(encoding="utf-8").startswith(
-        "# VGen managed dependency path"
+    assert (
+        (target / "__init__.py")
+        .read_text(encoding="utf-8")
+        .startswith("# VGen managed dependency path")
     )
     compile(
         (target / "__init__.py").read_text(encoding="utf-8"),
         str(target / "__init__.py"),
         "exec",
     )
+
+    legacy_cache = custom_nodes / "ComfyUI-VideoHelperSuite" / "__pycache__"
+    legacy_cache.mkdir(parents=True)
+    stale_bytecode = legacy_cache / "nodes.cpython-311.pyc"
+    stale_bytecode.write_bytes(b"stale")
+    preserved = legacy_cache / "keep.txt"
+    preserved.write_text("not bytecode", encoding="utf-8")
 
     reused = installer.install(
         archive,
@@ -118,7 +127,9 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
         expected_node_classes=("UnetLoaderGGUF",),
     )
     assert reused.status == "already_installed"
-    assert host.pauses == 1
+    assert host.pauses == 2
+    assert not stale_bytecode.exists()
+    assert preserved.is_file()
     assert len(wheel_calls) == 1
 
     (target / ".vgen-deps/gguf.py").write_text("tampered\n", encoding="utf-8")
@@ -129,7 +140,7 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
         expected_node_classes=("UnetLoaderGGUF",),
     )
     assert repaired.status == "installed"
-    assert host.pauses == 2
+    assert host.pauses == 3
     assert len(wheel_calls) == 2
 
 

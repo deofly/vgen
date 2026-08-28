@@ -183,12 +183,17 @@ class NodePackInstaller:
             target = self.custom_nodes_root / manifest.directory
             existing = self._existing_result(target, manifest, artifact_digest)
             if existing is not None:
+                if stage is not None:
+                    stage("pausing_comfyui")
+                with self.host_control.paused(timeout=90, ttl_seconds=600):
+                    self._remove_legacy_bytecode_caches()
+                if stage is not None:
+                    stage("probing_nodes")
+                self._wait_for_nodes(set(manifest.node_classes), timeout=probe_timeout)
                 return existing
 
             os.replace(source_root, candidate)
-            wheels = tuple(
-                wheel_root / item.filename for item in manifest.wheels
-            )
+            wheels = tuple(wheel_root / item.filename for item in manifest.wheels)
             if self.pure_python_only and any(
                 not wheel.name.endswith("-py3-none-any.whl") for wheel in wheels
             ):
@@ -212,6 +217,7 @@ class NodePackInstaller:
                         os.replace(target, backup)
                     os.replace(candidate, target)
                     activated = True
+                    self._remove_legacy_bytecode_caches()
                 if stage is not None:
                     stage("probing_nodes")
                 self._wait_for_nodes(set(manifest.node_classes), timeout=probe_timeout)
@@ -413,6 +419,53 @@ class NodePackInstaller:
         if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
             raise NodePackInstallError("NODE_PACK_TARGET_UNSAFE")
 
+    def _remove_legacy_bytecode_caches(self) -> None:
+        """Remove stale Python caches left before supervised no-bytecode startup.
+
+        Only regular ``.pyc``/``.pyo`` files inside literal ``__pycache__``
+        directories are removed. Links, provider source, native extensions and
+        all other ignored files remain fail-closed for provenance verification.
+        """
+
+        examined = 0
+        try:
+            for directory, child_directories, _ in os.walk(
+                self.custom_nodes_root,
+                topdown=True,
+                followlinks=False,
+            ):
+                parent = Path(directory)
+                safe_children: list[str] = []
+                for name in child_directories:
+                    examined += 1
+                    if examined > 8192:
+                        raise OSError
+                    child = parent / name
+                    if child.is_symlink():
+                        continue
+                    if name != "__pycache__":
+                        safe_children.append(name)
+                        continue
+                    with os.scandir(child) as entries:
+                        for entry in entries:
+                            examined += 1
+                            if examined > 8192:
+                                raise OSError
+                            candidate = child / entry.name
+                            if (
+                                entry.is_file(follow_symlinks=False)
+                                and not candidate.is_symlink()
+                                and candidate.suffix.casefold() in {".pyc", ".pyo"}
+                            ):
+                                candidate.unlink()
+                    try:
+                        child.rmdir()
+                    except OSError:
+                        pass
+                child_directories[:] = safe_children
+        except OSError as exc:
+            raise NodePackInstallError("NODE_PACK_CACHE_CLEANUP_FAILED") from exc
+
     def _wait_for_nodes(self, required: set[str], *, timeout: float) -> None:
         deadline = self.monotonic() + timeout
         while self.monotonic() < deadline:
@@ -430,4 +483,6 @@ class NodePackInstaller:
             if backup.exists():
                 self._validate_activation_path(backup)
                 os.replace(backup, target)
+
+
 __all__ = ["NodePackInstallError", "NodePackInstallResult", "NodePackInstaller"]
