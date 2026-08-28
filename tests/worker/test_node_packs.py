@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -119,6 +120,26 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
     stale_bytecode.write_bytes(b"stale")
     preserved = legacy_cache / "keep.txt"
     preserved.write_text("not bytecode", encoding="utf-8")
+    managed_cache = target / ".vgen-deps" / "__pycache__"
+    managed_cache.mkdir()
+    managed_bytecode = managed_cache / "gguf.cpython-311.pyc"
+    managed_bytecode.write_bytes(b"receipt-governed")
+
+    # Extend the synthetic receipt so reuse proves the managed cache before
+    # legacy cleanup deliberately skips the entire Node Pack directory.
+    marker_path = target / ".vgen-node-pack.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["files"].append(
+        {
+            "path": ".vgen-deps/__pycache__/gguf.cpython-311.pyc",
+            "sha256": hashlib.sha256(managed_bytecode.read_bytes()).hexdigest(),
+            "size": managed_bytecode.stat().st_size,
+        }
+    )
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
     reused = installer.install(
         archive,
@@ -130,6 +151,7 @@ def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> N
     assert host.pauses == 2
     assert not stale_bytecode.exists()
     assert preserved.is_file()
+    assert managed_bytecode.is_file()
     assert len(wheel_calls) == 1
 
     (target / ".vgen-deps/gguf.py").write_text("tampered\n", encoding="utf-8")

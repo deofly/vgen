@@ -435,6 +435,13 @@ class NodePackInstaller:
                 followlinks=False,
             ):
                 parent = Path(directory)
+                managed_marker = parent / _MARKER
+                if managed_marker.is_file() and not managed_marker.is_symlink():
+                    # Managed Node Pack receipts bind every installed byte,
+                    # including bytecode produced by offline pip. Never mutate
+                    # a receipt-governed provider during legacy cleanup.
+                    child_directories[:] = []
+                    continue
                 safe_children: list[str] = []
                 for name in child_directories:
                     examined += 1
