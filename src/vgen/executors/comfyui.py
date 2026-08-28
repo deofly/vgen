@@ -106,6 +106,11 @@ def _provenance_error(reason: str, entry: str | None = None) -> str:
     return reason
 
 
+def _canonical_git_source(source: str) -> str:
+    canonical = source.rstrip("/")
+    return canonical[:-4] if canonical.casefold().endswith(".git") else canonical
+
+
 def _is_reparse_point(path: Path) -> bool:
     """Return true for symlinks and Windows junction/reparse entries."""
 
@@ -2181,16 +2186,24 @@ class ComfyUIExecutor:
                     set(),
                     _provenance_error("provider_unverified", repository.name),
                 )
-            if identity not in expected:
+            matching_expected = {
+                expected_identity
+                for expected_identity in expected
+                if expected_identity[1] == identity[1]
+                and _canonical_git_source(expected_identity[0])
+                == _canonical_git_source(identity[0])
+            }
+            if len(matching_expected) != 1:
                 return (
                     set(),
                     False,
                     set(),
                     _provenance_error("provider_unexpected", repository.name),
                 )
-            if identity in verified:
+            verified_identity = next(iter(matching_expected))
+            if verified_identity in verified:
                 return set(), False, set(), "provider_duplicate"
-            verified.add(identity)
+            verified.add(verified_identity)
         closed = verified == expected
         return (
             verified,

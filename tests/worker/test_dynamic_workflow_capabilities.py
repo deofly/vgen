@@ -53,6 +53,13 @@ def test_custom_node_probe_budget_scales_with_a_bounded_root() -> None:
     assert comfyui_module._custom_node_probe_budget(32) == 30.0
 
 
+def test_git_source_normalization_only_accepts_git_suffix_and_trailing_slash() -> None:
+    source = "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
+    assert comfyui_module._canonical_git_source(source + ".git") == source
+    assert comfyui_module._canonical_git_source(source + "/") == source
+    assert comfyui_module._canonical_git_source(source + "-fork.git") != source
+
+
 class _ComfyClient:
     def __init__(self, node_classes: set[str] | None = None) -> None:
         self._node_classes = node_classes or {"SafeNode"}
