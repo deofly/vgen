@@ -492,7 +492,11 @@ class CapabilityInstallSpec(WireModel):
         list[
             Annotated[
                 str,
-                Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"),
+                Field(
+                    min_length=1,
+                    max_length=128,
+                    pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)$",
+                ),
             ]
         ]
         | None
@@ -559,7 +563,11 @@ class NodePackInstallSpec(WireModel):
     node_classes: list[
         Annotated[
             str,
-            Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"),
+            Field(
+                min_length=1,
+                max_length=128,
+                pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)$",
+            ),
         ]
     ] = Field(min_length=1, max_length=512)
     apply: Literal["on_idle"] = "on_idle"

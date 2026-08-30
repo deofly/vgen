@@ -37,7 +37,11 @@ class LocalTaskInput:
         )
 
     def prepare_descriptor(self) -> dict[str, Any]:
-        public_stem = "first-frame" if self.name == "image" else "last-frame"
+        public_stem = {
+            "image": "first-frame",
+            "last_image": "last-frame",
+            "video": "reference-video",
+        }.get(self.name, "input")
         suffix = self.path.suffix.lower()
         if not suffix or len(suffix) > 10 or not suffix[1:].isalnum():
             suffix = ""

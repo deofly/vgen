@@ -118,8 +118,18 @@ def test_profile_and_workflow_values_come_only_from_local_stores(
         "vgen/demo",
         "vgen/demo@1.0.0",
         "vgen/demo@2.0.0",
+        "demo",
+        "demo@1.0.0",
+        "demo@2.0.0",
+        "portrait",
+        "portrait@1.1.0",
     }
-    assert set(workflow_id_action.completer()) == {"custom/portrait", "vgen/demo"}
+    assert set(workflow_id_action.completer()) == {
+        "custom/portrait",
+        "vgen/demo",
+        "portrait",
+        "demo",
+    }
 
 
 def test_file_and_directory_arguments_use_native_shell_completion() -> None:
@@ -258,9 +268,7 @@ def test_completion_install_all_writes_bash_and_zsh_activation(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("shell", ("bash", "zsh"))
-def test_completion_install_writes_valid_shell_activation(
-    tmp_path: Path, shell: str
-) -> None:
+def test_completion_install_writes_valid_shell_activation(tmp_path: Path, shell: str) -> None:
     executable = shutil.which(shell)
     if executable is None:
         pytest.skip(f"{shell} is not installed")

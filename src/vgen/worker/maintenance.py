@@ -717,7 +717,7 @@ class WorkerMaintenanceController:
                     or len(raw_node_classes) > 512
                     or any(
                         not isinstance(item, str)
-                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", item) is None
+                        or re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)", item) is None
                         for item in raw_node_classes
                     )
                     or raw_node_classes != sorted(set(raw_node_classes))
@@ -867,7 +867,7 @@ class WorkerMaintenanceController:
             or raw_node_classes != sorted(set(raw_node_classes))
             or any(
                 not isinstance(item, str)
-                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", item) is None
+                or re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)", item) is None
                 for item in raw_node_classes
             )
         ):

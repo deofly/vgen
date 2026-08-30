@@ -614,6 +614,86 @@ returns to the previous runtime if activation fails. Runtime activation no longe
 rewrites or relaunches the immutable Windows installer scripts. Do not run the
 Worker under another loop that replaces its whole Python environment.
 
+### Browse descriptions and use workflow codes
+
+The CLI supports catalog-defined codes without changing immutable workflow IDs:
+
+```bash
+vgen workflow list --market
+vgen workflow list
+vgen workflow search h3
+vgen workflow show h3-face
+vgen workflow help h3-face
+vgen workflow show h3-face --format json
+vgen task submit --help
+vgen workflow install h3 --allow-unsigned
+vgen task preflight --workflow h3
+vgen task submit "A cat running across a meadow" --workflow h3@1.0.1 --wait
+```
+
+The official catalog defines `h3`, `h3-face`, and `ltx25-q4`. Listings include
+titles and summaries. Refreshing the market caches its codes; installed releases
+then resolve offline. Without a catalog code, a unique name without its namespace
+also works. Ambiguous names fail with candidate full IDs. Codes never replace
+package digest, version, or publisher checks.
+
+`workflow help <code>` and the text form of `workflow show <code>` include usage
+examples and parameter requirements derived from the selected manifest: defaults,
+ranges, enumerations, and combinations. The reviewed `h3-face` release also has a
+reference prompt, landscape example, frame-rate modes, and runtime prerequisites.
+Installed workflow help works offline; inspecting a remote package does not
+install or execute it. Generic `--help` is offline and includes discovery links
+and quick examples. Commands use Bash/Zsh quoting; replace media paths and
+angle-bracket placeholders. JSON manifest output retains its existing structure.
+
+Task execution prefers the newest installed version; an explicit install selects
+the newest version in the selected catalog. Add `@version` to pin a release.
+Full `namespace/name` references remain supported. `list`, `search`, and `show`
+default to text; scripts should use `--format json`. `verify` still defaults to
+JSON. `list --market`, `search`, and code-based installation accept `--index`;
+otherwise the official index or `VGEN_WORKFLOW_MARKET_INDEX` is used.
+
+Catalog publishers can add `code`, `title`, and `summary` to existing release
+entries without modifying the package ZIP. Keep codes stable across versions and
+never reassign an existing code to another workflow. The face-reference preview
+still requires a runtime with video input support; a shorter name does not change
+its compatibility or validation status.
+
+### Automatic frame-rate adaptation for face-reference video
+
+The new CLI accepts the original video for the reviewed `h3-face@1.0.0` release.
+Install FFmpeg with both `ffmpeg` and `ffprobe` on PATH. H3 Ref2VA still uses a
+24 fps time base; changing only the encoded output rate would change playback
+timing. This feature adapts the input, not the model or output frame rate.
+
+```bash
+vgen task preflight --workflow h3-face@1.0.0 --image ./face.png --video ./original.mp4
+vgen task submit "Use <Picture 1> for facial identity and <Video 1> for movement and timing." \
+  --workflow h3-face@1.0.0 --image ./face.png --video ./original.mp4 \
+  --video-fps-mode auto -p start_time=0 --wait --output-dir ./h3-face-output
+```
+
+`auto` is the default for this exact package identity and digest. It probes the
+reported frame rate and actual frame timestamps in the selected segment, then
+resamples that segment to constant 24 fps before encrypted upload. Fractional
+rates and variable frame rate are supported, with an input detection limit of
+240 fps. The source must have an audio track and at least 124/24 seconds remaining
+after `start_time`. Output remains 124 frames at 24 fps, about 5.17 seconds.
+
+Video and audio are selected together, and the workflow's start offset is reset
+to zero to avoid a second seek. Only the selected clip is uploaded in auto mode.
+The temporary H.264/AAC file has a maximum dimension of 1280; re-encoding can be
+lossy. Originals are unchanged, and temporary plaintext is removed after
+encrypted upload or failure. `--video-fps-mode strict` rejects non-constant-24-fps
+segments instead of converting; it retains original-file upload and in-workflow
+selection. Preflight probes only, never transcodes/uploads/reserves a task, and
+includes a local `video_input` report without adding it to public task metadata.
+
+The immutable package README retains its older manual conversion instructions;
+this section supersedes them for the new CLI. This change does not upgrade the
+Gateway or Worker: Executor >=1.3.0, video-input support, the Ref2VA model, and
+subsequent GPU output validation are still required.
+
 ## 7. Real zero-, one-, and two-image tests
 
 Check health and run a read-only scheduler preflight first:

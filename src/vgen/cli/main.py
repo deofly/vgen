@@ -14,6 +14,7 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -116,6 +117,17 @@ from .session_store import SessionStore, StoredSession
 from .setup import prompt_bootstrap_code, setup_command
 from .upgrade import stable_worker_wheel, upgrade_command
 from .user_enrollment import identity_registration_claim, sign_enrollment_admission
+from .video_inputs import prepare_reference_video
+from .workflow_catalog import (
+    WORKFLOW_CODE,
+    display_code,
+    entry_code,
+    read_catalog_cache,
+    resolve_code,
+    workflow_index,
+    write_catalog_cache,
+)
+from .workflow_help import parameter_help, task_help_examples, workflow_usage
 from .workspace_authorities import (
     PinnedInvite,
     WorkspaceAuthorityError,
@@ -3405,13 +3417,150 @@ def _worker_command(args: argparse.Namespace) -> None:
         client.close()
 
 
+def _workflow_catalog(
+    registry: WorkflowRegistry, *, refresh: bool = False, index: str | None = None
+) -> list[dict[str, Any]]:
+    selected_index = index or workflow_index()
+    root = getattr(registry, "root", None)
+    raw = (
+        registry.search_index(selected_index, "")
+        if refresh
+        else read_catalog_cache(root, selected_index)
+    )
+    entries: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise RegistryError("market workflow entry is invalid")
+        code = entry_code(entry)
+        target = _validated_workflow_update_target(entry, entry["id"])
+        if target is None:
+            raise RegistryError("market workflow target is invalid")
+        row: dict[str, Any] = {**target, "code": code}
+        for field in ("title", "summary", "status"):
+            value = entry.get(field)
+            if isinstance(value, str):
+                row[field] = value
+        entries.append(row)
+    if refresh:
+        write_catalog_cache(root, selected_index, entries)
+    return entries
+
+
+def _expand_workflow_reference(
+    reference: str,
+    registry: WorkflowRegistry,
+    *,
+    entries: list[dict[str, Any]] | None = None,
+    index: str | None = None,
+) -> str:
+    name, separator, version = reference.partition("@")
+    if not _workflow_reference(reference):
+        raise RegistryError("workflow must be a code or namespace/name, optionally @version")
+    if "/" in name:
+        return reference
+    known_ids = {item.manifest.id for item in registry.installed()} | {
+        workflow_id for workflow_id, _ in _BUNDLED_WORKFLOW_DIGESTS
+    }
+    catalog = _workflow_catalog(registry, index=index) if entries is None else entries
+    workflow_id = resolve_code(name, known_ids, catalog)
+    if workflow_id is None and entries is None:
+        catalog = _workflow_catalog(registry, refresh=True, index=index)
+        workflow_id = resolve_code(name, known_ids, catalog)
+    if workflow_id is None:
+        raise RegistryError(f"unknown workflow code {name!r}; run `vgen workflow list --market`")
+    return workflow_id + (f"@{version}" if separator else "")
+
+
+def _market_workflow_target(
+    reference: str, registry: WorkflowRegistry, *, index: str | None = None
+) -> dict[str, Any]:
+    entries = _workflow_catalog(registry, refresh=True, index=index)
+    expanded = _expand_workflow_reference(reference, registry, entries=entries)
+    workflow_id, separator, version = expanded.partition("@")
+    targets = [
+        row
+        for row in entries
+        if row["id"] == workflow_id and (not separator or row["version"] == version)
+    ]
+    if not targets:
+        raise RegistryError(f"workflow is not in the selected marketplace: {expanded}")
+    selected_version = max(Version(row["version"]) for row in targets)
+    latest = [row for row in targets if Version(row["version"]) == selected_version]
+    if len(latest) != 1:
+        raise RegistryError("marketplace has no unique exact workflow release")
+    return latest[0]
+
+
+def _workflow_display_rows(
+    entries: list[dict[str, Any]], registry: WorkflowRegistry
+) -> list[dict[str, Any]]:
+    ids = {item.manifest.id for item in registry.installed()} | {
+        workflow_id for workflow_id, _ in _BUNDLED_WORKFLOW_DIGESTS
+    }
+    return [{**row, "code": display_code(row["id"], ids, entries)} for row in entries]
+
+
+def _print_workflow_list(values: list[dict[str, Any]]) -> None:
+    if not values:
+        print("没有匹配的工作流。可运行 vgen workflow list --market 查看市场。")
+        return
+    for row in values:
+        code = row["code"]
+        label = _task_list_cell(row.get("title") or row["id"])
+        print(f"{code}@{row['version']}  {label}")
+        print(
+            f"  说明：{_task_list_cell(row.get('summary') or '暂无描述；使用 workflow show 查看参数。')}"
+        )
+        origin = row.get("provenance", "market")
+        status = f" | {_task_list_cell(row['status'])}" if row.get("status") else ""
+        print(f"  {row['id']} | {origin}{status}")
+    print(f"\n共 {len(values)} 个版本；可用 --workflow <代号> 或 <代号>@<版本> 调用。")
+    print("提示词和参数示例：vgen workflow help <代号>")
+
+
+def _print_workflow_details(
+    manifest: WorkflowManifest, digest: str, signed: bool, registry: WorkflowRegistry
+) -> None:
+    catalog = _workflow_catalog(registry)
+    ids = {item.manifest.id for item in registry.installed()} | {manifest.id}
+    code = display_code(manifest.id, ids, catalog)
+    print(f"名称：{_task_list_cell(manifest.title)}")
+    print(f"代号：{code}@{manifest.version}")
+    print(f"工作流：{manifest.id}@{manifest.version}")
+    print(f"说明：{_task_list_cell(manifest.summary)}")
+    print(f"来源：{manifest.provenance}；签名：{'已签名' if signed else '未签名'}")
+    print(f"摘要：sha256:{digest}")
+    for variant in manifest.variants:
+        print(
+            f"执行：{_task_list_cell(variant.executor_type)} >= {variant.executor_min_version or '-'}；"
+            f"运行时 >= {variant.runtime_min_version or '-'}；{', '.join(variant.operations)}"
+        )
+    print(parameter_help(manifest, digest))
+    print()
+    print(workflow_usage(manifest, digest, f"{code}@{manifest.version}"))
+
+
 def _workflow_command(args: argparse.Namespace) -> None:
     registry = WorkflowRegistry()
     if args.workflow_action == "install":
+        source = args.source
+        target = None
+        if not Path(source).expanduser().exists() and _workflow_reference(source):
+            target = _market_workflow_target(source, registry, index=args.index)
+            source = target["source"]
         result = registry.install(
-            args.source,
+            source,
             allow_unsigned=args.allow_unsigned,
             expected_publisher_key=args.publisher_key,
+            **(
+                {
+                    "expected_digest": target["digest"],
+                    "expected_workflow_id": target["id"],
+                    "expected_version": target["version"],
+                }
+                if target is not None
+                else {}
+            ),
         )
         _json(
             {
@@ -3439,45 +3588,62 @@ def _workflow_command(args: argparse.Namespace) -> None:
             }
         )
     elif args.workflow_action == "list":
+        if args.market:
+            values = _workflow_display_rows(
+                _workflow_catalog(registry, refresh=True, index=args.index), registry
+            )
+            if args.format == "json":
+                _json(values)
+            else:
+                _print_workflow_list(values)
+            return
+        catalog = _workflow_catalog(registry)
+        installed = registry.installed()
+        workflow_ids = {item.manifest.id for item in installed}
         values = [
             {
                 "id": item.manifest.id,
+                "code": display_code(item.manifest.id, workflow_ids, catalog),
+                "title": item.manifest.title,
+                "summary": item.manifest.summary,
                 "version": item.manifest.version,
                 "digest": f"sha256:{item.digest}",
                 "signed": item.signed,
                 "provenance": item.manifest.provenance,
                 "path": str(item.path),
             }
-            for item in registry.installed()
+            for item in installed
         ]
         if args.format == "json":
             _json(values)
         else:
-            _print_flat_list(
-                values,
-                columns=(
-                    ("WORKFLOW", 36, lambda row: row.get("id")),
-                    ("VERSION", 14, lambda row: row.get("version")),
-                    ("SOURCE", 10, lambda row: row.get("provenance")),
-                    ("SIGNED", 6, lambda row: "yes" if row.get("signed") else "no"),
-                    ("DIGEST", 24, lambda row: row.get("digest")),
-                ),
-                empty_message="没有安装的 Workflow。",
-            )
-    elif args.workflow_action in {"show", "verify"}:
+            _print_workflow_list(values)
+    elif args.workflow_action in {"show", "help", "verify"}:
         manifest, digest, signed = _inspect_workflow_source(args.source, registry=registry)
-        _json(
-            {
-                "manifest": manifest.model_dump(mode="json"),
-                "digest": f"sha256:{digest}",
-                "signed": signed,
-            }
-        )
+        if args.format == "json":
+            _json(
+                {
+                    "manifest": manifest.model_dump(mode="json"),
+                    "digest": f"sha256:{digest}",
+                    "signed": signed,
+                }
+            )
+        else:
+            _print_workflow_details(manifest, digest, signed, registry)
     elif args.workflow_action == "search":
-        _json(registry.search_index(args.index, args.query))
+        entries = _workflow_display_rows(
+            _workflow_catalog(registry, refresh=True, index=args.index), registry
+        )
+        query = args.query.casefold()
+        values = [row for row in entries if query in json.dumps(row, ensure_ascii=False).casefold()]
+        if args.format == "json":
+            _json(values)
+        else:
+            _print_workflow_list(values)
     elif args.workflow_action == "remove":
-        registry.remove(args.workflow_id, args.version, provenance=args.provenance)
-        _json({"removed": f"{args.workflow_id}@{args.version}"})
+        workflow_id = _expand_workflow_reference(args.workflow_id, registry)
+        registry.remove(workflow_id, args.version, provenance=args.provenance)
+        _json({"removed": f"{workflow_id}@{args.version}"})
     elif args.workflow_action == "sign":
         key = Ed25519PrivateKey.from_private_bytes(
             b64url_decode(
@@ -3509,6 +3675,7 @@ def _workflow_command(args: argparse.Namespace) -> None:
             }
         )
     elif args.workflow_action == "update":
+        args.workflow_id = _expand_workflow_reference(args.workflow_id, registry, index=args.index)
         try:
             validate_workflow_id(args.workflow_id)
         except ValueError as exc:
@@ -3616,7 +3783,10 @@ def _validated_workflow_update_target(
 def _workflow_reference(value: str) -> bool:
     workflow_id, separator, version = value.partition("@")
     try:
-        validate_workflow_id(workflow_id)
+        if "/" in workflow_id:
+            validate_workflow_id(workflow_id)
+        elif not WORKFLOW_CODE.fullmatch(workflow_id):
+            return False
         if separator:
             validate_workflow_version(version)
     except ValueError:
@@ -3631,9 +3801,30 @@ def _inspect_workflow_source(
 ) -> tuple[WorkflowManifest, str, bool]:
     selected_registry = registry or WorkflowRegistry()
     local_path = Path(source).expanduser()
-    if local_path.is_dir():
+    if local_path.exists():
         return selected_registry.inspect_source(local_path.resolve(), allow_unsigned=True)
     if _workflow_reference(source):
+        source = _expand_workflow_reference(source, selected_registry)
+        workflow_id, separator, version = source.partition("@")
+        known = any(
+            item.manifest.id == workflow_id and (not separator or item.manifest.version == version)
+            for item in selected_registry.installed()
+        ) or any(
+            item_id == workflow_id and (not separator or item_version == version)
+            for item_id, item_version in _BUNDLED_WORKFLOW_DIGESTS
+        )
+        if not known:
+            target = _market_workflow_target(source, selected_registry)
+            manifest, digest, signed = selected_registry.inspect_source(
+                target["source"], allow_unsigned=True
+            )
+            if (manifest.id, manifest.version, f"sha256:{digest}") != (
+                target["id"],
+                target["version"],
+                target["digest"],
+            ):
+                raise RegistryError("workflow inspection does not match the exact market target")
+            return manifest, digest, signed
         _, directory, resolved_digest = _resolve_workflow(
             source,
             registry=selected_registry,
@@ -3653,8 +3844,9 @@ def _resolve_workflow(
     *,
     registry: WorkflowRegistry | None = None,
 ) -> tuple[WorkflowManifest, Path, str]:
-    workflow_id, separator, version = reference.partition("@")
     selected_registry = registry or WorkflowRegistry()
+    reference = _expand_workflow_reference(reference, selected_registry)
+    workflow_id, separator, version = reference.partition("@")
     matches = [
         item
         for item in selected_registry.installed()
@@ -3665,6 +3857,9 @@ def _resolve_workflow(
         for (release_id, release_version), digest in _BUNDLED_WORKFLOW_DIGESTS.items()
         if release_id == workflow_id and (not separator or release_version == version)
     ]
+    if not matches and not bundled and not separator and registry is None:
+        target = _market_workflow_target(reference, selected_registry)
+        return _resolve_workflow(f"{target['id']}@{target['version']}")
     if not matches and not bundled and separator and registry is None:
         index = os.environ.get("VGEN_WORKFLOW_MARKET_INDEX", _DEFAULT_WORKFLOW_MARKET_INDEX)
         targets = [
@@ -3753,6 +3948,10 @@ def _effective_parameters(manifest: WorkflowManifest, args: argparse.Namespace) 
         if not args.image:
             raise ValueError("--last-image requires --image")
         parameters["last_image"] = Path(args.last_image).name
+    if getattr(args, "video", None):
+        parameters["video"] = Path(args.video).name
+    elif parameters.get("video"):
+        raise ValueError("video input requires --video <local-file>, not -p video=...")
     unknown = sorted(set(parameters) - set(properties))
     if unknown:
         raise ValueError(f"workflow does not define parameters: {unknown}")
@@ -3767,12 +3966,16 @@ def _effective_parameters(manifest: WorkflowManifest, args: argparse.Namespace) 
     return parameters
 
 
-def _local_task_inputs(args: argparse.Namespace) -> list[LocalTaskInput]:
+def _local_task_inputs(
+    args: argparse.Namespace, *, video_path: Path | None = None
+) -> list[LocalTaskInput]:
     values: list[LocalTaskInput] = []
     if args.image:
         values.append(LocalTaskInput.from_path("image", args.image))
     if args.last_image:
         values.append(LocalTaskInput.from_path("last_image", args.last_image))
+    if getattr(args, "video", None):
+        values.append(LocalTaskInput.from_path("video", video_path or args.video))
     return values
 
 
@@ -4237,10 +4440,22 @@ def _print_task_update(task: Mapping[str, Any], display: dict[str, Any]) -> None
 
 def _task_command(args: argparse.Namespace) -> None:
     client = _client(args.profile)
+    resources = ExitStack()
     try:
         if args.task_action == "preflight":
             manifest, directory, digest = _resolve_workflow(args.workflow)
             parameters = _effective_parameters(manifest, args)
+            video = resources.enter_context(
+                prepare_reference_video(
+                    manifest.id,
+                    manifest.version,
+                    digest,
+                    args.video,
+                    start_time=parameters.get("start_time", 0),
+                    mode=args.video_fps_mode,
+                    dry_run=True,
+                )
+            )
             variant = next(
                 (item for item in manifest.variants if item.executor_type == args.executor), None
             )
@@ -4270,11 +4485,30 @@ def _task_command(args: argparse.Namespace) -> None:
                 str(checked.get("state")),
                 ("Gateway 返回了未知预检状态。", "请升级 CLI 后重试。"),
             )
-            _json({**checked, "message": message, "next": next_step})
+            _json(
+                {
+                    **checked,
+                    "message": message,
+                    "next": next_step,
+                    **({"video_input": video.report()} if video is not None else {}),
+                }
+            )
         elif args.task_action == "submit":
             manifest, directory, digest = _resolve_workflow(args.workflow)
             parameters = _effective_parameters(manifest, args)
-            local_inputs = _local_task_inputs(args)
+            video = resources.enter_context(
+                prepare_reference_video(
+                    manifest.id,
+                    manifest.version,
+                    digest,
+                    args.video,
+                    start_time=parameters.get("start_time", 0),
+                    mode=args.video_fps_mode,
+                )
+            )
+            if video is not None:
+                parameters.update(video=video.path.name, start_time=video.start_time)
+            local_inputs = _local_task_inputs(args, video_path=video.path if video else None)
             variant = next(
                 (item for item in manifest.variants if item.executor_type == args.executor), None
             )
@@ -4333,6 +4567,8 @@ def _task_command(args: argparse.Namespace) -> None:
                 content_attempt_id=content_attempt_id,
                 key_version=key_version,
             )
+            # The plaintext normalized clip is no longer needed after encrypted upload.
+            resources.close()
             opaque = json.dumps(
                 {
                     "workflow": graph,
@@ -4538,7 +4774,10 @@ def _task_command(args: argparse.Namespace) -> None:
                 raise ValueError("workspace is required")
             _json(client.request("GET", f"/api/v1/workspaces/{workspace_id}/usage"))
     finally:
-        client.close()
+        try:
+            client.close()
+        finally:
+            resources.close()
 
 
 def _usage_command(args: argparse.Namespace) -> None:
@@ -4667,10 +4906,11 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("worker", "rate-approve"): "批准一条 Worker 费率建议。",
     ("worker", "serve"): "运行 Worker 主循环，领取、执行并回传加密任务。",
     ("workflow",): "安装、校验、制作和管理工作流包。",
-    ("workflow", "install"): "从本地文件或市场地址安装签名工作流包。",
+    ("workflow", "install"): "按代号、完整 ID、本地文件或市场地址安装工作流包。",
     ("workflow", "custom"): "安装自定义工作流，并与市场版本隔离保存。",
-    ("workflow", "list"): "列出本机已安装的工作流版本。",
+    ("workflow", "list"): "显示工作流代号、名称和描述；--market 查看 Marketplace。",
     ("workflow", "show"): "查看工作流清单、参数和依赖。",
+    ("workflow", "help"): "查看指定工作流的示例提示词、可用参数和复制命令。",
     ("workflow", "verify"): "校验工作流包的结构、摘要和签名。",
     ("workflow", "search"): "在指定市场索引中搜索工作流。",
     ("workflow", "remove"): "删除本机安装的指定工作流版本。",
@@ -4679,7 +4919,7 @@ _COMMAND_HELP: dict[tuple[str, ...], str] = {
     ("workflow", "publish"): "把工作流包发布到本地市场目录。",
     ("workflow", "update"): "从市场索引安装工作流的可用更新。",
     ("task",): "预检、提交、查看、取消和下载生成任务。",
-    ("task", "preflight"): "只检查工作流、Worker 能力和费率，不创建任务。",
+    ("task", "preflight"): "检查工作流、Worker 能力、费率及适用的本地视频要求，不创建任务。",
     ("task", "submit"): "加密提示词和输入文件，提交视频生成任务。",
     ("task", "show"): "查看任务状态、分配 Worker 和执行 Attempt。",
     ("task", "cancel"): "取消尚未结束的任务。",
@@ -4699,7 +4939,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "alias": "本地身份别名，默认使用 default。",
     "allocation_id": "待批准的 Worker allocation ID。",
     "allow_http": "允许连接明文 HTTP Gateway；仅建议本机测试使用。",
-    "allow_unsigned": "允许安装未签名工作流；仅限已人工审查的本地包。",
+    "allow_unsigned": "允许已审查的未签名包；远程安装仍须固定目录中的 ID、版本和摘要。",
     "announce": "启动后立即向 Gateway 上报 Worker 能力。",
     "approve_nodes": "批准命令显示的精确 ComfyUI 节点类摘要。",
     "broker": "Broker ID；省略时使用当前 Profile 的 Home Broker。",
@@ -4740,7 +4980,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "include_revoked": "同时显示已撤销的 Workspace 成员。",
     "identity_account": "Worker 身份在系统凭据存储中的账户名。",
     "identity_file": "Worker 私钥文件路径；应限制为仅当前用户可读。",
-    "image": "首帧图片路径；不指定图片时执行文生视频。",
+    "image": "输入图片路径；图生视频时作为首帧，人脸参考工作流中作为人脸照片。",
     "index": "工作流市场索引文件或 URL。",
     "interval": "轮询间隔秒数。",
     "invite_stdin": "从标准输入读取完整邀请 URI，避免 secret 进入命令历史。",
@@ -4750,6 +4990,8 @@ _ARGUMENT_HELP: dict[str, str] = {
     "key_version": "Workspace 数据密钥版本；省略时使用最新版本。",
     "kind": "准入主体类型，例如 user、broker_device、service 或 workspace_member。",
     "last_image": "尾帧图片路径；与 --image 同时指定时生成首尾帧视频。",
+    "video": "本地参考视频路径；使用支持视频输入的工作流，素材会加密上传。",
+    "video_fps_mode": "H3 人脸参考：auto 自动检测并转为 24 fps（默认）；strict 仅接受恒定 24 fps。",
     "lease_ttl": "Worker lease 有效秒数。",
     "limit": "最多返回的记录数。",
     "local_artifact_root": "允许 Worker 读取的本地 artifact 根目录；可重复指定。",
@@ -4805,7 +5047,7 @@ _ARGUMENT_HELP: dict[str, str] = {
     "work_root": "Worker 解密和执行任务所用的临时工作目录。",
     "worker": "Worker 名称或 ID；仅有一台自有 Worker 时可省略。",
     "worker_id": "Worker ID。",
-    "workflow": "已安装工作流引用，格式通常为 namespace/name。",
+    "workflow": "工作流代号或完整 ID，可追加 @版本；例如 h3-face@1.0.0。",
     "workflow_id": "工作流 ID，格式为 namespace/name。",
     "workspace": "Workspace 名称或 ID；省略时使用 Profile 默认值。",
     "workspace_name": "首次创建的 Workspace 名称。",
@@ -4814,6 +5056,7 @@ _ARGUMENT_HELP: dict[str, str] = {
 
 
 _OPTION_HELP: dict[str, str] = {
+    "--market": "查看 Marketplace 并刷新代号缓存；默认仅列出本机已安装版本。",
     "--approve": "批准该准入申请。",
     "--reject": "拒绝该准入申请。",
     "--version": "显示当前 VGen CLI 版本并退出。",
@@ -4821,6 +5064,10 @@ _OPTION_HELP: dict[str, str] = {
 
 
 _COMMAND_ARGUMENT_HELP: dict[tuple[str, ...], str] = {
+    ("workflow", "install", "source"): "工作流代号、完整 ID、包目录或地址；例如 h3-face@1.0.0。",
+    ("workflow", "show", "source"): "工作流代号、完整 ID 或包路径；例如 h3-face。",
+    ("workflow", "help", "source"): "工作流代号、完整 ID 或包路径；例如 h3-face。",
+    ("workflow", "verify", "source"): "要校验的代号、完整 ID 或包路径。",
     ("task", "list", "order"): "排序方向：desc 倒序，asc 正序。",
     ("task", "list", "sort"): (
         "排序因子：created 提交时间、updated 更新时间、priority 优先级、state 状态。"
@@ -4855,6 +5102,20 @@ def _enhance_cli_help(parser: argparse.ArgumentParser) -> None:
         current._positionals.title = "可用命令" if subparser_actions else "参数"
         if path in _COMMAND_HELP:
             current.description = _COMMAND_HELP[path]
+        if path == ("task", "submit"):
+            current.epilog = task_help_examples()
+        elif path in {
+            ("task",),
+            ("task", "preflight"),
+            ("workflow",),
+            ("workflow", "help"),
+            ("workflow", "show"),
+        }:
+            current.epilog = (
+                "查看工作流用途：vgen workflow list --market\n"
+                "查看提示词、参数和命令示例：vgen workflow help h3-face\n"
+                "其他工作流同样可用：vgen workflow help h3"
+            )
 
         for action in current._actions:
             if action.dest == "help":
@@ -4905,6 +5166,7 @@ def _enhance_cli_help(parser: argparse.ArgumentParser) -> None:
         "  vgen setup --gateway https://vgen.example.com\n"
         "  vgen gateway health\n"
         "  vgen worker list\n"
+        "  vgen workflow help h3-face\n"
         "  vgen task submit '一只猫在草地上奔跑' --wait\n\n"
         "查看某组命令：vgen <命令> --help；查看具体操作：vgen <命令> <子命令> --help。"
     )
@@ -5421,6 +5683,7 @@ def build_parser() -> argparse.ArgumentParser:
     install = workflow_sub.add_parser("install")
     install.add_argument("source")
     install.add_argument("--allow-unsigned", action="store_true")
+    install.add_argument("--index", help="workflow marketplace index for code-based installation")
     install.add_argument(
         "--publisher-key",
         help="base64 Ed25519 publisher key obtained independently of a remote market index",
@@ -5430,12 +5693,18 @@ def build_parser() -> argparse.ArgumentParser:
     custom.add_argument("--allow-unsigned", action="store_true")
     workflow_list = workflow_sub.add_parser("list")
     workflow_list.add_argument("--format", choices=("text", "json"), default="text")
-    for action in ("show", "verify"):
+    workflow_list.add_argument("--market", action="store_true")
+    workflow_list.add_argument("--index")
+    for action in ("show", "help", "verify"):
         command = workflow_sub.add_parser(action)
         command.add_argument("source")
+        command.add_argument(
+            "--format", choices=("text", "json"), default="json" if action == "verify" else "text"
+        )
     search = workflow_sub.add_parser("search")
-    search.add_argument("query")
-    search.add_argument("--index", required=True)
+    search.add_argument("query", nargs="?", default="")
+    search.add_argument("--index")
+    search.add_argument("--format", choices=("text", "json"), default="text")
     remove = workflow_sub.add_parser("remove")
     remove.add_argument("workflow_id")
     remove.add_argument("version")
@@ -5471,6 +5740,12 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--pool", help="Pool name (uses the Profile default when omitted)")
     preflight.add_argument("--image")
     preflight.add_argument("--last-image")
+    preflight.add_argument("--video", help="local reference video, encrypted before upload")
+    preflight.add_argument(
+        "--video-fps-mode",
+        choices=("auto", "strict"),
+        help="H3 人脸参考：auto 自动检测并转为 24 fps（默认）；strict 仅接受恒定 24 fps。",
+    )
     preflight.add_argument("--parameter", "-p", action="append", default=[])
     preflight.add_argument("--profile")
     submit = task_sub.add_parser("submit")
@@ -5481,6 +5756,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--pool", help="Pool name (uses the Profile default when omitted)")
     submit.add_argument("--image")
     submit.add_argument("--last-image")
+    submit.add_argument("--video", help="local reference video, encrypted before upload")
+    submit.add_argument(
+        "--video-fps-mode",
+        choices=("auto", "strict"),
+        help="H3 人脸参考：auto 自动检测并转为 24 fps（默认）；strict 仅接受恒定 24 fps。",
+    )
     submit.add_argument("--parameter", "-p", action="append", default=[])
     submit.add_argument("--priority", type=int, default=0)
     submit.add_argument("--idempotency-key")

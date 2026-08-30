@@ -56,7 +56,7 @@ _MEDIA_TYPE = re.compile(
 )
 _PUBLIC_MEDIA_TYPES = frozenset({*MEDIA_TYPE_EXTENSIONS, "application/octet-stream"})
 _WORKFLOW_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,511}$")
-_NODE_CLASS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_NODE_CLASS = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)$")
 _WORKFLOW_STATES = frozenset(
     {
         "ready",
@@ -86,6 +86,7 @@ _OPERATIONS = (
     "flf",
     "t2i",
     "i2i",
+    "v2v",
     "text-to-video",
     "image-to-video",
 )

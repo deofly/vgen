@@ -19,6 +19,7 @@ from vgen.market import WorkflowRegistry
 from vgen.market.registry import RegistryError
 
 from .profile import ProfileError, ProfileStore
+from .workflow_catalog import display_code, read_catalog_cache, workflow_index
 
 SUPPORTED_SHELLS = ("bash", "zsh")
 MANAGED_BLOCK_START = "# >>> vgen shell completion >>>"
@@ -39,6 +40,7 @@ _FILE_ARGUMENTS = frozenset(
         "index",
         "key_file",
         "last_image",
+        "video",
         "output",
         "private_key_file",
         "recovery_file",
@@ -221,7 +223,9 @@ def _profile_completer(**_kwargs: Any) -> Iterable[str]:
 
 def _workflow_completer(**_kwargs: Any) -> Iterable[str]:
     try:
-        installed = WorkflowRegistry().installed()
+        registry = WorkflowRegistry()
+        installed = registry.installed()
+        catalog = read_catalog_cache(getattr(registry, "root", None), workflow_index())
     except (OSError, RegistryError, UnicodeError, ValueError, yaml.YAMLError):
         return ()
     by_id: dict[str, list[str]] = {}
@@ -234,11 +238,21 @@ def _workflow_completer(**_kwargs: Any) -> Iterable[str]:
     for workflow_id, versions in sorted(by_id.items()):
         values.append(workflow_id)
         values.extend(f"{workflow_id}@{version}" for version in sorted(set(versions)))
-    return values
+        code = display_code(workflow_id, set(by_id), catalog)
+        values.append(code)
+        values.extend(f"{code}@{version}" for version in sorted(set(versions)))
+    for entry in catalog:
+        code = display_code(entry["id"], set(by_id), catalog)
+        values.extend((code, f"{code}@{entry['version']}"))
+    return tuple(dict.fromkeys(values))
 
 
 def _workflow_id_completer(**_kwargs: Any) -> Iterable[str]:
     return tuple(dict.fromkeys(value.partition("@")[0] for value in _workflow_completer()))
+
+
+def _workflow_source_completer(prefix: str, **kwargs: Any) -> Iterable[str]:
+    return tuple(dict.fromkeys((*_workflow_completer(), *FilesCompleter()(prefix, **kwargs))))
 
 
 def _cached_completer(kind: str):  # type: ignore[no-untyped-def]
@@ -264,6 +278,13 @@ def configure_parser_completers(parser: Any) -> None:
                 action.completer = _workflow_completer
             elif action.dest == "workflow_id":
                 action.completer = _workflow_id_completer
+            elif action.dest == "source" and path in {
+                ("workflow", "install"),
+                ("workflow", "show"),
+                ("workflow", "help"),
+                ("workflow", "verify"),
+            }:
+                action.completer = _workflow_source_completer
             elif action.dest in {"worker", "worker_id"}:
                 action.completer = _cached_completer("workers")
             elif action.dest == "workspace":

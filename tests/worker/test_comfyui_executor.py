@@ -55,7 +55,7 @@ class FakeComfyClient:
 
     def upload_image(self, path: Path, name: str) -> tuple[str, str]:
         self.uploaded.append((path, name))
-        return "staged.png", "vgen"
+        return "staged" + path.suffix, "vgen"
 
     def run(
         self,
@@ -394,7 +394,16 @@ def test_media_probe_uses_opencv_when_ffprobe_is_unavailable(
     }
 
 
-def test_comfyui_executor_keeps_graph_inside_adapter(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("loader", "field", "input_name", "filename", "operation"),
+    [
+        ("LoadImage", "image", "first_frame", "first.png", "i2v"),
+        ("LoadVideo", "file", "video", "reference.mp4", "v2v"),
+    ],
+)
+def test_comfyui_executor_keeps_graph_inside_adapter(
+    tmp_path: Path, loader: str, field: str, input_name: str, filename: str, operation: str
+) -> None:
     output_dir = tmp_path / "outputs"
     output_dir.mkdir()
     client = FakeComfyClient(output_dir / "result.mp4")
@@ -402,23 +411,21 @@ def test_comfyui_executor_keeps_graph_inside_adapter(tmp_path: Path) -> None:
         "http://127.0.0.1:8188",
         output_dir,
         client=client,
-        policy=_policy("LoadImage"),
+        policy=_policy(loader),
     )
     assert executor.maintenance_custom_nodes_root == tmp_path / "custom_nodes"
-    first_frame = tmp_path / "first.png"
+    first_frame = tmp_path / filename
     first_frame.write_bytes(b"image")
     payload = json.dumps(
         {
             "workflow": {
                 "1": {
-                    "class_type": "LoadImage",
-                    "inputs": {"image": "default.png"},
+                    "class_type": loader,
+                    "inputs": {field: "default" + first_frame.suffix},
                     "_meta": {"title": "INPUT_IMAGE"},
                 }
             },
-            "input_bindings": [
-                {"input": "first_frame", "node_title": "INPUT_IMAGE", "field": "image"}
-            ],
+            "input_bindings": [{"input": input_name, "node_title": "INPUT_IMAGE", "field": field}],
         }
     ).encode()
     progress = []
@@ -427,14 +434,14 @@ def test_comfyui_executor_keeps_graph_inside_adapter(tmp_path: Path) -> None:
             "tsk_1",
             "att_1",
             "a" * 64,
-            "i2v",
+            operation,
             COMFYUI_PAYLOAD_FORMAT,
             payload,
             inputs=(
                 ExecutionInput(
-                    "first_frame",
+                    input_name,
                     first_frame,
-                    ArtifactDescriptor("art_1", "first.png"),
+                    ArtifactDescriptor("art_1", filename),
                 ),
             ),
             timeout_seconds=30,
@@ -442,7 +449,7 @@ def test_comfyui_executor_keeps_graph_inside_adapter(tmp_path: Path) -> None:
         ExecutionContext(tmp_path / "work", progress.append),
     )
     assert client.workflow is not None
-    assert client.workflow["1"]["inputs"]["image"] == "vgen/staged.png"
+    assert client.workflow["1"]["inputs"][field] == "vgen/staged" + first_frame.suffix
     assert result.artifacts[0].path == output_dir / "result.mp4"
     assert result.executor_run_id == "prompt_1"
     assert result.usage.gpu_active_ms is None
@@ -851,9 +858,11 @@ def test_comfyui_model_pins_are_verified_before_advertising_or_execution(
     monkeypatch.setattr(
         comfyui_module.time,
         "time_ns",
-        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
-        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS
-        + 1,
+        lambda: (
+            max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
+            + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS
+            + 1
+        ),
     )
     capabilities = executor.capabilities()
     assert capabilities["model_digests"] == []
@@ -948,8 +957,10 @@ def test_model_symlink_resolution_failure_clears_prior_resolved_cache(
     monkeypatch.setattr(
         comfyui_module.time,
         "time_ns",
-        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
-        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
+        lambda: (
+            max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
+            + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS
+        ),
     )
 
     assert executor._verified_model_digests(policy.model_files) == (
@@ -1020,8 +1031,10 @@ def test_missing_model_clears_cache_before_same_fingerprint_recreation(
     monkeypatch.setattr(
         comfyui_module.time,
         "time_ns",
-        lambda: max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
-        + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS,
+        lambda: (
+            max(verified_metadata.st_mtime_ns, verified_metadata.st_ctime_ns)
+            + comfyui_module._MODEL_DIGEST_CACHE_SETTLE_NS
+        ),
     )
 
     assert executor.capabilities()["model_digests"] == [f"sha256:{digest}"]

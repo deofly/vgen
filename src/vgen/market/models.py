@@ -183,7 +183,7 @@ class WorkflowVariant(BaseModel):
     payload_format: str
     payload: str
     mapping: str | None = None
-    operations: list[Literal["t2v", "i2v", "flf", "t2i", "i2i"]]
+    operations: list[Literal["t2v", "i2v", "flf", "t2i", "i2i", "v2v"]]
     models: list[ModelRequirement] = Field(default_factory=list)
     custom_nodes: list[CustomNodeRequirement] = Field(default_factory=list, max_length=8)
     executor_min_version: str | None = None

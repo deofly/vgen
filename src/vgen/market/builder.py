@@ -43,7 +43,17 @@ def build_comfy_graph(
     for optional in ("image", "last_image"):
         if optional in mapping and not effective.get(optional):
             _remove_optional(graph, mapping[optional], optional)
-    operation = "flf" if effective.get("last_image") else "i2v" if effective.get("image") else "t2v"
+    if effective.get("video") and effective.get("last_image"):
+        raise WorkflowBuildError("video and last_image cannot be combined")
+    operation = (
+        "v2v"
+        if effective.get("video")
+        else "flf"
+        if effective.get("last_image")
+        else "i2v"
+        if effective.get("image")
+        else "t2v"
+    )
     if operation == "flf" and not effective.get("image"):
         raise WorkflowBuildError("last_image requires image")
     return graph, effective, operation

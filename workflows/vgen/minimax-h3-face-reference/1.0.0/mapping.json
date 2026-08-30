@@ -1,0 +1,38 @@
+{
+  "prompt": {
+    "node": "138",
+    "input": "value"
+  },
+  "image": {
+    "node": "137",
+    "input": "image"
+  },
+  "video": {
+    "node": "147",
+    "input": "file"
+  },
+  "seed": {
+    "node": "129",
+    "input": "noise_seed"
+  },
+  "steps": {
+    "node": "124",
+    "input": "steps"
+  },
+  "width": {
+    "node": "136",
+    "input": "width"
+  },
+  "height": {
+    "node": "136",
+    "input": "height"
+  },
+  "start_time": {
+    "node": "149",
+    "input": "start_time"
+  },
+  "ref_image_size": {
+    "node": "136",
+    "input": "ref_image_size"
+  }
+}

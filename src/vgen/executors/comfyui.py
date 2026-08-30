@@ -65,6 +65,11 @@ _HARD_MAX_INPUT_FIELDS = 256
 # fresh stat identity must settle for that full tick before cross-probe reuse.
 _MODEL_DIGEST_CACHE_SETTLE_NS = 2_000_000_000
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# A legacy native ComfyUI node uses this exact spaced ID. Keep arbitrary
+# whitespace out of node identifiers and public capability metadata.
+_SAFE_NODE_CLASS = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)$")
+# Only these exact native loader/input pairs may consume uploaded artifacts.
+_INPUT_LOADER_FIELDS = {"LoadImage": "image", "LoadVideo": "file"}
 _SAFE_PROVENANCE_ENTRY = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -320,10 +325,13 @@ class ComfyUIExecutionPolicy:
         if value.get("version") != 1:
             raise ComfyUIPolicyError("ComfyUI policy version must be 1.")
 
-        builtin = _policy_strings(value.get("allowed_node_classes"), "allowed_node_classes")
+        builtin = _policy_strings(
+            value.get("allowed_node_classes"), "allowed_node_classes", pattern=_SAFE_NODE_CLASS
+        )
         custom = _policy_strings(
             value.get("allowed_custom_node_classes", []),
             "allowed_custom_node_classes",
+            pattern=_SAFE_NODE_CLASS,
         )
         if not builtin and not custom:
             raise ComfyUIPolicyError("ComfyUI policy must allow at least one node class.")
@@ -395,7 +403,7 @@ class ComfyUIExecutionPolicy:
             class_type = node.get("class_type")
             inputs = node.get("inputs")
             metadata = node.get("_meta", {})
-            if not isinstance(class_type, str) or not _SAFE_IDENTIFIER.fullmatch(class_type):
+            if not isinstance(class_type, str) or not _SAFE_NODE_CLASS.fullmatch(class_type):
                 raise _policy_denied("invalid_node_class")
             if class_type not in allowed_classes:
                 raise _policy_denied("node_class_not_allowed")
@@ -534,7 +542,7 @@ class ComfyUIExecutionPolicy:
             field = binding.get("field", "image")
             if not isinstance(input_name, str) or not _SAFE_IDENTIFIER.fullmatch(input_name):
                 raise _policy_denied("invalid_input_binding")
-            if field != "image":
+            if field not in _INPUT_LOADER_FIELDS.values():
                 raise _policy_denied("invalid_input_binding_field")
             if node_id is None and node_title is None:
                 raise _policy_denied("invalid_input_binding")
@@ -552,7 +560,10 @@ class ComfyUIExecutionPolicy:
                 if (node_id is None or candidate_id == node_id)
                 and (node_title is None or (node.get("_meta") or {}).get("title") == node_title)
             ]
-            if len(matches) != 1 or workflow[matches[0]].get("class_type") != "LoadImage":
+            if (
+                len(matches) != 1
+                or _INPUT_LOADER_FIELDS.get(workflow[matches[0]].get("class_type")) != field
+            ):
                 raise _policy_denied("input_binding_target_not_allowed")
             if matches[0] in targets:
                 raise _policy_denied("duplicate_input_binding")
@@ -562,6 +573,11 @@ class ComfyUIExecutionPolicy:
         }
         if load_image_nodes - targets:
             raise _policy_denied("unbound_load_image")
+        load_video_nodes = {
+            node_id for node_id, node in workflow.items() if node.get("class_type") == "LoadVideo"
+        }
+        if load_video_nodes - targets:
+            raise _policy_denied("unbound_load_video")
 
 
 def _policy_strings(
@@ -917,7 +933,7 @@ def _workflow_capability(installed: InstallResult) -> ComfyUIWorkflowCapability:
             raise ComfyUIPolicyError(
                 "An active workflow capability mapping cannot build its declared operations."
             ) from exc
-        if operation in {"t2v", "i2v", "flf"} and derived_operation != operation:
+        if operation in {"t2v", "i2v", "flf", "v2v"} and derived_operation != operation:
             raise ComfyUIPolicyError(
                 "An active workflow capability operation does not match its mapping."
             )
@@ -1086,10 +1102,12 @@ def _model_references(value: Any) -> set[str]:
 
 def _sample_operation_parameters(operation: str, mapping: Mapping[str, Any]) -> dict[str, Any]:
     parameters: dict[str, Any] = {}
-    if operation in {"i2v", "i2i", "flf"} and "image" in mapping:
+    if operation in {"i2v", "i2i", "flf", "v2v"} and "image" in mapping:
         parameters["image"] = "vgen-input.png"
     if operation == "flf" and "last_image" in mapping:
         parameters["last_image"] = "vgen-last-input.png"
+    if operation == "v2v" and "video" in mapping:
+        parameters["video"] = "vgen-reference.mp4"
     return parameters
 
 
@@ -1099,7 +1117,7 @@ def _capability_expected_bindings(
     parameters: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     bindings: list[dict[str, Any]] = []
-    for name in ("image", "last_image"):
+    for name in ("image", "last_image", "video"):
         if not parameters.get(name):
             continue
         rule = mapping.get(name)
@@ -1967,9 +1985,9 @@ class ComfyUIExecutor:
     def descriptor(self) -> ExecutorDescriptor:
         return ExecutorDescriptor(
             executor_type="comfyui",
-            version="1.2.0",
+            version="1.3.0",
             payload_formats=(COMFYUI_PAYLOAD_FORMAT,),
-            operations=("t2v", "i2v", "flf", "t2i", "i2i"),
+            operations=("t2v", "i2v", "flf", "t2i", "i2i", "v2v"),
             max_concurrency=1,
         )
 
@@ -3135,7 +3153,7 @@ class ComfyUIExecutor:
         if (
             not isinstance(input_name, str)
             or not _SAFE_IDENTIFIER.fullmatch(input_name)
-            or field != "image"
+            or field not in _INPUT_LOADER_FIELDS.values()
         ):
             raise ExecutorFailure(
                 ErrorCode.UNSUPPORTED_PAYLOAD,
@@ -3156,7 +3174,10 @@ class ComfyUIExecutor:
             if node_title is not None and (node.get("_meta") or {}).get("title") != node_title:
                 continue
             matches.append(node)
-        if len(matches) != 1 or matches[0].get("class_type") != "LoadImage":
+        if (
+            len(matches) != 1
+            or _INPUT_LOADER_FIELDS.get(matches[0].get("class_type")) != field
+        ):
             raise ExecutorFailure(
                 ErrorCode.UNSUPPORTED_PAYLOAD,
                 "UNSUPPORTED_PAYLOAD",
@@ -3165,6 +3186,8 @@ class ComfyUIExecutor:
             )
         upload_name = f"vgen_{uuid.uuid4().hex}{execution_input.path.suffix[:16]}"
         try:
+            # ComfyUI's /upload/image endpoint also stores video uploads for
+            # its native LoadVideo node. Never pass a caller-supplied URL/path.
             comfy_name, subfolder = self._client.upload_image(execution_input.path, upload_name)
         except requests.RequestException as exc:
             raise ExecutorFailure(

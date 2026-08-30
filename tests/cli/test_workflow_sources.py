@@ -82,7 +82,11 @@ def test_workflow_inspection_resolves_bundled_reference(
     registry = WorkflowRegistry(tmp_path / "registry")
     monkeypatch.setattr(cli_main, "WorkflowRegistry", lambda: registry)
 
-    dispatch(build_parser().parse_args(["workflow", action, "vgen/ltx-2.5-distilled-t2v@1.0.0"]))
+    dispatch(
+        build_parser().parse_args(
+            ["workflow", action, "vgen/ltx-2.5-distilled-t2v@1.0.0", "--format", "json"]
+        )
+    )
 
     result = json.loads(capsys.readouterr().out)
     assert result["manifest"]["id"] == "vgen/ltx-2.5-distilled-t2v"
@@ -103,7 +107,11 @@ def test_workflow_inspection_resolves_installed_reference(
     installed = registry.install(package, allow_unsigned=True)
     monkeypatch.setattr(cli_main, "WorkflowRegistry", lambda: registry)
 
-    dispatch(build_parser().parse_args(["workflow", "show", "example/installed@1.0.0"]))
+    dispatch(
+        build_parser().parse_args(
+            ["workflow", "show", "example/installed@1.0.0", "--format", "json"]
+        )
+    )
 
     result = json.loads(capsys.readouterr().out)
     assert result["manifest"]["id"] == "example/installed"
@@ -140,7 +148,7 @@ def test_workflow_inspection_supports_zip(
     archive = build_archive(package, tmp_path / "workflow.zip", allow_unsigned=True)
     monkeypatch.setattr(cli_main, "WorkflowRegistry", lambda: registry)
 
-    dispatch(build_parser().parse_args(["workflow", "show", str(archive)]))
+    dispatch(build_parser().parse_args(["workflow", "show", str(archive), "--format", "json"]))
 
     result = json.loads(capsys.readouterr().out)
     assert result["manifest"]["id"] == "example/archive"

@@ -410,9 +410,7 @@ class WorkerCapabilityStore:
             self._write_index({"schema_version": _INDEX_VERSION, "workflows": workflows})
             return True
 
-    def reconcile_authorizations(
-        self, authorizations: Any
-    ) -> tuple[tuple[str, str], ...]:
+    def reconcile_authorizations(self, authorizations: Any) -> tuple[tuple[str, str], ...]:
         """Deactivate active releases absent from one validated Gateway snapshot."""
 
         # The active index is capped at 256 dynamic releases, while a Gateway
@@ -503,7 +501,7 @@ class WorkerCapabilityStore:
             and len(spec["node_classes"]) <= 512
             and all(
                 isinstance(item, str)
-                and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", item))
+                and bool(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)", item))
                 for item in spec["node_classes"]
             )
             and spec["node_classes"] == sorted(set(spec["node_classes"]))
@@ -910,7 +908,10 @@ class WorkerCapabilityStore:
             facts = comfyui_capability_facts(installed.manifest, installed.path)
         except WorkflowCapabilityError as exc:
             raise CapabilityInstallError("CAPABILITY_GRAPH_INVALID") from exc
-        if any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", item) for item in facts.node_classes):
+        if any(
+            not re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}|Video Slice)", item)
+            for item in facts.node_classes
+        ):
             raise CapabilityInstallError("CAPABILITY_ARCHIVE_INVALID")
         # Custom-node requirements remain review metadata.  A capability ZIP
         # must never carry source trees, wheel files, native libraries or setup

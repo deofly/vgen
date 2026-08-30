@@ -241,11 +241,17 @@ def test_profile_list_is_flat_but_json_keeps_current_wrapper(
     assert json.loads(capsys.readouterr().out)["current"] == "home"
 
 
-def test_workflow_list_prints_flat_rows_by_default(
+def test_workflow_list_prints_description_and_code_by_default(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     installed = SimpleNamespace(
-        manifest=SimpleNamespace(id="vgen/demo", version="1.0.0", provenance="market"),
+        manifest=SimpleNamespace(
+            id="vgen/demo",
+            version="1.0.0",
+            provenance="market",
+            title="Demo workflow",
+            summary="Generate a demo video.",
+        ),
         digest="a" * 64,
         signed=True,
         path=Path("/tmp/vgen-demo"),
@@ -259,7 +265,9 @@ def test_workflow_list_prints_flat_rows_by_default(
     dispatch(build_parser().parse_args(["workflow", "list"]))
 
     output = capsys.readouterr().out
-    assert "WORKFLOW" in output
+    assert "demo@1.0.0" in output
+    assert "Demo workflow" in output
+    assert "Generate a demo video." in output
     assert "vgen/demo" in output
     assert not output.lstrip().startswith("[")
 

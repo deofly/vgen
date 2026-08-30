@@ -9,9 +9,7 @@ def _subparser(parser: argparse.ArgumentParser, *path: str) -> argparse.Argument
     current = parser
     for name in path:
         action = next(
-            item
-            for item in current._actions
-            if isinstance(item, argparse._SubParsersAction)
+            item for item in current._actions if isinstance(item, argparse._SubParsersAction)
         )
         current = action.choices[name]
     return current
@@ -59,6 +57,8 @@ def test_cli_help_explains_common_and_advanced_flows_in_chinese() -> None:
     assert "direct_invite 领取即生效" in invite_help
     assert "避免 secret 进入命令历史" in join_help
     assert "本机 ComfyUI API 地址" in worker_help
-    assert "首帧图片路径；不指定图片时执行文生视频" in submit_help
+    assert "图生视频时作为首帧" in submit_help
+    assert "人脸参考工作流中作为人脸照片" in submit_help
+    assert "strict 仅接受恒定 24 fps" in submit_help
     assert "尾帧图片路径；与 --image 同时指定时生成首尾帧视频" in submit_help
     assert "格式为 key=value" in submit_help

@@ -717,6 +717,70 @@ vgen broker worker-update ~/Downloads/vgen-<版本>-py3-none-any.whl \
 nodes、Python、CUDA、显卡驱动或模型。授权维护 Broker 能向 Worker 部署代码，因此默认仍由
 Workspace Owner 显式执行命令；当前不在后台静默自动升级。
 
+### 6.4 查看工作流描述并使用短代号
+
+支持代号的新版 CLI 会显示工作流名称、用途说明、版本及可复制的代号：
+
+```bash
+vgen workflow list --market          # 查看 Marketplace，并缓存代号
+vgen workflow list                   # 查看本机已安装版本，不联网
+vgen workflow search 换脸            # 按代号、名称或说明搜索市场
+vgen workflow show h3-face           # 查看清单、用途和参数，不安装市场包
+vgen workflow help h3-face           # 示例提示词、参数范围、合法组合和复制命令
+vgen workflow show h3-face --format json
+vgen task submit --help              # 通用选项及 H3 快速示例，不联网
+```
+
+官方目录目前提供以下代号；代号在目录中维护，新增工作流不需要在 CLI 中硬编码名称：
+
+| 代号 | 工作流 | 用途 |
+| --- | --- | --- |
+| `h3` | `vgen/minimax-h3-8step` | H3 文生视频、首帧和首尾帧视频 |
+| `h3-face` | `vgen/minimax-h3-face-reference` | 根据人脸照片和原视频重新生成画面，接回原声；预览版 |
+| `ltx25-q4` | `vgen/ltx-2.5-gguf-q4-t2v` | LTX-2.5 Q4 文生视频和音频 |
+
+`workflow help <代号>` 与 `workflow show <代号>` 的文本输出包含工作流专属用法。参数的必填项、默认值、范围、枚举和组合约束直接读取所选版本的清单；`h3-face` 另有参考提示词、横屏示例、帧率处理说明和运行前提。已安装包可离线查看；查看未安装的市场包只读取并校验，不安装或运行。`--format json` 仍返回原有结构化清单。命令示例按 Bash/Zsh 引号规则生成，需替换素材路径或尖括号占位符。
+
+没有目录代号的已安装包，可以使用去掉命名空间后的名称；如果多家发布者重名，CLI 会列出候选完整 ID，不会猜选。代号缓存按 Marketplace 地址隔离，刷新时拒绝把已知代号悄悄改指向另一个工作流。补全只读取本地信息，不访问网络。
+
+```bash
+vgen workflow install h3 --allow-unsigned
+vgen broker workflow-install h3 --worker "HONEYLONG GPU Worker" --approve-nodes --allow-unsigned --wait
+vgen task preflight --workflow h3
+vgen task submit "一只猫在草地上奔跑" --workflow h3 --wait
+```
+
+`--workflow h3` 优先使用本机已安装的最高版本；本机没有该工作流时才从目录解析版本。`workflow install h3` 显式从目录选择最高版本。用 `h3@1.0.1` 可以固定版本，原来的完整 ID 和 `ID@版本` 继续有效。预览工作流仍受自己的执行器版本、模型和硬件限制约束；代号不会让旧 Worker 获得视频输入能力。
+
+`workflow list`、`search`、`show` 默认输出可读文本。脚本应显式使用 `--format json`；`verify` 默认仍为 JSON。`--index` 可以指定其他市场，默认使用官方目录或 `VGEN_WORKFLOW_MARKET_INDEX`。
+
+发布目录条目时可在原有 `id`、`version`、`source`、`digest` 外添加 `code`、`title`、`summary`。这些字段用于显示与选择；包的实际身份仍由 ID、版本、内容摘要和原有签名规则校验。请给同一个工作流的所有版本保留相同代号，不要把旧代号重新分配给其他工作流。
+
+### 6.5 人脸参考视频：自动适配输入帧率
+
+支持此功能的新版 CLI 可以直接接收原视频，不再要求先手工转成 24 fps。当前 ComfyUI H3 Ref2VA 节点仍以 24 fps 计算视频、音频与参考时间；不能只修改输出 FPS，否则会改变播放时长。此适配仅针对已审查的 `h3-face@1.0.0` 包摘要，不修改已发布的包。
+
+本机需要安装 FFmpeg（`ffmpeg` 和 `ffprobe` 在 PATH 中）。准备本人或获授权的清晰脸部照片，以及带音轨的单人视频。所选起点之后必须至少保留 124/24 秒，约 5.17 秒。
+
+```bash
+# 只检测素材和调度条件，不转码、不上传、不创建任务
+vgen task preflight --workflow h3-face@1.0.0 \
+  --image ./face.png --video ./original.mp4
+
+# 默认 auto：检测原视频，截取片段并转为 24 fps，再加密上传
+vgen task submit "Use <Picture 1> for facial identity and <Video 1> for movement and timing." \
+  --workflow h3-face@1.0.0 --image ./face.png --video ./original.mp4 \
+  --video-fps-mode auto -p start_time=0 --wait --output-dir ./h3-face-output
+```
+
+自动模式读取平均帧率及所选片段的实际帧时间戳，支持非整数帧率和可变帧率输入；按时间重采样，不把原始帧直接改成另一种播放速度。输入检测上限为 240 fps。输出仍为 124 帧、24 fps、约 5.17 秒；没有实现跟随原片帧率输出或延长整段视频。
+
+选段在本地只执行一次，画面和音轨使用同一 `start_time`。临时视频最长边不超过 1280，编码为 H.264/AAC，可能有重编码损失；原文件保持不变。上传时仅发送选中的片段，临时明文文件在加密上传后或失败时清理。检测结果只在本地显示，不加入 Gateway 的公开任务元数据。
+
+如果不希望自动转码，可指定 `--video-fps-mode strict`：仅接受所选片段恒定 24 fps 的输入，否则在提交前报错；此模式保留原文件上传和工作流内截取行为。预检结果中的 `video_input` 包含原帧率、是否检测到可变帧率、模型帧率和处理模式。
+
+这些是 CLI 的素材适配能力，不替代运行环境升级。仍需配套的 Gateway、支持视频输入的 Worker（Executor >=1.3.0）及 Ref2VA 模型；人脸效果尚待 GPU 实测。包内旧 README 的手工转帧率步骤可用于旧客户端；新版客户端以本节为准。
+
 ## 7. 真实 0/1/2 图测试
 
 先确认 Gateway、Broker 和 Worker 状态：
