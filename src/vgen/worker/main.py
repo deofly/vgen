@@ -399,6 +399,47 @@ def _safe_configured_python(path: Path | None) -> Path | None:
     return resolved
 
 
+def _discover_legacy_comfy_python(
+    arguments: argparse.Namespace,
+    custom_nodes_root: Path,
+) -> Path | None:
+    """Find one unambiguous ComfyUI interpreter for pre-Node-Pack services."""
+
+    comfy_root = custom_nodes_root.expanduser().absolute().parent
+    data_roots: list[Path] = [comfy_root]
+    for value in (
+        getattr(arguments, "comfy_model_root", None),
+        getattr(arguments, "comfy_output_dir", None),
+    ):
+        if isinstance(value, Path):
+            data_roots.append(value.expanduser().absolute().parent)
+
+    candidates = [
+        comfy_root / ".venv" / "Scripts" / "python.exe",
+        comfy_root / "venv" / "Scripts" / "python.exe",
+        comfy_root / "python_embeded" / "python.exe",
+        comfy_root.parent / "python_embeded" / "python.exe",
+        comfy_root.parent / "venv" / "base" / "python.exe",
+        comfy_root.parent / "venv" / "python.exe",
+        comfy_root.parent / "envs" / "default" / "Scripts" / "python.exe",
+    ]
+    for root in data_roots:
+        candidates.extend(
+            (
+                root / ".venv" / "Scripts" / "python.exe",
+                root / "venv" / "Scripts" / "python.exe",
+            )
+        )
+    resolved = {
+        candidate
+        for candidate in (_safe_configured_python(path) for path in candidates)
+        if candidate is not None
+    }
+    if len(resolved) != 1:
+        return None
+    return resolved.pop()
+
+
 def _build_maintenance(
     arguments: argparse.Namespace,
     credentials: WorkerCredentials,
@@ -415,6 +456,8 @@ def _build_maintenance(
     host_control_ready = prepare_windows_supervisor(work_root)
     if custom_nodes_root is not None and callable(node_probe) and host_control_ready:
         configured_python = _safe_configured_python(arguments.comfy_python_executable)
+        if configured_python is None:
+            configured_python = _discover_legacy_comfy_python(arguments, custom_nodes_root)
         installer_python = configured_python or Path(sys.executable).resolve(strict=True)
         node_pack_installer = NodePackInstaller(
             work_root,

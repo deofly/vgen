@@ -110,6 +110,28 @@ def test_maintenance_uses_worker_python_for_pure_node_packs_with_stale_host_pin(
     )
 
 
+def test_legacy_comfy_python_discovery_requires_one_known_layout(
+    tmp_path: Path,
+) -> None:
+    comfy_root = tmp_path / "portable" / "ComfyUI"
+    custom_nodes = comfy_root / "custom_nodes"
+    custom_nodes.mkdir(parents=True)
+    portable_python = tmp_path / "portable" / "python_embeded" / "python.exe"
+    portable_python.parent.mkdir()
+    portable_python.write_bytes(b"python")
+    arguments = SimpleNamespace(comfy_model_root=None, comfy_output_dir=None)
+
+    assert (
+        worker_main_module._discover_legacy_comfy_python(arguments, custom_nodes)
+        == portable_python
+    )
+
+    second_python = comfy_root / ".venv" / "Scripts" / "python.exe"
+    second_python.parent.mkdir(parents=True)
+    second_python.write_bytes(b"python")
+    assert worker_main_module._discover_legacy_comfy_python(arguments, custom_nodes) is None
+
+
 def test_doctor_outputs_machine_readable_executor_status(capsys: Any) -> None:
     exit_code = run(["doctor", "--json"], executor_factory=lambda _arguments: FakeExecutor())
     assert exit_code == EXIT_OK
