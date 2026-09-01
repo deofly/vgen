@@ -1,4 +1,4 @@
-"""Local media adaptation for the immutable H3 face-reference preview."""
+"""Local media adaptation for reviewed h3-face workflow releases."""
 
 from __future__ import annotations
 
@@ -14,14 +14,17 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-H3_FACE_RELEASE = ("vgen/minimax-h3-face-reference", "1.0.1")
+H3_FACE_RELEASE = ("vgen/minimax-h3-face-reference", "2.0.0")
 # Populated with the exact reviewed archive digest for every compatible release.
 # The legacy release remains supported for installed/offline callers.
 H3_FACE_RELEASE_DIGESTS = {
     ("vgen/minimax-h3-face-reference", "1.0.0"): (
         "a2d5fc8d4acb9f667ea625d3037ae13142f9f76a5c5d6576df80cd1158cd9463"
     ),
-    H3_FACE_RELEASE: "b2275088cc2af6afa7a4efc652bb6dd1354b44643ad1593805bbb34814e07f46",
+    ("vgen/minimax-h3-face-reference", "1.0.1"): (
+        "b2275088cc2af6afa7a4efc652bb6dd1354b44643ad1593805bbb34814e07f46"
+    ),
+    H3_FACE_RELEASE: "d212cdbdc83472e0172aef4715438427e44934f021da5adabfeeb5a07e4f0138",
 }
 H3_FACE_DIGEST = H3_FACE_RELEASE_DIGESTS[H3_FACE_RELEASE]
 H3_FPS = 24

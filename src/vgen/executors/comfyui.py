@@ -52,7 +52,16 @@ logger = logging.getLogger("vgen.executors.comfyui")
 COMFYUI_PAYLOAD_FORMAT = "comfyui-api-graph/v1"
 OUTPUT_FIELDS = ("gifs", "videos", "images", "audio")
 VIDEO_SUFFIXES = (".mp4", ".webm", ".mkv", ".mov", ".gif", ".avi")
-MODEL_EXTENSIONS = (".safetensors", ".ckpt", ".gguf", ".bin", ".onnx", ".pt", ".pth")
+MODEL_EXTENSIONS = (
+    ".safetensors",
+    ".ckpt",
+    ".gguf",
+    ".bin",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".task",
+)
 
 _POLICY_FILE_MAX_BYTES = 256 * 1024
 _HARD_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024

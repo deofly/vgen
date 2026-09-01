@@ -13,7 +13,7 @@ from vgen.cli.workflow_help import FACE_PROMPT, face_commands, parameter_help, w
 from vgen.market.models import WorkflowManifest
 from vgen.market.registry import WorkflowRegistry
 
-PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/1.0.1"
+PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/2.0.0"
 
 
 def test_face_example_commands_parse_and_pass_actual_parameter_validation():
@@ -23,14 +23,11 @@ def test_face_example_commands_parse_and_pass_actual_parameter_validation():
         parameters = cli._effective_parameters(manifest, args)
         assert parameters["image"] == "face.png"
         assert parameters["video"] == "original.mp4"
-        assert parameters["width"] == 480 and parameters["height"] == 832
         if args.task_action == "submit":
             assert args.prompt == FACE_PROMPT
             assert args.video_fps_mode == "auto"
-        horizontal = cli.build_parser().parse_args(
-            command[1:] + ["-p", "width=832", "-p", "height=480"]
-        )
-        assert cli._effective_parameters(manifest, horizontal)["width"] == 832
+        stronger = cli.build_parser().parse_args(command[1:] + ["-p", "strength=0.85"])
+        assert cli._effective_parameters(manifest, stronger)["strength"] == 0.85
 
 
 def test_workflow_help_reads_cached_code_offline_without_installing(tmp_path, monkeypatch, capsys):
@@ -42,7 +39,7 @@ def test_workflow_help_reads_cached_code_offline_without_installing(tmp_path, mo
         [
             {
                 "id": "vgen/minimax-h3-face-reference",
-                "version": "1.0.0",
+                "version": "2.0.0",
                 "code": "h3-face",
                 "source": "https://market.example/face.zip",
                 "digest": "sha256:" + H3_FACE_DIGEST,
@@ -58,8 +55,8 @@ def test_workflow_help_reads_cached_code_offline_without_installing(tmp_path, mo
     cli.dispatch(cli.build_parser().parse_args(["workflow", "help", "h3-face"]))
     output = capsys.readouterr().out
     assert "示例提示词" in output and FACE_PROMPT in output
-    assert "steps（-p steps=值）：可选；integer；默认 20；>= 20；<= 30" in output
-    assert "width=832, height=480" in output
+    assert "strength（-p strength=值）：可选；number；默认 1；>= 0；<= 1" in output
+    assert "逐帧单人换脸" in output
     assert "--video-fps-mode strict" in output
     assert "-p fps=..." in output and "不是 -p 工作流参数" in output
     assert len(registry.installed()) == 1
@@ -69,11 +66,11 @@ def test_workflow_help_reads_cached_code_offline_without_installing(tmp_path, mo
 
 def test_parameter_help_uses_schema_constraints_and_strips_terminal_controls():
     manifest = WorkflowManifest.load(PACKAGE / "manifest.yaml")
-    manifest.parameters["properties"]["steps"].update(
-        minimum=22, maximum=28, default=24, description="说明\x1b[31m\n下一行"
+    manifest.parameters["properties"]["strength"].update(
+        minimum=0.2, maximum=0.9, default=0.7, description="说明\x1b[31m\n下一行"
     )
     text = parameter_help(manifest, H3_FACE_DIGEST)
-    assert "默认 24；>= 22；<= 28" in text
+    assert "默认 0.7；>= 0.2；<= 0.9" in text
     assert "\x1b" not in text and "说明 [31m 下一行" in text
 
 

@@ -1,0 +1,102 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__UPLOAD_TARGET_FACE__.png"
+    },
+    "_meta": {
+      "title": "01 授权人脸照片"
+    }
+  },
+  "2": {
+    "class_type": "LoadVideo",
+    "inputs": {
+      "file": "__UPLOAD_REFERENCE_24FPS__.mp4"
+    },
+    "_meta": {
+      "title": "02 原视频（自动转换为 24 fps）"
+    }
+  },
+  "3": {
+    "class_type": "Video Slice",
+    "inputs": {
+      "start_time": 0,
+      "duration": 5.166666666666667,
+      "strict_duration": true,
+      "video": [
+        "2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "03 截取 124 帧"
+    }
+  },
+  "4": {
+    "class_type": "GetVideoComponents",
+    "inputs": {
+      "video": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "04 读取原画面和原音轨"
+    }
+  },
+  "5": {
+    "class_type": "VGenTemporalFaceSwap",
+    "inputs": {
+      "model_name": "face_landmarker.task",
+      "prompt": "Authorized single-face replacement. Preserve the original shot and audio.",
+      "seed": -1,
+      "strength": 1.0,
+      "identity_shape": 0.3,
+      "feather": 0.045,
+      "source_image": [
+        "1",
+        0
+      ],
+      "target_images": [
+        "4",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "05 逐帧替换单个人脸"
+    }
+  },
+  "6": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "fps": 24,
+      "bit_depth": 8,
+      "images": [
+        "5",
+        0
+      ],
+      "audio": [
+        "4",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "06 合并替换画面和原音轨"
+    }
+  },
+  "7": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "filename_prefix": "video/VGen_temporal_face_swap",
+      "format": "mp4",
+      "codec": "auto",
+      "video": [
+        "6",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "07 保存 MP4"
+    }
+  }
+}

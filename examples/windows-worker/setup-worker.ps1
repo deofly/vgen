@@ -1397,6 +1397,7 @@ function Write-VGenModelPathsConfig {
         "diffusers",
         "diffusion_models",
         "embeddings",
+        "face_landmarkers",
         "frame_interpolation",
         "geometry_estimation",
         "gligen",

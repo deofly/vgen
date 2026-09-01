@@ -15,7 +15,7 @@ from vgen.cli import video_inputs as video
 from vgen.market.builder import build_comfy_graph
 from vgen.market.models import WorkflowManifest
 
-PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/1.0.1"
+PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/2.0.0"
 HAS_FFMPEG = shutil.which("ffmpeg") and shutil.which("ffprobe")
 media_test = pytest.mark.skipif(not HAS_FFMPEG, reason="real FFmpeg media test")
 
@@ -305,7 +305,7 @@ def test_cli_submit_uploads_normalized_clip_and_cleans_it_on_failure(tmp_path, m
     def capture_graph(template, mapping, parameters):
         assert parameters["start_time"] == 0
         graph, effective, operation = real_build(template, mapping, parameters)
-        assert graph["149"]["inputs"]["start_time"] == 0
+        assert graph["3"]["inputs"]["start_time"] == 0
         return graph, effective, operation
 
     monkeypatch.setattr(cli, "_client", lambda profile: Client())

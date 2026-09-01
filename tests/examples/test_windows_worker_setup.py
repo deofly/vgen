@@ -759,6 +759,7 @@ def test_windows_worker_generates_only_a_controlled_model_path_map() -> None:
         "diffusers",
         "diffusion_models",
         "embeddings",
+        "face_landmarkers",
         "frame_interpolation",
         "geometry_estimation",
         "gligen",

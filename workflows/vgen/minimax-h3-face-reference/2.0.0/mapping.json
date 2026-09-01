@@ -1,0 +1,34 @@
+{
+  "prompt": {
+    "node": "5",
+    "input": "prompt"
+  },
+  "image": {
+    "node": "1",
+    "input": "image"
+  },
+  "video": {
+    "node": "2",
+    "input": "file"
+  },
+  "seed": {
+    "node": "5",
+    "input": "seed"
+  },
+  "start_time": {
+    "node": "3",
+    "input": "start_time"
+  },
+  "strength": {
+    "node": "5",
+    "input": "strength"
+  },
+  "identity_shape": {
+    "node": "5",
+    "input": "identity_shape"
+  },
+  "feather": {
+    "node": "5",
+    "input": "feather"
+  }
+}
