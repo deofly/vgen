@@ -101,7 +101,7 @@ def parameter_help(manifest: WorkflowManifest, digest: str) -> str:
     return "\n".join(lines)
 
 
-def face_commands(reference: str = "h3-face@2.0.0") -> list[list[str]]:
+def face_commands(reference: str = "h3-face@2.0.1") -> list[list[str]]:
     shared = ["--workflow", reference, "--image", "./face.png", "--video", "./original.mp4"]
     return [
         ["vgen", "task", "preflight", *shared],

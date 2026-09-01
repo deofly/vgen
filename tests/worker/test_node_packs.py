@@ -5,12 +5,17 @@ import hashlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from vgen.market.node_packs import build_node_pack_archive
 from vgen.worker.host_control import ComfyUIHostControlError
-from vgen.worker.node_packs import NodePackInstaller, NodePackInstallError
+from vgen.worker.node_packs import (
+    NodePackInstaller,
+    NodePackInstallError,
+    _default_wheel_installer,
+)
 
 
 class HostControl:
@@ -54,6 +59,42 @@ def _archive(
         wheel_root=wheels,
     )
     return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+def test_default_installer_lets_target_python_select_one_wheel_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel_root = tmp_path / "wheels"
+    wheel_root.mkdir()
+    wheels = tuple(
+        wheel_root / name
+        for name in (
+            "mediapipe-0.10.21-cp310-cp310-win_amd64.whl",
+            "mediapipe-0.10.21-cp311-cp311-win_amd64.whl",
+            "mediapipe-0.10.21-cp312-cp312-win_amd64.whl",
+            "attrs-25.4.0-py3-none-any.whl",
+        )
+    )
+    for wheel in wheels:
+        wheel.write_bytes(b"wheel")
+    observed: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        observed.append(command)
+        return SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr("vgen.worker.node_packs.subprocess.run", run)
+    _default_wheel_installer(
+        tmp_path / "python.exe",
+        wheels,
+        tmp_path / "target",
+    )
+
+    command = observed[0]
+    assert command[command.index("--find-links") + 1] == str(wheel_root)
+    assert command.count("mediapipe==0.10.21") == 1
+    assert command.count("attrs==25.4.0") == 1
+    assert all(not item.endswith(".whl") for item in command)
 
 
 def test_installs_offline_dependencies_activates_and_reuses(tmp_path: Path) -> None:

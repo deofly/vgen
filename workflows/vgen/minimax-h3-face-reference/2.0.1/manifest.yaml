@@ -1,0 +1,91 @@
+schema_version: 1
+id: vgen/minimax-h3-face-reference
+version: 2.0.1
+title: Temporal single-face swap
+summary: Replace one visible face frame by frame while retaining the source video's pixels, motion, timing and original audio.
+license: MIT
+provenance: market
+publisher:
+  id: vgen
+  public_key: null
+homepage: https://vgen.zcbiz.com
+source: https://github.com/deofly/vgen/tree/main/workflows/vgen/minimax-h3-face-reference/2.0.1
+parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - prompt
+    - image
+    - video
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+      maxLength: 10000
+      description: Task description and confirmation that the supplied face materials are authorized.
+    image:
+      type: string
+      minLength: 1
+      contentMediaType: image/*
+    video:
+      type: string
+      minLength: 1
+      contentMediaType: video/*
+    seed:
+      type: integer
+      minimum: -1
+      default: -1
+      description: Accepted for 1.x command compatibility; this deterministic workflow does not use randomness.
+    start_time:
+      type: number
+      minimum: 0
+      maximum: 3600
+      default: 0
+    strength:
+      type: number
+      minimum: 0
+      maximum: 1
+      default: 1
+    identity_shape:
+      type: number
+      minimum: 0
+      maximum: 0.6
+      default: 0.3
+    feather:
+      type: number
+      minimum: 0.01
+      maximum: 0.12
+      default: 0.045
+variants:
+  - name: comfyui
+    executor_type: comfyui
+    payload_format: comfyui-api-graph/v1
+    payload: workflow.json
+    mapping: mapping.json
+    operations:
+      - v2v
+    executor_min_version: 1.3.0
+    runtime_min_version: 0.33.0
+    models:
+      - filename: face_landmarker.task
+        folder: face_landmarkers
+        source: https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+        revision: "1"
+        sha256: 64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
+        size: 3758596
+        license: Apache-2.0
+        gated: false
+        manual_download: false
+    custom_nodes:
+      - name: VGen Temporal Face Swap
+        source: https://github.com/deofly/vgen/tree/e9bad744253a5bed81ea5711d93ad90ab744f61d/node-packs/vgen/comfyui-temporal-face-swap/1.0.0/source
+        revision: e9bad744253a5bed81ea5711d93ad90ab744f61d
+        license: MIT
+        node_types:
+          - VGenTemporalFaceSwap
+        node_pack: vgen/comfyui-temporal-face-swap@1.0.1
+        node_pack_source: https://vgen.zcbiz.com/marketplace/node-packs/vgen/comfyui-temporal-face-swap/1.0.1/node-pack.zip
+        node_pack_sha256: 07bcb2d581b4691a28a716773293fb2f586182ef23c9a82a5b039488bb47a53b
+        manual_install: false
+    min_vram_bytes: 2147483648
+    min_ram_bytes: 8589934592

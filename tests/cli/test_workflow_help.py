@@ -13,7 +13,7 @@ from vgen.cli.workflow_help import FACE_PROMPT, face_commands, parameter_help, w
 from vgen.market.models import WorkflowManifest
 from vgen.market.registry import WorkflowRegistry
 
-PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/2.0.0"
+PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/2.0.1"
 
 
 def test_face_example_commands_parse_and_pass_actual_parameter_validation():
@@ -39,7 +39,7 @@ def test_workflow_help_reads_cached_code_offline_without_installing(tmp_path, mo
         [
             {
                 "id": "vgen/minimax-h3-face-reference",
-                "version": "2.0.0",
+                "version": "2.0.1",
                 "code": "h3-face",
                 "source": "https://market.example/face.zip",
                 "digest": "sha256:" + H3_FACE_DIGEST,

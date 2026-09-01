@@ -15,7 +15,7 @@ from vgen.cli import video_inputs as video
 from vgen.market.builder import build_comfy_graph
 from vgen.market.models import WorkflowManifest
 
-PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/2.0.0"
+PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/2.0.1"
 HAS_FFMPEG = shutil.which("ffmpeg") and shutil.which("ffprobe")
 media_test = pytest.mark.skipif(not HAS_FFMPEG, reason="real FFmpeg media test")
 

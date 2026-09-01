@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+
 from vgen.crypto import canonical_json
 from vgen.market.node_packs import NodePackError, NodePackManifest, materialize_node_pack
 
@@ -79,6 +81,19 @@ def _default_wheel_installer(
 ) -> None:
     if not wheels:
         return
+    wheel_root = wheels[0].parent
+    requirements: dict[str, str] = {}
+    try:
+        for wheel in wheels:
+            if wheel.parent != wheel_root:
+                raise ValueError
+            name, version, _build, _tags = parse_wheel_filename(wheel.name)
+            normalized_version = str(version)
+            previous = requirements.setdefault(str(name), normalized_version)
+            if previous != normalized_version:
+                raise ValueError
+    except (InvalidWheelFilename, ValueError) as exc:
+        raise NodePackInstallError("NODE_PACK_DEPENDENCY_INSTALL_FAILED") from exc
     destination.mkdir(parents=True, exist_ok=True)
     command = [
         str(python_executable),
@@ -90,9 +105,12 @@ def _default_wheel_installer(
         "--no-input",
         "--no-index",
         "--no-deps",
+        "--only-binary=:all:",
+        "--find-links",
+        str(wheel_root),
         "--target",
         str(destination),
-        *(str(path) for path in wheels),
+        *(f"{name}=={requirements[name]}" for name in sorted(requirements)),
     ]
     try:
         completed = subprocess.run(  # noqa: S603
