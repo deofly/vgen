@@ -224,8 +224,8 @@ def validate_receipt(ticket: TransferTicket, receipt: TransferReceipt) -> None:
         )
 
 
-def validate_ticket_time(ticket: TransferTicket) -> None:
+def validate_ticket_time(ticket: TransferTicket, *, retryable: bool = False) -> None:
     if ticket.expires_at is not None and time.time() >= ticket.expires_at:
         raise ArtifactTransferError(
-            "authorize", "Artifact transfer ticket has expired.", retryable=False
+            "authorize", "Artifact transfer ticket has expired.", retryable=retryable
         )

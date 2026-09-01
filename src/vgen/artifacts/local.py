@@ -55,7 +55,7 @@ class LocalArtifactAdapter:
             raise ArtifactTransferError(
                 "upload", "Local upload ticket must use PUT or POST.", retryable=False
             )
-        validate_ticket_time(ticket)
+        validate_ticket_time(ticket, retryable=True)
         if not source.is_file():
             raise ArtifactTransferError("upload", "Local upload source does not exist.")
         size, digest = file_digest(source)

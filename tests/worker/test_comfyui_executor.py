@@ -174,6 +174,30 @@ def _request(payload: bytes, *, digest: str = "a" * 64) -> ExecutionRequest:
             ErrorCode.DEPENDENCY_MISSING,
         ),
         (
+            "RuntimeError",
+            "native MiniMax H3 module is missing required helpers: time_shift_slope",
+            "python_dependency_missing",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
+            "RuntimeError",
+            "quant_qk_per_thread_int8: Q/K base pointers and B/H/N strides must preserve 4-element alignment",
+            "tensor_shape_mismatch",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
+            "AcceleratorError",
+            "CUDA error: an illegal memory access was encountered",
+            "local_execution_failed",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
+            "RuntimeError",
+            "HostBuffer.truncate failed while loading MiniMax H3",
+            "local_execution_failed",
+            ErrorCode.DEPENDENCY_MISSING,
+        ),
+        (
             "SafetensorError",
             "invalid header while loading checkpoint",
             "model_load_incompatible",

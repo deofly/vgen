@@ -1259,6 +1259,7 @@ def _classify_execution_failure(exception_type: Any, exception_message: Any) -> 
         or "no module named" in diagnostic
         or "cannot import name" in diagnostic
         or "dll load failed while importing" in diagnostic
+        or "missing required helpers" in diagnostic
     ):
         return "python_dependency_missing"
     if any(
@@ -1270,9 +1271,22 @@ def _classify_execution_failure(exception_type: Any, exception_message: Any) -> 
             "must match the size",
             "dimension out of range",
             "invalid for input of size",
+            "must preserve 4-element alignment",
         )
     ):
         return "tensor_shape_mismatch"
+    if any(
+        marker in diagnostic
+        for marker in (
+            "cuda error: an illegal memory access",
+            "cuda error: unknown error",
+            "device-side assert triggered",
+            "gpu is lost",
+            "hostbuffer.truncate failed",
+            "hostbuffer.read_file_slice failed",
+        )
+    ):
+        return "local_execution_failed"
     if any(
         marker in compact for marker in ("safetensorerror", "gguferror", "modelloaderror")
     ) or any(

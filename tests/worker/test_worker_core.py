@@ -699,6 +699,82 @@ def test_pending_encrypted_upload_resumes_without_reexecuting(tmp_path: Path) ->
     assert plaintext.read_bytes() == b"private generated output"
 
 
+def test_expired_output_ticket_is_journaled_and_resumed_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    class CountingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def descriptor(self) -> ExecutorDescriptor:
+            return ExecutorDescriptor("fake", "1.0", ("fake/v1",), ("t2v",))
+
+        def health(self) -> ExecutorHealth:
+            return ExecutorHealth(True, "ready")
+
+        def capabilities(self) -> Mapping[str, Any]:
+            return {}
+
+        def execute(self, request: ExecutionRequest, context: ExecutionContext) -> ExecutionResult:
+            self.calls += 1
+            output = context.work_dir / "result.bin"
+            output.write_bytes(b"generated once")
+            return ExecutionResult((ExecutionArtifact("primary", output),))
+
+        def cancel(self, handle: str | None = None) -> None:
+            return None
+
+    destination = tmp_path / "published.vgen"
+    reference = LeaseReference("lea_expired", "tsk_expired", "atm_expired", "wrk_1", 3)
+    expired = TransferTicket(
+        destination.as_uri(),
+        "PUT",
+        expires_at=time.time() - 1,
+    )
+    lease = ExecutionLease(
+        reference=reference,
+        payload=ExecutorPayload("fake", "fake/v1", "t2v", "a" * 64, b"payload"),
+        outputs=(
+            ArtifactOutputTarget(
+                "primary",
+                ArtifactDescriptor("art_expired", "result.bin"),
+                expired,
+                kind="video",
+                store_type="local",
+                object_ref="art_expired",
+            ),
+        ),
+        crypto=LeaseCryptoContext("wsp_expired", "atm_expired", 1, b"k" * 32),
+    )
+
+    class RenewingGateway(FakeGateway):
+        def renew_output_tickets(
+            self, actual_reference: LeaseReference, artifact_ids: frozenset[str]
+        ) -> Mapping[str, TransferTicket]:
+            assert actual_reference == reference
+            assert artifact_ids == frozenset({"art_expired"})
+            return {"art_expired": TransferTicket(destination.as_uri(), "PUT")}
+
+    executor = CountingExecutor()
+    gateway = RenewingGateway()
+    core = WorkerCore(
+        ExecutorRegistry(executor),
+        ArtifactAdapterRegistry(LocalArtifactAdapter((tmp_path,))),
+        work_root=tmp_path / "worker-work",
+    )
+
+    with pytest.raises(UploadPendingError):
+        core.process(lease, gateway)
+    assert executor.calls == 1
+    assert list((tmp_path / "worker-work" / "upload-spool").glob("*/upload-manifest.json"))
+
+    resumed = core.resume_pending(gateway)
+    assert resumed is not None and resumed.succeeded
+    assert executor.calls == 1
+    assert destination.is_file()
+    assert not list((tmp_path / "worker-work" / "upload-spool").glob("*/upload-manifest.json"))
+
+
 def _save_test_upload(
     journal: UploadJournal,
     *,

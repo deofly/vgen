@@ -64,7 +64,7 @@ class OssStsArtifactAdapter:
     ) -> TransferReceipt:
         if ticket.method != "PUT":
             raise ArtifactTransferError("upload", "OSS upload ticket must use PUT.", retryable=False)
-        validate_ticket_time(ticket)
+        validate_ticket_time(ticket, retryable=True)
         if not source.is_file():
             raise ArtifactTransferError("upload", "Artifact upload source does not exist.")
         size, digest = file_digest(source)
