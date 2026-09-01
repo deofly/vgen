@@ -13,10 +13,12 @@ import os
 import re
 import stat
 import tempfile
+import urllib.parse
 import zipfile
 from pathlib import Path
 from typing import Literal
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vgen.crypto import canonical_json
@@ -28,6 +30,9 @@ _MANIFEST_NAME = "node-pack.json"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _MAX_FILES = 2048
 _MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+_DOWNLOAD_READ_TIMEOUT_SECONDS = 120.0
+_DOWNLOAD_ATTEMPTS = 8
+_CONTENT_RANGE = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
 
 
 class NodePackError(RuntimeError):
@@ -359,36 +364,106 @@ def materialize_node_pack(
     return manifest, destination / "source", destination / "wheels", artifact_digest
 
 
+def _download_node_pack(source: str, temporary: Path) -> None:
+    """Stream a bounded Node Pack to disk, resuming interrupted HTTPS reads."""
+
+    # Reuse the workflow registry's redirect, public-address, TLS and connected
+    # peer policy. The local import avoids a market package import cycle.
+    from .registry import MAX_REDIRECTS, RegistryError, WorkflowRegistry  # noqa: PLC0415
+
+    initial = WorkflowRegistry._remote_origin(source)  # noqa: SLF001
+    last_error: Exception | None = None
+    expected_total: int | None = None
+    for _attempt in range(_DOWNLOAD_ATTEMPTS):
+        offset = temporary.stat().st_size if temporary.exists() else 0
+        if offset > _MAX_UNCOMPRESSED_BYTES:
+            raise NodePackError("NODE_PACK_DOWNLOAD_SIZE_EXCEEDED")
+        current = source
+        try:
+            for redirect_count in range(MAX_REDIRECTS + 1):
+                headers = {"Range": f"bytes={offset}-"} if offset else None
+                with httpx.stream(
+                    "GET",
+                    current,
+                    headers=headers,
+                    timeout=_DOWNLOAD_READ_TIMEOUT_SECONDS,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as response:
+                    WorkflowRegistry._validate_response_peer(response)  # noqa: SLF001
+                    if 300 <= response.status_code < 400:
+                        if redirect_count >= MAX_REDIRECTS:
+                            raise RegistryError("remote Node Pack redirect limit exceeded")
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise RegistryError("remote Node Pack redirect has no location")
+                        redirected = urllib.parse.urljoin(current, location)
+                        if WorkflowRegistry._remote_origin(redirected) != initial:  # noqa: SLF001
+                            raise RegistryError("remote Node Pack redirect changed origin")
+                        current = redirected
+                        continue
+
+                    response.raise_for_status()
+                    append = offset > 0 and response.status_code == 206
+                    if append:
+                        match = _CONTENT_RANGE.fullmatch(
+                            response.headers.get("Content-Range", "")
+                        )
+                        if match is None or int(match.group(1)) != offset:
+                            raise RegistryError("remote Node Pack range response is invalid")
+                        expected_total = int(match.group(3))
+                    else:
+                        offset = 0
+                        content_length = response.headers.get("Content-Length")
+                        if content_length:
+                            try:
+                                expected_total = int(content_length)
+                            except ValueError as exc:
+                                raise RegistryError(
+                                    "remote Node Pack response has an invalid size"
+                                ) from exc
+                    if expected_total is not None and (
+                        expected_total < offset or expected_total > _MAX_UNCOMPRESSED_BYTES
+                    ):
+                        raise RegistryError("remote Node Pack response exceeds the size limit")
+
+                    with temporary.open("ab" if append else "wb") as handle:
+                        size = offset
+                        for chunk in response.iter_bytes():
+                            size += len(chunk)
+                            if size > _MAX_UNCOMPRESSED_BYTES:
+                                raise RegistryError(
+                                    "remote Node Pack response exceeds the size limit"
+                                )
+                            handle.write(chunk)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    if expected_total is not None and size != expected_total:
+                        raise RegistryError("remote Node Pack response ended early")
+                    return
+        except (httpx.HTTPError, OSError, RegistryError) as exc:
+            last_error = exc
+            continue
+    raise NodePackError("NODE_PACK_DOWNLOAD_FAILED") from last_error
+
+
 def fetch_node_pack(source: str, output: Path, *, expected_sha256: str) -> Path:
     """Download one bounded public Node Pack and bind it to an expected digest."""
 
     expected = expected_sha256.removeprefix("sha256:").lower()
     if not _DIGEST.fullmatch(expected):
         raise NodePackError("NODE_PACK_EXPECTED_DIGEST_INVALID")
-    try:
-        # Reuse the workflow registry's redirect, public-address, TLS and size
-        # policy. The local import avoids a market package import cycle.
-        from .registry import WorkflowRegistry  # noqa: PLC0415
-
-        data = WorkflowRegistry._download(  # noqa: SLF001
-            source,
-            max_bytes=_MAX_UNCOMPRESSED_BYTES,
-            timeout=120,
-        )
-    except Exception as exc:
-        raise NodePackError("NODE_PACK_DOWNLOAD_FAILED") from exc
-    if _sha256_bytes(data) != expected:
-        raise NodePackError("NODE_PACK_ARTIFACT_DIGEST_MISMATCH")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.parent / f".{output.name}.{os.urandom(12).hex()}.tmp"
     try:
-        with temporary.open("xb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _download_node_pack(source, temporary)
+        if _sha256_file(temporary) != expected:
+            raise NodePackError("NODE_PACK_ARTIFACT_DIGEST_MISMATCH")
         os.replace(temporary, output)
-    except OSError as exc:
-        raise NodePackError("NODE_PACK_DOWNLOAD_STORE_FAILED") from exc
+    except NodePackError:
+        raise
+    except Exception as exc:
+        raise NodePackError("NODE_PACK_DOWNLOAD_FAILED") from exc
     finally:
         temporary.unlink(missing_ok=True)
     return output
