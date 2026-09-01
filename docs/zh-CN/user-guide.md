@@ -758,18 +758,18 @@ vgen task submit "一只猫在草地上奔跑" --workflow h3 --wait
 
 ### 6.5 人脸参考视频：自动适配输入帧率
 
-支持此功能的新版 CLI 可以直接接收原视频，不再要求先手工转成 24 fps。当前 ComfyUI H3 Ref2VA 节点仍以 24 fps 计算视频、音频与参考时间；不能只修改输出 FPS，否则会改变播放时长。此适配仅针对已审查的 `h3-face@1.0.0` 包摘要，不修改已发布的包。
+支持此功能的新版 CLI 可以直接接收原视频，不再要求先手工转成 24 fps。当前 ComfyUI H3 Ref2VA 节点仍以 24 fps 计算视频、音频与参考时间；不能只修改输出 FPS，否则会改变播放时长。此适配仅针对已审查的 `h3-face@1.0.1` 包摘要，不修改已发布的包。
 
 本机需要安装 FFmpeg（`ffmpeg` 和 `ffprobe` 在 PATH 中）。准备本人或获授权的清晰脸部照片，以及带音轨的单人视频。所选起点之后必须至少保留 124/24 秒，约 5.17 秒。
 
 ```bash
 # 只检测素材和调度条件，不转码、不上传、不创建任务
-vgen task preflight --workflow h3-face@1.0.0 \
+vgen task preflight --workflow h3-face@1.0.1 \
   --image ./face.png --video ./original.mp4
 
 # 默认 auto：检测原视频，截取片段并转为 24 fps，再加密上传
 vgen task submit "Use <Picture 1> for facial identity and <Video 1> for movement and timing." \
-  --workflow h3-face@1.0.0 --image ./face.png --video ./original.mp4 \
+  --workflow h3-face@1.0.1 --image ./face.png --video ./original.mp4 \
   --video-fps-mode auto -p start_time=0 --wait --output-dir ./h3-face-output
 ```
 

@@ -1,0 +1,261 @@
+{
+  "92": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "filename_prefix": "video/VGen_H3_face_reference",
+      "format": "mp4",
+      "codec": "auto",
+      "video": [
+        "130",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "09 保存 MP4（检查脸与口型）"
+    }
+  },
+  "119": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "120": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "122": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "125",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "VAEDecode"
+    }
+  },
+  "123": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "res_multistep"
+    },
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "124": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "scheduler": "beta",
+      "steps": 20,
+      "denoise": 1,
+      "model": [
+        "127",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "07 采样：beta / 20 步"
+    }
+  },
+  "125": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "129",
+        0
+      ],
+      "guider": [
+        "126",
+        0
+      ],
+      "sampler": [
+        "123",
+        0
+      ],
+      "sigmas": [
+        "124",
+        0
+      ],
+      "latent_image": [
+        "136",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "126": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "127",
+        0
+      ],
+      "conditioning": [
+        "136",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "BasicGuider"
+    }
+  },
+  "127": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "Ref2VA 主模型（不是 FL2VA）"
+    }
+  },
+  "128": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "CLIPLoader"
+    }
+  },
+  "129": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 20260830
+    },
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "130": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "fps": 24,
+      "bit_depth": 8,
+      "images": [
+        "122",
+        0
+      ],
+      "audio": [
+        "148",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "08 生成画面 + 原视频音轨"
+    }
+  },
+  "136": {
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "inputs": {
+      "prompt": [
+        "138",
+        0
+      ],
+      "width": 480,
+      "height": 832,
+      "length": 124,
+      "ref_image_size": "match",
+      "clip": [
+        "128",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ],
+      "audio_vae": [
+        "120",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "137",
+        0
+      ],
+      "ref_videos.ref_video_0": [
+        "148",
+        0
+      ],
+      "ref_video_audios.ref_video_audio_0": [
+        "148",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "06 H3：宽高、帧数、参考精度"
+    }
+  },
+  "137": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__UPLOAD_TARGET_FACE__.png"
+    },
+    "_meta": {
+      "title": "01 目标人脸照片"
+    }
+  },
+  "138": {
+    "class_type": "PrimitiveStringMultiline",
+    "inputs": {
+      "value": "<Picture 1> supplies only the facial identity of the adult person in the output. <Video 1> supplies the single person's body movement, head poses, expressions, clothing, hairstyle, camera movement, lighting, scene layout and action timing.\n\nintegrated_multimodal_description: Re-create the continuous single-person shot in <Video 1>, replacing the visible person's facial identity with the adult face in <Picture 1>. Maintain that same facial identity consistently through turns, expression changes and temporary occlusions. Retain the video's original clothing, hairstyle, body proportions, scene, camera framing and sequence of actions as closely as possible. Do not copy the portrait's background or clothing. Match facial lighting, perspective, skin texture and shadows to the video. Keep natural blinking and the visible timing of speech and expression. No face morphing, extra people, added scene cuts, captions or overlays.\n\noverall_soundscape: Follow the reference shot's timing. Do not introduce new dialogue or music."
+    },
+    "_meta": {
+      "title": "05 换脸参考提示词"
+    }
+  },
+  "147": {
+    "class_type": "LoadVideo",
+    "inputs": {
+      "file": "__UPLOAD_REFERENCE_24FPS__.mp4"
+    },
+    "_meta": {
+      "title": "02 原视频：先转为 24 fps"
+    }
+  },
+  "148": {
+    "class_type": "GetVideoComponents",
+    "inputs": {
+      "video": [
+        "149",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "04 取参考帧与原音轨"
+    }
+  },
+  "149": {
+    "class_type": "Video Slice",
+    "inputs": {
+      "start_time": 0,
+      "duration": 5.166666666666667,
+      "strict_duration": true,
+      "video": [
+        "147",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "03 截取开头 124 帧对应时长"
+    }
+  }
+}

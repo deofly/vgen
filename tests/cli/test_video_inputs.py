@@ -15,7 +15,7 @@ from vgen.cli import video_inputs as video
 from vgen.market.builder import build_comfy_graph
 from vgen.market.models import WorkflowManifest
 
-PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/1.0.0"
+PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/1.0.1"
 HAS_FFMPEG = shutil.which("ffmpeg") and shutil.which("ffprobe")
 media_test = pytest.mark.skipif(not HAS_FFMPEG, reason="real FFmpeg media test")
 
@@ -198,6 +198,18 @@ def test_adaptation_is_pinned_and_does_not_change_other_workflows(monkeypatch):
     with pytest.raises(ValueError, match="摘要"):
         with video.prepare_reference_video(*video.H3_FACE_RELEASE, "0" * 64, "video.mp4"):
             pass
+
+
+def test_legacy_face_release_remains_digest_pinned(monkeypatch):
+    monkeypatch.setattr(
+        video,
+        "inspect_video",
+        lambda path, start_time=0: video.VideoInfo(Fraction(24), Fraction(6), False, True),
+    )
+    legacy = ("vgen/minimax-h3-face-reference", "1.0.0")
+    digest = video.H3_FACE_RELEASE_DIGESTS[legacy]
+    with video.prepare_reference_video(*legacy, digest, "video.mp4", mode="strict") as result:
+        assert result is not None and result.mode == "strict"
 
 
 def test_missing_ffmpeg_is_actionable(monkeypatch):

@@ -8,7 +8,7 @@ from typing import Any
 
 from vgen.market.models import WorkflowManifest
 
-from .video_inputs import H3_FACE_DIGEST, H3_FACE_RELEASE
+from .video_inputs import H3_FACE_RELEASE_DIGESTS
 
 FACE_PROMPT = (
     "Use <Picture 1> only for facial identity. Re-create the single-person shot in "
@@ -40,7 +40,7 @@ def _json(value: Any) -> str:
 
 
 def is_face_help(manifest: WorkflowManifest, digest: str) -> bool:
-    return (manifest.id, manifest.version) == H3_FACE_RELEASE and digest == H3_FACE_DIGEST
+    return H3_FACE_RELEASE_DIGESTS.get((manifest.id, manifest.version)) == digest
 
 
 def parameter_help(manifest: WorkflowManifest, digest: str) -> str:
@@ -98,7 +98,7 @@ def parameter_help(manifest: WorkflowManifest, digest: str) -> str:
     return "\n".join(lines)
 
 
-def face_commands(reference: str = "h3-face@1.0.0") -> list[list[str]]:
+def face_commands(reference: str = "h3-face@1.0.1") -> list[list[str]]:
     shared = ["--workflow", reference, "--image", "./face.png", "--video", "./original.mp4"]
     return [
         ["vgen", "task", "preflight", *shared],

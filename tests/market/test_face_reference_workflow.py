@@ -21,7 +21,7 @@ from vgen.market.builder import WorkflowBuildError, build_comfy_graph
 from vgen.market.registry import WorkflowRegistry, build_archive
 from vgen.worker.capabilities import WorkerCapabilityStore
 
-PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/1.0.0"
+PACKAGE = Path(__file__).parents[2] / "workflows/vgen/minimax-h3-face-reference/1.0.1"
 
 
 def test_market_archive_builds_exact_video_capability_and_rejects_tampering(tmp_path: Path) -> None:
@@ -151,7 +151,7 @@ def test_video_reference_cannot_silently_select_first_last_frame_operation() -> 
 def test_video_workflow_passes_gateway_maintenance_and_heartbeat_contracts() -> None:
     spec = CapabilityInstallSpec(
         kind="capability_install",
-        workflow_ref="vgen/minimax-h3-face-reference@1.0.0",
+        workflow_ref="vgen/minimax-h3-face-reference@1.0.1",
         workflow_digest="sha256:" + "a" * 64,
         artifact_sha256="b" * 64,
         artifact_size=100,

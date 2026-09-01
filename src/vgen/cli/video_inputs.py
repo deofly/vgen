@@ -14,8 +14,16 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-H3_FACE_RELEASE = ("vgen/minimax-h3-face-reference", "1.0.0")
-H3_FACE_DIGEST = "a2d5fc8d4acb9f667ea625d3037ae13142f9f76a5c5d6576df80cd1158cd9463"
+H3_FACE_RELEASE = ("vgen/minimax-h3-face-reference", "1.0.1")
+# Populated with the exact reviewed archive digest for every compatible release.
+# The legacy release remains supported for installed/offline callers.
+H3_FACE_RELEASE_DIGESTS = {
+    ("vgen/minimax-h3-face-reference", "1.0.0"): (
+        "a2d5fc8d4acb9f667ea625d3037ae13142f9f76a5c5d6576df80cd1158cd9463"
+    ),
+    H3_FACE_RELEASE: "b2275088cc2af6afa7a4efc652bb6dd1354b44643ad1593805bbb34814e07f46",
+}
+H3_FACE_DIGEST = H3_FACE_RELEASE_DIGESTS[H3_FACE_RELEASE]
 H3_FPS = 24
 H3_FRAMES = 124
 H3_DURATION = Fraction(H3_FRAMES, H3_FPS)
@@ -170,12 +178,14 @@ def prepare_reference_video(
     mode: str | None = None,
     dry_run: bool = False,
 ) -> Iterator[PreparedVideo | None]:
-    if (workflow_id, version) != H3_FACE_RELEASE:
+    release = (workflow_id, version)
+    expected_digest = H3_FACE_RELEASE_DIGESTS.get(release)
+    if expected_digest is None:
         if mode is not None:
-            raise ValueError("--video-fps-mode 当前仅适用于 h3-face@1.0.0。")
+            raise ValueError("--video-fps-mode 当前仅适用于已审查的 h3-face 版本。")
         yield None
         return
-    if digest != H3_FACE_DIGEST:
+    if digest != expected_digest:
         raise ValueError("H3 人脸参考包摘要与已审查版本不符，不能自动适配视频。")
     if not value:
         raise ValueError("此工作流需要 --video。")

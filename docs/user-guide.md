@@ -661,15 +661,15 @@ its compatibility or validation status.
 
 ### Automatic frame-rate adaptation for face-reference video
 
-The new CLI accepts the original video for the reviewed `h3-face@1.0.0` release.
+The new CLI accepts the original video for the reviewed `h3-face@1.0.1` release.
 Install FFmpeg with both `ffmpeg` and `ffprobe` on PATH. H3 Ref2VA still uses a
 24 fps time base; changing only the encoded output rate would change playback
 timing. This feature adapts the input, not the model or output frame rate.
 
 ```bash
-vgen task preflight --workflow h3-face@1.0.0 --image ./face.png --video ./original.mp4
+vgen task preflight --workflow h3-face@1.0.1 --image ./face.png --video ./original.mp4
 vgen task submit "Use <Picture 1> for facial identity and <Video 1> for movement and timing." \
-  --workflow h3-face@1.0.0 --image ./face.png --video ./original.mp4 \
+  --workflow h3-face@1.0.1 --image ./face.png --video ./original.mp4 \
   --video-fps-mode auto -p start_time=0 --wait --output-dir ./h3-face-output
 ```
 
