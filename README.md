@@ -83,6 +83,9 @@ configuration. Community expectations are in the
 
 ## API
 
+For a video-creation UI, see the [Toonflow integration preview](integrations/toonflow/README.md).
+It connects Toonflow's existing desktop/web workbench to the local VGen CLI.
+
 The machine-readable API contract is [`schemas/openapi-v1.json`](schemas/openapi-v1.json).
 Public API endpoints use `/api/v1`.
 

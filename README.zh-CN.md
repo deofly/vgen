@@ -77,6 +77,9 @@ python tools/check_public_repository.py
 
 ## API
 
+图形化视频创作入口见 [Toonflow 集成预览](integrations/toonflow/README.zh-CN.md)，
+可将 Toonflow 现有工作台接入本地 VGen CLI。
+
 机器可读的 API 契约位于 [`schemas/openapi-v1.json`](schemas/openapi-v1.json)。公共 API 使用
 `/api/v1`。
 
