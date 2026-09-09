@@ -98,3 +98,32 @@ Node tests run the direct executor against real local SQLite, a simulated CLI,
 and Toonflow's Sucrase/VM2 environment. They cover queue persistence, retries,
 parameter validation, private files, subprocess arguments and project recovery.
 GPU acceptance still requires actual clips, playback, project return and export.
+
+## Workflow maintenance
+
+Toonflow does not carry a second workflow registry. At startup it reads versioned
+workflows installed for the local VGen CLI and displays their model entries. Each
+video stores the selected `id@version` and digest; a digest mismatch blocks submission.
+
+Maintain a new release on the VGen/Worker side, then refresh Toonflow:
+
+```bash
+vgen workflow verify ./workflow-package
+vgen workflow install ./workflow-package
+vgen workflow list --format=json
+vgen broker workflow-install vgen/example@1.0.0 --worker <worker>
+vgen broker model-install vgen/example@1.0.0 --worker <worker> --wait
+vgen task preflight "test prompt" --workflow=vgen/example@1.0.0
+```
+
+A package must contain a versioned manifest, parameter Schema, graph, mapping,
+model digests and dependency declarations. Publish a new SemVer instead of replacing
+an existing release. Wait for the Worker to report its models, nodes, executor and
+resource requirements ready before refreshing Toonflow. Use
+`vgen broker workflow-deactivate` or `workflow-uninstall` for lifecycle changes;
+other versions remain separate.
+
+The workbench now exposes `cancelVideoGenerate` and `retryVideoGenerate`: cancel
+resolves the remote task correlated to one video record, while retry only accepts a
+failed/cancelled job and creates a new idempotency key. `checkVideoStateList` also
+returns in-progress videos and their latest task progress.

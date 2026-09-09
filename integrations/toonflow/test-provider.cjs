@@ -72,6 +72,26 @@ test('direct queue submits, polls and downloads without HTTP', async t => {
   assert.deepEqual(calls.map(c => c[0]), ['preflight', 'submit', 'show', 'get']);
 });
 
+test('a versioned video-reference workflow uses its own parameter schema', async t => {
+  const { q, calls } = fixture(t);
+  const model = { modelName: 'vgen/minimax-h3-face-reference@2.0.1',
+    workflowRef: 'vgen/minimax-h3-face-reference@2.0.1', workflowDigest: null,
+    mode: ['videoReference'], audio: false,
+    durationResolutionMap: [{ duration: [5.167], resolution: ['default'] }],
+    parameterDefaults: { seed: -1, start_time: 0, strength: 1 } };
+  const image = Buffer.from([137,80,78,71,13,10,26,10]).toString('base64');
+  const video = Buffer.concat([Buffer.from([0,0,0,24]), Buffer.from('ftypisom'), Buffer.alloc(16)]).toString('base64');
+  const request = { ...input, vgenRequestId: 'face:1', duration: 5.167, resolution: 'default',
+    mode: 'videoReference', referenceList: [{ type: 'image', base64: image }, { type: 'video', base64: video }] };
+  const row = q.add(request, model); await q.tick();
+  const args = calls.find(c => c[0] === 'submit');
+  assert.equal(q.get(row.id).state, 'submitted');
+  assert.ok(args.includes('--workflow=vgen/minimax-h3-face-reference@2.0.1'));
+  assert.ok(args.some(a => a.startsWith('--video=')));
+  assert.ok(args.some(a => a.startsWith('--image=')));
+  assert.ok(!args.some(a => a.startsWith('--parameter=frames=')));
+});
+
 test('duplicate requests and overlapping ticks submit only once', async t => {
   const { q, calls } = fixture(t);
   const first = q.add(input, model);
@@ -141,7 +161,7 @@ test('first and last images are private files; shell-looking prompt stays a posi
 
 test('unsupported duration, audio-off and invalid image counts are rejected', () => {
   for (const overrides of [{ duration: 5 }, { audio: false }, { mode: 'singleImage' },
-    { mode: 'startEndRequired' }, { referenceList: [{ type: 'video', base64: 'abc' }] }]) {
+    { mode: 'startEndRequired' }, { mode: 'videoReference', referenceList: [{ type: 'video', base64: 'abc' }] }, { referenceList: [{ type: 'video', base64: 'abc' }] }]) {
     assert.throws(() => normalize({ ...input, ...overrides }, model));
   }
 });

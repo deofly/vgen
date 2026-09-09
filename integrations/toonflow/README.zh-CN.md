@@ -60,3 +60,27 @@ Toonflow 与 CLI 需使用同一系统用户。
 本地提示词、参考图片和解密后视频尚未自动清理。
 
 验证命令与更多实现细节见 [英文说明](README.md)。
+
+## 工作流维护
+
+Toonflow 不保存工作流副本。启动时会读取本机 VGen 已安装的工作流目录，并显示
+带版本的模型；每个视频任务会保存当时的 `id@version` 和内容摘要。摘要变化时，
+任务会在提交前停止，避免使用被替换的工作流。
+
+新增或升级工作流时，在 VGen/Worker 侧完成完整维护链：
+
+```bash
+vgen workflow verify ./workflow-package
+vgen workflow install ./workflow-package
+vgen workflow list --format=json
+vgen broker workflow-install vgen/example@1.0.0 --worker <worker>
+vgen broker model-install vgen/example@1.0.0 --worker <worker> --wait
+vgen task preflight "测试提示词" --workflow=vgen/example@1.0.0
+```
+
+工作流包必须包含版本化 manifest、参数 Schema、节点图、映射、模型摘要和依赖。
+新版本使用新的 SemVer；不要覆盖已经发布的版本。升级后等待 Worker 报告模型、
+节点、执行器和显存条件均为 ready，再让 Toonflow 刷新模型列表。停用或卸载使用
+`vgen broker workflow-deactivate` / `workflow-uninstall`，不会自动影响其他版本。
+
+当前视频接口还提供 `cancelVideoGenerate` 和 `retryVideoGenerate`：前者按视频记录取消远端任务，后者只允许失败/取消任务重新排队，并为重试生成新的幂等编号。`checkVideoStateList` 会返回正在生成的视频及其进度。

@@ -19,10 +19,10 @@ export function cliExecutable(): string {
   return fs.existsSync(installed) ? installed : "vgen";
 }
 
-export function runCLI(args: string[]): Promise<any> {
-  const profile = process.env.VGEN_PROFILE ? [`--profile=${process.env.VGEN_PROFILE}`] : [];
+export function runVgenCLI(args: string[], selectedProfile = process.env.VGEN_PROFILE): Promise<any> {
+  const profile = args[0] === "task" && selectedProfile ? [`--profile=${selectedProfile}`] : [];
   return new Promise((resolve, reject) => {
-    execFile(cliExecutable(), ["task", args[0], ...profile, ...args.slice(1)], {
+    execFile(cliExecutable(), [args[0], ...profile, ...args.slice(1)], {
       shell: false, timeout: 600000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
     }, (error, stdout, stderr) => {
       if (error) {
@@ -32,41 +32,66 @@ export function runCLI(args: string[]): Promise<any> {
       }
       try {
         const result = JSON.parse(stdout);
-        if (!result || Array.isArray(result) || typeof result !== "object") throw new Error();
+        if (!result || typeof result !== "object") throw new Error();
         resolve(result);
       } catch { reject(new Error("VGen 返回了无效的 JSON。")); }
     });
   });
 }
 
+export function runCLI(args: string[], selectedProfile = process.env.VGEN_PROFILE): Promise<any> {
+  return runVgenCLI(["task", ...args], selectedProfile);
+}
+
 export function normalize(config: any, model: any) {
   const mode = Array.isArray(config.mode) && config.mode.length === 1 ? config.mode[0] : config.mode;
   const refs = config.referenceList || [];
-  const counts: Record<string, number[]> = { text: [0], singleImage: [1], startEndRequired: [2], endFrameOptional: [1, 2] };
-  if (model.modelName !== "h3-8step" || config.duration !== 1.625 || config.resolution !== "768p" ||
-      !["16:9", "9:16"].includes(config.aspectRatio) || config.audio === false ||
+  const counts: Record<string, number[]> = { text: [0], singleImage: [1], startEndRequired: [2], endFrameOptional: [1, 2], videoReference: [1, 2] };
+  const workflowRef = model.workflowRef || "vgen/minimax-h3-8step@1.0.1";
+  const h3 = workflowRef === "vgen/minimax-h3-8step@1.0.1";
+  const allowedDurations = model.durationResolutionMap?.flatMap((item: any) => item.duration) || [1.625];
+  if (!workflowRef.includes("@") || (h3 && config.duration !== 1.625) || !allowedDurations.includes(config.duration) ||
+      (h3 && config.resolution !== "768p") || !["16:9", "9:16"].includes(config.aspectRatio) || (model.audio !== false && config.audio === false) ||
       typeof config.prompt !== "string" || !config.prompt.trim() || config.prompt.length > 20000 ||
       !Array.isArray(refs) || !counts[mode]?.includes(refs.length)) {
-    throw new Error("生成参数不受支持，请使用 H3 39 帧预览及其支持的参考图片模式。");
+    throw new Error("生成参数不受支持，请使用当前工作流显示的参数。");
   }
   const images = refs.map((item: any) => {
-    if (item.type !== "image" || typeof item.base64 !== "string") throw new Error("仅支持参考图片。");
-    const raw = item.base64.replace(/^data:image\/(png|jpeg|webp);base64,/, "");
-    if (raw.length > 14 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) throw new Error("图片编码无效或过大。");
+    if (!['image', 'video'].includes(item.type) || typeof item.base64 !== "string") throw new Error("仅支持参考图片或视频。");
+    const raw = item.base64.replace(/^data:[^;]+;base64,/, "");
+    if (raw.length > (item.type === "video" ? 140 * 1024 * 1024 : 14 * 1024 * 1024) || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) throw new Error("素材编码无效或过大。");
     const bytes = Buffer.from(raw, "base64");
-    if (bytes.toString("base64") !== raw || !bytes.length || bytes.length > 10 * 1024 * 1024) throw new Error("图片编码无效或过大。");
-    const extension = bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? ".png" :
+    if (bytes.toString("base64") !== raw || !bytes.length || bytes.length > (item.type === "video" ? 100 * 1024 * 1024 : 10 * 1024 * 1024)) throw new Error("素材编码无效或过大。");
+    if (item.type === "video" && bytes.toString("ascii", 4, 8) !== "ftyp") throw new Error("参考视频必须是 MP4。");
+    const extension = item.type === "video" ? ".mp4" : bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? ".png" :
       bytes.subarray(0, 3).equals(Buffer.from([255,216,255])) ? ".jpg" :
       bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP" ? ".webp" : null;
     if (!extension) throw new Error("仅支持 PNG、JPEG、WebP 图片。");
-    return { base64: raw, extension };
+    return { base64: raw, extension, type: item.type };
   });
+  if (mode === "videoReference" && images.filter((item: any) => item.type === "video").length !== 1) {
+    throw new Error("视频参考模式需要一条视频和可选的参考图片。");
+  }
   const context = config.vgenContext || {};
   const requestId = config.vgenRequestId || crypto.randomUUID();
   if (!/^[A-Za-z0-9:_-]{1,160}$/.test(requestId)) throw new Error("无效的任务关联编号。");
+  const defaults = model.parameterDefaults || {};
+  const parameters = { ...defaults, prompt: config.prompt };
+  if (Object.hasOwn(defaults, "width") && Object.hasOwn(defaults, "height")) {
+    const portrait = Number(defaults.height) > Number(defaults.width);
+    if (config.aspectRatio === "9:16" !== portrait) {
+      parameters.width = defaults.height;
+      parameters.height = defaults.width;
+    }
+  }
+  if (Object.hasOwn(defaults, "frames") && Object.hasOwn(defaults, "fps")) {
+    parameters.frames = Math.max(1, Math.round(config.duration * Number(defaults.fps)));
+  }
   return { requestId, prompt: config.prompt, mode, aspectRatio: config.aspectRatio, images,
+    workflowRef, workflowDigest: model.workflowDigest || null, parameters,
     context: { instance_id: context.instance_id, project_id: context.project_id,
-      script_id: context.script_id, video_id: context.video_id } };
+      script_id: context.script_id, video_id: context.video_id,
+      profile: process.env.VGEN_PROFILE || null } };
 }
 
 export class LocalQueue {
@@ -74,7 +99,9 @@ export class LocalQueue {
   private busy = false;
   private closing = false;
   private timer?: ReturnType<typeof setInterval>;
-  constructor(readonly root: string, private run: Runner = runCLI) {
+  private run: Runner;
+  constructor(readonly root: string, run?: Runner, readonly profile = process.env.VGEN_PROFILE || null) {
+    this.run = run || (args => runCLI(args, this.profile || undefined));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     fs.chmodSync(root, 0o700);
     this.db = new Database(path.join(root, "jobs.sqlite"));
@@ -82,7 +109,8 @@ export class LocalQueue {
     this.db.exec(`CREATE TABLE IF NOT EXISTS owner (id INTEGER PRIMARY KEY, pid INTEGER);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, request_id TEXT UNIQUE,
       digest TEXT, request TEXT, state TEXT, task_id TEXT, error TEXT, result TEXT,
-      created INTEGER, updated INTEGER)`);
+      progress TEXT, created INTEGER, updated INTEGER)`);
+    try { this.db.exec("ALTER TABLE jobs ADD COLUMN progress TEXT"); } catch { /* already present */ }
     try {
       this.db.transaction(() => {
         const owner = this.db.prepare("SELECT pid FROM owner WHERE id=1").get();
@@ -114,6 +142,18 @@ export class LocalQueue {
   }
   rows(): any[] { return this.db.prepare("SELECT * FROM jobs ORDER BY created ASC").all(); }
   get(id: string): any { return this.db.prepare("SELECT * FROM jobs WHERE id=?").get(id); }
+  async cancelRemote(taskId: string) { return this.run(["cancel", taskId]); }
+  retry(id: string) {
+    const row = this.get(id);
+    if (!row || !["failed", "cancelled"].includes(row.state)) return null;
+    const request = JSON.parse(row.request);
+    const requestId = `${request.requestId}:retry:${crypto.randomUUID().slice(0, 12)}`;
+    const retryId = crypto.randomUUID();
+    const now = Date.now();
+    this.db.prepare("INSERT INTO jobs(id,request_id,digest,request,state,created,updated) VALUES(?,?,?,?,?,?,?)")
+      .run(retryId, requestId, row.digest, JSON.stringify({ ...request, requestId }), "queued", now, now);
+    return this.get(retryId);
+  }
   update(id: string, fields: Record<string, any>) {
     const values = { ...fields, updated: Date.now() };
     this.db.prepare(`UPDATE jobs SET ${Object.keys(values).map(key => `${key}=?`).join(",")} WHERE id=?`)
@@ -121,6 +161,7 @@ export class LocalQueue {
   }
   add(config: any, model: any) {
     const request = normalize(config, model);
+    request.context.profile = this.profile;
     const raw = JSON.stringify(request);
     const digest = crypto.createHash("sha256").update(raw).digest("hex");
     return this.db.transaction(() => {
@@ -141,12 +182,23 @@ export class LocalQueue {
     const directory = path.join(this.root, row.id);
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const [width, height] = request.aspectRatio === "16:9" ? [1344, 768] : [768, 1344];
-    const args = ["--workflow=vgen/minimax-h3-8step@1.0.1", `--parameter=width=${width}`,
-      `--parameter=height=${height}`, "--parameter=frames=39", "--parameter=fps=24"];
+    const parameters = { ...request.parameters };
+    const h3 = request.workflowRef === "vgen/minimax-h3-8step@1.0.1";
+    if (h3 && !Object.hasOwn(parameters, "width")) parameters.width = width;
+    if (h3 && !Object.hasOwn(parameters, "height")) parameters.height = height;
+    if (h3 && !Object.hasOwn(parameters, "frames")) parameters.frames = 39;
+    if (h3 && !Object.hasOwn(parameters, "fps")) parameters.fps = 24;
+    delete parameters.prompt;
+    const args = [`--workflow=${request.workflowRef}`];
+    for (const [key, value] of Object.entries(parameters)) {
+      if (["image", "last_image", "video"].includes(key) || value === undefined || value === null) continue;
+      args.push(`--parameter=${key}=${typeof value === "string" ? value : JSON.stringify(value)}`);
+    }
     request.images.forEach((image: any, index: number) => {
       const file = path.join(directory, `input-${index}${image.extension}`);
       fs.writeFileSync(file, Buffer.from(image.base64, "base64"), { mode: 0o600 });
-      args.push(`--${index === 0 ? "image" : "last-image"}=${file}`);
+      const imageIndex = request.images.slice(0, index).filter((item: any) => item.type === "image").length;
+      args.push(`--${image.type === "video" ? "video" : imageIndex === 0 ? "image" : "last-image"}=${file}`);
     });
     return [...args, "--", request.prompt];
   }
@@ -160,6 +212,13 @@ export class LocalQueue {
       if (row.state === "queued") {
         this.update(row.id, { state: "checking", error: null });
         const args = this.args(row);
+        if (row.request && JSON.parse(row.request).workflowDigest) {
+          const current = await runVgenCLI(["workflow", "show", JSON.parse(row.request).workflowRef, "--format=json"]);
+          if (current.digest !== JSON.parse(row.request).workflowDigest) {
+            this.update(row.id, { state: "failed", error: "工作流文件摘要已变化，已阻止提交。" });
+            return;
+          }
+        }
         const checked = await this.run(["preflight", ...args]);
         if (!["ready", "queue_available"].includes(checked.state)) {
           const messages: Record<string, string> = {
@@ -180,6 +239,12 @@ export class LocalQueue {
         return;
       }
       const task = await this.run(["show", row.task_id, "--format=json"]);
+      const attempts = Array.isArray(task.attempts) ? task.attempts : [];
+      const latest = attempts.slice().reverse().find((item: any) => item && item.progress);
+      if (latest) {
+        const progress = typeof latest.progress === "string" ? latest.progress : JSON.stringify(latest.progress);
+        this.update(row.id, { progress });
+      }
       if (["failed", "cancelled", "expired"].includes(task.state)) {
         this.update(row.id, { state: task.state === "cancelled" ? "cancelled" : "failed", error: "VGen 任务已失败、取消或过期。" });
       } else if (task.state === "succeeded") {
